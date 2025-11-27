@@ -10,4 +10,6 @@ flamegraph*.svg
 
 # Benchmark results
 /criterion
-ai/tmp/
+
+# AI session context (local only)
+/ai/
