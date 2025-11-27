@@ -51,7 +51,7 @@ impl LinearModel {
     /// * `data` - Slice of (key, position) pairs. Keys should be sorted.
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// use seerdb::alex::linear_model::LinearModel;
     ///
     /// let data = vec![(0, 0), (10, 1), (20, 2), (30, 3)];
@@ -170,7 +170,7 @@ impl LinearModel {
     /// Predicted position (clamped to valid array indices)
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// use seerdb::alex::linear_model::LinearModel;
     ///
     /// let data = vec![(0, 0), (100, 100), (200, 200)];

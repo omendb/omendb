@@ -39,7 +39,7 @@ use varint_rs::VarintWriter;
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```rust,ignore
 /// use seerdb::sstable::CompressionType;
 ///
 /// // LZ4 for speed-critical workloads

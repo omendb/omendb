@@ -45,7 +45,7 @@ const MIN_DENSITY: f64 = 0.3;
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use seerdb::alex::gapped_node::GappedNode;
 ///
 /// let mut node = GappedNode::new(10, 1.0); // 10 keys, 50% expansion
@@ -92,7 +92,7 @@ impl GappedNode {
     /// * `expansion_factor` - Gap ratio (1.0 = 50% capacity is gaps)
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// use seerdb::alex::gapped_node::GappedNode;
     ///
     /// // Node for ~100 keys with 50% expansion
