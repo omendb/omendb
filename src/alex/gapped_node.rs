@@ -10,7 +10,7 @@
 //! [1, 2, 3, 4, 5] ← Dense, no room for inserts
 //! ```
 //!
-//! Gapped array (expansion_factor = 1.0):
+//! Gapped array (`expansion_factor` = 1.0):
 //! ```text
 //! [1, None, 2, None, 3, None, 4, None, 5] ← 50% gaps
 //!  ↑  gap   ↑  gap   ↑  gap   ↑  gap   ↑
@@ -73,7 +73,7 @@ pub struct GappedNode {
     /// Linear model for predicting position
     model: LinearModel,
 
-    /// Expansion factor: capacity = num_keys × (1 + expansion_factor)
+    /// Expansion factor: capacity = `num_keys` × (1 + `expansion_factor`)
     /// 1.0 = 50% gaps, 2.0 = 66% gaps, 0.5 = 33% gaps
     expansion_factor: f64,
 
@@ -99,6 +99,7 @@ impl GappedNode {
     /// let node = GappedNode::new(100, 1.0);
     /// assert_eq!(node.capacity(), 200); // 100 * (1 + 1.0)
     /// ```
+    #[must_use] 
     pub fn new(expected_keys: usize, expansion_factor: f64) -> Self {
         let capacity = ((expected_keys as f64 * (1.0 + expansion_factor)).ceil() as usize).max(4);
 
@@ -157,7 +158,7 @@ impl GappedNode {
     /// 2. Checks capacity once instead of per-key
     /// 3. Amortizes gap allocation overhead
     ///
-    /// **Performance**: 10-100x faster than sequential insert() for large batches
+    /// **Performance**: 10-100x faster than sequential `insert()` for large batches
     ///
     /// Returns false if node needs split (at capacity)
     pub fn insert_batch(&mut self, entries: &[(i64, Vec<u8>)]) -> Result<bool> {
@@ -326,7 +327,7 @@ impl GappedNode {
 
     /// Search for exact key match (SIMD-accelerated when available)
     ///
-    /// Uses SIMD to search 4 keys at once using std::simd.
+    /// Uses SIMD to search 4 keys at once using `std::simd`.
     /// Provides ~3-4x speedup over scalar linear search.
     fn binary_search_exact(&self, start: usize, end: usize, key: i64) -> Option<usize> {
         simd_search::simd_search_i64(&self.keys[start..end], key).map(|pos| start + pos)
@@ -335,7 +336,7 @@ impl GappedNode {
     /// Binary search for gap to insert key
     ///
     /// Returns position where key should be inserted to maintain sorted order.
-    /// insert() will handle finding gap and shifting if needed.
+    /// `insert()` will handle finding gap and shifting if needed.
     fn binary_search_gap(&self, start: usize, end: usize, key: i64) -> usize {
         // Find first position where key should go to maintain sorted order
         for i in start..end {
@@ -378,7 +379,7 @@ impl GappedNode {
     fn find_any_gap(&self) -> usize {
         self.keys
             .iter()
-            .position(|k| k.is_none())
+            .position(std::option::Option::is_none)
             .unwrap_or(self.keys.len() - 1)
     }
 
@@ -424,6 +425,7 @@ impl GappedNode {
     /// This prevents excessive retraining that causes too many node splits.
     ///
     /// **Threshold**: Retrain if error > 20% of node capacity
+    #[must_use] 
     pub fn needs_retrain(&self) -> bool {
         if self.num_keys < 10 {
             return false; // Too few keys to benefit from retraining
@@ -452,7 +454,7 @@ impl GappedNode {
 
     /// Retrain model on current data
     ///
-    /// Should be called after bulk inserts or splits, OR when needs_retrain() returns true.
+    /// Should be called after bulk inserts or splits, OR when `needs_retrain()` returns true.
     /// **Time complexity**: O(n log n) where n is number of keys (due to sorting)
     pub fn retrain(&mut self) -> Result<()> {
         // Collect (key, position) pairs for training
@@ -477,7 +479,8 @@ impl GappedNode {
     /// Get all keys (without values) for efficient searching
     ///
     /// Returns Vec of (key, position) pairs without cloning values.
-    /// Much faster than pairs() for lower_bound operations.
+    /// Much faster than `pairs()` for `lower_bound` operations.
+    #[must_use] 
     pub fn keys_only(&self) -> Vec<(i64, usize)> {
         self.keys
             .iter()
@@ -486,12 +489,13 @@ impl GappedNode {
             .collect()
     }
 
-    /// Find position of first key >= search_key using learned model + exponential search
+    /// Find position of first key >= `search_key` using learned model + exponential search
     ///
-    /// This is the ALEX-optimized lower_bound that avoids materializing all keys.
+    /// This is the ALEX-optimized `lower_bound` that avoids materializing all keys.
     /// **Time complexity**: O(log error) where error is model prediction error
     ///
-    /// Returns (key, position) if found, None if no key >= search_key exists
+    /// Returns (key, position) if found, None if no key >= `search_key` exists
+    #[must_use] 
     pub fn lower_bound_position(&self, search_key: i64) -> Option<(i64, usize)> {
         if self.num_keys == 0 {
             return None;
@@ -559,25 +563,29 @@ impl GappedNode {
 
     /// Get current density (fraction of capacity that is filled)
     ///
-    /// Density = num_keys / capacity
+    /// Density = `num_keys` / capacity
     /// - 0.0 = empty
     /// - 1.0 = completely full (no gaps)
     /// - Typical: 0.3 - 0.8 (30-80% full)
+    #[must_use] 
     pub fn density(&self) -> f64 {
         self.num_keys as f64 / self.keys.len() as f64
     }
 
     /// Get number of keys (not counting gaps)
-    pub fn num_keys(&self) -> usize {
+    #[must_use] 
+    pub const fn num_keys(&self) -> usize {
         self.num_keys
     }
 
     /// Get total capacity (including gaps)
-    pub fn capacity(&self) -> usize {
+    #[must_use] 
+    pub const fn capacity(&self) -> usize {
         self.keys.len()
     }
 
     /// Check if node should be split
+    #[must_use] 
     pub fn should_split(&self) -> bool {
         self.density() >= MAX_DENSITY
     }
@@ -587,13 +595,13 @@ impl GappedNode {
     /// From ALEX paper: "When a node reaches max density, split at median key.
     /// Create two child nodes, distribute data, and retrain models locally."
     ///
-    /// Returns (split_key, right_node) where:
-    /// - split_key: Median key that divides left/right
-    /// - right_node: New node containing keys >= split_key
-    /// - self becomes left_node containing keys < split_key
+    /// Returns (`split_key`, `right_node`) where:
+    /// - `split_key`: Median key that divides left/right
+    /// - `right_node`: New node containing keys >= `split_key`
+    /// - self becomes `left_node` containing keys < `split_key`
     ///
     /// **Time complexity**: O(n log n) due to sorting
-    pub fn split(&mut self) -> Result<(i64, GappedNode)> {
+    pub fn split(&mut self) -> Result<(i64, Self)> {
         if !self.should_split() {
             return Err(anyhow::anyhow!(
                 "Node doesn't need splitting (density < MAX_DENSITY)"
@@ -616,8 +624,8 @@ impl GappedNode {
         let right_size = pairs.len() - split_idx;
         let expansion = self.expansion_factor.max(1.0);
 
-        let mut left = GappedNode::new(left_size, expansion);
-        let mut right = GappedNode::new(right_size, expansion);
+        let mut left = Self::new(left_size, expansion);
+        let mut right = Self::new(right_size, expansion);
 
         // Distribute pairs
         for (key, value) in pairs.drain(..split_idx) {
@@ -640,6 +648,7 @@ impl GappedNode {
     /// Get all key-value pairs (for splitting/iteration)
     ///
     /// Returns sorted list of (key, value) pairs
+    #[must_use] 
     pub fn into_pairs(self) -> Vec<(i64, Vec<u8>)> {
         let mut pairs: Vec<(i64, Vec<u8>)> = self
             .keys
@@ -659,6 +668,7 @@ impl GappedNode {
     }
 
     /// Get reference to all key-value pairs
+    #[must_use] 
     pub fn pairs(&self) -> Vec<(i64, Vec<u8>)> {
         let mut pairs: Vec<(i64, Vec<u8>)> = self
             .keys

@@ -1,6 +1,3 @@
-// Traditional Bloom Filter implementation
-// Based on standard bloom filter with multiple hash functions
-
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use twox_hash::XxHash64;

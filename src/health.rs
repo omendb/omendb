@@ -1,6 +1,3 @@
-// Health check system for production monitoring
-// Detects degraded performance and critical conditions
-
 use std::fmt;
 
 /// Overall health status of the database
@@ -14,12 +11,14 @@ pub struct HealthStatus {
 
 impl HealthStatus {
     /// Create a new health status
+    #[must_use] 
     pub fn new(checks: Vec<HealthCheck>) -> Self {
         let healthy = checks.iter().all(|c| c.status == CheckStatus::Healthy);
         Self { healthy, checks }
     }
 
     /// Check if any check is unhealthy
+    #[must_use] 
     pub fn has_unhealthy(&self) -> bool {
         self.checks
             .iter()
@@ -27,6 +26,7 @@ impl HealthStatus {
     }
 
     /// Check if any check is degraded
+    #[must_use] 
     pub fn has_degraded(&self) -> bool {
         self.checks
             .iter()
@@ -55,7 +55,7 @@ impl fmt::Display for HealthStatus {
 /// Individual health check result
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthCheck {
-    /// Name of the check (e.g., "disk_space", "compaction_lag")
+    /// Name of the check (e.g., "`disk_space`", "`compaction_lag`")
     pub name: String,
     /// Status of this check
     pub status: CheckStatus,
@@ -100,7 +100,7 @@ impl HealthCheck {
         }
     }
 
-    fn status_icon(&self) -> &'static str {
+    const fn status_icon(&self) -> &'static str {
         match self.status {
             CheckStatus::Healthy => "✅",
             CheckStatus::Degraded => "⚠️ ",
@@ -113,7 +113,7 @@ impl fmt::Display for HealthCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.name, self.status)?;
         if let Some(ref msg) = self.message {
-            write!(f, " - {}", msg)?;
+            write!(f, " - {msg}")?;
         }
         Ok(())
     }
@@ -133,9 +133,9 @@ pub enum CheckStatus {
 impl fmt::Display for CheckStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CheckStatus::Healthy => write!(f, "HEALTHY"),
-            CheckStatus::Degraded => write!(f, "DEGRADED"),
-            CheckStatus::Unhealthy => write!(f, "UNHEALTHY"),
+            Self::Healthy => write!(f, "HEALTHY"),
+            Self::Degraded => write!(f, "DEGRADED"),
+            Self::Unhealthy => write!(f, "UNHEALTHY"),
         }
     }
 }

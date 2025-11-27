@@ -37,6 +37,7 @@ pub struct BlockedBloomFilter {
 
 impl BlockedBloomFilter {
     /// Create a new blocked bloom filter with expected capacity and desired false positive rate
+    #[must_use] 
     pub fn new(expected_elements: usize, false_positive_rate: f64) -> Self {
         // Calculate optimal number of bits: m = -n*ln(p) / (ln(2)^2)
         let num_bits = (-(expected_elements as f64) * false_positive_rate.ln()
@@ -94,21 +95,25 @@ impl BlockedBloomFilter {
     }
 
     /// Get the number of elements inserted
-    pub fn len(&self) -> usize {
+    #[must_use] 
+    pub const fn len(&self) -> usize {
         self.count
     }
 
     /// Check if the bloom filter is empty
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get the size in bytes
-    pub fn size_bytes(&self) -> usize {
+    #[must_use] 
+    pub const fn size_bytes(&self) -> usize {
         self.blocks.len() * CACHE_LINE_BYTES + std::mem::size_of::<Self>()
     }
 
     /// Calculate actual false positive rate based on current state
+    #[must_use] 
     pub fn false_positive_rate(&self) -> f64 {
         if self.count == 0 {
             return 0.0;
@@ -125,6 +130,7 @@ impl BlockedBloomFilter {
     }
 
     /// Serialize blocked bloom filter to bytes
+    #[must_use] 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -144,6 +150,7 @@ impl BlockedBloomFilter {
     }
 
     /// Deserialize blocked bloom filter from bytes
+    #[must_use] 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 20 {
             return None; // Not enough data for header
@@ -198,9 +205,9 @@ impl BlockedBloomFilter {
 
     /// Calculate nth bit position within a block using enhanced double hashing
     ///
-    /// Uses Kirsch-Mitzenmacher optimization: g_i(x) = h1(x) + i * h2(x)
+    /// Uses Kirsch-Mitzenmacher optimization: `g_i(x)` = h1(x) + i * h2(x)
     /// This provides good distribution with only 2 hash functions
-    fn nth_bit_in_block(block_hash: u64, n: usize) -> usize {
+    const fn nth_bit_in_block(block_hash: u64, n: usize) -> usize {
         // Enhanced double hashing within block
         let h = block_hash.wrapping_add((n as u64).wrapping_mul(block_hash >> 32));
         (h % CACHE_LINE_BITS as u64) as usize

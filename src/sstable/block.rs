@@ -1,26 +1,21 @@
-// Block-based storage for SSTable
-// Implements RocksDB-style block format with prefix compression + varint + LZ4
-//
-// Block Structure (4KB default, compressed):
-// ┌─────────────────────────────────────────────────────┐
-// │ LZ4 Compressed Block Data:                         │
-// │   Entry 0 (restart): [0][key_len][key][value_len][value] │
-// │   Entry 1: [prefix_len][suffix_len][suffix][value_len][value] │
-// │   ...                                                │
-// │   Restart Points: [offset_0: varint][offset_16: varint]... │
-// │   Num Restart Points: varint                        │
-// ├─────────────────────────────────────────────────────┤
-// │ Uncompressed Size: u32 (original size before LZ4)  │
-// │ Compressed Flag: u8 (1=compressed, 0=uncompressed)  │
-// │ Restart Offset: u32 (offset in *uncompressed* data) │
-// │ Checksum: u32 (over compressed data + metadata)     │
-// └─────────────────────────────────────────────────────┘
-//
-// Optimizations:
-// - Prefix compression: 30-50% space savings
-// - Varint encoding: 3-5% space savings
-// - LZ4 compression: 40-60% space savings (CRITICAL - +30-40% performance)
-// - Decompressed block cache: 2x cache efficiency
+//! `SSTable` block format with prefix compression, varint encoding, and LZ4.
+//!
+//! ```text
+//! Block Structure (4KB default, compressed):
+//! ┌─────────────────────────────────────────────────────┐
+//! │ LZ4 Compressed Block Data:                         │
+//! │   Entry 0 (restart): [0][key_len][key][value_len][value] │
+//! │   Entry 1: [prefix_len][suffix_len][suffix][value_len][value] │
+//! │   ...                                                │
+//! │   Restart Points: [offset_0: varint][offset_16: varint]... │
+//! │   Num Restart Points: varint                        │
+//! ├─────────────────────────────────────────────────────┤
+//! │ Uncompressed Size: u32 (original size before LZ4)  │
+//! │ Compressed Flag: u8 (1=compressed, 0=uncompressed)  │
+//! │ Restart Offset: u32 (offset in *uncompressed* data) │
+//! │ Checksum: u32 (over compressed data + metadata)     │
+//! └─────────────────────────────────────────────────────┘
+//! ```
 
 use crate::buffer::manager::FrameRef;
 use bytes::{Bytes, BytesMut};
@@ -32,7 +27,7 @@ use thiserror::Error;
 use varint_rs::VarintReader;
 use varint_rs::VarintWriter;
 
-/// Compression algorithm for SSTable blocks
+/// Compression algorithm for `SSTable` blocks
 ///
 /// Controls the compression algorithm used for data blocks. Different algorithms
 /// offer different trade-offs between compression ratio and speed.
@@ -63,26 +58,26 @@ pub enum CompressionType {
 
 impl CompressionType {
     /// Convert to block footer byte
-    pub(crate) fn to_byte(self) -> u8 {
+    pub(crate) const fn to_byte(self) -> u8 {
         match self {
-            CompressionType::None => 0,
-            CompressionType::Lz4 => 1,
-            CompressionType::Zstd => 2,
+            Self::None => 0,
+            Self::Lz4 => 1,
+            Self::Zstd => 2,
         }
     }
 
     /// Parse from block footer byte
-    pub(crate) fn from_byte(b: u8) -> Option<Self> {
+    pub(crate) const fn from_byte(b: u8) -> Option<Self> {
         match b {
-            0 => Some(CompressionType::None),
-            1 => Some(CompressionType::Lz4),
-            2 => Some(CompressionType::Zstd),
+            0 => Some(Self::None),
+            1 => Some(Self::Lz4),
+            2 => Some(Self::Zstd),
             _ => None,
         }
     }
 }
 
-/// Helper to write varint to BytesMut
+/// Helper to write varint to `BytesMut`
 fn write_varint(buf: &mut BytesMut, value: u64) {
     let mut temp = Vec::new();
     temp.write_u64_varint(value)
@@ -176,11 +171,13 @@ pub struct BlockBuilder {
 
 impl BlockBuilder {
     /// Create a new block builder with default size
+    #[must_use] 
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BLOCK_SIZE)
     }
 
     /// Create a new block builder with custom capacity
+    #[must_use] 
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
             buffer: BytesMut::with_capacity(max_size),
@@ -193,13 +190,13 @@ impl BlockBuilder {
     }
 
     /// Set compression algorithm
-    pub fn set_compression_type(&mut self, compression_type: CompressionType) {
+    pub const fn set_compression_type(&mut self, compression_type: CompressionType) {
         self.compression_type = compression_type;
     }
 
     /// Enable or disable compression (legacy API)
     #[deprecated(since = "0.1.0", note = "use set_compression_type instead")]
-    pub fn set_compression(&mut self, enabled: bool) {
+    pub const fn set_compression(&mut self, enabled: bool) {
         self.compression_type = if enabled {
             CompressionType::Lz4
         } else {
@@ -361,7 +358,7 @@ impl Default for BlockBuilder {
     }
 }
 
-/// Data storage for a Block: either Owned (Bytes) or Borrowed (FrameRef)
+/// Data storage for a Block: either Owned (Bytes) or Borrowed (`FrameRef`)
 #[derive(Clone, Debug)]
 pub enum BlockData {
     Owned(Bytes),
@@ -372,8 +369,8 @@ impl BlockData {
     /// Access the underlying byte slice
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            BlockData::Owned(bytes) => bytes.as_ref(),
-            BlockData::Borrowed(frame) => unsafe { frame.data_unchecked() },
+            Self::Owned(bytes) => bytes.as_ref(),
+            Self::Borrowed(frame) => unsafe { frame.data_unchecked() },
         }
     }
 
@@ -381,8 +378,8 @@ impl BlockData {
     /// For Borrowed data, this performs a copy to ensure the Bytes object is valid independently
     pub fn slice(&self, range: std::ops::Range<usize>) -> Bytes {
         match self {
-            BlockData::Owned(bytes) => bytes.slice(range),
-            BlockData::Borrowed(frame) => unsafe {
+            Self::Owned(bytes) => bytes.slice(range),
+            Self::Borrowed(frame) => unsafe {
                 let data = frame.data_unchecked();
                 Bytes::copy_from_slice(&data[range])
             },
@@ -396,8 +393,8 @@ pub struct Block {
     data: BlockData,
     restart_offset: usize,
     num_restarts: usize,
-    /// Decompressed entries cache (lazy initialized on first iter())
-    /// Arc allows sharing across clones, OnceLock ensures thread-safe lazy init
+    /// Decompressed entries cache (lazy initialized on first `iter()`)
+    /// Arc allows sharing across clones, `OnceLock` ensures thread-safe lazy init
     decompressed_cache: Arc<OnceLock<Vec<(Bytes, Bytes)>>>,
 }
 
@@ -468,9 +465,8 @@ impl Block {
                             if count as usize == num_restarts {
                                 num_restarts = count as usize;
                                 break;
-                            } else {
-                                offset = pos_after;
                             }
+                            offset = pos_after;
                         } else {
                             break;
                         }
@@ -504,9 +500,8 @@ impl Block {
                         if count as usize == num_restarts {
                             num_restarts = count as usize;
                             break;
-                        } else {
-                            offset = pos_after;
                         }
+                        offset = pos_after;
                     } else {
                         break;
                     }
@@ -573,26 +568,26 @@ impl Block {
         }
     }
 
-    /// Find entry for MVCC lookup by user_key.
+    /// Find entry for MVCC lookup by `user_key`.
     ///
-    /// This handles the InternalKey encoding correctly: when searching for a user_key,
-    /// the encoded search key (user_key + inverted MAX seq) may sort before entries
-    /// with longer user_keys that share the same prefix. This method scans forward
-    /// from the lower bound position to find the first entry with matching user_key.
+    /// This handles the `InternalKey` encoding correctly: when searching for a `user_key`,
+    /// the encoded search key (`user_key` + inverted MAX seq) may sort before entries
+    /// with longer `user_keys` that share the same prefix. This method scans forward
+    /// from the lower bound position to find the first entry with matching `user_key`.
     ///
-    /// Key insight: InternalKey encoding is `[user_key][8-byte-inverted-trailer]`.
+    /// Key insight: `InternalKey` encoding is `[user_key][8-byte-inverted-trailer]`.
     /// For prefix keys like "key1" and "key10":
     /// - key10 encodes as [k,e,y,1,0,trailer...]
     /// - key1 encodes as  [k,e,y,1,trailer...]
     ///
     /// Since '0' (0x30) < 0xFF (first trailer byte), key10 < key1 in encoded order!
-    /// But in user_key order: "key1" < "key10" (shorter string is smaller).
+    /// But in `user_key` order: "key1" < "key10" (shorter string is smaller).
     ///
-    /// So we must scan forward until we find a matching user_key, and we can only
+    /// So we must scan forward until we find a matching `user_key`, and we can only
     /// terminate early when the encoded key passes beyond what any version of our
-    /// target user_key could be (i.e., when the user_key prefix no longer matches).
+    /// target `user_key` could be (i.e., when the `user_key` prefix no longer matches).
     ///
-    /// Returns Some((encoded_key, value)) if found, None otherwise.
+    /// Returns `Some((encoded_key`, value)) if found, None otherwise.
     #[inline]
     pub fn find_mvcc(&self, encoded_search_key: &[u8], user_key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self
@@ -636,7 +631,7 @@ impl Block {
     }
 
     /// Get number of entries (approximate - counts restart points)
-    pub fn num_entries_approx(&self) -> usize {
+    pub const fn num_entries_approx(&self) -> usize {
         self.num_restarts * RESTART_INTERVAL
     }
 

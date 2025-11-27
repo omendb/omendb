@@ -1,10 +1,3 @@
-// Background worker threads for async operations
-//
-// This module contains the background worker implementation for:
-// - WAL writer: Batches writes to the write-ahead log
-// - Flush worker: Converts memtables to SSTables
-// - Compaction worker: Merges SSTables to reduce read amplification
-
 use crate::compaction::CompactionFilter;
 use crate::compaction::LSMTree;
 use crate::memtable::{Entry, Memtable};
@@ -41,7 +34,7 @@ pub(crate) enum CompactionTask {
 /// Messages sent to the background flush worker thread
 #[derive(Debug)]
 pub(crate) enum FlushTask {
-    /// Flush the memtable to SSTable
+    /// Flush the memtable to `SSTable`
     Flush,
     /// Shutdown signal
     Shutdown,
@@ -50,7 +43,7 @@ pub(crate) enum FlushTask {
 /// Static compaction method for background worker thread
 /// This is called from the worker thread without &self
 ///
-/// Supports tiered storage: when `cold_tier_level` is set, SSTables at that level
+/// Supports tiered storage: when `cold_tier_level` is set, `SSTables` at that level
 /// and above are written to `cold_storage_backend` instead of local disk.
 pub(crate) fn run_compaction(
     lsm: &Arc<ArcSwap<LSMTree>>,
@@ -108,8 +101,8 @@ pub(crate) fn run_compaction(
 /// Static flush method for background worker thread
 /// This is called from the worker thread without &self
 ///
-/// NOTE: Memtable swap already happened in try_swap_memtable() before signal was sent.
-/// This method just builds the SSTable from immutable_memtable (slow part).
+/// NOTE: Memtable swap already happened in `try_swap_memtable()` before signal was sent.
+/// This method just builds the `SSTable` from `immutable_memtable` (slow part).
 pub(crate) fn run_background_flush_partitioned(
     _memtables: &Arc<[ArcSwap<Memtable>; NUM_PARTITIONS]>,
     immutable_memtables: &Arc<ArcSwap<Option<Arc<Vec<Arc<Memtable>>>>>>,

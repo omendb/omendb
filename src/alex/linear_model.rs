@@ -25,7 +25,8 @@ impl LinearModel {
     /// Create a new untrained linear model
     ///
     /// Default model: y = x (identity function)
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             slope: 1.0,
             intercept: 0.0,
@@ -35,7 +36,7 @@ impl LinearModel {
     /// Train model using least squares linear regression
     ///
     /// Given (key, position) pairs, finds best-fit line that minimizes
-    /// squared error: min Σ(predicted_pos - actual_pos)²
+    /// squared error: min `Σ(predicted_pos` - `actual_pos)²`
     ///
     /// **Algorithm**: Standard least squares regression
     /// ```text
@@ -114,12 +115,12 @@ impl LinearModel {
         }
     }
 
-    /// Train on sampled dataset (CDFShop SIGMOD 2024)
+    /// Train on sampled dataset (`CDFShop` SIGMOD 2024)
     ///
     /// Adaptive sampling: Train on √n samples instead of n keys for 10-100x speedup.
     ///
     /// **Algorithm**: Stratified sampling to preserve data distribution
-    /// 1. Divide data into sample_size buckets
+    /// 1. Divide data into `sample_size` buckets
     /// 2. Sample one point from each bucket
     /// 3. Train linear regression on samples
     ///
@@ -128,7 +129,7 @@ impl LinearModel {
     /// - Accuracy: Similar to full training for monotonic data
     /// - Best for: Sorted/nearly-sorted data (ALEX's primary use case)
     ///
-    /// **Time complexity**: O(sample_size) vs O(n) for full training
+    /// **Time complexity**: `O(sample_size)` vs O(n) for full training
     ///
     /// # Arguments
     /// * `data` - Full dataset (sorted)
@@ -181,6 +182,7 @@ impl LinearModel {
     /// let pos = model.predict(50);
     /// assert!((pos as i64 - 50).abs() < 10);
     /// ```
+    #[must_use] 
     pub fn predict(&self, key: i64) -> usize {
         let pos = self.slope * key as f64 + self.intercept;
         // Clamp to valid range (non-negative)
@@ -188,22 +190,25 @@ impl LinearModel {
     }
 
     /// Get model slope
-    pub fn slope(&self) -> f64 {
+    #[must_use] 
+    pub const fn slope(&self) -> f64 {
         self.slope
     }
 
     /// Get model intercept
-    pub fn intercept(&self) -> f64 {
+    #[must_use] 
+    pub const fn intercept(&self) -> f64 {
         self.intercept
     }
 
     /// Compute maximum prediction error on training data
     ///
-    /// Returns worst-case error: max|predicted_pos - actual_pos|
+    /// Returns worst-case error: `max|predicted_pos` - `actual_pos`|
     ///
     /// Used to determine search window size for exponential search.
     ///
     /// **Time complexity**: O(n)
+    #[must_use] 
     pub fn max_error(&self, data: &[(i64, usize)]) -> usize {
         data.iter()
             .map(|(key, pos)| {
@@ -216,9 +221,10 @@ impl LinearModel {
 
     /// Compute average prediction error on training data
     ///
-    /// Returns mean absolute error: avg(|predicted_pos - actual_pos|)
+    /// Returns mean absolute error: `avg(|predicted_pos` - `actual_pos`|)
     ///
     /// **Time complexity**: O(n)
+    #[must_use] 
     pub fn avg_error(&self, data: &[(i64, usize)]) -> f64 {
         if data.is_empty() {
             return 0.0;

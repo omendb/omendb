@@ -1,15 +1,3 @@
-// SIMD-accelerated operations using portable SIMD (std::simd)
-//
-// Implements vectorized operations for performance-critical paths:
-// - Key comparisons (memtable, block iteration)
-// - Bloom filter hash checks
-// - Prefix length calculation
-//
-// Uses portable SIMD API that works across all platforms (x86_64, ARM, etc.)
-// Compiler automatically selects optimal instructions (SSE2, AVX2, NEON, etc.)
-//
-// Expected improvement: +5-15% overall throughput in key-heavy operations
-
 use std::cmp::Ordering;
 use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, u8x16};
 
@@ -22,6 +10,7 @@ const SIMD_WIDTH: usize = 16;
 /// portable SIMD to process 16 bytes at a time. The compiler
 /// automatically selects the best instructions for the target platform.
 #[inline]
+#[must_use] 
 pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
     let len_a = a.len();
     let len_b = b.len();
@@ -44,7 +33,7 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
             for j in 0..SIMD_WIDTH {
                 let pos = i + j;
                 match a[pos].cmp(&b[pos]) {
-                    Ordering::Equal => continue,
+                    Ordering::Equal => {}
                     other => return other,
                 }
             }
@@ -66,11 +55,12 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 /// Decode a varint from a byte slice using SIMD to find the length
-/// Returns (value, bytes_read) if successful
+/// Returns (value, `bytes_read`) if successful
 ///
-/// Optimized using std::simd to quickly scan for the varint terminator (MSB=0)
+/// Optimized using `std::simd` to quickly scan for the varint terminator (MSB=0)
 /// avoiding branch mispredictions in the loop.
 #[inline]
+#[must_use] 
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
         return None;
@@ -177,6 +167,7 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 /// Used in prefix compression to find how many leading bytes are identical.
 /// Returns the number of matching bytes from the start.
 #[inline]
+#[must_use] 
 pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let min_len = a.len().min(b.len());
     let mut i = 0;

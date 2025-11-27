@@ -18,13 +18,14 @@ fn benchmark_binary_search(c: &mut Criterion) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bench.sst");
 
-        let mut builder = SSTableBuilder::new();
+        let mut builder = SSTableBuilder::create(&path).unwrap();
         for i in 0..size {
             let key = format!("key_{:08}", i);
             let value = format!("value_{:08}", i);
             builder.add(Bytes::from(key), Bytes::from(value));
         }
-        let mut sstable = builder.build(&path).unwrap();
+        builder.finish().unwrap();
+        let mut sstable = seerdb::sstable::SSTable::open(&path).unwrap();
 
         // Benchmark: existing keys (worst case - at end)
         let target_key = format!("key_{:08}", size - 1);

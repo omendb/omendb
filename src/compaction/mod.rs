@@ -1,6 +1,3 @@
-// LSM-Tree Compaction
-// Implements leveled compaction to keep read amplification bounded
-
 pub mod filter;
 pub mod merge;
 
@@ -27,23 +24,17 @@ pub enum CompactionError {
 
 pub type Result<T> = std::result::Result<T, CompactionError>;
 
-/// Compact multiple SSTables into a single SSTable
+/// Compact multiple `SSTables` into a single `SSTable`.
 ///
 /// # Arguments
-/// * `input_paths` - Paths to SSTables to compact (newer first)
-/// * `output_path` - Path for output SSTable
+/// * `input_paths` - Paths to `SSTables` to compact (newer first)
+/// * `output_path` - Path for output `SSTable`
 /// * `compaction_level` - The level being compacted TO (passed to filter)
 /// * `filter` - Optional compaction filter
+/// * `oldest_snapshot` - Oldest active snapshot seq for MVCC GC (`u64::MAX` = no GC)
 ///
 /// # Returns
-/// Path to the new SSTable and its size in bytes
-///
-/// # Arguments
-/// * `input_paths` - Paths to SSTables to compact (newer first)
-/// * `output_path` - Path for output SSTable
-/// * `compaction_level` - The level being compacted TO (passed to filter)
-/// * `filter` - Optional compaction filter
-/// * `oldest_snapshot` - Oldest active snapshot seq for MVCC GC (u64::MAX = no GC)
+/// Path to the new `SSTable` and its size in bytes
 pub fn compact_sstables(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
@@ -86,21 +77,21 @@ pub fn compact_sstables(
     Ok((output_path, size))
 }
 
-/// Compact multiple SSTables into bytes (for cloud storage support)
+/// Compact multiple `SSTables` into bytes (for cloud storage support)
 ///
 /// Same as `compact_sstables` but buffers the output in memory and returns
-/// the complete SSTable as bytes. This enables:
+/// the complete `SSTable` as bytes. This enables:
 /// - Single-write local disk operations (fewer syscalls)
 /// - Cloud storage uploads (S3/GCS/Azure)
 ///
 /// # Arguments
-/// * `input_paths` - Paths to SSTables to compact (newer first)
+/// * `input_paths` - Paths to `SSTables` to compact (newer first)
 /// * `compaction_level` - The level being compacted TO (passed to filter)
 /// * `filter` - Optional compaction filter
-/// * `oldest_snapshot` - Oldest active snapshot seq for MVCC GC (u64::MAX = no GC)
+/// * `oldest_snapshot` - Oldest active snapshot seq for MVCC GC (`u64::MAX` = no GC)
 ///
 /// # Returns
-/// Complete SSTable as bytes (caller writes to file and/or uploads to cloud)
+/// Complete `SSTable` as bytes (caller writes to file and/or uploads to cloud)
 pub fn compact_sstables_buffered(
     input_paths: &[PathBuf],
     compaction_level: usize,
@@ -142,7 +133,7 @@ pub fn compact_sstables_buffered(
 pub struct Level {
     /// Level number (0 = memtable flush target, 1+ = compacted levels)
     level_num: usize,
-    /// SSTables in this level (sorted by key range)
+    /// `SSTables` in this level (sorted by key range)
     sstables: Vec<PathBuf>,
     /// Current size in bytes
     size: u64,
@@ -152,7 +143,8 @@ pub struct Level {
 
 impl Level {
     /// Create a new level with given threshold
-    pub fn new(level_num: usize, size_threshold: u64) -> Self {
+    #[must_use] 
+    pub const fn new(level_num: usize, size_threshold: u64) -> Self {
         Self {
             level_num,
             sstables: Vec::new(),
@@ -161,33 +153,38 @@ impl Level {
         }
     }
 
-    /// Add an SSTable to this level
+    /// Add an `SSTable` to this level
     pub fn add_sstable(&mut self, path: PathBuf, size: u64) {
         self.sstables.push(path);
         self.size += size;
     }
 
     /// Check if this level needs compaction
-    pub fn needs_compaction(&self) -> bool {
+    #[must_use] 
+    pub const fn needs_compaction(&self) -> bool {
         self.size >= self.size_threshold
     }
 
-    /// Get number of SSTables in this level
-    pub fn num_sstables(&self) -> usize {
+    /// Get number of `SSTables` in this level
+    #[must_use] 
+    pub const fn num_sstables(&self) -> usize {
         self.sstables.len()
     }
 
     /// Get current size
-    pub fn size(&self) -> u64 {
+    #[must_use] 
+    pub const fn size(&self) -> u64 {
         self.size
     }
 
     /// Get level number
-    pub fn level_num(&self) -> usize {
+    #[must_use] 
+    pub const fn level_num(&self) -> usize {
         self.level_num
     }
 
-    /// Get SSTables
+    /// Get `SSTables`
+    #[must_use] 
     pub fn sstables(&self) -> &[PathBuf] {
         &self.sstables
     }
@@ -211,7 +208,8 @@ pub enum CompactionStrategy {
 
 impl CompactionStrategy {
     /// Get current size ratio
-    pub fn current_ratio(&self) -> u64 {
+    #[must_use] 
+    pub const fn current_ratio(&self) -> u64 {
         match self {
             Self::Fixed(ratio) => *ratio,
             Self::Adaptive { current_ratio, .. } => *current_ratio,
@@ -270,7 +268,7 @@ impl LSMTree {
     /// Create a new LSM tree with fixed size ratio
     ///
     /// # Arguments
-    /// * `data_dir` - Directory for SSTable files
+    /// * `data_dir` - Directory for `SSTable` files
     /// * `base_size` - L1 size threshold (default: 10MB)
     /// * `size_ratio` - Size ratio between levels (default: 10)
     /// * `num_levels` - Number of levels (default: 7)
@@ -291,7 +289,7 @@ impl LSMTree {
     /// Create a new LSM tree with adaptive size ratio (Dostoevsky)
     ///
     /// # Arguments
-    /// * `data_dir` - Directory for SSTable files
+    /// * `data_dir` - Directory for `SSTable` files
     /// * `base_size` - L1 size threshold (default: 10MB)
     /// * `num_levels` - Number of levels (default: 7)
     /// * `min_ratio` - Minimum size ratio (default: 4)
@@ -343,12 +341,13 @@ impl LSMTree {
         }
     }
 
-    /// Add an SSTable to L0 (memtable flush)
+    /// Add an `SSTable` to L0 (memtable flush)
     pub fn add_l0_sstable(&mut self, path: PathBuf, size: u64) {
         self.levels[0].add_sstable(path, size);
     }
 
     /// Check if any level needs compaction
+    #[must_use] 
     pub fn needs_compaction(&self) -> Option<usize> {
         // Check L0 first (special case: trigger on # of files, not size)
         if self.levels[0].num_sstables() >= 4 {
@@ -366,16 +365,19 @@ impl LSMTree {
     }
 
     /// Get a level
+    #[must_use] 
     pub fn level(&self, level_num: usize) -> Option<&Level> {
         self.levels.get(level_num)
     }
 
     /// Get number of levels
-    pub fn num_levels(&self) -> usize {
+    #[must_use] 
+    pub const fn num_levels(&self) -> usize {
         self.levels.len()
     }
 
     /// Get data directory
+    #[must_use] 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -428,18 +430,19 @@ impl LSMTree {
     }
 
     /// Get current compaction strategy
-    pub fn strategy(&self) -> &CompactionStrategy {
+    #[must_use] 
+    pub const fn strategy(&self) -> &CompactionStrategy {
         &self.strategy
     }
 
-    /// Add an SSTable to a specific level (after compaction)
+    /// Add an `SSTable` to a specific level (after compaction)
     pub fn add_to_level(&mut self, level_num: usize, path: PathBuf, size: u64) {
         if let Some(level) = self.levels.get_mut(level_num) {
             level.add_sstable(path, size);
         }
     }
 
-    /// Remove specific SSTables from a level (after compaction)
+    /// Remove specific `SSTables` from a level (after compaction)
     pub fn remove_sstables_from_level(&mut self, level_num: usize, paths: &[PathBuf]) {
         if let Some(level) = self.levels.get_mut(level_num) {
             for path in paths {
@@ -456,7 +459,7 @@ impl LSMTree {
         }
     }
 
-    /// Clear all SSTables from a level (used during compaction)
+    /// Clear all `SSTables` from a level (used during compaction)
     pub fn clear_level(&mut self, level_num: usize) -> Vec<PathBuf> {
         if let Some(level) = self.levels.get_mut(level_num) {
             let paths = std::mem::take(&mut level.sstables);
@@ -467,10 +470,11 @@ impl LSMTree {
         }
     }
 
-    /// Get all SSTable paths across all levels
+    /// Get all `SSTable` paths across all levels
     ///
     /// Returns paths in level order (L0 first, then L1, L2, etc.)
-    /// Used by db.verify() for full database integrity checking.
+    /// Used by `db.verify()` for full database integrity checking.
+    #[must_use] 
     pub fn all_sstable_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for level in &self.levels {
@@ -479,10 +483,10 @@ impl LSMTree {
         paths
     }
 
-    /// Load existing SSTables from disk into the LSM tree
+    /// Load existing `SSTables` from disk into the LSM tree
     ///
-    /// Scans the data directory for SSTable files and adds them to L0.
-    /// This is called during DB::open() to recover existing data.
+    /// Scans the data directory for `SSTable` files and adds them to L0.
+    /// This is called during `DB::open()` to recover existing data.
     pub fn load_existing_sstables(&mut self) -> std::io::Result<()> {
         use crate::sstable::SSTable;
 
@@ -514,7 +518,7 @@ impl LSMTree {
             let mut sstable = SSTable::open(&path).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Corrupt SSTable: {}", e),
+                    format!("Corrupt SSTable: {e}"),
                 )
             })?;
 
@@ -522,7 +526,7 @@ impl LSMTree {
             sstable.validate().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Corrupt SSTable: {}", e),
+                    format!("Corrupt SSTable: {e}"),
                 )
             })?;
 

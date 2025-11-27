@@ -1,8 +1,3 @@
-// Database helper functions
-//
-// Utility functions used by the main DB implementation that are relatively
-// self-contained and don't require the full DB struct.
-
 use crate::db::{partition_for_key, DBError, DBOptions, Result};
 use crate::memtable::{Entry, Memtable};
 use crate::merge_operator::MergeOperator;
@@ -15,7 +10,7 @@ use tracing::{debug, error, warn};
 /// Recover partitioned memtables from WAL
 ///
 /// Reads records one by one and distributes them across partitions using hash function.
-/// Behavior on corruption depends on recovery_mode:
+/// Behavior on corruption depends on `recovery_mode`:
 /// - `RecoveryMode::Strict`: Returns error on any corruption
 /// - `RecoveryMode::BestEffort`: Stops reading but recovers all valid records before corruption
 pub(crate) fn recover_partitioned(
@@ -100,8 +95,7 @@ pub(crate) fn recover_partitioned(
                             "WAL corruption detected in strict mode"
                         );
                         return Err(DBError::WalCorruption(format!(
-                            "WAL corruption after {} records: {}",
-                            records_recovered, e
+                            "WAL corruption after {records_recovered} records: {e}"
                         )));
                     }
                     RecoveryMode::BestEffort => {
@@ -142,13 +136,12 @@ fn apply_merge(
                 Entry::Merge(vec![operand])
             }
         }
-        Some(Entry::Merge(ops)) => {
-            let mut new_ops = ops.clone();
+        Some(Entry::Merge(mut ops)) => {
             if let Some(op) = merge_operator {
-                let pushed = if let Some(last) = new_ops.last() {
+                let pushed = if let Some(last) = ops.last() {
                     if let Some(merged) = op.partial_merge(&key, last, &operand) {
-                        new_ops.pop();
-                        new_ops.push(Bytes::from(merged));
+                        ops.pop();
+                        ops.push(Bytes::from(merged));
                         true
                     } else {
                         false
@@ -157,26 +150,25 @@ fn apply_merge(
                     false
                 };
                 if !pushed {
-                    new_ops.push(operand);
+                    ops.push(operand);
                 }
             } else {
-                new_ops.push(operand);
+                ops.push(operand);
             }
-            Entry::Merge(new_ops)
+            Entry::Merge(ops)
         }
-        Some(Entry::Tombstone) => Entry::Merge(vec![operand]),
-        None => Entry::Merge(vec![operand]),
+        Some(Entry::Tombstone) | None => Entry::Merge(vec![operand]),
     };
     mt.put_entry(key, new_entry);
 }
 
-/// Clean up old SSTable deletion queue
+/// Clean up old `SSTable` deletion queue
 ///
 /// Files are queued for deletion after compaction but kept for 5 seconds
 /// to allow concurrent readers to finish. This function periodically removes
 /// files that are old enough.
 ///
-/// This is called after each compaction to safely delete old SSTable files
+/// This is called after each compaction to safely delete old `SSTable` files
 /// without interfering with concurrent readers.
 pub(crate) fn cleanup_old_deletions(
     pending_deletions: &Arc<Mutex<Vec<(PathBuf, std::time::Instant)>>>,
@@ -217,7 +209,7 @@ pub(crate) fn cleanup_old_deletions(
 
 /// Check if there is sufficient disk space
 ///
-/// If min_disk_space_bytes is configured in options, verifies that the disk
+/// If `min_disk_space_bytes` is configured in options, verifies that the disk
 /// containing the data directory has at least that much space available.
 ///
 /// Returns an error if disk space is insufficient.

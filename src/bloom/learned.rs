@@ -1,11 +1,3 @@
-// Learned Bloom Filter implementation
-// Based on Kraska et al., "Learned Bloom Filters" (2018)
-//
-// Architecture: ML model + backup bloom filter
-// - Model predicts set membership with confidence score
-// - High confidence → return prediction
-// - Low confidence → check backup traditional bloom filter
-
 use super::bitpacked::BloomFilter;
 use smartcore::linalg::basic::matrix::DenseMatrix;
 use smartcore::tree::decision_tree_classifier::DecisionTreeClassifier;
@@ -41,6 +33,7 @@ impl LearnedBloomFilter {
     /// * `expected_elements` - Expected number of elements
     /// * `false_positive_rate` - Target false positive rate
     /// * `threshold` - Confidence threshold (0.0-1.0, higher = trust model more)
+    #[must_use] 
     pub fn new(expected_elements: usize, false_positive_rate: f64, threshold: f64) -> Self {
         // Backup filter is much smaller since model handles most queries
         // Use higher FPR for backup since it's only for uncertain cases
@@ -144,7 +137,7 @@ impl LearnedBloomFilter {
         }
     }
 
-    /// Predict confidence that item is in set (deprecated - use predict_with_confidence)
+    /// Predict confidence that item is in set (deprecated - use `predict_with_confidence`)
     #[allow(dead_code)]
     fn predict_confidence<T: Hash>(&self, item: &T) -> Option<f64> {
         self.predict_with_confidence(item).map(|(_, conf)| conf)
@@ -168,16 +161,19 @@ impl LearnedBloomFilter {
     }
 
     /// Get the number of elements
-    pub fn len(&self) -> usize {
+    #[must_use] 
+    pub const fn len(&self) -> usize {
         self.count
     }
 
     /// Check if empty
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get size in bytes (for benchmarking)
+    #[must_use] 
     pub fn size_bytes(&self) -> usize {
         let backup_size = self.backup_filter.size_bytes();
 

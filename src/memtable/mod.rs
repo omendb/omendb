@@ -1,6 +1,3 @@
-// Memtable: In-memory buffer for recent writes
-// Uses concurrent skiplist for lock-free reads/writes
-
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use std::path::Path;
@@ -18,33 +15,25 @@ pub enum Entry {
     Merge(Vec<Bytes>),
 }
 
-/// In-memory sorted table for recent writes
+/// In-memory sorted table for recent writes.
 pub struct Memtable {
-    /// Underlying skiplist (concurrent, lock-free)
-    /// Key: InternalKey (UserKey + Seq + Kind)
-    /// Value: Raw bytes (empty for Tombstone)
     data: Arc<SkipMap<InternalKey, Bytes>>,
-    /// Current size in bytes (approximate)
     size: AtomicUsize,
-    /// Capacity threshold for flushing
     capacity: usize,
-    /// Current sequence number generator (shared with DB, or passed in)
-    /// For now, we assume sequence numbers are passed in.
-    _unused: (),
 }
 
 impl Memtable {
-    /// Create a new memtable with given capacity
+    #[must_use] 
     pub fn new(capacity: usize) -> Self {
         Self {
             data: Arc::new(SkipMap::new()),
             size: AtomicUsize::new(0),
             capacity,
-            _unused: (),
         }
     }
 
     /// Create memtable with default capacity (64MB)
+    #[must_use] 
     pub fn with_default_capacity() -> Self {
         Self::new(64 * 1024 * 1024)
     }
@@ -80,7 +69,7 @@ impl Memtable {
     }
 
     /// Get the latest value for a key (Snapshot Isolation)
-    /// Returns (Value, Sequence) if found and visible <= snapshot_seq
+    /// Returns (Value, Sequence) if found and visible <= `snapshot_seq`
     /// Returns None if not found or deleted
     #[inline]
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Option<(Bytes, u64)> {
@@ -105,8 +94,8 @@ impl Memtable {
             match ikey.kind {
                 ValueType::Value => return Some((entry.value().clone(), ikey.seq)),
                 ValueType::Deletion => return None, // Deleted
-                ValueType::Merge => continue, // Skip merge operands for simple get (needs merge logic)
-                ValueType::Log => continue,
+                // Skip merge operands and log entries for simple get (needs merge logic)
+                ValueType::Merge | ValueType::Log => {}
             }
         }
 
@@ -131,22 +120,20 @@ impl Memtable {
                 ValueType::Value => {
                     if merges.is_empty() {
                         return Some(Entry::Value(entry.value().clone()));
-                    } else {
-                        // Value implies base.
-                        return Some(Entry::Merge(merges));
                     }
+                    // Value implies base.
+                    return Some(Entry::Merge(merges));
                 }
                 ValueType::Deletion => {
                     if merges.is_empty() {
                         return Some(Entry::Tombstone);
-                    } else {
-                        return Some(Entry::Merge(merges));
                     }
+                    return Some(Entry::Merge(merges));
                 }
                 ValueType::Merge => {
                     merges.push(entry.value().clone());
                 }
-                ValueType::Log => continue,
+                ValueType::Log => {}
             }
         }
 
@@ -158,7 +145,7 @@ impl Memtable {
     }
 
     /// Put an Entry (used for compaction/merge resolution)
-    /// Uses a default sequence number (u64::MAX) since this is usually for
+    /// Uses a default sequence number (`u64::MAX`) since this is usually for
     /// memory-only compaction or immediate updates?
     /// WARNING: This bypasses normal seq assignment.
     pub fn put_entry(&self, key: Bytes, entry: Entry) {
@@ -217,7 +204,7 @@ impl Memtable {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
-    /// Iterate over all entries as (user_key, Entry) pairs, grouped by user key.
+    /// Iterate over all entries as (`user_key`, Entry) pairs, grouped by user key.
     /// This is the high-level interface for flush operations.
     pub fn iter_entries(&self) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
         self.range_from(&[])
@@ -228,7 +215,7 @@ impl Memtable {
         Arc::clone(&self.data)
     }
 
-    /// Flush memtable to disk as an SSTable
+    /// Flush memtable to disk as an `SSTable`
     pub fn flush(&self, path: impl AsRef<Path>) -> Result<(), crate::sstable::SSTableError> {
         let mut builder = SSTableBuilder::create(path)?;
 
@@ -249,7 +236,7 @@ impl Memtable {
 
     // --- Range Iteration Support for RangeIterator ---
 
-    /// Forward range scan returning (user_key, Entry) pairs.
+    /// Forward range scan returning (`user_key`, Entry) pairs.
     /// Groups by user key and returns the latest Entry for each.
     /// End key is exclusive.
     pub fn range(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
@@ -307,7 +294,7 @@ impl Memtable {
         result.into_iter()
     }
 
-    /// Forward range scan from start key to end, returning (user_key, Entry) pairs.
+    /// Forward range scan from start key to end, returning (`user_key`, Entry) pairs.
     pub fn range_from(&self, start: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
         let start_key = InternalKey::new(Bytes::copy_from_slice(start), u64::MAX, ValueType::Value);
 
@@ -356,7 +343,7 @@ impl Memtable {
         result.into_iter()
     }
 
-    /// Reverse range scan returning (user_key, Entry) pairs.
+    /// Reverse range scan returning (`user_key`, Entry) pairs.
     pub fn range_rev(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
         // Collect forward then reverse (simpler than true reverse iteration with grouping)
         let entries: Vec<_> = self.range(start, end).collect();

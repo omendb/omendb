@@ -1,6 +1,3 @@
-// K-way merge iterator for range scans
-// Merges sorted iterators from memtable + multiple SSTable levels using a min-heap
-
 use bytes::Bytes;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -123,40 +120,31 @@ where
 
     #[inline]
     fn resolve_merges(
-        &mut self,
+        &self,
         key: &Bytes,
         base: Option<&Bytes>,
     ) -> Result<Entry, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(op) = &self.merge_operator {
             // Operands are stored newest-first (as we encountered them), but MergeOperator
-
             // typically expects them in chronological order (oldest-first) to apply them correctly.
-
             // e.g. "Value" -> Merge(A) -> Merge(B).
-
             // We see B then A. pending_operands = [B, A].
-
             // We want to apply A then B.
-
             let ops: Vec<&[u8]> = self
                 .pending_operands
                 .iter()
                 .rev()
-                .map(|b| b.as_ref())
+                .map(std::convert::AsRef::as_ref)
                 .collect();
 
-            match op.full_merge(key, base.map(|b| b.as_ref()), &ops) {
+            match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
                 Some(res) => Ok(Entry::Value(Bytes::from(res))),
-
                 None => Ok(Entry::Tombstone),
             }
         } else {
             // No merge operator - can't resolve.
-
             // Fallback: return the newest merge operand as if it were a value?
-
             // Or just fail? existing get() returns the raw bytes.
-
             if let Some(first) = self.pending_operands.first() {
                 Ok(Entry::Merge(vec![first.clone()]))
             } else {
@@ -307,7 +295,7 @@ where
     }
 }
 
-/// Wrapper for HeapEntry to implement Max-Heap ordering with correct level priority
+/// Wrapper for `HeapEntry` to implement Max-Heap ordering with correct level priority
 struct RevHeapEntry<I>(HeapEntry<I>)
 where
     I: Iterator<Item = Result<(Bytes, Entry), Box<dyn std::error::Error + Send + Sync>>>;
@@ -402,10 +390,9 @@ where
         })
     }
 
-    // Copied from KWayMergeIterator (TODO: Refactor to shared trait?)
     #[inline]
     fn resolve_merges(
-        &mut self,
+        &self,
         key: &Bytes,
         base: Option<&Bytes>,
     ) -> Result<Entry, Box<dyn std::error::Error + Send + Sync>> {
@@ -414,10 +401,10 @@ where
                 .pending_operands
                 .iter()
                 .rev()
-                .map(|b| b.as_ref())
+                .map(std::convert::AsRef::as_ref)
                 .collect();
 
-            match op.full_merge(key, base.map(|b| b.as_ref()), &ops) {
+            match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
                 Some(res) => Ok(Entry::Value(Bytes::from(res))),
                 None => Ok(Entry::Tombstone),
             }

@@ -1,11 +1,3 @@
-// Value Log (vLog) implementation
-// Based on WiscKey paper (USENIX FAST 2016)
-//
-// Architecture: Append-only log for storing values separately from keys
-// - LSM tree stores: key + vLog pointer (offset + length)
-// - vLog stores: actual values sequentially
-// - Benefit: Compaction only rewrites keys, not values (10-100x less write amp)
-
 use bytes::{Bytes, BytesMut};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -13,8 +5,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 // VLog file format magic number: "VLOG"
-const MAGIC: u32 = 0x564C4F47;
-const VERSION: u32 = 0x00000001;
+const MAGIC: u32 = 0x564C_4F47;
+const VERSION: u32 = 0x0000_0001;
 const HEADER_SIZE: u64 = 8; // magic (4) + version (4)
 
 #[derive(Debug, Error)]
@@ -45,9 +37,10 @@ pub struct ValuePointer {
 }
 
 impl ValuePointer {
-    /// Encode pointer to bytes for SSTable storage
+    /// Encode pointer to bytes for `SSTable` storage
     ///
     /// Format: [offset: u64][length: u32] = 12 bytes total
+    #[must_use] 
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = bytes::BytesMut::with_capacity(12);
         buf.extend_from_slice(&self.offset.to_le_bytes());
@@ -57,7 +50,7 @@ impl ValuePointer {
 }
 
 /// Value Log record format:
-/// [key_len: u32][key: bytes][value_len: u32][value: bytes][crc: u32]
+/// [`key_len`: u32][key: bytes][`value_len`: u32][value: bytes][crc: u32]
 ///
 /// Key is stored for GC validation (check if value is still valid)
 #[derive(Debug, Clone)]
@@ -223,7 +216,7 @@ impl VLog {
 
     /// Append a value to the vLog
     /// Returns pointer (offset, length) to be stored in LSM tree
-    /// NOTE: Does NOT sync - caller must call sync() or sync_data() explicitly
+    /// NOTE: Does NOT sync - caller must call `sync()` or `sync_data()` explicitly
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
         let record = VLogRecord {
             key: Bytes::copy_from_slice(key),
@@ -305,17 +298,19 @@ impl VLog {
     }
 
     /// Get current head position
-    pub fn head(&self) -> u64 {
+    #[must_use] 
+    pub const fn head(&self) -> u64 {
         self.head
     }
 
     /// Get current tail position
-    pub fn tail(&self) -> u64 {
+    #[must_use] 
+    pub const fn tail(&self) -> u64 {
         self.tail
     }
 
     /// Set tail position (for GC)
-    pub fn set_tail(&mut self, tail: u64) {
+    pub const fn set_tail(&mut self, tail: u64) {
         self.tail = tail;
     }
 
@@ -325,6 +320,7 @@ impl VLog {
     }
 
     /// Get vLog path
+    #[must_use] 
     pub fn path(&self) -> &Path {
         &self.path
     }

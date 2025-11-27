@@ -1,11 +1,3 @@
-// Batch write operations for atomic multi-key updates
-//
-// Allows collecting multiple put/delete operations and committing them atomically
-// to the WAL and memtable. This is more efficient than individual operations as it:
-// - Writes to WAL once (instead of N times)
-// - Reduces channel overhead
-// - Better cache locality
-
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 
@@ -65,7 +57,7 @@ pub struct Batch<'db> {
 
 impl<'db> Batch<'db> {
     /// Create a new batch for the given database
-    pub(crate) fn new(db: &'db DB) -> Self {
+    pub(crate) const fn new(db: &'db DB) -> Self {
         Self {
             db,
             operations: Vec::new(),
@@ -145,12 +137,14 @@ impl<'db> Batch<'db> {
     }
 
     /// Get the number of operations in the batch
-    pub fn len(&self) -> usize {
+    #[must_use] 
+    pub const fn len(&self) -> usize {
         self.operations.len()
     }
 
     /// Check if the batch is empty
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 

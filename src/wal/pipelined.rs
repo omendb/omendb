@@ -3,7 +3,7 @@
 //! - Adaptive batch delay based on queue depth
 //! - Pipelined writes (overlap memtable write N with WAL write N+1)
 //!
-//! Based on RocksDB's pipelined write design which achieves 20-30% improvement.
+//! Based on `RocksDB`'s pipelined write design which achieves 20-30% improvement.
 
 use crate::wal::{Record, Result, WAL};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
@@ -63,7 +63,7 @@ pub struct PipelineConfig {
     pub min_delay: Duration,
     /// Maximum batch delay (used when queue is deep)
     pub max_delay: Duration,
-    /// Queue depth at which we use max_delay
+    /// Queue depth at which we use `max_delay`
     pub adaptive_threshold: usize,
     /// Maximum writers per batch
     pub max_batch_size: usize,
@@ -86,7 +86,7 @@ impl Default for PipelineConfig {
 impl PipelineConfig {
     /// Compute adaptive delay based on queue depth using integer math
     #[inline]
-    fn adaptive_delay(&self, queue_depth: usize) -> Duration {
+    const fn adaptive_delay(&self, queue_depth: usize) -> Duration {
         if queue_depth == 0 {
             self.min_delay
         } else if queue_depth >= self.adaptive_threshold {

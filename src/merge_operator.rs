@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-/// MergeOperator allows defining custom Read-Modify-Write logic
+/// `MergeOperator` allows defining custom Read-Modify-Write logic
 /// that is applied at compaction time (and read time).
 ///
 /// This enables efficient "blind writes" where a client can issue a
@@ -60,7 +60,8 @@ pub struct StringAppendOperator {
 }
 
 impl StringAppendOperator {
-    pub fn new(delimiter: char) -> Self {
+    #[must_use] 
+    pub const fn new(delimiter: char) -> Self {
         Self { delimiter }
     }
 }

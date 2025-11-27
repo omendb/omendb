@@ -127,7 +127,7 @@ impl<'db> Transaction<'db> {
         }
 
         // Record in read-set for OCC validation
-        self.read_set.insert(key_bytes.clone());
+        self.read_set.insert(key_bytes);
 
         // Read from snapshot
         self.db.get_at_seq(key.as_ref(), self.start_seq)
@@ -255,7 +255,7 @@ impl<'db> Transaction<'db> {
     /// Abort the transaction, discarding all buffered writes.
     ///
     /// This is a no-op since writes are only buffered. Dropping the transaction
-    /// without calling commit() has the same effect.
+    /// without calling `commit()` has the same effect.
     pub fn abort(mut self) {
         self.active = false;
         self.write_buffer.clear();
@@ -263,16 +263,19 @@ impl<'db> Transaction<'db> {
     }
 
     /// Check if the transaction is still active.
-    pub fn is_active(&self) -> bool {
+    #[must_use] 
+    pub const fn is_active(&self) -> bool {
         self.active
     }
 
     /// Get the number of buffered write operations.
+    #[must_use] 
     pub fn write_count(&self) -> usize {
         self.write_buffer.len()
     }
 
     /// Get the number of keys in the read-set.
+    #[must_use] 
     pub fn read_count(&self) -> usize {
         self.read_set.len()
     }
@@ -280,7 +283,7 @@ impl<'db> Transaction<'db> {
     /// Validate read-set for OCC conflicts.
     ///
     /// Returns a list of keys that have been modified since transaction start.
-    /// A conflict occurs when a key's latest sequence number is >= start_seq,
+    /// A conflict occurs when a key's latest sequence number is >= `start_seq`,
     /// meaning it was potentially written after the transaction began.
     fn validate_read_set(&self) -> Result<Vec<Bytes>> {
         let mut conflicts = Vec::new();

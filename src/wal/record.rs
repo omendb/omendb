@@ -45,19 +45,19 @@ impl Record {
     #[inline]
     pub fn encoded_len(&self) -> usize {
         match self {
-            Record::Put { key, value, .. } => {
+            Self::Put { key, value, .. } => {
                 // type(1) + seq(8) + key_len(4) + key + value_len(4) + value
                 1 + 8 + 4 + key.len() + 4 + value.len()
             }
-            Record::Delete { key, .. } => {
+            Self::Delete { key, .. } => {
                 // type(1) + seq(8) + key_len(4) + key
                 1 + 8 + 4 + key.len()
             }
-            Record::Merge { key, operand, .. } => {
+            Self::Merge { key, operand, .. } => {
                 // type(1) + seq(8) + key_len(4) + key + operand_len(4) + operand
                 1 + 8 + 4 + key.len() + 4 + operand.len()
             }
-            Record::Batch { operations, .. } => {
+            Self::Batch { operations, .. } => {
                 // type(1) + base_seq(8) + count(4) + ops
                 let ops_len: usize = operations
                     .iter()
@@ -76,18 +76,18 @@ impl Record {
         let mut buf = BytesMut::new();
 
         match self {
-            Record::Put { key, value, seq } => {
+            Self::Put { key, value, seq } => {
                 buf.put_u8(1); // Type 1 = Put
                 buf.put_u64_le(*seq); // Sequence number
                 put_bytes(&mut buf, key);
                 put_bytes(&mut buf, value);
             }
-            Record::Delete { key, seq } => {
+            Self::Delete { key, seq } => {
                 buf.put_u8(2); // Type 2 = Delete
                 buf.put_u64_le(*seq); // Sequence number
                 put_bytes(&mut buf, key);
             }
-            Record::Batch {
+            Self::Batch {
                 base_seq,
                 operations,
             } => {
@@ -113,7 +113,7 @@ impl Record {
                     }
                 }
             }
-            Record::Merge { key, operand, seq } => {
+            Self::Merge { key, operand, seq } => {
                 buf.put_u8(4); // Type 4 = Merge
                 buf.put_u64_le(*seq); // Sequence number
                 put_bytes(&mut buf, key);
@@ -140,7 +140,7 @@ impl Record {
                 let seq = buf.get_u64_le();
                 let key = get_bytes(&mut buf)?;
                 let value = get_bytes(&mut buf)?;
-                Ok(Record::Put { key, value, seq })
+                Ok(Self::Put { key, value, seq })
             }
             2 => {
                 // Delete
@@ -149,7 +149,7 @@ impl Record {
                 }
                 let seq = buf.get_u64_le();
                 let key = get_bytes(&mut buf)?;
-                Ok(Record::Delete { key, seq })
+                Ok(Self::Delete { key, seq })
             }
             3 => {
                 // Batch
@@ -187,7 +187,7 @@ impl Record {
                         _ => return Err(RecordError::InvalidType(op_type)),
                     }
                 }
-                Ok(Record::Batch {
+                Ok(Self::Batch {
                     base_seq,
                     operations,
                 })
@@ -200,7 +200,7 @@ impl Record {
                 let seq = buf.get_u64_le();
                 let key = get_bytes(&mut buf)?;
                 let operand = get_bytes(&mut buf)?;
-                Ok(Record::Merge { key, operand, seq })
+                Ok(Self::Merge { key, operand, seq })
             }
             _ => Err(RecordError::InvalidType(record_type)),
         }

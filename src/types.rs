@@ -19,12 +19,13 @@ pub enum ValueType {
 }
 
 impl ValueType {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    #[must_use] 
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0x00 => Some(ValueType::Deletion),
-            0x01 => Some(ValueType::Value),
-            0x02 => Some(ValueType::Merge),
-            0x03 => Some(ValueType::Log),
+            0x00 => Some(Self::Deletion),
+            0x01 => Some(Self::Value),
+            0x02 => Some(Self::Merge),
+            0x03 => Some(Self::Log),
             _ => None,
         }
     }
@@ -32,7 +33,7 @@ impl ValueType {
 
 /// Internal Key used for MVCC (Multi-Version Concurrency Control)
 ///
-/// Format: [ User Key ] [ 8 bytes: (SeqNum << 8) | ValueType ]
+/// Format: [ User Key ] [ 8 bytes: (`SeqNum` << 8) | `ValueType` ]
 ///
 /// Sorting:
 /// 1. User Key (Ascending)
@@ -45,7 +46,7 @@ pub struct InternalKey {
 }
 
 impl InternalKey {
-    pub fn new(user_key: Bytes, seq: u64, kind: ValueType) -> Self {
+    pub const fn new(user_key: Bytes, seq: u64, kind: ValueType) -> Self {
         Self {
             user_key,
             seq,
@@ -55,7 +56,7 @@ impl InternalKey {
 
     /// Create a search key that will match the latest version of a user key
     /// (Sequence number = MAX)
-    pub fn for_lookup(user_key: Bytes) -> Self {
+    pub const fn for_lookup(user_key: Bytes) -> Self {
         Self {
             user_key,
             seq: u64::MAX,
@@ -63,7 +64,7 @@ impl InternalKey {
         }
     }
 
-    /// Encode the InternalKey into bytes for storage
+    /// Encode the `InternalKey` into bytes for storage
     /// Uses big-endian encoding for the sequence number wrapper to preserve sort order
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.user_key.len() + 8);
@@ -80,7 +81,7 @@ impl InternalKey {
         buf.freeze()
     }
 
-    /// Decode an InternalKey from bytes
+    /// Decode an `InternalKey` from bytes
     pub fn decode(bytes: Bytes) -> Option<Self> {
         if bytes.len() < 8 {
             return None;
@@ -107,7 +108,7 @@ impl InternalKey {
 
     /// Extract just the user key from an encoded buffer (zero copy)
     /// If the key is shorter than 9 bytes (min: 1 byte user key + 8 byte trailer),
-    /// returns the key unchanged (assumes it's a plain user key, not an InternalKey).
+    /// returns the key unchanged (assumes it's a plain user key, not an `InternalKey`).
     pub fn extract_user_key(bytes: &Bytes) -> Bytes {
         if bytes.len() <= 8 {
             // Too short to be an InternalKey - treat as plain user key
@@ -197,7 +198,7 @@ mod tests {
 /// All operations are thread-safe. The `oldest_snapshot()` method uses an
 /// atomic cache to avoid lock contention during compaction.
 pub struct SnapshotTracker {
-    /// Active snapshot sequence numbers (BTreeSet for O(1) min lookup)
+    /// Active snapshot sequence numbers (`BTreeSet` for O(1) min lookup)
     active: Mutex<BTreeSet<u64>>,
     /// Cached oldest snapshot for lock-free access during compaction
     oldest_cached: AtomicU64,
@@ -205,7 +206,8 @@ pub struct SnapshotTracker {
 
 impl SnapshotTracker {
     /// Create a new snapshot tracker with no active snapshots.
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             active: Mutex::new(BTreeSet::new()),
             oldest_cached: AtomicU64::new(u64::MAX), // No snapshots = GC everything
@@ -226,10 +228,12 @@ impl SnapshotTracker {
     /// Unregister a snapshot when it's dropped.
     /// Called from `Snapshot::drop()`.
     pub fn unregister(&self, seq: u64) {
-        let mut active = self.active.lock().expect("SnapshotTracker lock poisoned");
-        active.remove(&seq);
-        // Update cached oldest (u64::MAX if no snapshots)
-        let oldest = active.iter().next().copied().unwrap_or(u64::MAX);
+        let oldest = {
+            let mut active = self.active.lock().expect("SnapshotTracker lock poisoned");
+            active.remove(&seq);
+            // Update cached oldest (u64::MAX if no snapshots)
+            active.iter().next().copied().unwrap_or(u64::MAX)
+        };
         self.oldest_cached.store(oldest, AtomicOrdering::Release);
     }
 
@@ -275,7 +279,8 @@ impl SnapshotHandle {
     }
 
     /// Get the sequence number this handle tracks.
-    pub fn seq(&self) -> u64 {
+    #[must_use] 
+    pub const fn seq(&self) -> u64 {
         self.seq
     }
 }

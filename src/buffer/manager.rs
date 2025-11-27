@@ -43,6 +43,7 @@ pub struct FrameRef {
 }
 
 impl FrameRef {
+    #[must_use] 
     pub fn data(&self) -> &[u8] {
         // SAFETY:
         // 1. We hold a pin count > 0 (ensured by constructor and Drop).
@@ -64,15 +65,16 @@ impl FrameRef {
     /// # Safety
     /// Caller must ensure that:
     /// 1. The frame is pinned (which `FrameRef` ensures).
-    /// 2. The data is not being mutated concurrently (guaranteed for SSTables as they are immutable).
+    /// 2. The data is not being mutated concurrently (guaranteed for `SSTables` as they are immutable).
     /// 3. The `Vec` does not reallocate (guaranteed as we only resize on initial load).
     ///
     /// This is safe because:
-    /// - Frame is pinned (pin_count > 0) so it won't be evicted
-    /// - SSTable data is immutable (never modified after loading)
-    /// - Vec won't reallocate (we resize() once during load, then never touch it)
-    /// - data_ptr and data_len are captured after data is loaded
-    pub unsafe fn data_unchecked(&self) -> &[u8] {
+    /// - Frame is pinned (`pin_count` > 0) so it won't be evicted
+    /// - `SSTable` data is immutable (never modified after loading)
+    /// - Vec won't reallocate (we `resize()` once during load, then never touch it)
+    /// - `data_ptr` and `data_len` are captured after data is loaded
+    #[must_use] 
+    pub const unsafe fn data_unchecked(&self) -> &[u8] {
         std::slice::from_raw_parts(self.data_ptr, self.data_len)
     }
 }
@@ -167,7 +169,7 @@ impl BufferShard {
     }
 
     #[inline]
-    fn local_frame_id(&self, global_id: FrameId) -> usize {
+    const fn local_frame_id(&self, global_id: FrameId) -> usize {
         global_id - self.frame_offset
     }
 
@@ -234,6 +236,7 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
+    #[must_use] 
     pub fn new(options: BufferPoolOptions) -> Arc<Self> {
         let num_frames = options.capacity_bytes / options.frame_size;
         let frames_per_shard = num_frames.div_ceil(options.num_shards);
@@ -290,9 +293,8 @@ impl BufferPool {
         }
 
         // 2. Miss - Allocate frame
-        let frame_id = match shard.allocate_frame() {
-            Some(id) => id,
-            None => return Err(self.make_capacity_error::<E>()),
+        let Some(frame_id) = shard.allocate_frame() else {
+            return Err(self.make_capacity_error::<E>());
         };
 
         // CRITICAL: Pin frame immediately to prevent eviction from stealing it

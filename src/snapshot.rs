@@ -45,7 +45,7 @@ pub struct Snapshot {
     sstables: Vec<Vec<Arc<Mutex<SSTable>>>>,
     sequence_number: u64,
     merge_operator: Option<Arc<dyn MergeOperator>>,
-    /// Handle for automatic unregistration from SnapshotTracker on drop.
+    /// Handle for automatic unregistration from `SnapshotTracker` on drop.
     /// When this Snapshot is dropped, the handle unregisters from the tracker,
     /// allowing compaction to GC versions older than this snapshot.
     #[allow(dead_code)] // Drop impl uses this implicitly
@@ -118,10 +118,10 @@ impl Snapshot {
         end_key: Option<&[u8]>,
     ) -> crate::db::Result<RangeIterator> {
         let mut partition_refs: Vec<&Memtable> =
-            self.memtables.iter().map(|arc| arc.as_ref()).collect();
+            self.memtables.iter().map(std::convert::AsRef::as_ref).collect();
 
         if let Some(ref immutables) = self.immutable_memtables {
-            partition_refs.extend(immutables.iter().map(|arc| arc.as_ref()));
+            partition_refs.extend(immutables.iter().map(std::convert::AsRef::as_ref));
         }
 
         let mut sstables = Vec::new();
@@ -149,14 +149,15 @@ impl Snapshot {
         )
     }
 
-    pub fn sequence_number(&self) -> u64 {
+    #[must_use] 
+    pub const fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
 }
 
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total_sstables: usize = self.sstables.iter().map(|l| l.len()).sum();
+        let total_sstables: usize = self.sstables.iter().map(std::vec::Vec::len).sum();
         f.debug_struct("Snapshot")
             .field("sequence_number", &self.sequence_number)
             .field("memtable_partitions", &self.memtables.len())

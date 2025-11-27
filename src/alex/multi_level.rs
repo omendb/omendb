@@ -60,7 +60,8 @@ impl Default for MultiLevelAlexTree {
 
 impl MultiLevelAlexTree {
     /// Create an empty tree
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             root: None,
             leaves: Vec::new(),
@@ -85,11 +86,10 @@ impl MultiLevelAlexTree {
         let leaves = Self::build_leaves(&data)?;
 
         // Verify all keys were inserted
-        let total_leaf_keys: usize = leaves.iter().map(|l| l.num_keys()).sum();
+        let total_leaf_keys: usize = leaves.iter().map(super::gapped_node::GappedNode::num_keys).sum();
         if total_leaf_keys != num_keys {
             eprintln!(
-                "WARNING: Only {} of {} keys inserted into leaves",
-                total_leaf_keys, num_keys
+                "WARNING: Only {total_leaf_keys} of {num_keys} keys inserted into leaves"
             );
         }
 
@@ -115,7 +115,7 @@ impl MultiLevelAlexTree {
     }
 
     /// Calculate appropriate tree height for given data size
-    fn calculate_height(num_keys: usize) -> usize {
+    const fn calculate_height(num_keys: usize) -> usize {
         if num_keys <= 10_000 {
             1 // Single level for small data
         } else if num_keys <= 10_000_000 {
@@ -262,22 +262,26 @@ impl MultiLevelAlexTree {
     }
 
     /// Get number of keys
-    pub fn len(&self) -> usize {
+    #[must_use] 
+    pub const fn len(&self) -> usize {
         self.num_keys
     }
 
     /// Check if tree is empty
-    pub fn is_empty(&self) -> bool {
+    #[must_use] 
+    pub const fn is_empty(&self) -> bool {
         self.num_keys == 0
     }
 
     /// Get number of leaves
-    pub fn num_leaves(&self) -> usize {
+    #[must_use] 
+    pub const fn num_leaves(&self) -> usize {
         self.leaves.len()
     }
 
     /// Get tree height
-    pub fn height(&self) -> usize {
+    #[must_use] 
+    pub const fn height(&self) -> usize {
         self.height
     }
 }
@@ -330,7 +334,7 @@ impl InnerNode {
         // Create children
         let children = if level < target_height - 1 {
             // Need more inner node levels
-            let inner_children: Result<Vec<Box<InnerNode>>> = groups
+            let inner_children: Result<Vec<Box<Self>>> = groups
                 .into_iter()
                 .map(|group| Self::build_from_leaves(&group, level + 1, target_height))
                 .map(|r| r.map(Box::new))
@@ -424,7 +428,7 @@ impl InnerNode {
     }
 
     /// Get number of children
-    fn num_children(&self) -> usize {
+    const fn num_children(&self) -> usize {
         match &self.children {
             InnerNodeChildren::Inner(children) => children.len(),
             InnerNodeChildren::Leaves(indices) => indices.len(),
@@ -470,12 +474,14 @@ impl InnerNode {
 // Extension to GappedNode for multi-level support
 impl GappedNode {
     /// Get minimum key in node
+    #[must_use] 
     pub fn min_key(&self) -> Option<i64> {
         let pairs = self.pairs();
         pairs.iter().map(|(k, _)| *k).min()
     }
 
     /// Get maximum key in node
+    #[must_use] 
     pub fn max_key(&self) -> Option<i64> {
         let pairs = self.pairs();
         pairs.iter().map(|(k, _)| *k).max()

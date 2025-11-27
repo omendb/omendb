@@ -1,7 +1,7 @@
-//! AlexTree: Adaptive learned index tree structure
+//! `AlexTree`: Adaptive learned index tree structure
 //!
 //! Simplified single-level ALEX tree implementation:
-//! - Array of leaf nodes (GappedNode)
+//! - Array of leaf nodes (`GappedNode`)
 //! - Each leaf handles a key range
 //! - Splits create new leaves
 //!
@@ -10,7 +10,7 @@
 use super::GappedNode;
 use anyhow::Result;
 
-/// AlexTree: Single-level adaptive learned index
+/// `AlexTree`: Single-level adaptive learned index
 ///
 /// Current implementation uses a simple array of leaf nodes.
 /// When a leaf splits, we insert the new leaf into the array.
@@ -19,7 +19,7 @@ pub struct AlexTree {
     /// Leaf nodes, sorted by key range
     leaves: Vec<GappedNode>,
 
-    /// Split keys between leaves (leaves[i] handles keys < split_keys[i])
+    /// Split keys between leaves (leaves[i] handles keys < `split_keys`[i])
     /// Last leaf handles all remaining keys
     split_keys: Vec<i64>,
 
@@ -29,6 +29,7 @@ pub struct AlexTree {
 
 impl AlexTree {
     /// Create new ALEX tree
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             leaves: vec![GappedNode::new(100, 1.0)], // Start with one leaf
@@ -38,6 +39,7 @@ impl AlexTree {
     }
 
     /// Create ALEX tree with custom expansion factor
+    #[must_use] 
     pub fn with_expansion(expansion_factor: f64) -> Self {
         Self {
             leaves: vec![GappedNode::new(100, expansion_factor)],
@@ -80,7 +82,7 @@ impl AlexTree {
     /// 2. Bulk inserts per leaf (amortizes gap allocation)
     /// 3. Defers splits until after batch (amortizes split cost)
     ///
-    /// **Performance**: 10-50x faster than sequential insert() for random data
+    /// **Performance**: 10-50x faster than sequential `insert()` for random data
     ///
     /// **Time complexity**: O(n log m) where n = batch size, m = num leaves
     pub fn insert_batch(&mut self, mut entries: Vec<(i64, Vec<u8>)>) -> Result<()> {
@@ -146,10 +148,10 @@ impl AlexTree {
         self.leaves[leaf_idx].get(key)
     }
 
-    /// Find first key >= search_key (lower bound search)
+    /// Find first key >= `search_key` (lower bound search)
     ///
-    /// Returns the smallest (key, value) pair where key >= search_key.
-    /// This is useful for partition_point semantics in indexes.
+    /// Returns the smallest (key, value) pair where key >= `search_key`.
+    /// This is useful for `partition_point` semantics in indexes.
     ///
     /// **Time complexity**: O(log n) to find leaf + O(log error) to search within leaf
     ///
@@ -177,10 +179,10 @@ impl AlexTree {
 
     /// Find leaf index for key using binary search on split keys
     ///
-    /// Leaf routing: split_keys[i] is the FIRST key of leaf[i+1]
-    /// - leaf[0]: keys < split_keys[0]
-    /// - leaf[i]: keys in [split_keys[i-1], split_keys[i])
-    /// - leaf[n-1]: keys >= split_keys[n-2]
+    /// Leaf routing: `split_keys`[i] is the FIRST key of leaf[i+1]
+    /// - leaf[0]: keys < `split_keys`[0]
+    /// - leaf[i]: keys in [`split_keys`[i-1], `split_keys`[i])
+    /// - leaf[n-1]: keys >= `split_keys`[n-2]
     fn find_leaf_index(&self, key: i64) -> usize {
         // Binary search for first split_key > key
         match self.split_keys.binary_search(&key) {
@@ -191,22 +193,24 @@ impl AlexTree {
 
     /// Get total number of keys across all leaves
     pub fn len(&self) -> usize {
-        self.leaves.iter().map(|leaf| leaf.num_keys()).sum()
+        self.leaves.iter().map(super::gapped_node::GappedNode::num_keys).sum()
     }
 
     /// Check if tree is empty
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Get number of leaf nodes
-    pub fn num_leaves(&self) -> usize {
+    #[must_use] 
+    pub const fn num_leaves(&self) -> usize {
         self.leaves.len()
     }
 
-    /// Range query - return all (key, value) pairs where start_key <= key <= end_key
+    /// Range query - return all (key, value) pairs where `start_key` <= key <= `end_key`
     ///
-    /// **Time complexity**: O(log n) to find start + O(result_size) to collect
+    /// **Time complexity**: O(log n) to find start + `O(result_size)` to collect
     pub fn range(&self, start_key: i64, end_key: i64) -> Result<Vec<(i64, Vec<u8>)>> {
         if start_key > end_key {
             return Ok(Vec::new());

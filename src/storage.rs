@@ -1,9 +1,3 @@
-// Storage backend abstraction for pluggable storage tiers
-//
-// Feature-gated: Cloud storage backends only compiled when --features object-store
-// Default (no feature): Uses concrete LocalStorage (zero overhead)
-// With feature: Generic Storage trait + ObjectStoreBackend (cloud support)
-
 use crate::db::Result;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -167,7 +161,8 @@ impl LocalStorage {
     /// # Arguments
     ///
     /// * `base_path` - Base directory for all storage operations
-    pub fn new(base_path: PathBuf) -> Self {
+    #[must_use] 
+    pub const fn new(base_path: PathBuf) -> Self {
         Self { base_path }
     }
 
@@ -253,7 +248,7 @@ impl Storage for LocalStorage {
 // This avoids trait overhead and keeps binary size minimal
 #[cfg(not(feature = "object-store"))]
 impl LocalStorage {
-    /// Read a block from an SSTable (direct implementation, no trait)
+    /// Read a block from an `SSTable` (direct implementation, no trait)
     pub fn read_block(&self, path: &Path, offset: u64, size: u32) -> Result<Vec<u8>> {
         let full_path = self.full_path(path);
         let mut file = File::open(&full_path)?;
@@ -264,7 +259,7 @@ impl LocalStorage {
         Ok(buffer)
     }
 
-    /// Write an SSTable (direct implementation, no trait)
+    /// Write an `SSTable` (direct implementation, no trait)
     pub fn write_sstable(&self, path: &Path, data: &[u8]) -> Result<()> {
         let full_path = self.full_path(path);
 
@@ -283,14 +278,14 @@ impl LocalStorage {
         Ok(())
     }
 
-    /// Delete an SSTable (direct implementation, no trait)
+    /// Delete an `SSTable` (direct implementation, no trait)
     pub fn delete_sstable(&self, path: &Path) -> Result<()> {
         let full_path = self.full_path(path);
         std::fs::remove_file(full_path)?;
         Ok(())
     }
 
-    /// Fsync an SSTable (direct implementation, no trait)
+    /// Fsync an `SSTable` (direct implementation, no trait)
     pub fn sync(&self, path: &Path) -> Result<()> {
         let full_path = self.full_path(path);
         let file = OpenOptions::new().write(true).open(full_path)?;
@@ -298,13 +293,13 @@ impl LocalStorage {
         Ok(())
     }
 
-    /// Check if an SSTable exists (direct implementation, no trait)
+    /// Check if an `SSTable` exists (direct implementation, no trait)
     pub fn exists(&self, path: &Path) -> Result<bool> {
         let full_path = self.full_path(path);
         Ok(full_path.exists())
     }
 
-    /// List all SSTables (direct implementation, no trait)
+    /// List all `SSTables` (direct implementation, no trait)
     pub fn list_sstables(&self, dir: &Path) -> Result<Vec<PathBuf>> {
         let full_dir = self.full_path(dir);
         let mut sstables = Vec::new();

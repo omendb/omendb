@@ -6,7 +6,7 @@ pub use manager::{BufferPool, BufferPoolOptions, FrameRef, PageId};
 
 use thiserror::Error;
 
-/// BufferPool error types
+/// `BufferPool` error types
 #[derive(Debug, Error)]
 pub enum BufferPoolError {
     #[error("Buffer pool is full (all frames pinned or in use)")]

@@ -1,6 +1,3 @@
-// Write-Ahead Log (WAL) implementation
-// Provides durability guarantees for memtable operations
-
 pub mod pipelined;
 pub mod reader;
 pub mod record;
@@ -17,9 +14,9 @@ pub use reader::WALReader;
 pub use record::{BatchOp, Record};
 
 // WAL file format magic number: "WLOG"
-const MAGIC: u32 = 0x574C4F47;
+const MAGIC: u32 = 0x574C_4F47;
 // Version 2 adds per-record CRC32C checksums
-const VERSION: u32 = 0x00000002;
+const VERSION: u32 = 0x0000_0002;
 const HEADER_SIZE: u64 = 8; // magic (4) + version (4)
 
 #[derive(Debug, Error)]
@@ -46,7 +43,7 @@ pub enum SyncPolicy {
     None,
 }
 
-/// Recovery mode for WAL replay during DB::open()
+/// Recovery mode for WAL replay during `DB::open()`
 ///
 /// Controls how the database handles corruption or truncation in the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -261,11 +258,13 @@ impl WAL {
     }
 
     /// Get the current offset (end of file)
-    pub fn offset(&self) -> u64 {
+    #[must_use] 
+    pub const fn offset(&self) -> u64 {
         self.offset
     }
 
     /// Get the file path
+    #[must_use] 
     pub fn path(&self) -> &Path {
         &self.path
     }

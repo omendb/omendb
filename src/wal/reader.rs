@@ -1,5 +1,3 @@
-// WAL reader for crash recovery
-
 use super::record::{Record, RecordError};
 use bytes::Bytes;
 use std::fs::File;
@@ -8,9 +6,9 @@ use std::path::Path;
 use thiserror::Error;
 
 // WAL file format magic number: "WLOG"
-const MAGIC: u32 = 0x574C4F47;
-const VERSION_V1: u32 = 0x00000001; // No checksums
-const VERSION_V2: u32 = 0x00000002; // Per-record CRC32C checksums
+const MAGIC: u32 = 0x574C_4F47;
+const VERSION_V1: u32 = 0x0000_0001; // No checksums
+const VERSION_V2: u32 = 0x0000_0002; // Per-record CRC32C checksums
 const HEADER_SIZE: u64 = 8; // magic (4) + version (4)
 
 #[derive(Debug, Error)]
@@ -154,7 +152,8 @@ impl WALReader {
     }
 
     /// Get the current offset
-    pub fn offset(&self) -> u64 {
+    #[must_use] 
+    pub const fn offset(&self) -> u64 {
         self.offset
     }
 }

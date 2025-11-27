@@ -1,31 +1,28 @@
-// Merge iterator for compaction
-// Merges multiple sorted SSTables with MVCC garbage collection
-
 use crate::compaction::{CompactionFilter, FilterDecision};
 use crate::sstable::{SSTable, SSTableError};
 use crate::types::InternalKey;
 use bytes::Bytes;
 use std::sync::Arc;
 
-/// Merged entries from all SSTables, sorted by key
+/// Merged entries from all `SSTables`, sorted by key
 pub struct MergeIterator {
     entries: std::vec::IntoIter<(Bytes, Bytes)>,
 }
 
 impl MergeIterator {
-    /// Create a new merge iterator from multiple SSTables
+    /// Create a new merge iterator from multiple `SSTables`
     ///
     /// Collects all entries, sorts by key, and applies MVCC garbage collection.
-    /// For L0 compaction, "newest" means from HIGHER source_id (later in vector).
-    /// L0 SSTables are ordered oldest→newest, so higher index = newer data.
+    /// For L0 compaction, "newest" means from HIGHER `source_id` (later in vector).
+    /// L0 `SSTables` are ordered oldest→newest, so higher index = newer data.
     ///
     /// # MVCC Garbage Collection
     /// - `oldest_snapshot`: Sequence number of the oldest active snapshot.
     ///   Pass `u64::MAX` if no snapshots are active (GC everything possible).
-    /// - For each user_key, keeps:
+    /// - For each `user_key`, keeps:
     ///   - The newest version (always)
-    ///   - Any version with seq >= oldest_snapshot (visible to active snapshots)
-    /// - Drops old versions with seq < oldest_snapshot when a newer version exists.
+    ///   - Any version with seq >= `oldest_snapshot` (visible to active snapshots)
+    /// - Drops old versions with seq < `oldest_snapshot` when a newer version exists.
     pub fn new(
         sstables: Vec<SSTable>,
         level: usize,
@@ -38,10 +35,10 @@ impl MergeIterator {
     /// Create a merge iterator with MVCC garbage collection
     ///
     /// # Arguments
-    /// * `sstables` - SSTables to merge (older first for L0)
+    /// * `sstables` - `SSTables` to merge (older first for L0)
     /// * `level` - Target compaction level
     /// * `filter` - Optional compaction filter
-    /// * `oldest_snapshot` - Oldest active snapshot seq (u64::MAX = no snapshots)
+    /// * `oldest_snapshot` - Oldest active snapshot seq (`u64::MAX` = no snapshots)
     pub fn with_gc(
         mut sstables: Vec<SSTable>,
         level: usize,
@@ -136,9 +133,9 @@ impl MergeIterator {
 
     /// Apply MVCC garbage collection to sorted entries
     ///
-    /// Groups entries by user_key and keeps:
+    /// Groups entries by `user_key` and keeps:
     /// - Newest version (always)
-    /// - Versions with seq >= oldest_snapshot (visible to snapshots)
+    /// - Versions with seq >= `oldest_snapshot` (visible to snapshots)
     fn apply_mvcc_gc(
         all_entries: &[(Bytes, Bytes, usize)],
         oldest_snapshot: u64,

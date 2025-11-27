@@ -65,16 +65,16 @@
 //!
 //! - **Memtable**: In-memory buffer using concurrent skiplist
 //! - **WAL**: Write-ahead log for durability
-//! - **SSTable**: Sorted string tables on disk with bloom filters
+//! - **`SSTable`**: Sorted string tables on disk with bloom filters
 //! - **LSM Levels**: 7 levels with exponential sizing (10x ratio)
-//! - **VLog**: Optional value log for key-value separation (large values)
-//! - **Compaction**: Background merge of SSTables to reduce read amplification
+//! - **`VLog`**: Optional value log for key-value separation (large values)
+//! - **Compaction**: Background merge of `SSTables` to reduce read amplification
 //!
 //! # Performance Characteristics
 //!
 //! - **Writes**: O(log n) in-memory + O(1) WAL append
-//! - **Reads**: O(log n) skiplist + O(levels) SSTable lookups with bloom filter optimization
-//! - **Scans**: Efficient via merge iteration over memtable + SSTables
+//! - **Reads**: O(log n) skiplist + O(levels) `SSTable` lookups with bloom filter optimization
+//! - **Scans**: Efficient via merge iteration over memtable + `SSTables`
 //! - **Space Amplification**: ~2x (typical LSM-tree)
 //! - **Write Amplification**: 10-30x (reduced with vLog for large values)
 //!
@@ -179,10 +179,3 @@ pub use metrics::DBStats;
 // Bulk operations
 pub use db::{BulkLoadOptions, BulkLoadStats, VerifyResult};
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn basic_test() {
-        assert_eq!(2 + 2, 4);
-    }
-}

@@ -1,14 +1,9 @@
-// SIMD-optimized search for Option<i64> arrays in ALEX nodes
-//
-// Uses std::simd to vectorize searching for a key in gapped arrays.
-// Processes 4 i64 values at once, providing ~3-4x speedup over linear search.
-
 use std::simd::{cmp::SimdPartialEq, i64x4};
 
 /// SIMD-optimized search for key in Option<i64> array
 ///
 /// Searches for first occurrence of Some(key) in the slice.
-/// Uses std::simd to compare 4 values at once.
+/// Uses `std::simd` to compare 4 values at once.
 ///
 /// Returns Some(index) if found, None otherwise.
 #[inline]

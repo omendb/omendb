@@ -35,6 +35,7 @@ const REF_BIT: u8 = 0b01;
 const HOT_BIT: u8 = 0b10;
 
 impl ClockProPolicy {
+    #[must_use] 
     pub fn new(capacity: usize) -> Self {
         let mut state = Vec::with_capacity(capacity);
         for _ in 0..capacity {
@@ -120,6 +121,7 @@ pub struct ClockPolicy {
 }
 
 impl ClockPolicy {
+    #[must_use] 
     pub fn new(capacity: usize) -> Self {
         let mut bits = Vec::with_capacity(capacity);
         for _ in 0..capacity {

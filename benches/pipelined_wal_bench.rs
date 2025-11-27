@@ -21,6 +21,7 @@ fn create_test_record(key: &[u8], value: &[u8]) -> Record {
     Record::Put {
         key: bytes::Bytes::copy_from_slice(key),
         value: bytes::Bytes::copy_from_slice(value),
+        seq: 0,
     }
 }
 

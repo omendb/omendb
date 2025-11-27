@@ -1,6 +1,3 @@
-// SSTable: Sorted String Table on disk
-// Block-based format with lazy loading for memory efficiency
-
 pub mod block;
 
 use crate::alex::AlexTree;
@@ -46,9 +43,9 @@ pub enum SSTableError {
 
 pub type Result<T> = std::result::Result<T, SSTableError>;
 
-/// Magic number for SSTable format: "SSTB"
-const MAGIC: u32 = 0x53535442;
-const VERSION: u32 = 0x00000002; // v2: Added prefix bloom filter
+/// Magic number for `SSTable` format: "SSTB"
+const MAGIC: u32 = 0x5353_5442;
+const VERSION: u32 = 0x0000_0002; // v2: Added prefix bloom filter
 
 /// Entry value type flags
 pub const FLAG_INLINE: u8 = 0x00;
@@ -59,11 +56,11 @@ pub const FLAG_MERGE: u8 = 0x03;
 /// Default prefix length for prefix bloom filter
 pub const DEFAULT_PREFIX_LEN: usize = 3;
 
-/// Helper: Handle vLog separation logic (shared by SSTableBuilder implementations)
+/// Helper: Handle vLog separation logic (shared by `SSTableBuilder` implementations)
 ///
-/// Returns (encoded_value, flag):
-/// - If value is large (>threshold), appends to vLog and returns (pointer_bytes, FLAG_POINTER)
-/// - Otherwise, returns (value, FLAG_INLINE)
+/// Returns (`encoded_value`, flag):
+/// - If value is large (>threshold), appends to vLog and returns (`pointer_bytes`, `FLAG_POINTER`)
+/// - Otherwise, returns (value, `FLAG_INLINE`)
 fn handle_vlog_value(
     key: &Bytes,
     value: Bytes,
@@ -74,7 +71,7 @@ fn handle_vlog_value(
         // Large value: store in vLog and return pointer
         let pointer = vlog
             .append(key, &value)
-            .map_err(|e| SSTableError::VLog(format!("Failed to append to vLog: {}", e)))?;
+            .map_err(|e| SSTableError::VLog(format!("Failed to append to vLog: {e}")))?;
         Ok((pointer.to_bytes(), FLAG_POINTER))
     } else {
         // Small value: store inline
@@ -134,7 +131,7 @@ fn bytes_to_i64(bytes: &[u8]) -> i64 {
 // SSTableBuilder - Write SSTables incrementally
 // ============================================================================
 
-/// SSTable builder with block-based format
+/// `SSTable` builder with block-based format
 ///
 /// Generic over any writer that implements Read + Write + Seek.
 /// - Use `SSTableBuilder<File>` for direct-to-disk (low memory)
@@ -153,7 +150,7 @@ pub struct SSTableBuilder<W> {
     index_blocks_start: u64,
     min_key: Option<Bytes>,
     max_key: Option<Bytes>,
-    /// Maximum sequence number in this SSTable
+    /// Maximum sequence number in this `SSTable`
     /// Used to coordinate flush and compaction to prevent live key deletion
     max_sequence: u64,
     /// Compression algorithm for blocks
@@ -161,7 +158,7 @@ pub struct SSTableBuilder<W> {
 }
 
 impl SSTableBuilder<File> {
-    /// Create a new SSTable builder writing directly to a file
+    /// Create a new `SSTable` builder writing directly to a file
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -203,7 +200,8 @@ impl SSTableBuilder<File> {
 }
 
 impl SSTableBuilder<Cursor<Vec<u8>>> {
-    /// Create a new buffered SSTable builder (in-memory)
+    /// Create a new buffered `SSTable` builder (in-memory)
+    #[must_use] 
     pub fn new_buffered() -> Self {
         let header = Self::create_header(DEFAULT_PREFIX_LEN);
         let header_size = header.len() as u64;
@@ -233,7 +231,7 @@ impl SSTableBuilder<Cursor<Vec<u8>>> {
         }
     }
 
-    /// Finish building and return the complete SSTable as bytes
+    /// Finish building and return the complete `SSTable` as bytes
     pub fn finish_to_bytes(self) -> Result<Bytes> {
         let writer = self.finish_internal()?;
         Ok(Bytes::from(writer.into_inner()))
@@ -261,7 +259,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         header
     }
 
-    pub fn with_vlog_threshold(mut self, threshold: usize) -> Self {
+    pub const fn with_vlog_threshold(mut self, threshold: usize) -> Self {
         self.vlog_threshold = Some(threshold);
         self
     }
@@ -276,13 +274,13 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         self
     }
 
-    /// Set the maximum sequence number for this SSTable
-    pub fn with_max_sequence(mut self, seq: u64) -> Self {
+    /// Set the maximum sequence number for this `SSTable`
+    pub const fn with_max_sequence(mut self, seq: u64) -> Self {
         self.max_sequence = seq;
         self
     }
 
-    /// Set the compression algorithm for SSTable blocks
+    /// Set the compression algorithm for `SSTable` blocks
     ///
     /// Controls the compression used for data and index blocks.
     ///
@@ -303,12 +301,12 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
     }
 
     /// Check if the builder is empty (no entries added yet)
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.num_entries == 0
     }
 
     /// Get the number of entries added so far
-    pub fn num_entries(&self) -> u64 {
+    pub const fn num_entries(&self) -> u64 {
         self.num_entries
     }
 
@@ -350,10 +348,10 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         Ok(())
     }
 
-    /// Add a raw entry from MVCC-encoded SSTable (for compaction)
+    /// Add a raw entry from MVCC-encoded `SSTable` (for compaction)
     ///
-    /// Similar to `add_raw()` but extracts user key from encoded InternalKey for bloom filter.
-    /// This ensures get_mvcc() can find keys in compacted SSTables.
+    /// Similar to `add_raw()` but extracts user key from encoded `InternalKey` for bloom filter.
+    /// This ensures `get_mvcc()` can find keys in compacted `SSTables`.
     #[inline]
     pub fn add_raw_mvcc(&mut self, key: Bytes, encoded_value: Bytes) -> Result<()> {
         // Track min/max keys for range filtering
@@ -468,10 +466,10 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
     // MVCC-aware methods: Store encoded InternalKeys, bloom filter uses user keys
     // ========================================================================
 
-    /// Add an entry with InternalKey (MVCC-aware)
+    /// Add an entry with `InternalKey` (MVCC-aware)
     ///
-    /// - Encodes InternalKey for storage (sorted by user_key ASC, seq DESC)
-    /// - Uses user_key for bloom filter (so get_mvcc can check bloom)
+    /// - Encodes `InternalKey` for storage (sorted by `user_key` ASC, seq DESC)
+    /// - Uses `user_key` for bloom filter (so `get_mvcc` can check bloom)
     /// - Tracks max sequence number
     pub fn add_internal(&mut self, ikey: &InternalKey, value: Bytes) -> Result<()> {
         // Update max sequence for this SSTable
@@ -497,10 +495,9 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
 
         // Encode value with appropriate flag based on ValueType
         let flag = match ikey.kind {
-            ValueType::Value => FLAG_INLINE,
+            ValueType::Value | ValueType::Log => FLAG_INLINE, // Log treated as inline value
             ValueType::Deletion => FLAG_TOMBSTONE,
             ValueType::Merge => FLAG_MERGE,
-            ValueType::Log => FLAG_INLINE, // Treat log as inline value
         };
         let encoded_value = self.encode_entry(&encoded_key, flag, &value);
 
@@ -522,7 +519,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         Ok(())
     }
 
-    /// Add an entry with InternalKey and vLog support (MVCC-aware)
+    /// Add an entry with `InternalKey` and vLog support (MVCC-aware)
     pub fn add_internal_with_vlog(
         &mut self,
         ikey: &InternalKey,
@@ -590,7 +587,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         buf.freeze()
     }
 
-    /// Create a new BlockBuilder with the configured compression type
+    /// Create a new `BlockBuilder` with the configured compression type
     fn new_block_builder(&self) -> BlockBuilder {
         let mut builder = BlockBuilder::with_capacity(DEFAULT_BLOCK_SIZE);
         builder.set_compression_type(self.compression_type);
@@ -731,12 +728,12 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         let mut buffer = Vec::new();
 
         // Write min_key
-        let min_key = self.min_key.as_ref().map(|k| k.as_ref()).unwrap_or(&[]);
+        let min_key = self.min_key.as_ref().map(std::convert::AsRef::as_ref).unwrap_or(&[]);
         buffer.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(min_key);
 
         // Write max_key
-        let max_key = self.max_key.as_ref().map(|k| k.as_ref()).unwrap_or(&[]);
+        let max_key = self.max_key.as_ref().map(std::convert::AsRef::as_ref).unwrap_or(&[]);
         buffer.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(max_key);
 
@@ -791,11 +788,11 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
 // SSTable - Read SSTables with lazy loading
 // ============================================================================
 
-/// SSTable reader with lazy block loading
+/// `SSTable` reader with lazy block loading
 ///
-/// File handle optimization: Keeps file open for the lifetime of the SSTable to eliminate
-/// repeated open/close overhead. Each SSTable maintains 1 file descriptor, bounded by the
-/// number of SSTables in the LSM tree (typically 70-350 across all levels).
+/// File handle optimization: Keeps file open for the lifetime of the `SSTable` to eliminate
+/// repeated open/close overhead. Each `SSTable` maintains 1 file descriptor, bounded by the
+/// number of `SSTables` in the LSM tree (typically 70-350 across all levels).
 pub struct SSTable {
     file: Arc<Mutex<File>>, // File handle kept open for zero-overhead reads
     path: PathBuf,
@@ -811,19 +808,19 @@ pub struct SSTable {
     block_cache: Arc<Cache<u64, Block>>, // LRU cache with size limits
     min_key: Option<Bytes>,
     max_key: Option<Bytes>,
-    /// Maximum sequence number in this SSTable
+    /// Maximum sequence number in this `SSTable`
     /// Used to coordinate flush and compaction to prevent live key deletion
     max_sequence: u64,
     // Cache performance metrics (Arc for sharing with iterators)
     cache_hits: Arc<AtomicU64>,
     cache_misses: Arc<AtomicU64>,
-    /// Optional global block cache shared across all SSTables
-    /// Key: (path_hash, block_offset), Value: raw block data
+    /// Optional global block cache shared across all `SSTables`
+    /// Key: (`path_hash`, `block_offset`), Value: raw block data
     global_cache: Option<Arc<Cache<(u64, u64), Bytes>>>,
-    /// Optional LeanStore BufferPool (L2 Raw Page Cache)
-    /// Replaces global_cache/OS cache usage when enabled
+    /// Optional `LeanStore` `BufferPool` (L2 Raw Page Cache)
+    /// Replaces `global_cache/OS` cache usage when enabled
     buffer_pool: Option<Arc<BufferPool>>,
-    /// Hash of this SSTable's path for global cache key
+    /// Hash of this `SSTable`'s path for global cache key
     path_hash: u64,
 }
 
@@ -841,10 +838,10 @@ impl SSTable {
         Self::open_with_options(path, None, None)
     }
 
-    /// Open SSTable with optional global block cache
+    /// Open `SSTable` with optional global block cache
     ///
-    /// When a global cache is provided, blocks are cached there with key (path_hash, offset).
-    /// This allows hot blocks to be shared across all SSTables, improving cache hit rates.
+    /// When a global cache is provided, blocks are cached there with key (`path_hash`, offset).
+    /// This allows hot blocks to be shared across all `SSTables`, improving cache hit rates.
     pub fn open_with_global_cache(
         path: impl AsRef<Path>,
         global_cache: Option<Arc<Cache<(u64, u64), Bytes>>>,
@@ -931,32 +928,31 @@ impl SSTable {
         self
     }
 
-    /// Get maximum sequence number in this SSTable
-    pub fn max_sequence(&self) -> u64 {
+    /// Get maximum sequence number in this `SSTable`
+    pub const fn max_sequence(&self) -> u64 {
         self.max_sequence
     }
 
-    /// Get the minimum key in this SSTable (for range filtering)
-    pub fn min_key(&self) -> Option<&Bytes> {
+    /// Get the minimum key in this `SSTable` (for range filtering)
+    pub const fn min_key(&self) -> Option<&Bytes> {
         self.min_key.as_ref()
     }
 
-    /// Get the maximum key in this SSTable (for range filtering)
-    pub fn max_key(&self) -> Option<&Bytes> {
+    /// Get the maximum key in this `SSTable` (for range filtering)
+    pub const fn max_key(&self) -> Option<&Bytes> {
         self.max_key.as_ref()
     }
 
-    /// Get the configured prefix length for this SSTable
-    pub fn prefix_len(&self) -> usize {
+    /// Get the configured prefix length for this `SSTable`
+    pub const fn prefix_len(&self) -> usize {
         self.prefix_len
     }
 
-    /// Check if this SSTable's key range overlaps with [start_key, end_key)
+    /// Check if this `SSTable`'s key range overlaps with [`start_key`, `end_key`)
     pub fn overlaps_range(&self, start_key: &[u8], end_key: Option<&[u8]>) -> bool {
         // If we don't have metadata, assume it overlaps (conservative)
-        let (min, max) = match (&self.min_key, &self.max_key) {
-            (Some(min), Some(max)) => (min, max),
-            _ => return true,
+        let (Some(min), Some(max)) = (&self.min_key, &self.max_key) else {
+            return true;
         };
 
         // Check if ranges overlap
@@ -975,12 +971,12 @@ impl SSTable {
         true // Ranges overlap
     }
 
-    /// Check if key might be in this SSTable (bloom filter check)
+    /// Check if key might be in this `SSTable` (bloom filter check)
     pub fn may_contain(&self, key: &[u8]) -> bool {
         self.bloom.contains(key)
     }
 
-    /// Check if a prefix might be in this SSTable (prefix bloom filter check)
+    /// Check if a prefix might be in this `SSTable` (prefix bloom filter check)
     /// Returns true if the prefix might exist, false if definitely not.
     /// If prefix filter is not present or prefix is too short, returns true (conservative).
     pub fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
@@ -1029,43 +1025,41 @@ impl SSTable {
             return Ok(None);
         }
 
-        let (index_block_offset, index_block_size) = match self.find_index_block(key) {
-            Some((offset, size)) => (offset, size),
-            None => return Ok(None),
+        let Some((index_block_offset, index_block_size)) = self.find_index_block(key) else {
+            return Ok(None);
         };
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
-        let (data_block_offset, data_block_size) =
-            match self.find_in_index_block(&index_block, key)? {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(None),
-            };
+        let Some((data_block_offset, data_block_size)) =
+            self.find_in_index_block(&index_block, key)?
+        else {
+            return Ok(None);
+        };
 
         let data_block = self.load_block(data_block_offset, data_block_size)?;
 
         self.find_in_data_block(&data_block, key)
     }
 
-    /// Check if a key exists in this SSTable (even if it's a tombstone)
+    /// Check if a key exists in this `SSTable` (even if it's a tombstone)
     /// Returns true if the key is present (value or tombstone), false otherwise
     pub fn contains(&mut self, key: &[u8]) -> Result<bool> {
         if !self.bloom.contains(key) {
             return Ok(false);
         }
 
-        let (index_block_offset, index_block_size) = match self.find_index_block(key) {
-            Some((offset, size)) => (offset, size),
-            None => return Ok(false),
+        let Some((index_block_offset, index_block_size)) = self.find_index_block(key) else {
+            return Ok(false);
         };
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
-        let (data_block_offset, data_block_size) =
-            match self.find_in_index_block(&index_block, key)? {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(false),
-            };
+        let Some((data_block_offset, data_block_size)) =
+            self.find_in_index_block(&index_block, key)?
+        else {
+            return Ok(false);
+        };
 
         let data_block = self.load_block(data_block_offset, data_block_size)?;
 
@@ -1077,15 +1071,15 @@ impl SSTable {
     // MVCC-aware get methods: Search for user_key with seq <= snapshot_seq
     // ========================================================================
 
-    /// Get value for user_key visible at snapshot_seq (MVCC-aware)
+    /// Get value for `user_key` visible at `snapshot_seq` (MVCC-aware)
     ///
-    /// Searches for the first version of user_key with seq <= snapshot_seq.
+    /// Searches for the first version of `user_key` with seq <= `snapshot_seq`.
     /// Returns:
     /// - Ok(Some(value)) if a live value is found
     /// - Ok(None) if key not found or deleted (tombstone)
     /// - Err if I/O or format error
     ///
-    /// IMPORTANT: Only works on SSTables built with add_internal() methods.
+    /// IMPORTANT: Only works on `SSTables` built with `add_internal()` methods.
     pub fn get_mvcc(&mut self, user_key: &[u8], snapshot_seq: u64) -> Result<Option<Bytes>> {
         match self.get_entry_mvcc(user_key, snapshot_seq)? {
             Some((data, flag)) => {
@@ -1099,9 +1093,9 @@ impl SSTable {
         }
     }
 
-    /// Get entry with type flag for user_key visible at snapshot_seq (MVCC-aware)
+    /// Get entry with type flag for `user_key` visible at `snapshot_seq` (MVCC-aware)
     ///
-    /// Returns (value_data, flag) where flag indicates the entry type.
+    /// Returns (`value_data`, flag) where flag indicates the entry type.
     pub fn get_entry_mvcc(
         &mut self,
         user_key: &[u8],
@@ -1124,20 +1118,20 @@ impl SSTable {
         let encoded_search_key = search_key.encode();
 
         // Find the index block containing this key
-        let (index_block_offset, index_block_size) =
-            match self.find_index_block(&encoded_search_key) {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(None),
-            };
+        let Some((index_block_offset, index_block_size)) =
+            self.find_index_block(&encoded_search_key)
+        else {
+            return Ok(None);
+        };
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
         // Find the data block containing this key
-        let (data_block_offset, data_block_size) =
-            match self.find_in_index_block(&index_block, &encoded_search_key)? {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(None),
-            };
+        let Some((data_block_offset, data_block_size)) =
+            self.find_in_index_block(&index_block, &encoded_search_key)?
+        else {
+            return Ok(None);
+        };
 
         let data_block = self.load_block(data_block_offset, data_block_size)?;
 
@@ -1147,20 +1141,20 @@ impl SSTable {
 
     /// Find entry in data block using MVCC semantics
     ///
-    /// Uses find_mvcc to locate the first visible version of the target user_key.
-    /// This handles the InternalKey encoding correctly when one user_key is a
+    /// Uses `find_mvcc` to locate the first visible version of the target `user_key`.
+    /// This handles the `InternalKey` encoding correctly when one `user_key` is a
     /// prefix of another (e.g., "key1" vs "key10").
     #[inline]
     fn find_in_data_block_mvcc(
-        &mut self,
+        &self,
         data_block: &Block,
         user_key: &[u8],
         encoded_search_key: &[u8],
     ) -> Result<Option<(Bytes, u8)>> {
         // find_mvcc scans forward from the lower bound to find matching user_key
-        let (_found_key, entry_value) = match data_block.find_mvcc(encoded_search_key, user_key) {
-            Some(entry) => entry,
-            None => return Ok(None),
+        let Some((_found_key, entry_value)) = data_block.find_mvcc(encoded_search_key, user_key)
+        else {
+            return Ok(None);
         };
 
         // Found a matching entry - decode the value
@@ -1172,7 +1166,7 @@ impl SSTable {
         let data = entry_value.slice(1..);
 
         match flag {
-            FLAG_INLINE => Ok(Some((data, flag))),
+            FLAG_INLINE | FLAG_MERGE => Ok(Some((data, flag))),
             FLAG_POINTER => {
                 if data.len() < 12 {
                     return Err(SSTableError::InvalidFormat);
@@ -1195,7 +1189,6 @@ impl SSTable {
                 }
             }
             FLAG_TOMBSTONE => Ok(Some((Bytes::new(), FLAG_TOMBSTONE))),
-            FLAG_MERGE => Ok(Some((data, flag))),
             _ => Err(SSTableError::InvalidFormat),
         }
     }
@@ -1203,7 +1196,7 @@ impl SSTable {
     /// Get the raw entry (encoded key + value) for the latest version of a user key.
     ///
     /// Used by transactions for OCC conflict detection - returns the encoded
-    /// InternalKey so the sequence number can be extracted.
+    /// `InternalKey` so the sequence number can be extracted.
     pub fn get_raw_entry(&mut self, user_key: &[u8]) -> Result<Option<(Bytes, Bytes)>> {
         // Check bloom filter
         if !self.bloom.contains(user_key) {
@@ -1216,27 +1209,27 @@ impl SSTable {
         let encoded_search_key = search_key.encode();
 
         // Find the index block
-        let (index_block_offset, index_block_size) =
-            match self.find_index_block(&encoded_search_key) {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(None),
-            };
+        let Some((index_block_offset, index_block_size)) =
+            self.find_index_block(&encoded_search_key)
+        else {
+            return Ok(None);
+        };
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
         // Find the data block
-        let (data_block_offset, data_block_size) =
-            match self.find_in_index_block(&index_block, &encoded_search_key)? {
-                Some((offset, size)) => (offset, size),
-                None => return Ok(None),
-            };
+        let Some((data_block_offset, data_block_size)) =
+            self.find_in_index_block(&index_block, &encoded_search_key)?
+        else {
+            return Ok(None);
+        };
 
         let data_block = self.load_block(data_block_offset, data_block_size)?;
 
         // Get raw entry from data block using MVCC-aware lookup
-        let (found_key, entry_value) = match data_block.find_mvcc(&encoded_search_key, user_key) {
-            Some(entry) => entry,
-            None => return Ok(None),
+        let Some((found_key, entry_value)) = data_block.find_mvcc(&encoded_search_key, user_key)
+        else {
+            return Ok(None);
         };
 
         Ok(Some((found_key, entry_value)))
@@ -1265,12 +1258,9 @@ impl SSTable {
     #[inline]
     fn find_in_index_block(&self, index_block: &Block, key: &[u8]) -> Result<Option<(u64, u32)>> {
         // Binary search for first entry where entry_key >= key
-        let entry = match index_block.find_lower_bound(key) {
-            Some(entry) => entry,
-            None => return Ok(None),
+        let Some((_entry_key, entry_value)) = index_block.find_lower_bound(key) else {
+            return Ok(None);
         };
-
-        let (_entry_key, entry_value) = entry;
         let value_len = entry_value.len();
 
         if value_len < 12 {
@@ -1290,14 +1280,13 @@ impl SSTable {
 
     #[inline]
     fn find_in_data_block(
-        &mut self,
+        &self,
         data_block: &Block,
         key: &[u8],
     ) -> Result<Option<(Bytes, u8)>> {
         // Binary search for exact key match
-        let (_entry_key, entry_value) = match data_block.find_exact(key) {
-            Some(entry) => entry,
-            None => return Ok(None),
+        let Some((_entry_key, entry_value)) = data_block.find_exact(key) else {
+            return Ok(None);
         };
 
         if entry_value.is_empty() {
@@ -1308,7 +1297,7 @@ impl SSTable {
         let data = entry_value.slice(1..);
 
         match flag {
-            FLAG_INLINE => Ok(Some((data, flag))),
+            FLAG_INLINE | FLAG_MERGE => Ok(Some((data, flag))),
             FLAG_POINTER => {
                 if data.len() < 12 {
                     return Err(SSTableError::InvalidFormat);
@@ -1331,7 +1320,6 @@ impl SSTable {
                 }
             }
             FLAG_TOMBSTONE => Ok(Some((Bytes::new(), FLAG_TOMBSTONE))),
-            FLAG_MERGE => Ok(Some((data, flag))),
             _ => Err(SSTableError::InvalidFormat),
         }
     }
@@ -1615,11 +1603,11 @@ impl SSTable {
         BloomFilter::from_bytes(&bloom_bytes).ok_or(SSTableError::InvalidFormat)
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.num_entries as usize
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.num_entries == 0
     }
 
@@ -1627,7 +1615,7 @@ impl SSTable {
         &self.path
     }
 
-    /// Validate all blocks in the SSTable by loading and checking checksums
+    /// Validate all blocks in the `SSTable` by loading and checking checksums
     /// This is expensive but useful for corruption detection
     pub fn validate(&mut self) -> Result<()> {
         let file_size = std::fs::metadata(&self.path)?.len();
@@ -1677,8 +1665,7 @@ impl SSTable {
                     return Err(SSTableError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "Data block extends past end of file: offset={}, size={}, file_size={}",
-                            offset, size, file_size
+                            "Data block extends past end of file: offset={offset}, size={size}, file_size={file_size}"
                         ),
                     )));
                 }
@@ -1690,9 +1677,9 @@ impl SSTable {
         Ok(())
     }
 
-    /// Verify SSTable integrity by checking all block checksums
+    /// Verify `SSTable` integrity by checking all block checksums
     ///
-    /// Reads and validates the CRC32C checksum of every data block in the SSTable.
+    /// Reads and validates the CRC32C checksum of every data block in the `SSTable`.
     /// Returns the number of blocks verified and total bytes read.
     ///
     /// # Errors
@@ -1751,7 +1738,7 @@ impl SSTable {
     }
 }
 
-/// Result of SSTable verification
+/// Result of `SSTable` verification
 #[derive(Debug, Clone, Default)]
 pub struct SSTableVerifyResult {
     /// Number of blocks verified
@@ -2019,7 +2006,7 @@ impl Iterator for SSTableRangeIterator {
 
             // Need to advance to next data block
             match self.advance_to_next_data_block() {
-                Ok(true) => continue,
+                Ok(true) => {}
                 Ok(false) => return None,
                 Err(e) => return Some(Err(e)),
             }
@@ -2103,10 +2090,9 @@ impl SSTable {
                             if self.vlog.is_some() {
                                 // User-facing read: filter out tombstones (deleted keys)
                                 continue;
-                            } else {
-                                // Compaction: preserve tombstones in output SSTable
-                                entry_value
                             }
+                            // Compaction: preserve tombstones in output SSTable
+                            entry_value
                         }
                         _ => continue,
                     };
@@ -2127,7 +2113,7 @@ impl SSTable {
         Ok(self.iter()?.rev())
     }
 
-    /// Scan a range of keys from this SSTable using lazy iteration
+    /// Scan a range of keys from this `SSTable` using lazy iteration
     ///
     /// Returns an iterator that yields (key, `Option<value>`) where None indicates a tombstone.
     /// Blocks are loaded on-demand as the iterator is consumed, avoiding upfront materialization.

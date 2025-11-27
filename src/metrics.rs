@@ -1,6 +1,3 @@
-// Metrics collection for production observability
-// Tracks throughput, latency, and resource usage with minimal overhead
-
 use hdrhistogram::Histogram;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -170,7 +167,7 @@ impl MetricsCollector {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Record physical bytes written to disk (WAL, SSTable, vLog, compaction)
+    /// Record physical bytes written to disk (WAL, `SSTable`, vLog, compaction)
     #[inline]
     pub fn record_physical_bytes(&self, bytes: u64) {
         self.physical_bytes_written
@@ -213,29 +210,34 @@ impl MetricsCollector {
 
     /// Get latency percentiles (microseconds)
     pub fn get_latency_percentiles(&self) -> LatencyPercentiles {
-        let put_hist = self.put_latencies.lock().expect("mutex poisoned");
-        let get_hist = self.get_latencies.lock().expect("mutex poisoned");
-        let delete_hist = self.delete_latencies.lock().expect("mutex poisoned");
+        let put_stats = {
+            let hist = self.put_latencies.lock().expect("mutex poisoned");
+            (
+                hist.value_at_percentile(50.0),
+                hist.value_at_percentile(95.0),
+                hist.value_at_percentile(99.0),
+                hist.value_at_percentile(99.9),
+            )
+        };
 
-        let put_stats = (
-            put_hist.value_at_percentile(50.0),
-            put_hist.value_at_percentile(95.0),
-            put_hist.value_at_percentile(99.0),
-            put_hist.value_at_percentile(99.9),
-        );
+        let get_stats = {
+            let hist = self.get_latencies.lock().expect("mutex poisoned");
+            (
+                hist.value_at_percentile(50.0),
+                hist.value_at_percentile(95.0),
+                hist.value_at_percentile(99.0),
+                hist.value_at_percentile(99.9),
+            )
+        };
 
-        let get_stats = (
-            get_hist.value_at_percentile(50.0),
-            get_hist.value_at_percentile(95.0),
-            get_hist.value_at_percentile(99.0),
-            get_hist.value_at_percentile(99.9),
-        );
-
-        let delete_stats = (
-            delete_hist.value_at_percentile(50.0),
-            delete_hist.value_at_percentile(95.0),
-            delete_hist.value_at_percentile(99.0),
-        );
+        let delete_stats = {
+            let hist = self.delete_latencies.lock().expect("mutex poisoned");
+            (
+                hist.value_at_percentile(50.0),
+                hist.value_at_percentile(95.0),
+                hist.value_at_percentile(99.0),
+            )
+        };
 
         (put_stats, get_stats, delete_stats)
     }

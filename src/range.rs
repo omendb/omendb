@@ -1,5 +1,3 @@
-// Range scan iterator for efficient key range queries
-
 use crate::memtable::Entry;
 use crate::range_merge::{KWayMergeIterator, KWayMergeIteratorRev};
 use crate::sstable::SSTableRangeIterator;
@@ -10,13 +8,13 @@ use std::sync::Arc;
 /// Iterator item: (key, value) pair
 pub type RangeItem = (Bytes, Bytes);
 
-/// Adapter to convert SSTable range iterator error types
+/// Adapter to convert `SSTable` range iterator error types
 struct SSTableRangeAdapter<I> {
     inner: I,
 }
 
 impl<I> SSTableRangeAdapter<I> {
-    fn new(inner: I) -> Self {
+    const fn new(inner: I) -> Self {
         Self { inner }
     }
 }
@@ -33,7 +31,7 @@ where
     }
 }
 
-/// Range iterator that merges memtable and SSTable data using k-way merge
+/// Range iterator that merges memtable and `SSTable` data using k-way merge
 ///
 /// Provides efficient streaming iteration over key ranges in the database,
 /// automatically merging data from memtables and all LSM levels.
@@ -51,7 +49,7 @@ impl RangeIterator {
     /// * `start_key` - Start of range (inclusive)
     /// * `end_key` - End of range (exclusive), None for open-ended
     /// * `memtables` - Memtable partitions to extract range data from
-    /// * `sstable_iters` - Pre-created SSTable range iterators
+    /// * `sstable_iters` - Pre-created `SSTable` range iterators
     /// * `merge_operator` - Optional merge operator for resolving merge entries
     pub fn new(
         start_key: &[u8],
@@ -71,15 +69,9 @@ impl RangeIterator {
         // Level 0: Each memtable partition as a SEPARATE iterator (for proper deduplication)
         for memtable in memtables {
             let partition_entries: Vec<(Bytes, Entry)> = if let Some(end_key) = end_key {
-                memtable
-                    .range(start_key, end_key)
-                    .map(|(key, entry)| (key, entry.clone()))
-                    .collect()
+                memtable.range(start_key, end_key).collect()
             } else {
-                memtable
-                    .range_from(start_key)
-                    .map(|(key, entry)| (key, entry.clone()))
-                    .collect()
+                memtable.range_from(start_key).collect()
             };
 
             let partition_iter: Box<
@@ -104,7 +96,7 @@ impl RangeIterator {
         let merge =
             KWayMergeIterator::new(iterators, merge_operator).map_err(std::io::Error::other)?;
 
-        Ok(RangeIterator { inner: merge })
+        Ok(Self { inner: merge })
     }
 }
 
@@ -127,7 +119,7 @@ impl Iterator for RangeIterator {
     }
 }
 
-/// Reverse range iterator that merges memtable and SSTable data using reverse k-way merge
+/// Reverse range iterator that merges memtable and `SSTable` data using reverse k-way merge
 pub struct RangeIteratorRev {
     inner: KWayMergeIteratorRev<
         Box<dyn Iterator<Item = Result<(Bytes, Entry), Box<dyn std::error::Error + Send + Sync>>>>,
@@ -155,10 +147,7 @@ impl RangeIteratorRev {
         for memtable in memtables {
             // Collect entries in reverse order
             let partition_entries: Vec<(Bytes, Entry)> = if let Some(end_key) = end_key {
-                memtable
-                    .range_rev(start_key, end_key)
-                    .map(|(key, entry)| (key, entry.clone()))
-                    .collect()
+                memtable.range_rev(start_key, end_key).collect()
             } else {
                 // range_from().rev() logic if supported, or filter
                 // Memtable doesn't have range_from_rev, so we simulate:
@@ -167,7 +156,6 @@ impl RangeIteratorRev {
                 // SkipMap::range(start..) is DoubleEndedIterator.
                 memtable
                     .range_from(start_key)
-                    .map(|(key, entry)| (key, entry.clone()))
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
@@ -196,7 +184,7 @@ impl RangeIteratorRev {
         let merge =
             KWayMergeIteratorRev::new(iterators, merge_operator).map_err(std::io::Error::other)?;
 
-        Ok(RangeIteratorRev { inner: merge })
+        Ok(Self { inner: merge })
     }
 }
 

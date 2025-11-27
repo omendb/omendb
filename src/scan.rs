@@ -38,7 +38,7 @@ pub struct Scan<'db> {
 }
 
 impl<'db> Scan<'db> {
-    pub(crate) fn new(db: &'db DB) -> Self {
+    pub(crate) const fn new(db: &'db DB) -> Self {
         Self {
             db,
             start: None,
@@ -56,6 +56,7 @@ impl<'db> Scan<'db> {
     /// ```rust,ignore
     /// db.scan().range(b"key00", b"key99").iter()?;
     /// ```
+    #[must_use] 
     pub fn range(mut self, start: &[u8], end: &[u8]) -> Self {
         self.start = Some(start.to_vec());
         self.end = Some(end.to_vec());
@@ -70,6 +71,7 @@ impl<'db> Scan<'db> {
     /// ```rust,ignore
     /// db.scan().from(b"key50").iter()?; // key50, key51, ...
     /// ```
+    #[must_use] 
     pub fn from(mut self, start: &[u8]) -> Self {
         self.start = Some(start.to_vec());
         self.end = None;
@@ -84,6 +86,7 @@ impl<'db> Scan<'db> {
     /// ```rust,ignore
     /// db.scan().prefix(b"user:").iter()?; // user:1, user:2, ...
     /// ```
+    #[must_use] 
     pub fn prefix(mut self, prefix: &[u8]) -> Self {
         self.prefix = Some(prefix.to_vec());
         self.start = None;
@@ -94,13 +97,15 @@ impl<'db> Scan<'db> {
     /// Only return keys, skip reading values
     ///
     /// More efficient when you only need keys, especially with large values.
-    pub fn keys_only(mut self) -> Self {
+    #[must_use] 
+    pub const fn keys_only(mut self) -> Self {
         self.keys_only = true;
         self
     }
 
     /// Iterate in reverse order (largest to smallest)
-    pub fn reverse(mut self) -> Self {
+    #[must_use] 
+    pub const fn reverse(mut self) -> Self {
         self.reverse = true;
         self
     }
@@ -162,8 +167,8 @@ impl Iterator for ScanIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            ScanIterator::Forward(iter) => iter.next(),
-            ScanIterator::Reverse(iter) => iter.next(),
+            Self::Forward(iter) => iter.next(),
+            Self::Reverse(iter) => iter.next(),
         }
     }
 }
