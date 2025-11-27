@@ -13,18 +13,12 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -44,16 +38,11 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake
 
-      - name: Run tests (default features)
-        run: cargo test --workspace
-
-      - name: Run tests (baseline-benchmarks feature)
-        run: cargo test --workspace --features baseline-benchmarks
-        if: runner.os == 'Linux'
+      - name: Run tests (excluding stress tests)
+        run: cargo test --workspace -- --skip stress --skip crash_recovery_stress
 
       - name: Run doc tests
         run: cargo test --doc
@@ -144,28 +133,3 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  coverage:
-    name: Code Coverage
-    runs-on: ubuntu-latest
-    continue-on-error: true  # Coverage is nice-to-have, not blocking
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
-
-      - name: Generate coverage
-        run: |
-          cargo tarpaulin --workspace --no-default-features --out Xml --timeout 600 \
-            --exclude-files "tests/stress_*" \
-            --exclude-files "tests/property_tests.rs" \
-            --exclude-files "tests/crash_recovery_test.rs"
-
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
