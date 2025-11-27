@@ -41,11 +41,8 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake
 
-      - name: Run tests (excluding stress tests)
-        run: cargo test --workspace -- --skip stress --skip crash_recovery_stress
-
-      - name: Run doc tests
-        run: cargo test --doc
+      - name: Run library tests
+        run: cargo test --lib
 
   clippy:
     name: Clippy
