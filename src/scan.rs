@@ -21,7 +21,7 @@
 //! ```
 
 use crate::db::{Result, DB};
-use crate::range::{RangeIterator, RangeIteratorRev, RangeItem};
+use crate::range::{RangeItem, RangeIterator, RangeIteratorRev};
 use std::error::Error;
 
 /// Builder for constructing range scans

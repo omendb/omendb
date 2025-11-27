@@ -142,9 +142,9 @@ pub mod transaction;
 
 // Re-export public API types
 // Core database types
-pub use db::{DBError, DBOptions, ReadOptions, WriteOptions, DB};
 #[cfg(feature = "object-store")]
 pub use db::StorageConfig;
+pub use db::{DBError, DBOptions, ReadOptions, WriteOptions, DB};
 
 // Configuration
 pub use sstable::CompressionType;
