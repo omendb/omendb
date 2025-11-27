@@ -9,7 +9,7 @@
 #![cfg(feature = "object-store")]
 
 use object_store::memory::InMemory;
-use seerdb::{ObjectStoreBackend, RetryConfig, Storage};
+use seerdb::storage::{ObjectStoreBackend, RetryConfig, Storage};
 use std::path::Path;
 use std::sync::Arc;
 
