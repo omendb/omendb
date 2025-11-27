@@ -92,7 +92,7 @@ fn test_memory_pressure_80_percent_trigger() {
 
     // Debug: Manually open SSTables and check if key exists
     println!("\n=== Manually checking SSTables for key_0000000000 ===");
-    use seerdb::SSTable;
+    use seerdb::sstable::SSTable;
     for sst_path in &sstable_paths {
         match SSTable::open(sst_path) {
             Ok(mut sst) => {
