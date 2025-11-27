@@ -88,6 +88,93 @@ fn increment_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Options for write operations
+///
+/// Configure per-write behavior like sync policy and WAL behavior.
+/// For global defaults, see [`DBOptions`].
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use seerdb::{DB, DBOptions, WriteOptions};
+///
+/// let db = DB::open(DBOptions::default())?;
+///
+/// // Fast write without sync
+/// db.put_opts(b"key", b"value", WriteOptions::default())?;
+///
+/// // Durable write with sync
+/// db.put_opts(b"key", b"value", WriteOptions::sync())?;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct WriteOptions {
+    /// Force fsync after this write
+    pub sync: bool,
+    /// Skip WAL for this write (data loss risk on crash)
+    pub skip_wal: bool,
+}
+
+impl WriteOptions {
+    /// Create options that force sync after write
+    pub fn sync() -> Self {
+        Self {
+            sync: true,
+            skip_wal: false,
+        }
+    }
+
+    /// Create options that skip WAL (faster but data loss risk)
+    pub fn skip_wal() -> Self {
+        Self {
+            sync: false,
+            skip_wal: true,
+        }
+    }
+}
+
+/// Options for read operations
+///
+/// Configure per-read behavior like cache interaction and checksum verification.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use seerdb::{DB, DBOptions, ReadOptions};
+///
+/// let db = DB::open(DBOptions::default())?;
+///
+/// // Normal read (uses cache)
+/// let value = db.get_opts(b"key", ReadOptions::default())?;
+///
+/// // Bypass cache for this read
+/// let value = db.get_opts(b"key", ReadOptions::no_cache())?;
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct ReadOptions {
+    /// Skip block cache for this read
+    pub no_cache: bool,
+    /// Verify checksums during read
+    pub verify_checksums: bool,
+}
+
+impl ReadOptions {
+    /// Create options that bypass the block cache
+    pub fn no_cache() -> Self {
+        Self {
+            no_cache: true,
+            verify_checksums: false,
+        }
+    }
+
+    /// Create options that verify checksums
+    pub fn verify() -> Self {
+        Self {
+            no_cache: false,
+            verify_checksums: true,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DBError {
     #[error("IO error: {0}")]
@@ -4532,10 +4619,33 @@ impl DB {
         )
     }
 
-    /// Iterate over all keys in the database
+    /// Create a scan builder for flexible range queries
     ///
-    /// This is a convenience method equivalent to `range(&[], None)`.
-    /// Returns an iterator over all key-value pairs in sorted order.
+    /// Returns a [`Scan`](crate::scan::Scan) builder that allows configuring
+    /// range bounds, prefix matching, key-only mode, and iteration direction.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use seerdb::{DB, DBOptions};
+    ///
+    /// let db = DB::open(DBOptions::default()).unwrap();
+    ///
+    /// // Range scan
+    /// for result in db.scan().range(b"a", b"z").iter().unwrap() {
+    ///     let (key, value) = result.unwrap();
+    /// }
+    ///
+    /// // Prefix scan, keys only, reversed
+    /// for result in db.scan().prefix(b"user:").keys_only().reverse().iter().unwrap() {
+    ///     let (key, _) = result.unwrap();
+    /// }
+    /// ```
+    pub fn scan(&self) -> crate::scan::Scan<'_> {
+        crate::scan::Scan::new(self)
+    }
+
+    /// Iterate over all keys in the database
     ///
     /// # Example
     ///
@@ -4691,58 +4801,41 @@ impl DB {
     /// - Backup operations
     /// - Long-running analytical queries
     ///
-    /// # Implementation Note
+    /// # Implementation
     ///
-    /// This is a lightweight snapshot that captures the current LSM tree state.
-    /// Due to the current architecture (mutable memtables), this snapshot only
-    /// provides isolation for data that has been flushed to SSTables.
+    /// Creates a consistent point-in-time view by:
+    /// 1. Waiting for any pending background flush
+    /// 2. Swapping active memtables with new empty ones
+    /// 3. Capturing the old memtables (now immutable) and current SSTables
+    /// 4. Triggering background flush of old memtables
     ///
-    /// For fully consistent snapshots that include in-memory data, use
-    /// `snapshot_consistent()` which forces a flush first.
+    /// The returned Snapshot is fully isolated from subsequent writes.
     ///
     /// # Thread Safety
     ///
-    /// This method is lock-free and can be called concurrently with writes.
-    /// The returned snapshot is fully thread-safe.
+    /// Thread-safe and can be called concurrently with writes.
     ///
-    /// # Memory Management
+    /// # Memory
     ///
-    /// Snapshots hold references to the LSM tree state.
-    /// Long-lived snapshots can increase memory usage. Drop snapshots
-    /// when no longer needed to allow garbage collection.
+    /// Snapshots hold references to the LSM tree state. Long-lived snapshots
+    /// increase memory usage. Drop when no longer needed.
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
     /// use seerdb::{DB, DBOptions};
     ///
     /// let db = DB::open(DBOptions::default()).unwrap();
     /// db.put(b"key", b"value1").unwrap();
-    /// db.flush().unwrap(); // Flush to ensure data is in snapshot
     ///
-    /// // Create snapshot
     /// let snapshot = db.snapshot().unwrap();
-    ///
-    /// // Write after snapshot
     /// db.put(b"key", b"value2").unwrap();
     ///
-    /// // Snapshot sees old value (from SSTable)
+    /// // Snapshot sees old value
     /// assert_eq!(snapshot.get(b"key").unwrap().unwrap().as_ref(), b"value1");
+    /// // DB sees new value
+    /// assert_eq!(db.get(b"key").unwrap().unwrap().as_ref(), b"value2");
     /// ```
-    /// Create a consistent point-in-time snapshot of the database
-    ///
-    /// This method forces a memtable switch to ensure consistency:
-    /// 1. Waits for any pending background flush to complete
-    /// 2. Swaps the active memtable with a new empty one
-    /// 3. Captures the old memtable (now immutable) and current SSTables
-    /// 4. Triggers a background flush of the old memtable
-    ///
-    /// The returned Snapshot is isolated from subsequent writes.
-    ///
-    /// # Performance
-    ///
-    /// - If `background_flush` is enabled: Fast (memory swap only)
-    /// - If `background_flush` is disabled: Slow (synchronous flush to disk)
     pub fn snapshot(&self) -> Result<Snapshot> {
         // 1. Wait for any pending background flush
         if self.options.background_flush {
@@ -4837,40 +4930,6 @@ impl DB {
         }
 
         Ok(snapshot)
-    }
-
-    /// Create a fully consistent point-in-time snapshot
-    ///
-    /// This method flushes all in-memory data to disk before creating the
-    /// snapshot, ensuring complete consistency. This is more expensive than
-    /// `snapshot()` but provides true isolation for all data.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use seerdb::{DB, DBOptions};
-    ///
-    /// let db = DB::open(DBOptions::default()).unwrap();
-    /// db.put(b"key", b"value1").unwrap();
-    ///
-    /// // Create consistent snapshot (flushes first)
-    /// let snapshot = db.snapshot_consistent().unwrap();
-    ///
-    /// // Write after snapshot
-    /// db.put(b"key", b"value2").unwrap();
-    ///
-    /// // Snapshot sees old value
-    /// assert_eq!(snapshot.get(b"key").unwrap().unwrap().as_ref(), b"value1");
-    ///
-    /// // DB sees new value
-    /// assert_eq!(db.get(b"key").unwrap().unwrap().as_ref(), b"value2");
-    /// ```
-    pub fn snapshot_consistent(&self) -> Result<crate::snapshot::Snapshot> {
-        // Flush all memtables to ensure data is in immutable SSTables
-        self.flush()?;
-
-        // Now create snapshot with guaranteed consistency
-        self.snapshot()
     }
 
     fn resolve_merge(
@@ -5867,7 +5926,7 @@ mod tests {
         db.put(b"key2", b"value2").unwrap();
 
         // Create consistent snapshot (forces flush)
-        let snapshot = db.snapshot_consistent().unwrap();
+        let snapshot = db.snapshot().unwrap();
 
         // Write after snapshot
         db.put(b"key1", b"modified").unwrap();
@@ -5901,7 +5960,7 @@ mod tests {
         db.put(b"c", b"3").unwrap();
 
         // Create consistent snapshot (forces flush)
-        let snapshot = db.snapshot_consistent().unwrap();
+        let snapshot = db.snapshot().unwrap();
 
         // Modify after snapshot
         db.put(b"b", b"modified").unwrap();
@@ -5952,7 +6011,7 @@ mod tests {
         }
 
         // Create consistent snapshot (forces flush)
-        let snapshot = db.snapshot_consistent().unwrap();
+        let snapshot = db.snapshot().unwrap();
 
         // Spawn writer thread that modifies data concurrently
         let db_clone = Arc::clone(&db);
@@ -6028,15 +6087,15 @@ mod tests {
 
         // Initial state
         db.put(b"key", b"v1").unwrap();
-        let snap1 = db.snapshot_consistent().unwrap();
+        let snap1 = db.snapshot().unwrap();
 
         // Second state
         db.put(b"key", b"v2").unwrap();
-        let snap2 = db.snapshot_consistent().unwrap();
+        let snap2 = db.snapshot().unwrap();
 
         // Third state
         db.put(b"key", b"v3").unwrap();
-        let snap3 = db.snapshot_consistent().unwrap();
+        let snap3 = db.snapshot().unwrap();
 
         // Current state
         db.put(b"key", b"v4").unwrap();
@@ -6069,7 +6128,7 @@ mod tests {
         db.delete(b"key1").unwrap();
 
         // Snapshot sees key1 as deleted (after flush)
-        let snap = db.snapshot_consistent().unwrap();
+        let snap = db.snapshot().unwrap();
         assert_eq!(snap.get(b"key1").unwrap(), None);
         assert_eq!(snap.get(b"key2").unwrap(), Some(Bytes::from("value2")));
 

@@ -112,50 +112,59 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-pub mod alex;
+// Internal modules (implementation details)
+pub(crate) mod alex;
 mod background_workers;
-pub mod batch;
-pub mod bloom;
-pub mod buffer;
-pub mod compaction;
-pub mod db;
+pub(crate) mod bloom;
+pub(crate) mod buffer;
+pub(crate) mod compaction;
 mod db_helpers;
+pub(crate) mod memtable;
+pub(crate) mod range;
+pub(crate) mod range_merge;
+#[cfg(feature = "simd")]
+pub(crate) mod simd;
+pub(crate) mod sstable;
+pub(crate) mod storage;
+pub(crate) mod types;
+pub(crate) mod vlog;
+pub(crate) mod wal;
+
+// Public modules (user-facing API)
+pub mod batch;
+pub mod db;
 pub mod health;
-pub mod memtable;
 pub mod merge_operator;
 pub mod metrics;
-pub mod range;
-pub mod range_merge;
-#[cfg(feature = "simd")]
-pub mod simd;
+pub mod scan;
 pub mod snapshot;
-pub mod sstable;
-pub mod storage;
 pub mod transaction;
-pub mod types;
-pub mod vlog;
-pub mod wal;
 
-// Re-export main types for convenient access
-pub use alex::AlexTree;
-pub use batch::Batch;
-pub use bloom::{BlockedBloomFilter, BloomFilter, LearnedBloomFilter};
+// Re-export public API types
+// Core database types
+pub use db::{DBError, DBOptions, ReadOptions, WriteOptions, DB};
 #[cfg(feature = "object-store")]
 pub use db::StorageConfig;
-pub use db::{BulkLoadOptions, BulkLoadStats, DBError, DBOptions, VerifyResult, DB};
-pub use health::{CheckStatus, HealthCheck, HealthStatus};
-pub use memtable::Memtable;
-pub use merge_operator::{MergeOperator, StringAppendOperator};
-pub use metrics::DBStats;
+
+// Configuration
+pub use sstable::CompressionType;
+pub use wal::{RecoveryMode, SyncPolicy};
+
+// Operations
+pub use batch::Batch;
+pub use scan::{Scan, ScanIterator};
 pub use snapshot::Snapshot;
-pub use sstable::{CompressionType, SSTable, SSTableBuilder};
-pub use storage::LocalStorage;
-#[cfg(feature = "object-store")]
-pub use storage::{ObjectStoreBackend, RetryConfig, Storage};
 pub use transaction::{Transaction, TransactionConflict};
-pub use types::{InternalKey, ValueType};
-pub use vlog::{VLog, ValuePointer};
-pub use wal::{Record, RecoveryMode, SyncPolicy, WAL};
+
+// Merge operators (user-extensible)
+pub use merge_operator::{MergeOperator, StringAppendOperator};
+
+// Observability
+pub use health::{CheckStatus, HealthCheck, HealthStatus};
+pub use metrics::DBStats;
+
+// Bulk operations
+pub use db::{BulkLoadOptions, BulkLoadStats, VerifyResult};
 
 #[cfg(test)]
 mod tests {
