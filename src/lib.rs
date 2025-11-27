@@ -112,23 +112,36 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// Internal modules (implementation details)
-pub(crate) mod alex;
+// Internal modules (not re-exported, but accessible for tests)
+#[doc(hidden)]
+pub mod alex;
 mod background_workers;
-pub(crate) mod bloom;
-pub(crate) mod buffer;
-pub(crate) mod compaction;
+#[doc(hidden)]
+pub mod bloom;
+#[doc(hidden)]
+pub mod buffer;
+#[doc(hidden)]
+pub mod compaction;
 mod db_helpers;
-pub(crate) mod memtable;
-pub(crate) mod range;
-pub(crate) mod range_merge;
+#[doc(hidden)]
+pub mod memtable;
+#[doc(hidden)]
+pub mod range;
+#[doc(hidden)]
+pub mod range_merge;
 #[cfg(feature = "simd")]
-pub(crate) mod simd;
-pub(crate) mod sstable;
-pub(crate) mod storage;
-pub(crate) mod types;
-pub(crate) mod vlog;
-pub(crate) mod wal;
+#[doc(hidden)]
+pub mod simd;
+#[doc(hidden)]
+pub mod sstable;
+#[doc(hidden)]
+pub mod storage;
+#[doc(hidden)]
+pub mod types;
+#[doc(hidden)]
+pub mod vlog;
+#[doc(hidden)]
+pub mod wal;
 
 // Public modules (user-facing API)
 pub mod batch;
