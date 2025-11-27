@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use seerdb::buffer::{BufferPool, BufferPoolOptions};
-use seerdb::{SSTable, SSTableBuilder};
+use seerdb::sstable::{SSTable, SSTableBuilder};
 use tempfile::tempdir;
 
 // Build an SSTable with specified number of entries and value size

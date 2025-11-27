@@ -2,7 +2,8 @@
 // Shows how large values are stored separately from keys
 
 use bytes::Bytes;
-use seerdb::{SSTableBuilder, VLog};
+use seerdb::sstable::SSTableBuilder;
+use seerdb::vlog::VLog;
 use tempfile::tempdir;
 
 fn main() {
@@ -48,7 +49,7 @@ fn main() {
     builder.finish().unwrap();
 
     // Open SSTable for reading
-    let mut sstable = seerdb::SSTable::open(&sstable_path).unwrap();
+    let mut sstable = seerdb::sstable::SSTable::open(&sstable_path).unwrap();
 
     // Check file sizes
     let sstable_size = std::fs::metadata(&sstable_path).unwrap().len();
@@ -90,7 +91,7 @@ fn main() {
 
     // Attach vLog
     let vlog = VLog::open(&vlog_path).unwrap();
-    let mut sstable = seerdb::SSTable::open(&sstable_path)
+    let mut sstable = seerdb::sstable::SSTable::open(&sstable_path)
         .unwrap()
         .with_vlog(vlog);
 

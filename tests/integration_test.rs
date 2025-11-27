@@ -2,8 +2,9 @@
 // Tests the complete write → flush → recovery flow
 
 use bytes::Bytes;
-use seerdb::wal::{reader::WALReader, SyncPolicy};
-use seerdb::{Memtable, Record, SSTable, WAL};
+use seerdb::memtable::Memtable;
+use seerdb::sstable::SSTable;
+use seerdb::wal::{reader::WALReader, Record, SyncPolicy, WAL};
 use tempfile::tempdir;
 
 #[test]

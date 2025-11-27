@@ -24,7 +24,7 @@ fn test_snapshot_isolation_under_concurrent_writes() {
     db.flush().unwrap();
 
     // Create snapshot BEFORE writes
-    let snapshot = db.snapshot_consistent().unwrap();
+    let snapshot = db.snapshot().unwrap();
 
     // Now write "v2" to all keys concurrently
     let barrier = Arc::new(Barrier::new(5));
@@ -103,7 +103,7 @@ fn test_multiple_snapshots_under_load() {
         db.flush().unwrap();
 
         // Capture snapshot
-        let snap = db.snapshot_consistent().unwrap();
+        let snap = db.snapshot().unwrap();
         println!(
             "Version {}: snapshot seq_num = {}",
             version,
@@ -116,7 +116,7 @@ fn test_multiple_snapshots_under_load() {
     for (expected_version, snapshot) in snapshots {
         let expected_val = format!("v{}", expected_version);
         let key = b"key_0000";
-        let val = snapshot.get(key).unwrap().unwrap();
+        let val: bytes::Bytes = snapshot.get(key).unwrap().unwrap();
         println!(
             "Snapshot {} (seq_num {}): key_0000 = {:?} (expected {:?})",
             expected_version,
@@ -252,7 +252,7 @@ fn test_snapshot_range_under_load() {
     db.flush().unwrap();
 
     // Create snapshot
-    let snapshot = db.snapshot_consistent().unwrap();
+    let snapshot = db.snapshot().unwrap();
 
     // Modify every other key after snapshot
     for i in (0..1000).step_by(2) {
@@ -264,13 +264,15 @@ fn test_snapshot_range_under_load() {
     let range_count = snapshot
         .range(b"key_", Some(b"key_z"))
         .unwrap()
-        .filter(|r| {
-            if let Ok((_, val)) = r {
-                val.as_ref() == b"original"
-            } else {
-                false
-            }
-        })
+        .filter(
+            |r: &Result<(bytes::Bytes, bytes::Bytes), Box<dyn std::error::Error>>| {
+                if let Ok((_, val)) = r {
+                    val.as_ref() == b"original"
+                } else {
+                    false
+                }
+            },
+        )
         .count();
 
     assert_eq!(range_count, 1000, "Snapshot range should see all originals");
@@ -408,20 +410,16 @@ fn test_snapshot_memory_pressure() {
             db.put(key.as_bytes(), b"data").unwrap();
         }
 
-        // Create consistent snapshot (flushes to ensure data is captured)
-        // Using snapshot_consistent() because snapshot() only captures SSTable state
-        let snap = db.snapshot_consistent().unwrap();
+        // Create snapshot (flushes to ensure data is captured)
+        let snap = db.snapshot().unwrap();
         snapshots.push(snap);
     }
 
     // Verify all snapshots are still accessible
     for (i, snap) in snapshots.iter().enumerate() {
         let key = format!("batch{}:key0", i);
-        assert!(
-            snap.get(key.as_bytes()).unwrap().is_some(),
-            "Snapshot {} should still work",
-            i
-        );
+        let result: Option<bytes::Bytes> = snap.get(key.as_bytes()).unwrap();
+        assert!(result.is_some(), "Snapshot {} should still work", i);
     }
 
     // Drop snapshots and verify no memory leaks (implicit via test completion)

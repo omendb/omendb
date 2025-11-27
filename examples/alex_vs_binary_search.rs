@@ -1,7 +1,7 @@
 // Benchmark: ALEX learned index vs binary search for SSTable index lookups
 // Tests whether learned index provides speedup for finding index blocks
 
-use seerdb::AlexTree;
+use seerdb::alex::AlexTree;
 use std::time::Instant;
 
 /// Convert Bytes to i64 preserving lexicographic ordering
