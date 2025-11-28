@@ -531,50 +531,40 @@ impl SSTable {
         Ok(Some((found_key, entry_value)))
     }
 
-    /// Find index block containing the key.
-    ///
-    /// For MVCC SSTables, compares `user_key` portions to avoid the `InternalKey`
-    /// encoding quirk where "v:80" < "v:8" in encoded order.
+    /// Whether this SSTable uses MVCC (has sequence numbers).
     #[inline]
-    fn find_index_block(&self, key: &[u8]) -> Option<(u64, u32)> {
-        let idx = if self.max_sequence > 0 {
-            // MVCC: extract user_key from search key and compare against entry user_keys
-            let user_key = if key.len() >= 8 { &key[..key.len() - 8] } else { key };
-            self.top_level_index.partition_point(|entry| {
-                let entry_user_key = if entry.last_key.len() >= 8 {
-                    &entry.last_key[..entry.last_key.len() - 8]
-                } else {
-                    entry.last_key.as_ref()
-                };
-                entry_user_key < user_key
-            })
-        } else {
-            // Non-MVCC: compare raw keys
-            self.top_level_index
-                .partition_point(|entry| entry.last_key.as_ref() < key)
-        };
-
-        if idx < self.top_level_index.len() {
-            Some((
-                self.top_level_index[idx].offset,
-                self.top_level_index[idx].size,
-            ))
-        } else {
-            self.top_level_index.last().map(|e| (e.offset, e.size))
-        }
+    const fn is_mvcc(&self) -> bool {
+        self.max_sequence > 0
     }
 
-    /// Find the data block containing `user_key` in this index block.
-    ///
-    /// For MVCC SSTables (`max_sequence` > 0), compares `user_key`s to correctly
-    /// handle the lexicographic quirk where `InternalKey("v:80")` < `InternalKey("v:8")`
-    /// but `user_key("v:80")` > `user_key("v:8")`.
-    ///
-    /// For non-MVCC SSTables (`max_sequence` == 0), uses raw key comparison.
+    /// Extract user_key from potentially-encoded `InternalKey` bytes.
+    #[inline]
+    fn extract_user_key(key: &[u8]) -> &[u8] {
+        if key.len() >= 8 { &key[..key.len() - 8] } else { key }
+    }
+
+    /// Find the index block containing `key`.
+    #[inline]
+    fn find_index_block(&self, key: &[u8]) -> Option<(u64, u32)> {
+        let idx = if self.is_mvcc() {
+            let user_key = Self::extract_user_key(key);
+            self.top_level_index.partition_point(|e| {
+                Self::extract_user_key(&e.last_key) < user_key
+            })
+        } else {
+            self.top_level_index.partition_point(|e| e.last_key.as_ref() < key)
+        };
+
+        self.top_level_index
+            .get(idx)
+            .or_else(|| self.top_level_index.last())
+            .map(|e| (e.offset, e.size))
+    }
+
+    /// Find the data block containing `user_key` within an index block.
     #[inline]
     fn find_in_index_block(&self, index_block: &Block, user_key: &[u8]) -> Result<Option<(u64, u32)>> {
-        // MVCC SSTables store InternalKeys; non-MVCC store raw user_keys
-        let result = if self.max_sequence > 0 {
+        let result = if self.is_mvcc() {
             index_block.find_lower_bound_by_user_key(user_key)
         } else {
             index_block.find_lower_bound(user_key)

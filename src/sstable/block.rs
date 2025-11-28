@@ -550,39 +550,26 @@ impl Block {
         }
     }
 
-    /// Find first key >= target using binary search (for non-MVCC index blocks).
+    /// Find first entry >= key (raw byte comparison).
     #[inline]
     pub fn find_lower_bound(&self, key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self
             .decompressed_cache
             .get_or_init(|| self.decompress_all_entries());
-
         let idx = entries.partition_point(|(k, _)| simd::compare_keys(k.as_ref(), key).is_lt());
         entries.get(idx).cloned()
     }
 
-    /// Find first entry whose `user_key` >= target (for MVCC index block lookups).
-    ///
-    /// Extracts `user_key` from `InternalKey` entries (strips 8-byte trailer) and compares.
-    /// This is necessary because `InternalKey` encoding causes incorrect ordering for
-    /// prefix keys: "v:80" encodes before "v:8" (since '0' < trailer byte 0xFF),
-    /// but `user_key` order is "v:8" < "v:80".
+    /// Find first entry whose user_key >= target (strips 8-byte `InternalKey` trailer).
     #[inline]
     pub fn find_lower_bound_by_user_key(&self, user_key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self
             .decompressed_cache
             .get_or_init(|| self.decompress_all_entries());
-
         let idx = entries.partition_point(|(k, _)| {
-            // InternalKey = user_key + 8-byte trailer
-            let entry_user_key = if k.len() >= 8 {
-                &k[..k.len() - 8]
-            } else {
-                k.as_ref()
-            };
+            let entry_user_key = if k.len() >= 8 { &k[..k.len() - 8] } else { k.as_ref() };
             entry_user_key < user_key
         });
-
         entries.get(idx).cloned()
     }
 
