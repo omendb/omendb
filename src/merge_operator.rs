@@ -60,7 +60,7 @@ pub struct StringAppendOperator {
 }
 
 impl StringAppendOperator {
-    #[must_use] 
+    #[must_use]
     pub const fn new(delimiter: char) -> Self {
         Self { delimiter }
     }

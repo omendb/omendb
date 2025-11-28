@@ -23,7 +23,7 @@ pub struct Memtable {
 }
 
 impl Memtable {
-    #[must_use] 
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
             data: Arc::new(SkipMap::new()),
@@ -33,7 +33,7 @@ impl Memtable {
     }
 
     /// Create memtable with default capacity (64MB)
-    #[must_use] 
+    #[must_use]
     pub fn with_default_capacity() -> Self {
         Self::new(64 * 1024 * 1024)
     }

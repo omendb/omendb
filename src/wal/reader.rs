@@ -152,7 +152,7 @@ impl WALReader {
     }
 
     /// Get the current offset
-    #[must_use] 
+    #[must_use]
     pub const fn offset(&self) -> u64 {
         self.offset
     }

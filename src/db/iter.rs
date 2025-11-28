@@ -1,4 +1,4 @@
-use super::{increment_bytes, FlushTask, Result, DBError, NUM_PARTITIONS, DB};
+use super::{increment_bytes, DBError, FlushTask, Result, DB, NUM_PARTITIONS};
 use crate::memtable::Memtable;
 use crate::range::RangeIterator;
 use crate::snapshot::Snapshot;
@@ -144,8 +144,10 @@ impl DB {
             .iter()
             .map(|mt| (*mt.load()).clone())
             .collect();
-        let mut partition_refs: Vec<&Memtable> =
-            partition_arcs.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut partition_refs: Vec<&Memtable> = partition_arcs
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
 
         // Also include immutable partitions if they exist (LOCK-FREE!)
         let immutable_arc = self.immutable_memtables.load();
@@ -281,8 +283,10 @@ impl DB {
             .iter()
             .map(|mt| (*mt.load()).clone())
             .collect();
-        let mut partition_refs: Vec<&Memtable> =
-            partition_arcs.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut partition_refs: Vec<&Memtable> = partition_arcs
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
 
         let immutable_arc = self.immutable_memtables.load();
         let immutable_refs: Vec<&Memtable> = if let Some(ref immutable_partitions) = **immutable_arc

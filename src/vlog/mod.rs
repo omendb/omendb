@@ -40,7 +40,7 @@ impl ValuePointer {
     /// Encode pointer to bytes for `SSTable` storage
     ///
     /// Format: [offset: u64][length: u32] = 12 bytes total
-    #[must_use] 
+    #[must_use]
     pub fn to_bytes(&self) -> Bytes {
         let mut buf = bytes::BytesMut::with_capacity(12);
         buf.extend_from_slice(&self.offset.to_le_bytes());
@@ -299,13 +299,13 @@ impl VLog {
     }
 
     /// Get current head position
-    #[must_use] 
+    #[must_use]
     pub const fn head(&self) -> u64 {
         self.head
     }
 
     /// Get current tail position
-    #[must_use] 
+    #[must_use]
     pub const fn tail(&self) -> u64 {
         self.tail
     }
@@ -321,7 +321,7 @@ impl VLog {
     }
 
     /// Get vLog path
-    #[must_use] 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }

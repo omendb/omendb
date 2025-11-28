@@ -19,7 +19,7 @@ pub enum ValueType {
 }
 
 impl ValueType {
-    #[must_use] 
+    #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x00 => Some(Self::Deletion),
@@ -207,7 +207,7 @@ pub struct SnapshotTracker {
 
 impl SnapshotTracker {
     /// Create a new snapshot tracker with no active snapshots.
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             active: Mutex::new(BTreeSet::new()),
@@ -280,7 +280,7 @@ impl SnapshotHandle {
     }
 
     /// Get the sequence number this handle tracks.
-    #[must_use] 
+    #[must_use]
     pub const fn seq(&self) -> u64 {
         self.seq
     }

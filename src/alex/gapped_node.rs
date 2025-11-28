@@ -99,7 +99,7 @@ impl GappedNode {
     /// let node = GappedNode::new(100, 1.0);
     /// assert_eq!(node.capacity(), 200); // 100 * (1 + 1.0)
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn new(expected_keys: usize, expansion_factor: f64) -> Self {
         let capacity = ((expected_keys as f64 * (1.0 + expansion_factor)).ceil() as usize).max(4);
 
@@ -423,7 +423,7 @@ impl GappedNode {
     /// This prevents excessive retraining that causes too many node splits.
     ///
     /// **Threshold**: Retrain if error > 20% of node capacity
-    #[must_use] 
+    #[must_use]
     pub fn needs_retrain(&self) -> bool {
         if self.num_keys < 10 {
             return false; // Too few keys to benefit from retraining
@@ -478,7 +478,7 @@ impl GappedNode {
     ///
     /// Returns Vec of (key, position) pairs without cloning values.
     /// Much faster than `pairs()` for `lower_bound` operations.
-    #[must_use] 
+    #[must_use]
     pub fn keys_only(&self) -> Vec<(i64, usize)> {
         self.keys
             .iter()
@@ -493,7 +493,7 @@ impl GappedNode {
     /// **Time complexity**: O(log error) where error is model prediction error
     ///
     /// Returns (key, position) if found, None if no key >= `search_key` exists
-    #[must_use] 
+    #[must_use]
     pub fn lower_bound_position(&self, search_key: i64) -> Option<(i64, usize)> {
         if self.num_keys == 0 {
             return None;
@@ -565,25 +565,25 @@ impl GappedNode {
     /// - 0.0 = empty
     /// - 1.0 = completely full (no gaps)
     /// - Typical: 0.3 - 0.8 (30-80% full)
-    #[must_use] 
+    #[must_use]
     pub fn density(&self) -> f64 {
         self.num_keys as f64 / self.keys.len() as f64
     }
 
     /// Get number of keys (not counting gaps)
-    #[must_use] 
+    #[must_use]
     pub const fn num_keys(&self) -> usize {
         self.num_keys
     }
 
     /// Get total capacity (including gaps)
-    #[must_use] 
+    #[must_use]
     pub const fn capacity(&self) -> usize {
         self.keys.len()
     }
 
     /// Check if node should be split
-    #[must_use] 
+    #[must_use]
     pub fn should_split(&self) -> bool {
         self.density() >= MAX_DENSITY
     }
@@ -646,7 +646,7 @@ impl GappedNode {
     /// Get all key-value pairs (for splitting/iteration)
     ///
     /// Returns sorted list of (key, value) pairs
-    #[must_use] 
+    #[must_use]
     pub fn into_pairs(self) -> Vec<(i64, Vec<u8>)> {
         let mut pairs: Vec<(i64, Vec<u8>)> = self
             .keys
@@ -666,7 +666,7 @@ impl GappedNode {
     }
 
     /// Get reference to all key-value pairs
-    #[must_use] 
+    #[must_use]
     pub fn pairs(&self) -> Vec<(i64, Vec<u8>)> {
         let mut pairs: Vec<(i64, Vec<u8>)> = self
             .keys

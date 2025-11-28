@@ -37,7 +37,7 @@ pub struct BlockedBloomFilter {
 
 impl BlockedBloomFilter {
     /// Create a new blocked bloom filter with expected capacity and desired false positive rate
-    #[must_use] 
+    #[must_use]
     pub fn new(expected_elements: usize, false_positive_rate: f64) -> Self {
         // Calculate optimal number of bits: m = -n*ln(p) / (ln(2)^2)
         let num_bits = (-(expected_elements as f64) * false_positive_rate.ln()
@@ -95,25 +95,25 @@ impl BlockedBloomFilter {
     }
 
     /// Get the number of elements inserted
-    #[must_use] 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.count
     }
 
     /// Check if the bloom filter is empty
-    #[must_use] 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get the size in bytes
-    #[must_use] 
+    #[must_use]
     pub const fn size_bytes(&self) -> usize {
         self.blocks.len() * CACHE_LINE_BYTES + std::mem::size_of::<Self>()
     }
 
     /// Calculate actual false positive rate based on current state
-    #[must_use] 
+    #[must_use]
     pub fn false_positive_rate(&self) -> f64 {
         if self.count == 0 {
             return 0.0;
@@ -130,7 +130,7 @@ impl BlockedBloomFilter {
     }
 
     /// Serialize blocked bloom filter to bytes
-    #[must_use] 
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -150,7 +150,7 @@ impl BlockedBloomFilter {
     }
 
     /// Deserialize blocked bloom filter from bytes
-    #[must_use] 
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 20 {
             return None; // Not enough data for header

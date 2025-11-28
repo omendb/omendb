@@ -263,19 +263,19 @@ impl<'db> Transaction<'db> {
     }
 
     /// Check if the transaction is still active.
-    #[must_use] 
+    #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active
     }
 
     /// Get the number of buffered write operations.
-    #[must_use] 
+    #[must_use]
     pub fn write_count(&self) -> usize {
         self.write_buffer.len()
     }
 
     /// Get the number of keys in the read-set.
-    #[must_use] 
+    #[must_use]
     pub fn read_count(&self) -> usize {
         self.read_set.len()
     }

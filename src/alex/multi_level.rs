@@ -60,7 +60,7 @@ impl Default for MultiLevelAlexTree {
 
 impl MultiLevelAlexTree {
     /// Create an empty tree
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             root: None,
@@ -86,11 +86,12 @@ impl MultiLevelAlexTree {
         let leaves = Self::build_leaves(&data)?;
 
         // Verify all keys were inserted
-        let total_leaf_keys: usize = leaves.iter().map(super::gapped_node::GappedNode::num_keys).sum();
+        let total_leaf_keys: usize = leaves
+            .iter()
+            .map(super::gapped_node::GappedNode::num_keys)
+            .sum();
         if total_leaf_keys != num_keys {
-            eprintln!(
-                "WARNING: Only {total_leaf_keys} of {num_keys} keys inserted into leaves"
-            );
+            eprintln!("WARNING: Only {total_leaf_keys} of {num_keys} keys inserted into leaves");
         }
 
         // If only one leaf, no inner nodes needed
@@ -262,25 +263,25 @@ impl MultiLevelAlexTree {
     }
 
     /// Get number of keys
-    #[must_use] 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.num_keys
     }
 
     /// Check if tree is empty
-    #[must_use] 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.num_keys == 0
     }
 
     /// Get number of leaves
-    #[must_use] 
+    #[must_use]
     pub const fn num_leaves(&self) -> usize {
         self.leaves.len()
     }
 
     /// Get tree height
-    #[must_use] 
+    #[must_use]
     pub const fn height(&self) -> usize {
         self.height
     }
@@ -467,14 +468,14 @@ impl InnerNode {
 // Extension to GappedNode for multi-level support
 impl GappedNode {
     /// Get minimum key in node
-    #[must_use] 
+    #[must_use]
     pub fn min_key(&self) -> Option<i64> {
         let pairs = self.pairs();
         pairs.iter().map(|(k, _)| *k).min()
     }
 
     /// Get maximum key in node
-    #[must_use] 
+    #[must_use]
     pub fn max_key(&self) -> Option<i64> {
         let pairs = self.pairs();
         pairs.iter().map(|(k, _)| *k).max()

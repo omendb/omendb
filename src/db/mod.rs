@@ -267,14 +267,20 @@ impl DB {
         // Recover from WAL if it exists
         if wal_path.exists() {
             info!("Recovering from WAL");
-            let total_entries_before: usize = memtables_vec.iter().map(super::memtable::Memtable::len).sum();
+            let total_entries_before: usize = memtables_vec
+                .iter()
+                .map(super::memtable::Memtable::len)
+                .sum();
             crate::db_helpers::recover_partitioned(
                 &wal_path,
                 &memtables_vec,
                 options.merge_operator.as_ref(),
                 options.recovery_mode,
             )?;
-            let total_entries_after: usize = memtables_vec.iter().map(super::memtable::Memtable::len).sum();
+            let total_entries_after: usize = memtables_vec
+                .iter()
+                .map(super::memtable::Memtable::len)
+                .sum();
             let recovered = total_entries_after - total_entries_before;
             info!(entries = recovered, "WAL recovery complete");
         } else {
@@ -656,7 +662,6 @@ impl DB {
         Ok(db)
     }
 
-
     /// Verify database integrity by checking all checksums
     ///
     /// Performs a full integrity check of the database by validating:
@@ -736,7 +741,6 @@ impl DB {
 
         Ok(result)
     }
-
 
     /// Bulk load key-value pairs directly to `SSTables`
     ///
@@ -1892,8 +1896,6 @@ impl DB {
 
         HealthStatus::new(checks)
     }
-
-
 }
 
 /// Graceful shutdown: signal compaction thread to stop and wait for it

@@ -43,7 +43,7 @@ pub struct FrameRef {
 }
 
 impl FrameRef {
-    #[must_use] 
+    #[must_use]
     pub fn data(&self) -> &[u8] {
         // SAFETY:
         // 1. We hold a pin count > 0 (ensured by constructor and Drop).
@@ -73,7 +73,7 @@ impl FrameRef {
     /// - `SSTable` data is immutable (never modified after loading)
     /// - Vec won't reallocate (we `resize()` once during load, then never touch it)
     /// - `data_ptr` and `data_len` are captured after data is loaded
-    #[must_use] 
+    #[must_use]
     pub const unsafe fn data_unchecked(&self) -> &[u8] {
         std::slice::from_raw_parts(self.data_ptr, self.data_len)
     }
@@ -236,7 +236,7 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    #[must_use] 
+    #[must_use]
     pub fn new(options: BufferPoolOptions) -> Arc<Self> {
         let num_frames = options.capacity_bytes / options.frame_size;
         let frames_per_shard = num_frames.div_ceil(options.num_shards);

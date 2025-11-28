@@ -25,7 +25,7 @@ impl LinearModel {
     /// Create a new untrained linear model
     ///
     /// Default model: y = x (identity function)
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             slope: 1.0,
@@ -182,7 +182,7 @@ impl LinearModel {
     /// let pos = model.predict(50);
     /// assert!((pos as i64 - 50).abs() < 10);
     /// ```
-    #[must_use] 
+    #[must_use]
     pub fn predict(&self, key: i64) -> usize {
         let pos = self.slope * key as f64 + self.intercept;
         // Clamp to valid range (non-negative)
@@ -190,13 +190,13 @@ impl LinearModel {
     }
 
     /// Get model slope
-    #[must_use] 
+    #[must_use]
     pub const fn slope(&self) -> f64 {
         self.slope
     }
 
     /// Get model intercept
-    #[must_use] 
+    #[must_use]
     pub const fn intercept(&self) -> f64 {
         self.intercept
     }
@@ -208,7 +208,7 @@ impl LinearModel {
     /// Used to determine search window size for exponential search.
     ///
     /// **Time complexity**: O(n)
-    #[must_use] 
+    #[must_use]
     pub fn max_error(&self, data: &[(i64, usize)]) -> usize {
         data.iter()
             .map(|(key, pos)| {
@@ -224,7 +224,7 @@ impl LinearModel {
     /// Returns mean absolute error: `avg(|predicted_pos` - `actual_pos`|)
     ///
     /// **Time complexity**: O(n)
-    #[must_use] 
+    #[must_use]
     pub fn avg_error(&self, data: &[(i64, usize)]) -> f64 {
         if data.is_empty() {
             return 0.0;

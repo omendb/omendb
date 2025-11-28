@@ -161,7 +161,7 @@ impl LocalStorage {
     /// # Arguments
     ///
     /// * `base_path` - Base directory for all storage operations
-    #[must_use] 
+    #[must_use]
     pub const fn new(base_path: PathBuf) -> Self {
         Self { base_path }
     }

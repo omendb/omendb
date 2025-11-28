@@ -1,4 +1,4 @@
-use super::{partition_for_key, FlushTask, Result, DBError, DB};
+use super::{partition_for_key, DBError, FlushTask, Result, DB};
 use crate::wal::Record;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
@@ -61,7 +61,9 @@ impl DB {
         loop {
             // Check worker health
             if !self.compaction_healthy.load(Ordering::SeqCst) {
-                tracing::error!("Compaction worker is dead - breaking stall loop to avoid deadlock");
+                tracing::error!(
+                    "Compaction worker is dead - breaking stall loop to avoid deadlock"
+                );
                 break;
             }
             if !self.flush_healthy.load(Ordering::SeqCst) {
@@ -417,8 +419,10 @@ impl DB {
     /// be retried with fresh data.
     pub fn begin_transaction(&self) -> crate::transaction::Transaction<'_> {
         let start_seq = self.next_seq.load(Ordering::SeqCst);
-        let gc_handle =
-            crate::types::SnapshotHandle::new(start_seq, std::sync::Arc::clone(&self.snapshot_tracker));
+        let gc_handle = crate::types::SnapshotHandle::new(
+            start_seq,
+            std::sync::Arc::clone(&self.snapshot_tracker),
+        );
         crate::transaction::Transaction::new(self, start_seq, gc_handle)
     }
 

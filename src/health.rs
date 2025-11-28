@@ -11,14 +11,14 @@ pub struct HealthStatus {
 
 impl HealthStatus {
     /// Create a new health status
-    #[must_use] 
+    #[must_use]
     pub fn new(checks: Vec<HealthCheck>) -> Self {
         let healthy = checks.iter().all(|c| c.status == CheckStatus::Healthy);
         Self { healthy, checks }
     }
 
     /// Check if any check is unhealthy
-    #[must_use] 
+    #[must_use]
     pub fn has_unhealthy(&self) -> bool {
         self.checks
             .iter()
@@ -26,7 +26,7 @@ impl HealthStatus {
     }
 
     /// Check if any check is degraded
-    #[must_use] 
+    #[must_use]
     pub fn has_degraded(&self) -> bool {
         self.checks
             .iter()

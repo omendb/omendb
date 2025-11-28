@@ -40,7 +40,9 @@ impl DB {
             let partition_mt = &immutable_partitions[partition];
             if let Some(entry) = partition_mt.get_entry(key) {
                 match entry {
-                    Entry::Value(v) => return Ok(self.resolve_merge(key, Some(v), &operands, start)),
+                    Entry::Value(v) => {
+                        return Ok(self.resolve_merge(key, Some(v), &operands, start))
+                    }
                     Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
                     Entry::Merge(ops) => {
                         operands.extend(ops.iter().rev().cloned());
@@ -246,8 +248,11 @@ impl DB {
         }
 
         if let Some(ref op) = self.options.merge_operator {
-            let ops_reversed: Vec<&[u8]> =
-                operands.iter().rev().map(std::convert::AsRef::as_ref).collect();
+            let ops_reversed: Vec<&[u8]> = operands
+                .iter()
+                .rev()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
             let base_slice = base.as_ref().map(std::convert::AsRef::as_ref);
 
             if let Some(merged) = op.full_merge(key, base_slice, &ops_reversed) {

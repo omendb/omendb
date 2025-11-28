@@ -10,7 +10,7 @@ const SIMD_WIDTH: usize = 16;
 /// portable SIMD to process 16 bytes at a time. The compiler
 /// automatically selects the best instructions for the target platform.
 #[inline]
-#[must_use] 
+#[must_use]
 pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
     let len_a = a.len();
     let len_b = b.len();
@@ -60,7 +60,7 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
 /// Optimized using `std::simd` to quickly scan for the varint terminator (MSB=0)
 /// avoiding branch mispredictions in the loop.
 #[inline]
-#[must_use] 
+#[must_use]
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
         return None;
@@ -167,7 +167,7 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 /// Used in prefix compression to find how many leading bytes are identical.
 /// Returns the number of matching bytes from the start.
 #[inline]
-#[must_use] 
+#[must_use]
 pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let min_len = a.len().min(b.len());
     let mut i = 0;

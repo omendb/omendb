@@ -11,7 +11,7 @@ pub struct WriteOptions {
 }
 
 impl WriteOptions {
-    #[must_use] 
+    #[must_use]
     pub const fn sync() -> Self {
         Self {
             sync: true,
@@ -19,7 +19,7 @@ impl WriteOptions {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn skip_wal() -> Self {
         Self {
             sync: false,
@@ -36,7 +36,7 @@ pub struct ReadOptions {
 }
 
 impl ReadOptions {
-    #[must_use] 
+    #[must_use]
     pub const fn no_cache() -> Self {
         Self {
             no_cache: true,
@@ -44,7 +44,7 @@ impl ReadOptions {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn verify() -> Self {
         Self {
             no_cache: false,
@@ -131,7 +131,7 @@ impl Default for DBOptions {
 
 impl DBOptions {
     /// Configuration profile for embedded/single-process applications.
-    #[must_use] 
+    #[must_use]
     pub fn embedded(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -146,7 +146,7 @@ impl DBOptions {
     }
 
     /// Configuration profile for high-throughput server workloads.
-    #[must_use] 
+    #[must_use]
     pub fn high_throughput(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -162,7 +162,7 @@ impl DBOptions {
     }
 
     /// Configuration profile for large-scale deployments (1B+ keys).
-    #[must_use] 
+    #[must_use]
     pub fn large_scale(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -184,49 +184,49 @@ impl DBOptions {
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_memtable_capacity(mut self, bytes: usize) -> Self {
         self.memtable_capacity = bytes;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_block_cache_capacity(mut self, num_blocks: usize) -> Self {
         self.block_cache_capacity = num_blocks;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_sync_policy(mut self, policy: SyncPolicy) -> Self {
         self.wal_sync_policy = policy;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_background_compaction(mut self, enabled: bool) -> Self {
         self.background_compaction = enabled;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_background_flush(mut self, enabled: bool) -> Self {
         self.background_flush = enabled;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_metrics(mut self, enabled: bool) -> Self {
         self.disable_metrics = !enabled;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_direct_wal(mut self, enabled: bool) -> Self {
         self.use_direct_wal = enabled;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_skip_wal(mut self, enabled: bool) -> Self {
         self.skip_wal = enabled;
         self
@@ -275,19 +275,19 @@ impl Default for BulkLoadOptions {
 }
 
 impl BulkLoadOptions {
-    #[must_use] 
+    #[must_use]
     pub const fn with_target_level(mut self, level: usize) -> Self {
         self.target_level = level;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries_per_sst = max;
         self
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn already_sorted(mut self) -> Self {
         self.already_sorted = true;
         self

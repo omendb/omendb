@@ -33,7 +33,7 @@ impl LearnedBloomFilter {
     /// * `expected_elements` - Expected number of elements
     /// * `false_positive_rate` - Target false positive rate
     /// * `threshold` - Confidence threshold (0.0-1.0, higher = trust model more)
-    #[must_use] 
+    #[must_use]
     pub fn new(expected_elements: usize, false_positive_rate: f64, threshold: f64) -> Self {
         // Backup filter is much smaller since model handles most queries
         // Use higher FPR for backup since it's only for uncertain cases
@@ -161,19 +161,19 @@ impl LearnedBloomFilter {
     }
 
     /// Get the number of elements
-    #[must_use] 
+    #[must_use]
     pub const fn len(&self) -> usize {
         self.count
     }
 
     /// Check if empty
-    #[must_use] 
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Get size in bytes (for benchmarking)
-    #[must_use] 
+    #[must_use]
     pub fn size_bytes(&self) -> usize {
         let backup_size = self.backup_filter.size_bytes();
 

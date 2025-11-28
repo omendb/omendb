@@ -171,13 +171,13 @@ pub struct BlockBuilder {
 
 impl BlockBuilder {
     /// Create a new block builder with default size
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BLOCK_SIZE)
     }
 
     /// Create a new block builder with custom capacity
-    #[must_use] 
+    #[must_use]
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
             buffer: BytesMut::with_capacity(max_size),

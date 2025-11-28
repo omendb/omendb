@@ -204,7 +204,7 @@ impl SSTableBuilder<File> {
 
 impl SSTableBuilder<Cursor<Vec<u8>>> {
     /// Create a new buffered `SSTable` builder (in-memory)
-    #[must_use] 
+    #[must_use]
     pub fn new_buffered() -> Self {
         let header = Self::create_header(DEFAULT_PREFIX_LEN);
         let header_size = header.len() as u64;
@@ -731,12 +731,20 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         let mut buffer = Vec::new();
 
         // Write min_key
-        let min_key = self.min_key.as_ref().map(std::convert::AsRef::as_ref).unwrap_or(&[]);
+        let min_key = self
+            .min_key
+            .as_ref()
+            .map(std::convert::AsRef::as_ref)
+            .unwrap_or(&[]);
         buffer.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(min_key);
 
         // Write max_key
-        let max_key = self.max_key.as_ref().map(std::convert::AsRef::as_ref).unwrap_or(&[]);
+        let max_key = self
+            .max_key
+            .as_ref()
+            .map(std::convert::AsRef::as_ref)
+            .unwrap_or(&[]);
         buffer.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(max_key);
 
@@ -1282,11 +1290,7 @@ impl SSTable {
     }
 
     #[inline]
-    fn find_in_data_block(
-        &self,
-        data_block: &Block,
-        key: &[u8],
-    ) -> Result<Option<(Bytes, u8)>> {
+    fn find_in_data_block(&self, data_block: &Block, key: &[u8]) -> Result<Option<(Bytes, u8)>> {
         // Binary search for exact key match
         let Some((_entry_key, entry_value)) = data_block.find_exact(key) else {
             return Ok(None);

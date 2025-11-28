@@ -29,7 +29,7 @@ pub struct AlexTree {
 
 impl AlexTree {
     /// Create new ALEX tree
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             leaves: vec![GappedNode::new(100, 1.0)], // Start with one leaf
@@ -39,7 +39,7 @@ impl AlexTree {
     }
 
     /// Create ALEX tree with custom expansion factor
-    #[must_use] 
+    #[must_use]
     pub fn with_expansion(expansion_factor: f64) -> Self {
         Self {
             leaves: vec![GappedNode::new(100, expansion_factor)],
@@ -193,17 +193,20 @@ impl AlexTree {
 
     /// Get total number of keys across all leaves
     pub fn len(&self) -> usize {
-        self.leaves.iter().map(super::gapped_node::GappedNode::num_keys).sum()
+        self.leaves
+            .iter()
+            .map(super::gapped_node::GappedNode::num_keys)
+            .sum()
     }
 
     /// Check if tree is empty
-    #[must_use] 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Get number of leaf nodes
-    #[must_use] 
+    #[must_use]
     pub const fn num_leaves(&self) -> usize {
         self.leaves.len()
     }

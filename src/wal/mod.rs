@@ -258,13 +258,13 @@ impl WAL {
     }
 
     /// Get the current offset (end of file)
-    #[must_use] 
+    #[must_use]
     pub const fn offset(&self) -> u64 {
         self.offset
     }
 
     /// Get the file path
-    #[must_use] 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }

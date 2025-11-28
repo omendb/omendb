@@ -1,4 +1,4 @@
-use super::{CompactionTask, Result, NUM_PARTITIONS, DB};
+use super::{CompactionTask, Result, DB, NUM_PARTITIONS};
 use crate::memtable::Memtable;
 use crate::types::InternalKey;
 use bytes::Bytes;

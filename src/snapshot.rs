@@ -117,8 +117,11 @@ impl Snapshot {
         start_key: &[u8],
         end_key: Option<&[u8]>,
     ) -> crate::db::Result<RangeIterator> {
-        let mut partition_refs: Vec<&Memtable> =
-            self.memtables.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut partition_refs: Vec<&Memtable> = self
+            .memtables
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
 
         if let Some(ref immutables) = self.immutable_memtables {
             partition_refs.extend(immutables.iter().map(std::convert::AsRef::as_ref));
@@ -149,7 +152,7 @@ impl Snapshot {
         )
     }
 
-    #[must_use] 
+    #[must_use]
     pub const fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
