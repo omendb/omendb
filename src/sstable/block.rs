@@ -567,8 +567,7 @@ impl Block {
             .decompressed_cache
             .get_or_init(|| self.decompress_all_entries());
         let idx = entries.partition_point(|(k, _)| {
-            let entry_user_key = if k.len() >= 8 { &k[..k.len() - 8] } else { k.as_ref() };
-            entry_user_key < user_key
+            simd::compare_internal_to_user_key(k.as_ref(), user_key).is_lt()
         });
         entries.get(idx).cloned()
     }

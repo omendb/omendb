@@ -13,6 +13,7 @@ pub use iter::{SSTableIterator, SSTableRangeIterator};
 use crate::alex::AlexTree;
 use crate::bloom::BloomFilter;
 use crate::buffer::{BufferPool, PageId};
+use crate::simd;
 use crate::types::{InternalKey, ValueType};
 use crate::vlog::{VLog, ValuePointer};
 use block::Block;
@@ -549,10 +550,11 @@ impl SSTable {
         let idx = if self.is_mvcc() {
             let user_key = Self::extract_user_key(key);
             self.top_level_index.partition_point(|e| {
-                Self::extract_user_key(&e.last_key) < user_key
+                simd::compare_internal_to_user_key(&e.last_key, user_key).is_lt()
             })
         } else {
-            self.top_level_index.partition_point(|e| e.last_key.as_ref() < key)
+            self.top_level_index
+                .partition_point(|e| simd::compare_keys(&e.last_key, key).is_lt())
         };
 
         self.top_level_index

@@ -4,32 +4,35 @@ use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, u8x16};
 /// SIMD vector size (16 bytes for u8x16)
 const SIMD_WIDTH: usize = 16;
 
-/// Compare two byte slices using SIMD
+/// Compare `user_key` portion of an `InternalKey` against a `user_key`.
 ///
-/// This is a drop-in replacement for slice comparison that uses
-/// portable SIMD to process 16 bytes at a time. The compiler
-/// automatically selects the best instructions for the target platform.
+/// Strips the 8-byte trailer from `internal_key` before comparing.
+/// Used for MVCC `SSTable` lookups where index entries are `InternalKey`s
+/// but we search by `user_key`.
 #[inline]
 #[must_use]
-pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
-    let len_a = a.len();
-    let len_b = b.len();
+pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ordering {
+    let internal_user_len = internal_key.len().saturating_sub(8);
+    compare_keys_with_len(internal_key, internal_user_len, user_key, user_key.len())
+}
+
+/// Compare two byte slices using SIMD, with explicit lengths.
+///
+/// Compares `a[..len_a]` against `b[..len_b]` using SIMD.
+#[inline]
+fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
     let min_len = len_a.min(len_b);
 
     let mut i = 0;
 
     // Process 16 bytes at a time with SIMD
     while i + SIMD_WIDTH <= min_len {
-        // Load 16 bytes from each slice
         let a_vec = u8x16::from_slice(&a[i..i + SIMD_WIDTH]);
         let b_vec = u8x16::from_slice(&b[i..i + SIMD_WIDTH]);
 
-        // Compare for equality
         let eq = a_vec.simd_eq(b_vec);
 
-        // If not all bytes are equal, find first difference
         if !eq.all() {
-            // Find position of first differing byte
             for j in 0..SIMD_WIDTH {
                 let pos = i + j;
                 match a[pos].cmp(&b[pos]) {
@@ -50,8 +53,16 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
         }
     }
 
-    // If all compared bytes are equal, compare lengths
     len_a.cmp(&len_b)
+}
+
+/// Compare two byte slices using SIMD.
+///
+/// Drop-in replacement for slice comparison using portable SIMD.
+#[inline]
+#[must_use]
+pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
+    compare_keys_with_len(a, a.len(), b, b.len())
 }
 
 /// Decode a varint from a byte slice using SIMD to find the length
