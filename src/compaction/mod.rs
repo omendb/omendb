@@ -1,6 +1,9 @@
 pub mod filter;
 pub mod merge;
 
+#[cfg(test)]
+mod merge_tests;
+
 use crate::sstable::{SSTable, SSTableBuilder};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
