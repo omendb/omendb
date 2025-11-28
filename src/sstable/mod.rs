@@ -2,6 +2,9 @@
 #![allow(clippy::needless_pass_by_value)]
 
 pub mod block;
+mod error;
+
+pub use error::{Result, SSTableError};
 
 use crate::alex::AlexTree;
 use crate::bloom::BloomFilter;
@@ -10,41 +13,14 @@ use crate::memtable::Entry;
 use crate::types::{InternalKey, ValueType};
 use crate::vlog::{VLog, ValuePointer};
 pub use block::CompressionType;
-use block::{Block, BlockBuilder, BlockError, DEFAULT_BLOCK_SIZE};
+use block::{Block, BlockBuilder, DEFAULT_BLOCK_SIZE};
 use bytes::{Bytes, BytesMut};
 use quick_cache::sync::Cache;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum SSTableError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-
-    #[error("Key not found")]
-    KeyNotFound,
-
-    #[error("Invalid SSTable format")]
-    InvalidFormat,
-
-    #[error("VLog error: {0}")]
-    VLog(String),
-
-    #[error("SSTable corrupted: expected checksum {expected:#x}, got {actual:#x}")]
-    Corruption { expected: u32, actual: u32 },
-
-    #[error("Block error: {0}")]
-    Block(#[from] BlockError),
-
-    #[error("Buffer pool error: {0}")]
-    BufferPool(#[from] crate::buffer::BufferPoolError),
-}
-
-pub type Result<T> = std::result::Result<T, SSTableError>;
 
 /// Magic number for `SSTable` format: "SSTB"
 const MAGIC: u32 = 0x5353_5442;

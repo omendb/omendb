@@ -60,11 +60,11 @@ impl Memtable {
 
     /// Insert a merge operand
     #[inline]
-    pub fn merge(&self, key: Bytes, value: Bytes, seq: u64) {
-        let size_delta = key.len() + value.len() + 8;
+    pub fn merge(&self, key: Bytes, operand: Bytes, seq: u64) {
+        let size_delta = key.len() + operand.len() + 8;
         let internal_key = InternalKey::new(key, seq, ValueType::Merge);
 
-        self.data.insert(internal_key, value);
+        self.data.insert(internal_key, operand);
         self.size.fetch_add(size_delta, Ordering::Relaxed);
     }
 
@@ -105,6 +105,7 @@ impl Memtable {
     /// Get Entry (Value, Tombstone, or Merge list) for a key.
     /// This collects all versions/merges visible?
     /// Assuming this retrieves the LATEST state for merge resolution.
+    #[inline]
     pub fn get_entry(&self, key: &[u8]) -> Option<Entry> {
         let lookup_key = InternalKey::new(Bytes::copy_from_slice(key), u64::MAX, ValueType::Value);
 

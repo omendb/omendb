@@ -506,11 +506,8 @@ impl LSMTree {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|name| {
-                        if name.starts_with('L') {
-                            name[1..].split('_').next()?.parse::<usize>().ok()
-                        } else {
-                            None
-                        }
+                        name.strip_prefix('L')
+                            .and_then(|rest| rest.split('_').next()?.parse::<usize>().ok())
                     })
                     .unwrap_or(0); // Default to L0 if parsing fails
 
