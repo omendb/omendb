@@ -628,20 +628,12 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         let mut buffer = Vec::new();
 
         // Write min_key
-        let min_key = self
-            .min_key
-            .as_ref()
-            .map(std::convert::AsRef::as_ref)
-            .unwrap_or(&[]);
+        let min_key = self.min_key.as_ref().map_or(&[][..], AsRef::as_ref);
         buffer.extend_from_slice(&(min_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(min_key);
 
         // Write max_key
-        let max_key = self
-            .max_key
-            .as_ref()
-            .map(std::convert::AsRef::as_ref)
-            .unwrap_or(&[]);
+        let max_key = self.max_key.as_ref().map_or(&[][..], AsRef::as_ref);
         buffer.extend_from_slice(&(max_key.len() as u32).to_le_bytes());
         buffer.extend_from_slice(max_key);
 

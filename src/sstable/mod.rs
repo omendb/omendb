@@ -274,6 +274,7 @@ impl SSTable {
     }
 
     /// Check if key might be in this `SSTable` (bloom filter check)
+    #[inline]
     pub fn may_contain(&self, key: &[u8]) -> bool {
         self.bloom.contains(key)
     }
@@ -281,6 +282,7 @@ impl SSTable {
     /// Check if a prefix might be in this `SSTable` (prefix bloom filter check)
     /// Returns true if the prefix might exist, false if definitely not.
     /// If prefix filter is not present or prefix is too short, returns true (conservative).
+    #[inline]
     pub fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
         if let Some(ref pb) = self.prefix_bloom {
             if prefix.len() >= self.prefix_len {

@@ -77,6 +77,7 @@ impl BlockedBloomFilter {
 
     /// Check if an element might be in the set
     /// Returns true if possibly in set, false if definitely not in set
+    #[inline]
     pub fn contains<T: Hash + ?Sized>(&self, item: &T) -> bool {
         let (block_index, block_hash) = self.hash_to_block(item);
 

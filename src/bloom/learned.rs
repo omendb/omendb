@@ -99,6 +99,7 @@ impl LearnedBloomFilter {
     }
 
     /// Check if an element might be in the set
+    #[inline]
     pub fn contains<T: Hash>(&self, item: &T) -> bool {
         // Check backup filter first for positive cases (guarantees no false negatives)
         if self.backup_filter.contains(item) {

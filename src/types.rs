@@ -19,6 +19,7 @@ pub enum ValueType {
 }
 
 impl ValueType {
+    #[inline]
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -46,6 +47,7 @@ pub struct InternalKey {
 }
 
 impl InternalKey {
+    #[inline]
     pub const fn new(user_key: Bytes, seq: u64, kind: ValueType) -> Self {
         Self {
             user_key,
@@ -56,6 +58,7 @@ impl InternalKey {
 
     /// Create a search key that will match the latest version of a user key
     /// (Sequence number = MAX)
+    #[inline]
     pub const fn for_lookup(user_key: Bytes) -> Self {
         Self {
             user_key,
@@ -66,6 +69,7 @@ impl InternalKey {
 
     /// Encode the `InternalKey` into bytes for storage
     /// Uses big-endian encoding for the sequence number wrapper to preserve sort order
+    #[inline]
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.user_key.len() + 8);
         buf.extend_from_slice(&self.user_key);
@@ -82,6 +86,7 @@ impl InternalKey {
     }
 
     /// Decode an `InternalKey` from bytes
+    #[inline]
     #[allow(clippy::needless_pass_by_value)] // Bytes::slice() creates zero-copy views
     pub fn decode(bytes: Bytes) -> Option<Self> {
         if bytes.len() < 8 {
@@ -110,6 +115,7 @@ impl InternalKey {
     /// Extract just the user key from an encoded buffer (zero copy)
     /// If the key is shorter than 9 bytes (min: 1 byte user key + 8 byte trailer),
     /// returns the key unchanged (assumes it's a plain user key, not an `InternalKey`).
+    #[inline]
     pub fn extract_user_key(bytes: &Bytes) -> Bytes {
         if bytes.len() <= 8 {
             // Too short to be an InternalKey - treat as plain user key
@@ -120,18 +126,21 @@ impl InternalKey {
 }
 
 impl PartialEq for InternalKey {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.user_key == other.user_key && self.seq == other.seq && self.kind == other.kind
     }
 }
 
 impl PartialOrd for InternalKey {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for InternalKey {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         // 1. Compare User Key (Ascending)
         match self.user_key.cmp(&other.user_key) {

@@ -87,7 +87,7 @@ fn write_varint(buf: &mut BytesMut, value: u64) {
 
 /// Helper to read varint from slice, advancing offset
 /// Uses SIMD acceleration if enabled
-#[inline(always)]
+#[inline]
 fn read_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
     #[cfg(feature = "simd")]
     {

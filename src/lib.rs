@@ -1,6 +1,33 @@
 #![cfg_attr(feature = "simd", feature(portable_simd))] // SIMD optimizations (nightly-only)
+// Pedantic allows for systems code
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
+#![allow(clippy::cast_possible_truncation)] // Systems code often truncates intentionally
+#![allow(clippy::cast_precision_loss)] // f64 calculations are approximate by design
+#![allow(clippy::cast_sign_loss)] // Intentional in hashing/indexing
+#![allow(clippy::cast_lossless)] // Prefer explicit `as` for clarity in hot paths
+#![allow(clippy::cast_possible_wrap)] // Intentional in size calculations
+#![allow(clippy::missing_errors_doc)] // Internal errors are self-explanatory
+#![allow(clippy::missing_panics_doc)] // Panics indicate bugs, not expected behavior
+#![allow(clippy::items_after_statements)] // Common pattern for scoped helpers
+#![allow(clippy::too_many_lines)] // Complex DB operations require complex functions
+#![allow(clippy::must_use_candidate)] // Builder pattern methods don't need must_use
+#![allow(clippy::unused_self)] // Future-proofing for method signatures
+#![allow(clippy::ref_option)] // &Option<T> is sometimes clearer than Option<&T>
+#![allow(clippy::wildcard_imports)] // Used intentionally in modules
+#![allow(clippy::iter_not_returning_iterator)] // iter() returns cursor-like types
+#![allow(clippy::assigning_clones)] // clone_from() isn't always better for small types
+#![allow(clippy::explicit_iter_loop)] // .iter() is more explicit than &
+#![allow(clippy::struct_excessive_bools)] // Config structs need many bools
+#![allow(clippy::return_self_not_must_use)] // Builder patterns
+#![allow(clippy::needless_lifetimes)] // Sometimes explicit lifetimes are clearer
+#![allow(clippy::struct_field_names)] // Prefixing fields is sometimes clearer
+#![allow(clippy::manual_let_else)] // let-else isn't always clearer
+#![allow(clippy::match_same_arms)] // Explicit match arms can be clearer
+#![allow(clippy::missing_fields_in_debug)] // Debug impls don't need all fields
+#![allow(clippy::default_trait_access)] // Type::default() is sometimes clearer
+#![allow(clippy::unit_arg)] // Matching on () is valid
+#![allow(clippy::unnecessary_wraps)] // Wrapping in Option/Result for API consistency
 
 //! seerdb - Research-grade embedded storage engine
 //!

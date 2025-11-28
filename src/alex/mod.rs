@@ -1,3 +1,12 @@
+// ALEX is a numeric algorithm with inherent precision tradeoffs
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::similar_names
+)]
+
 //! ALEX: Adaptive Learned Index
 //!
 //! A production-ready implementation of the ALEX learned index structure
