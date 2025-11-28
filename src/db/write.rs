@@ -300,7 +300,7 @@ impl DB {
     /// Merge a value into the database
     ///
     /// Applies a merge operand to a key. The merge logic is defined by the configured
-    /// [`MergeOperator`].
+    /// `MergeOperator`.
     ///
     /// # Arguments
     /// * `key` - The key to merge into

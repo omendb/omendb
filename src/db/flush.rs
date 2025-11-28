@@ -49,9 +49,9 @@ impl DB {
     ///
     /// # Errors
     ///
-    /// - [`DBError::Io`]: Failed to write `SSTable` or clear WAL
-    /// - [`DBError::SSTable`]: `SSTable` builder error
-    /// - [`DBError::Compaction`]: Compaction failed (if triggered)
+    /// - `DBError::Io`: Failed to write `SSTable` or clear WAL
+    /// - `DBError::SSTable`: `SSTable` builder error
+    /// - `DBError::Compaction`: Compaction failed (if triggered)
     ///
     /// # Performance
     ///

@@ -1,6 +1,6 @@
 use std::simd::{cmp::SimdPartialEq, i64x4};
 
-/// SIMD-optimized search for key in Option<i64> array
+/// SIMD-optimized search for key in `Option<i64>` array
 ///
 /// Searches for first occurrence of Some(key) in the slice.
 /// Uses `std::simd` to compare 4 values at once.

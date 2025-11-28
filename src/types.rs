@@ -33,7 +33,7 @@ impl ValueType {
 
 /// Internal Key used for MVCC (Multi-Version Concurrency Control)
 ///
-/// Format: [ User Key ] [ 8 bytes: (`SeqNum` << 8) | `ValueType` ]
+/// Format: `[ User Key ] [ 8 bytes: (SeqNum << 8) | ValueType ]`
 ///
 /// Sorting:
 /// 1. User Key (Ascending)
