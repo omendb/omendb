@@ -304,7 +304,7 @@ impl LSMTree {
         min_ratio: u64,
         max_ratio: u64,
     ) -> Self {
-        let initial_ratio = (min_ratio + max_ratio) / 2; // Start in middle
+        let initial_ratio = u64::midpoint(min_ratio, max_ratio); // Start in middle
         let strategy = CompactionStrategy::Adaptive {
             current_ratio: initial_ratio,
             min_ratio,
@@ -413,12 +413,11 @@ impl LSMTree {
         self.last_workload = (writes, reads);
 
         // If ratio changed, update level thresholds
-        if new_ratio != old_ratio {
+        let changed = new_ratio != old_ratio;
+        if changed {
             self.update_level_thresholds(new_ratio);
-            true
-        } else {
-            false
         }
+        changed
     }
 
     /// Update level thresholds based on new size ratio

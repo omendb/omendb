@@ -49,7 +49,7 @@ pub trait MergeOperator: Debug + Send + Sync + 'static {
 
     /// Returns the name of the merge operator.
     /// Used for verification to ensure the same operator is used on recovery.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 }
 
 /// A simple merge operator that appends operands as strings with a delimiter.
@@ -111,7 +111,7 @@ impl MergeOperator for StringAppendOperator {
         None
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "StringAppendOperator"
     }
 }

@@ -183,7 +183,9 @@ impl SSTable {
         let (min_key, max_key) = Self::load_metadata(&mut file, metadata_offset)?;
 
         // Build ALEX learned index for faster top-level index lookups
-        let alex_index = if !top_level_index.is_empty() {
+        let alex_index = if top_level_index.is_empty() {
+            None
+        } else {
             let mut alex = AlexTree::new();
             for (idx, entry) in top_level_index.iter().enumerate() {
                 let key_i64 = bytes_to_i64(&entry.last_key);
@@ -195,8 +197,6 @@ impl SSTable {
                 }
             }
             Some(alex)
-        } else {
-            None
         };
 
         // Create LRU block cache with capacity for 10,000 blocks (~40MB at 4KB/block)

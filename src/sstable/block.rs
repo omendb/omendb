@@ -717,7 +717,7 @@ impl<'a> BlockIterator<'a> {
     }
 }
 
-impl<'a> Iterator for BlockIterator<'a> {
+impl Iterator for BlockIterator<'_> {
     type Item = Result<(Bytes, Bytes)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -725,11 +725,20 @@ impl<'a> Iterator for BlockIterator<'a> {
     }
 }
 
-impl<'a> DoubleEndedIterator for BlockIterator<'a> {
+impl DoubleEndedIterator for BlockIterator<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.iter
             .next_back()
             .map(|(k, v)| Ok((k.clone(), v.clone())))
+    }
+}
+
+impl<'a> IntoIterator for &'a Block {
+    type Item = Result<(Bytes, Bytes)>;
+    type IntoIter = BlockIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 

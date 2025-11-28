@@ -315,7 +315,7 @@ impl BufferPool {
 
             // Execute loader with mutable access to the buffer
             match loader(&mut data_guard) {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) => {
                     drop(data_guard);
                     shard.free_frame(frame_id);
