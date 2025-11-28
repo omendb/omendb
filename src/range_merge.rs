@@ -4,20 +4,8 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use crate::memtable::Entry;
-use crate::MergeOperator;
-
-// Use SIMD-accelerated comparison when available, fallback to standard otherwise
-#[cfg(feature = "simd")]
 use crate::simd;
-
-#[cfg(not(feature = "simd"))]
-mod simd {
-    use std::cmp::Ordering;
-    #[inline]
-    pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
-        a.cmp(b)
-    }
-}
+use crate::MergeOperator;
 
 /// Entry in the min-heap for k-way merge
 struct HeapEntry<I>

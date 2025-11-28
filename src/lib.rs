@@ -156,7 +156,6 @@ pub mod memtable;
 pub mod range;
 #[doc(hidden)]
 pub mod range_merge;
-#[cfg(feature = "simd")]
 #[doc(hidden)]
 pub mod simd;
 #[doc(hidden)]
