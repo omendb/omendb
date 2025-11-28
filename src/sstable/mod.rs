@@ -405,15 +405,11 @@ impl SSTable {
         user_key: &[u8],
         snapshot_seq: u64,
     ) -> Result<Option<(Bytes, u8)>> {
-        // Check bloom filter with user_key (bloom stores user keys, not encoded InternalKeys)
         if !self.bloom.contains(user_key) {
             return Ok(None);
         }
 
-        // Create search key: looking for first entry with seq <= snapshot_seq
-        // Since encoded keys sort by (user_key ASC, seq DESC), searching for
-        // InternalKey(user_key, snapshot_seq) with find_lower_bound gives us
-        // the first version <= snapshot_seq
+        // Create search key with snapshot_seq for MVCC ordering
         let search_key = InternalKey::new(
             Bytes::copy_from_slice(user_key),
             snapshot_seq,
@@ -421,7 +417,6 @@ impl SSTable {
         );
         let encoded_search_key = search_key.encode();
 
-        // Find the index block containing this key
         let Some((index_block_offset, index_block_size)) =
             self.find_index_block(&encoded_search_key)
         else {
@@ -430,16 +425,13 @@ impl SSTable {
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
-        // Find the data block containing this key
         let Some((data_block_offset, data_block_size)) =
-            self.find_in_index_block(&index_block, &encoded_search_key)?
+            self.find_in_index_block(&index_block, user_key)?
         else {
             return Ok(None);
         };
 
         let data_block = self.load_block(data_block_offset, data_block_size)?;
-
-        // Search for the entry in the data block
         self.find_in_data_block_mvcc(&data_block, user_key, &encoded_search_key)
     }
 
@@ -521,9 +513,9 @@ impl SSTable {
 
         let index_block = self.load_block(index_block_offset, index_block_size)?;
 
-        // Find the data block
+        // Find the data block (use user_key for correct comparison)
         let Some((data_block_offset, data_block_size)) =
-            self.find_in_index_block(&index_block, &encoded_search_key)?
+            self.find_in_index_block(&index_block, user_key)?
         else {
             return Ok(None);
         };
@@ -541,10 +533,6 @@ impl SSTable {
 
     #[inline]
     fn find_index_block(&self, key: &[u8]) -> Option<(u64, u32)> {
-        // CRITICAL FIX (Bug #11): Disable ALEX for top-level index lookup
-        // ALEX learned index cannot correctly handle keys with shared prefixes
-        // (e.g., "key_0000000000" and "key_0000000100" produce non-monotonic i64 values)
-        // The partition_point binary search is correct and fast (O(log N) where N is typically 2-10)
         let idx = self
             .top_level_index
             .partition_point(|entry| entry.last_key.as_ref() < key);
@@ -559,12 +547,26 @@ impl SSTable {
         }
     }
 
+    /// Find the data block containing `user_key` in this index block.
+    ///
+    /// For MVCC SSTables (max_sequence > 0), compares user_keys to correctly
+    /// handle the lexicographic quirk where InternalKey("v:80") < InternalKey("v:8")
+    /// but user_key("v:80") > user_key("v:8").
+    ///
+    /// For non-MVCC SSTables (max_sequence == 0), uses raw key comparison.
     #[inline]
-    fn find_in_index_block(&self, index_block: &Block, key: &[u8]) -> Result<Option<(u64, u32)>> {
-        // Binary search for first entry where entry_key >= key
-        let Some((_entry_key, entry_value)) = index_block.find_lower_bound(key) else {
+    fn find_in_index_block(&self, index_block: &Block, user_key: &[u8]) -> Result<Option<(u64, u32)>> {
+        // MVCC SSTables store InternalKeys; non-MVCC store raw user_keys
+        let result = if self.max_sequence > 0 {
+            index_block.find_lower_bound_by_user_key(user_key)
+        } else {
+            index_block.find_lower_bound(user_key)
+        };
+
+        let Some((_entry_key, entry_value)) = result else {
             return Ok(None);
         };
+
         let value_len = entry_value.len();
 
         if value_len < 12 {

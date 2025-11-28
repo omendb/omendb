@@ -992,3 +992,105 @@ fn test_persistence_100_keys() {
         );
     }
 }
+
+/// Test persistence with multiple key prefixes (omendb pattern)
+///
+/// Risk: CRITICAL - Data loss with mixed prefixes
+/// Pattern: v:{id}, m:{id}, i:{string_id} keys interleaved
+#[test]
+fn test_persistence_multiple_prefixes() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().to_path_buf();
+
+    // Write 100 items with 3 keys each (300 total keys)
+    {
+        let options = DBOptions {
+            data_dir: path.clone(),
+            wal_sync_policy: SyncPolicy::SyncAll,
+            background_compaction: false,
+            background_flush: false,
+            ..Default::default()
+        };
+        let db = DB::open(options).unwrap();
+
+        for i in 0..100u64 {
+            // Vector data prefix
+            let v_key = format!("v:{}", i);
+            let v_value = vec![i as u8; 128];
+            db.put(v_key.as_bytes(), &v_value).unwrap();
+
+            // Metadata prefix
+            let m_key = format!("m:{}", i);
+            let m_value = format!(r#"{{"index":{}}}"#, i);
+            db.put(m_key.as_bytes(), m_value.as_bytes()).unwrap();
+
+            // ID mapping prefix
+            let i_key = format!("i:item{}", i);
+            let i_value = i.to_le_bytes();
+            db.put(i_key.as_bytes(), &i_value).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    // Debug: list SSTable files
+    let sst_files: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "sst"))
+        .collect();
+    eprintln!("SSTable files after flush: {:?}", sst_files.iter().map(|e| e.path()).collect::<Vec<_>>());
+
+    // Reopen and verify all 300 keys present
+    {
+        let options = DBOptions {
+            data_dir: path.clone(),
+            background_compaction: false,
+            background_flush: false,
+            ..Default::default()
+        };
+        let db = DB::open(options).unwrap();
+
+        let mut missing_v = Vec::new();
+        let mut missing_m = Vec::new();
+        let mut missing_i = Vec::new();
+
+        // Also collect all keys via scan to compare
+        let mut scanned_v_keys = Vec::new();
+        for item in db.range(b"v:", Some(b"v:\xff")).unwrap() {
+            if let Ok((k, _)) = item {
+                if k.starts_with(b"v:") {
+                    scanned_v_keys.push(String::from_utf8_lossy(&k).to_string());
+                }
+            }
+        }
+        eprintln!("Scanned v: keys count: {}", scanned_v_keys.len());
+
+        for i in 0..100u64 {
+            let v_key = format!("v:{}", i);
+            let result = db.get(v_key.as_bytes()).unwrap();
+            if result.is_none() {
+                missing_v.push(i);
+            }
+
+            let m_key = format!("m:{}", i);
+            if db.get(m_key.as_bytes()).unwrap().is_none() {
+                missing_m.push(i);
+            }
+
+            let i_key = format!("i:item{}", i);
+            if db.get(i_key.as_bytes()).unwrap().is_none() {
+                missing_i.push(i);
+            }
+        }
+
+        let total_missing = missing_v.len() + missing_m.len() + missing_i.len();
+        assert!(
+            total_missing == 0,
+            "Missing {} keys after reopen:\n  v: {:?}\n  m: {:?}\n  i: {:?}",
+            total_missing,
+            missing_v,
+            missing_m,
+            missing_i
+        );
+    }
+}

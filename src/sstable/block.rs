@@ -568,6 +568,48 @@ impl Block {
         }
     }
 
+    /// Find first entry whose user_key >= target user_key (for index block lookups).
+    ///
+    /// CRITICAL: This method compares USER_KEYS, not full InternalKeys!
+    ///
+    /// Why this matters: InternalKey encoding can cause incorrect block selection.
+    /// For keys "v:8" and "v:80":
+    /// - InternalKey("v:80", max_seq) = [v,:,8,0,0x00...] sorts BEFORE
+    /// - InternalKey("v:8", seq) = [v,:,8,~0xFF...]
+    ///
+    /// Because '0' < 0xFF at position 3. But in user_key order: "v:8" < "v:80"!
+    ///
+    /// When selecting which data block contains a user_key, we need to find the first
+    /// block whose last_user_key >= our_user_key, NOT compare full InternalKeys.
+    ///
+    /// Handles both formats:
+    /// - MVCC SSTables: keys are InternalKeys with 8-byte trailer
+    /// - Non-MVCC SSTables: keys are raw user_keys without trailer
+    #[inline]
+    pub fn find_lower_bound_by_user_key(&self, user_key: &[u8]) -> Option<(Bytes, Bytes)> {
+        let entries = self
+            .decompressed_cache
+            .get_or_init(|| self.decompress_all_entries());
+
+        // Binary search comparing user_key portions only
+        let idx = entries.partition_point(|(k, _)| {
+            // Extract user_key: if key has 8-byte trailer (InternalKey), strip it
+            // Otherwise treat the whole key as user_key (non-MVCC format)
+            let entry_user_key = if k.len() >= 8 {
+                &k[..k.len() - 8]
+            } else {
+                k.as_ref()
+            };
+            entry_user_key < user_key
+        });
+
+        if idx < entries.len() {
+            Some(entries[idx].clone())
+        } else {
+            None
+        }
+    }
+
     /// Find entry for MVCC lookup by `user_key`.
     ///
     /// This handles the `InternalKey` encoding correctly: when searching for a `user_key`,
@@ -600,33 +642,21 @@ impl Block {
 
         // Scan forward from start_idx looking for matching user_key
         for (entry_key, entry_value) in entries.iter().skip(start_idx) {
-            // Extract user_key from encoded InternalKey (all but last 8 bytes)
             if entry_key.len() < 8 {
-                continue; // Invalid entry, skip
+                continue;
             }
             let entry_user_key = &entry_key[..entry_key.len() - 8];
 
             if entry_user_key == user_key {
-                // Found matching user_key
                 return Some((entry_key.clone(), entry_value.clone()));
             }
 
-            // Early termination check: can we stop scanning?
-            // We can stop when the entry's user_key no longer shares our prefix AND
-            // the encoded key is > our search key. This happens when:
-            // 1. entry_user_key doesn't start with our user_key as prefix, AND
-            // 2. entry_user_key > user_key lexicographically (for non-prefix cases)
-            //
-            // But for prefix cases (entry is longer and starts with target), we must
-            // continue because our target might appear later.
+            // Early termination: entry's user_key is strictly greater and not a prefix extension
             if !entry_user_key.starts_with(user_key) && entry_user_key > user_key {
-                // This entry's user_key is strictly greater and not a prefix extension
-                // Any remaining entries will also be > our target, so stop
                 return None;
             }
         }
 
-        // Reached end of entries without finding
         None
     }
 
