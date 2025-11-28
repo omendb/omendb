@@ -65,7 +65,7 @@ impl MergeOperator for AdjacencyMerge {
         Some(result)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "AdjacencyMerge"
     }
 }
