@@ -38,7 +38,7 @@ impl MergeOperator for StringAppendOperator {
         Some(result)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "StringAppend"
     }
 }
