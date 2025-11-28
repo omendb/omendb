@@ -933,3 +933,62 @@ fn test_snapshot_consistency_during_writes() {
         assert_eq!(value.as_ref(), b"v2", "DB should see v2 for key {}", i);
     }
 }
+
+// =============================================================================
+// 6. PERSISTENCE TESTS
+// =============================================================================
+
+/// Test that 100 keys persist correctly across reopen
+///
+/// Risk: CRITICAL - Data loss bug reported
+/// Suspected cause: Partitioned memtable flush/recovery issue
+#[test]
+fn test_persistence_100_keys() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().to_path_buf();
+
+    // Write 100 keys
+    {
+        let options = DBOptions {
+            data_dir: path.clone(),
+            wal_sync_policy: SyncPolicy::SyncAll,
+            background_compaction: false,
+            background_flush: false,
+            ..Default::default()
+        };
+        let db = DB::open(options).unwrap();
+
+        for i in 0..100 {
+            let key = format!("v:{}", i);
+            let value = vec![i as u8; 128];
+            db.put(key.as_bytes(), &value).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    // Reopen and verify
+    {
+        let options = DBOptions {
+            data_dir: path.clone(),
+            background_compaction: false,
+            background_flush: false,
+            ..Default::default()
+        };
+        let db = DB::open(options).unwrap();
+
+        let mut missing = Vec::new();
+        for i in 0..100 {
+            let key = format!("v:{}", i);
+            if db.get(key.as_bytes()).unwrap().is_none() {
+                missing.push(i);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Missing {} keys after reopen: {:?}",
+            missing.len(),
+            missing
+        );
+    }
+}
