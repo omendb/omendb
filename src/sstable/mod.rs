@@ -531,11 +531,28 @@ impl SSTable {
         Ok(Some((found_key, entry_value)))
     }
 
+    /// Find index block containing the key.
+    ///
+    /// For MVCC SSTables, compares `user_key` portions to avoid the `InternalKey`
+    /// encoding quirk where "v:80" < "v:8" in encoded order.
     #[inline]
     fn find_index_block(&self, key: &[u8]) -> Option<(u64, u32)> {
-        let idx = self
-            .top_level_index
-            .partition_point(|entry| entry.last_key.as_ref() < key);
+        let idx = if self.max_sequence > 0 {
+            // MVCC: extract user_key from search key and compare against entry user_keys
+            let user_key = if key.len() >= 8 { &key[..key.len() - 8] } else { key };
+            self.top_level_index.partition_point(|entry| {
+                let entry_user_key = if entry.last_key.len() >= 8 {
+                    &entry.last_key[..entry.last_key.len() - 8]
+                } else {
+                    entry.last_key.as_ref()
+                };
+                entry_user_key < user_key
+            })
+        } else {
+            // Non-MVCC: compare raw keys
+            self.top_level_index
+                .partition_point(|entry| entry.last_key.as_ref() < key)
+        };
 
         if idx < self.top_level_index.len() {
             Some((
