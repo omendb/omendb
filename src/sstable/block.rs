@@ -128,6 +128,11 @@ mod simd {
     pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
         a.cmp(b)
     }
+    #[inline]
+    pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ordering {
+        let internal_user_len = internal_key.len().saturating_sub(8);
+        internal_key[..internal_user_len].cmp(user_key)
+    }
 }
 
 #[derive(Debug, Error)]

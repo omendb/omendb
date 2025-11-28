@@ -13,8 +13,24 @@ pub use iter::{SSTableIterator, SSTableRangeIterator};
 use crate::alex::AlexTree;
 use crate::bloom::BloomFilter;
 use crate::buffer::{BufferPool, PageId};
-use crate::simd;
 use crate::types::{InternalKey, ValueType};
+
+#[cfg(feature = "simd")]
+use crate::simd;
+
+#[cfg(not(feature = "simd"))]
+mod simd {
+    use std::cmp::Ordering;
+    #[inline]
+    pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
+        a.cmp(b)
+    }
+    #[inline]
+    pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ordering {
+        let internal_user_len = internal_key.len().saturating_sub(8);
+        internal_key[..internal_user_len].cmp(user_key)
+    }
+}
 use crate::vlog::{VLog, ValuePointer};
 use block::Block;
 pub use block::CompressionType;
