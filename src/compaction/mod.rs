@@ -143,7 +143,7 @@ pub struct Level {
 
 impl Level {
     /// Create a new level with given threshold
-    #[must_use] 
+    #[must_use]
     pub const fn new(level_num: usize, size_threshold: u64) -> Self {
         Self {
             level_num,
@@ -160,31 +160,31 @@ impl Level {
     }
 
     /// Check if this level needs compaction
-    #[must_use] 
+    #[must_use]
     pub const fn needs_compaction(&self) -> bool {
         self.size >= self.size_threshold
     }
 
     /// Get number of `SSTables` in this level
-    #[must_use] 
+    #[must_use]
     pub const fn num_sstables(&self) -> usize {
         self.sstables.len()
     }
 
     /// Get current size
-    #[must_use] 
+    #[must_use]
     pub const fn size(&self) -> u64 {
         self.size
     }
 
     /// Get level number
-    #[must_use] 
+    #[must_use]
     pub const fn level_num(&self) -> usize {
         self.level_num
     }
 
     /// Get `SSTables`
-    #[must_use] 
+    #[must_use]
     pub fn sstables(&self) -> &[PathBuf] {
         &self.sstables
     }
@@ -208,7 +208,7 @@ pub enum CompactionStrategy {
 
 impl CompactionStrategy {
     /// Get current size ratio
-    #[must_use] 
+    #[must_use]
     pub const fn current_ratio(&self) -> u64 {
         match self {
             Self::Fixed(ratio) => *ratio,
@@ -347,7 +347,7 @@ impl LSMTree {
     }
 
     /// Check if any level needs compaction
-    #[must_use] 
+    #[must_use]
     pub fn needs_compaction(&self) -> Option<usize> {
         // Check L0 first (special case: trigger on # of files, not size)
         if self.levels[0].num_sstables() >= 4 {
@@ -365,19 +365,19 @@ impl LSMTree {
     }
 
     /// Get a level
-    #[must_use] 
+    #[must_use]
     pub fn level(&self, level_num: usize) -> Option<&Level> {
         self.levels.get(level_num)
     }
 
     /// Get number of levels
-    #[must_use] 
+    #[must_use]
     pub const fn num_levels(&self) -> usize {
         self.levels.len()
     }
 
     /// Get data directory
-    #[must_use] 
+    #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -430,7 +430,7 @@ impl LSMTree {
     }
 
     /// Get current compaction strategy
-    #[must_use] 
+    #[must_use]
     pub const fn strategy(&self) -> &CompactionStrategy {
         &self.strategy
     }
@@ -474,7 +474,7 @@ impl LSMTree {
     ///
     /// Returns paths in level order (L0 first, then L1, L2, etc.)
     /// Used by `db.verify()` for full database integrity checking.
-    #[must_use] 
+    #[must_use]
     pub fn all_sstable_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for level in &self.levels {
@@ -485,14 +485,15 @@ impl LSMTree {
 
     /// Load existing `SSTables` from disk into the LSM tree
     ///
-    /// Scans the data directory for `SSTable` files and adds them to L0.
+    /// Scans the data directory for `SSTable` files and adds them to their correct levels.
+    /// Level is parsed from filename format: `L{level}_{seq:06}.sst`
     /// This is called during `DB::open()` to recover existing data.
     pub fn load_existing_sstables(&mut self) -> std::io::Result<()> {
         use crate::sstable::SSTable;
 
         // Scan data directory for .sst files
         let entries = std::fs::read_dir(&self.data_dir)?;
-        let mut sstable_paths = Vec::new();
+        let mut sstable_paths: Vec<(PathBuf, usize)> = Vec::new(); // (path, level)
 
         for entry in entries {
             let entry = entry?;
@@ -500,15 +501,28 @@ impl LSMTree {
 
             // Only process .sst files
             if path.extension().and_then(|s| s.to_str()) == Some("sst") {
-                sstable_paths.push(path);
+                // Parse level from filename: L{level}_{seq}.sst
+                let level = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|name| {
+                        if name.starts_with('L') {
+                            name[1..].split('_').next()?.parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0); // Default to L0 if parsing fails
+
+                sstable_paths.push((path, level));
             }
         }
 
-        // Sort paths lexicographically to ensure L0 order (Oldest -> Newest)
+        // Sort paths lexicographically within each level to ensure order (Oldest -> Newest)
         // Filenames are formatted as "L{level}_{seq:06}.sst", so lexicographical sort works
-        sstable_paths.sort();
+        sstable_paths.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for path in sstable_paths {
+        for (path, level) in sstable_paths {
             // Get file size
             let metadata = std::fs::metadata(&path)?;
             let size = metadata.len();
@@ -530,8 +544,13 @@ impl LSMTree {
                 )
             })?;
 
-            // Add to L0 (all recovered SSTables go to L0)
-            self.levels[0].add_sstable(path, size);
+            // Add to correct level (parsed from filename)
+            if level < self.levels.len() {
+                self.levels[level].add_sstable(path, size);
+            } else {
+                // Fallback to L0 if level exceeds configured levels
+                self.levels[0].add_sstable(path, size);
+            }
         }
 
         Ok(())
