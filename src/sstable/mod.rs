@@ -541,7 +541,11 @@ impl SSTable {
     /// Extract `user_key` from potentially-encoded `InternalKey` bytes.
     #[inline]
     fn extract_user_key(key: &[u8]) -> &[u8] {
-        if key.len() >= 8 { &key[..key.len() - 8] } else { key }
+        if key.len() >= 8 {
+            &key[..key.len() - 8]
+        } else {
+            key
+        }
     }
 
     /// Find the index block containing `key`.
@@ -565,7 +569,11 @@ impl SSTable {
 
     /// Find the data block containing `user_key` within an index block.
     #[inline]
-    fn find_in_index_block(&self, index_block: &Block, user_key: &[u8]) -> Result<Option<(u64, u32)>> {
+    fn find_in_index_block(
+        &self,
+        index_block: &Block,
+        user_key: &[u8],
+    ) -> Result<Option<(u64, u32)>> {
         let result = if self.is_mvcc() {
             index_block.find_lower_bound_by_user_key(user_key)
         } else {

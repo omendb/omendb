@@ -1038,7 +1038,10 @@ fn test_persistence_multiple_prefixes() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "sst"))
         .collect();
-    eprintln!("SSTable files after flush: {:?}", sst_files.iter().map(|e| e.path()).collect::<Vec<_>>());
+    eprintln!(
+        "SSTable files after flush: {:?}",
+        sst_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
 
     // Reopen and verify all 300 keys present
     {
