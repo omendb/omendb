@@ -550,51 +550,31 @@ impl Block {
         }
     }
 
-    /// Find first key >= target using binary search (for index blocks)
-    /// Returns Some((key, value)) if found, None otherwise
+    /// Find first key >= target using binary search (for non-MVCC index blocks).
     #[inline]
     pub fn find_lower_bound(&self, key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self
             .decompressed_cache
             .get_or_init(|| self.decompress_all_entries());
 
-        // Binary search for first entry where entry_key >= key using SIMD
         let idx = entries.partition_point(|(k, _)| simd::compare_keys(k.as_ref(), key).is_lt());
-
-        if idx < entries.len() {
-            Some(entries[idx].clone())
-        } else {
-            None
-        }
+        entries.get(idx).cloned()
     }
 
-    /// Find first entry whose user_key >= target user_key (for index block lookups).
+    /// Find first entry whose `user_key` >= target (for MVCC index block lookups).
     ///
-    /// CRITICAL: This method compares USER_KEYS, not full InternalKeys!
-    ///
-    /// Why this matters: InternalKey encoding can cause incorrect block selection.
-    /// For keys "v:8" and "v:80":
-    /// - InternalKey("v:80", max_seq) = [v,:,8,0,0x00...] sorts BEFORE
-    /// - InternalKey("v:8", seq) = [v,:,8,~0xFF...]
-    ///
-    /// Because '0' < 0xFF at position 3. But in user_key order: "v:8" < "v:80"!
-    ///
-    /// When selecting which data block contains a user_key, we need to find the first
-    /// block whose last_user_key >= our_user_key, NOT compare full InternalKeys.
-    ///
-    /// Handles both formats:
-    /// - MVCC SSTables: keys are InternalKeys with 8-byte trailer
-    /// - Non-MVCC SSTables: keys are raw user_keys without trailer
+    /// Extracts `user_key` from `InternalKey` entries (strips 8-byte trailer) and compares.
+    /// This is necessary because `InternalKey` encoding causes incorrect ordering for
+    /// prefix keys: "v:80" encodes before "v:8" (since '0' < trailer byte 0xFF),
+    /// but `user_key` order is "v:8" < "v:80".
     #[inline]
     pub fn find_lower_bound_by_user_key(&self, user_key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self
             .decompressed_cache
             .get_or_init(|| self.decompress_all_entries());
 
-        // Binary search comparing user_key portions only
         let idx = entries.partition_point(|(k, _)| {
-            // Extract user_key: if key has 8-byte trailer (InternalKey), strip it
-            // Otherwise treat the whole key as user_key (non-MVCC format)
+            // InternalKey = user_key + 8-byte trailer
             let entry_user_key = if k.len() >= 8 {
                 &k[..k.len() - 8]
             } else {
@@ -603,11 +583,7 @@ impl Block {
             entry_user_key < user_key
         });
 
-        if idx < entries.len() {
-            Some(entries[idx].clone())
-        } else {
-            None
-        }
+        entries.get(idx).cloned()
     }
 
     /// Find entry for MVCC lookup by `user_key`.

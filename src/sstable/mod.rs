@@ -549,11 +549,11 @@ impl SSTable {
 
     /// Find the data block containing `user_key` in this index block.
     ///
-    /// For MVCC SSTables (max_sequence > 0), compares user_keys to correctly
-    /// handle the lexicographic quirk where InternalKey("v:80") < InternalKey("v:8")
-    /// but user_key("v:80") > user_key("v:8").
+    /// For MVCC SSTables (`max_sequence` > 0), compares `user_key`s to correctly
+    /// handle the lexicographic quirk where `InternalKey("v:80")` < `InternalKey("v:8")`
+    /// but `user_key("v:80")` > `user_key("v:8")`.
     ///
-    /// For non-MVCC SSTables (max_sequence == 0), uses raw key comparison.
+    /// For non-MVCC SSTables (`max_sequence` == 0), uses raw key comparison.
     #[inline]
     fn find_in_index_block(&self, index_block: &Block, user_key: &[u8]) -> Result<Option<(u64, u32)>> {
         // MVCC SSTables store InternalKeys; non-MVCC store raw user_keys
