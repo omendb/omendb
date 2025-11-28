@@ -15,14 +15,13 @@ enum DBOp {
     Range { start: Vec<u8>, end: Option<Vec<u8>> },
     Flush,
     Snapshot,
-    SnapshotConsistent,
     Iter,
     Prefix { prefix: Vec<u8> },
 }
 
 impl<'a> Arbitrary<'a> for DBOp {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let op_type: u8 = u.int_in_range(0..=8)?;
+        let op_type: u8 = u.int_in_range(0..=7)?;
 
         match op_type {
             0 => {
@@ -50,9 +49,8 @@ impl<'a> Arbitrary<'a> for DBOp {
             }
             4 => Ok(DBOp::Flush),
             5 => Ok(DBOp::Snapshot),
-            6 => Ok(DBOp::SnapshotConsistent),
-            7 => Ok(DBOp::Iter),
-            8 => {
+            6 => Ok(DBOp::Iter),
+            7 => {
                 let prefix = u.arbitrary::<Vec<u8>>()?;
                 Ok(DBOp::Prefix { prefix })
             }
@@ -139,13 +137,6 @@ fuzz_target!(|data: &[u8]| {
             DBOp::Snapshot => {
                 if let Ok(snap) = db.snapshot() {
                     // Limit number of snapshots to avoid memory explosion
-                    if snapshots.len() < 10 {
-                        snapshots.push(snap);
-                    }
-                }
-            }
-            DBOp::SnapshotConsistent => {
-                if let Ok(snap) = db.snapshot_consistent() {
                     if snapshots.len() < 10 {
                         snapshots.push(snap);
                     }
