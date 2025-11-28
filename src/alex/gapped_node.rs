@@ -143,7 +143,7 @@ impl GappedNode {
             self.num_keys += 1;
         } else if pos < self.keys.len() {
             // No gap - shift to nearest gap and insert
-            self.shift_and_insert(pos, key, value)?;
+            self.shift_and_insert(pos, key, value);
         } else {
             return Err(anyhow::anyhow!("Insert position out of bounds"));
         }
@@ -191,7 +191,7 @@ impl GappedNode {
                 self.num_keys += 1;
             } else if pos < self.keys.len() {
                 // No gap - shift and insert
-                self.shift_and_insert(pos, key, value)?;
+                self.shift_and_insert(pos, key, value);
             }
         }
 
@@ -393,7 +393,7 @@ impl GappedNode {
     }
 
     /// Shift elements to make room and insert
-    fn shift_and_insert(&mut self, pos: usize, key: i64, value: Vec<u8>) -> Result<()> {
+    fn shift_and_insert(&mut self, pos: usize, key: i64, value: Vec<u8>) {
         // Find nearest gap
         let gap_pos = self.find_nearest_gap(pos);
 
@@ -415,8 +415,6 @@ impl GappedNode {
         self.keys[pos] = Some(key);
         self.values[pos] = Some(value);
         self.num_keys += 1;
-
-        Ok(())
     }
 
     /// Check if model needs retraining based on error threshold

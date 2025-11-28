@@ -88,6 +88,7 @@ impl VLogRecord {
     }
 
     /// Decode record from bytes
+    #[allow(clippy::needless_pass_by_value)] // Bytes::slice() creates zero-copy views
     pub fn decode(data: Bytes) -> Result<Self> {
         if data.len() < 12 {
             // Minimum: key_len(4) + value_len(4) + crc(4)

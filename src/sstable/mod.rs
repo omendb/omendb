@@ -1,3 +1,6 @@
+// Public API takes Bytes by value intentionally - O(1) clone, convenient for callers
+#![allow(clippy::needless_pass_by_value)]
+
 pub mod block;
 
 use crate::alex::AlexTree;

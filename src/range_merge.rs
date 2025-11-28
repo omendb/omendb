@@ -119,11 +119,7 @@ where
     }
 
     #[inline]
-    fn resolve_merges(
-        &self,
-        key: &Bytes,
-        base: Option<&Bytes>,
-    ) -> Result<Entry, Box<dyn std::error::Error + Send + Sync>> {
+    fn resolve_merges(&self, key: &Bytes, base: Option<&Bytes>) -> Entry {
         if let Some(op) = &self.merge_operator {
             // Operands are stored newest-first (as we encountered them), but MergeOperator
             // typically expects them in chronological order (oldest-first) to apply them correctly.
@@ -138,17 +134,17 @@ where
                 .collect();
 
             match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
-                Some(res) => Ok(Entry::Value(Bytes::from(res))),
-                None => Ok(Entry::Tombstone),
+                Some(res) => Entry::Value(Bytes::from(res)),
+                None => Entry::Tombstone,
             }
         } else {
             // No merge operator - can't resolve.
             // Fallback: return the newest merge operand as if it were a value?
             // Or just fail? existing get() returns the raw bytes.
             if let Some(first) = self.pending_operands.first() {
-                Ok(Entry::Merge(vec![first.clone()]))
+                Entry::Merge(vec![first.clone()])
             } else {
-                Ok(Entry::Tombstone)
+                Entry::Tombstone
             }
         }
     }
@@ -250,19 +246,14 @@ where
                         match next_entry.entry {
                             Entry::Value(val) => {
                                 // Found base value. Resolve.
-                                match self.resolve_merges(&current_key, Some(&val)) {
-                                    Ok(res) => resolved_entry = Some(res),
-                                    Err(e) => return Some(Err(e)),
-                                }
+                                resolved_entry =
+                                    Some(self.resolve_merges(&current_key, Some(&val)));
                                 base_found = true;
                                 break;
                             }
                             Entry::Tombstone => {
                                 // Found base tombstone. Resolve against None.
-                                match self.resolve_merges(&current_key, None) {
-                                    Ok(res) => resolved_entry = Some(res),
-                                    Err(e) => return Some(Err(e)),
-                                }
+                                resolved_entry = Some(self.resolve_merges(&current_key, None));
                                 base_found = true;
                                 break;
                             }
@@ -276,10 +267,7 @@ where
                     if !base_found {
                         // Ran out of versions without finding base Value/Tombstone.
                         // Assume base is None (fresh key).
-                        match self.resolve_merges(&current_key, None) {
-                            Ok(res) => resolved_entry = Some(res),
-                            Err(e) => return Some(Err(e)),
-                        }
+                        resolved_entry = Some(self.resolve_merges(&current_key, None));
                     }
 
                     // Emit result
@@ -391,11 +379,7 @@ where
     }
 
     #[inline]
-    fn resolve_merges(
-        &self,
-        key: &Bytes,
-        base: Option<&Bytes>,
-    ) -> Result<Entry, Box<dyn std::error::Error + Send + Sync>> {
+    fn resolve_merges(&self, key: &Bytes, base: Option<&Bytes>) -> Entry {
         if let Some(op) = &self.merge_operator {
             let ops: Vec<&[u8]> = self
                 .pending_operands
@@ -405,13 +389,13 @@ where
                 .collect();
 
             match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
-                Some(res) => Ok(Entry::Value(Bytes::from(res))),
-                None => Ok(Entry::Tombstone),
+                Some(res) => Entry::Value(Bytes::from(res)),
+                None => Entry::Tombstone,
             }
         } else if let Some(first) = self.pending_operands.first() {
-            Ok(Entry::Merge(vec![first.clone()]))
+            Entry::Merge(vec![first.clone()])
         } else {
-            Ok(Entry::Tombstone)
+            Entry::Tombstone
         }
     }
 }
@@ -502,18 +486,13 @@ where
 
                         match next_entry.entry {
                             Entry::Value(val) => {
-                                match self.resolve_merges(&current_key, Some(&val)) {
-                                    Ok(res) => resolved_entry = Some(res),
-                                    Err(e) => return Some(Err(e)),
-                                }
+                                resolved_entry =
+                                    Some(self.resolve_merges(&current_key, Some(&val)));
                                 base_found = true;
                                 break;
                             }
                             Entry::Tombstone => {
-                                match self.resolve_merges(&current_key, None) {
-                                    Ok(res) => resolved_entry = Some(res),
-                                    Err(e) => return Some(Err(e)),
-                                }
+                                resolved_entry = Some(self.resolve_merges(&current_key, None));
                                 base_found = true;
                                 break;
                             }
@@ -524,10 +503,7 @@ where
                     }
 
                     if !base_found {
-                        match self.resolve_merges(&current_key, None) {
-                            Ok(res) => resolved_entry = Some(res),
-                            Err(e) => return Some(Err(e)),
-                        }
+                        resolved_entry = Some(self.resolve_merges(&current_key, None));
                     }
 
                     if let Some(final_entry) = resolved_entry {

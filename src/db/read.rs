@@ -26,8 +26,8 @@ impl DB {
         let mt = self.memtables[partition].load();
         if let Some(entry) = mt.get_entry(key) {
             match entry {
-                Entry::Value(v) => return self.resolve_merge(key, Some(v), operands, start),
-                Entry::Tombstone => return self.resolve_merge(key, None, operands, start),
+                Entry::Value(v) => return Ok(self.resolve_merge(key, Some(v), &operands, start)),
+                Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
                 Entry::Merge(ops) => {
                     operands.extend(ops.iter().rev().cloned());
                 }
@@ -40,8 +40,8 @@ impl DB {
             let partition_mt = &immutable_partitions[partition];
             if let Some(entry) = partition_mt.get_entry(key) {
                 match entry {
-                    Entry::Value(v) => return self.resolve_merge(key, Some(v), operands, start),
-                    Entry::Tombstone => return self.resolve_merge(key, None, operands, start),
+                    Entry::Value(v) => return Ok(self.resolve_merge(key, Some(v), &operands, start)),
+                    Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
                     Entry::Merge(ops) => {
                         operands.extend(ops.iter().rev().cloned());
                     }
@@ -86,10 +86,10 @@ impl DB {
                     if let Some((data, flag)) = result {
                         match flag {
                             FLAG_INLINE | FLAG_POINTER => {
-                                return self.resolve_merge(key, Some(data), operands, start);
+                                return Ok(self.resolve_merge(key, Some(data), &operands, start));
                             }
                             FLAG_TOMBSTONE => {
-                                return self.resolve_merge(key, None, operands, start);
+                                return Ok(self.resolve_merge(key, None, &operands, start));
                             }
                             FLAG_MERGE => {
                                 let end_key_vec = increment_bytes(key);
@@ -111,7 +111,7 @@ impl DB {
             }
         }
 
-        self.resolve_merge(key, None, operands, start)
+        Ok(self.resolve_merge(key, None, &operands, start))
     }
 
     /// Get a value at a specific sequence number (snapshot isolation).
@@ -235,36 +235,37 @@ impl DB {
         &self,
         key: &[u8],
         base: Option<Bytes>,
-        operands: Vec<Bytes>,
+        operands: &[Bytes],
         start: Instant,
-    ) -> Result<Option<Bytes>> {
+    ) -> Option<Bytes> {
         if operands.is_empty() {
             if !self.options.disable_metrics {
                 self.metrics.record_get(start.elapsed());
             }
-            return Ok(base);
+            return base;
         }
 
         if let Some(ref op) = self.options.merge_operator {
-            let ops_reversed: Vec<&[u8]> = operands.iter().rev().map(std::convert::AsRef::as_ref).collect();
+            let ops_reversed: Vec<&[u8]> =
+                operands.iter().rev().map(std::convert::AsRef::as_ref).collect();
             let base_slice = base.as_ref().map(std::convert::AsRef::as_ref);
 
             if let Some(merged) = op.full_merge(key, base_slice, &ops_reversed) {
                 if !self.options.disable_metrics {
                     self.metrics.record_get(start.elapsed());
                 }
-                Ok(Some(Bytes::from(merged)))
+                Some(Bytes::from(merged))
             } else {
                 if !self.options.disable_metrics {
                     self.metrics.record_get(start.elapsed());
                 }
-                Ok(base)
+                base
             }
         } else {
             if !self.options.disable_metrics {
                 self.metrics.record_get(start.elapsed());
             }
-            Ok(base)
+            base
         }
     }
 }

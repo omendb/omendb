@@ -444,7 +444,7 @@ impl DB {
         if should_flush {
             if let Some(ref tx) = self.flush_tx {
                 // Background flush: swap memtable immediately (fast), then signal background thread
-                if self.try_swap_memtable()? {
+                if self.try_swap_memtable() {
                     // Successfully swapped - signal background thread to build SSTable
                     debug!("Memtable swapped, signaling background flush");
                     let _ = tx.send(FlushTask::Flush);
@@ -479,7 +479,7 @@ impl DB {
         if should_flush {
             if let Some(ref tx) = self.flush_tx {
                 // Background flush: swap memtable immediately (fast), then signal background thread
-                if self.try_swap_memtable()? {
+                if self.try_swap_memtable() {
                     // Successfully swapped - signal background thread to build SSTable
                     debug!("Memtable swapped, signaling background flush");
                     let _ = tx.send(FlushTask::Flush);
@@ -507,7 +507,7 @@ impl DB {
         let should_flush = self.memtables.iter().any(|mt| mt.load().should_flush());
         if should_flush {
             if let Some(ref tx) = self.flush_tx {
-                if self.try_swap_memtable()? {
+                if self.try_swap_memtable() {
                     debug!("Memtable swapped, signaling background flush");
                     let _ = tx.send(FlushTask::Flush);
                 }

@@ -82,6 +82,7 @@ impl InternalKey {
     }
 
     /// Decode an `InternalKey` from bytes
+    #[allow(clippy::needless_pass_by_value)] // Bytes::slice() creates zero-copy views
     pub fn decode(bytes: Bytes) -> Option<Self> {
         if bytes.len() < 8 {
             return None;

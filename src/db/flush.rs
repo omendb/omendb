@@ -483,10 +483,10 @@ impl DB {
     ///
     /// Returns true if partitions were successfully swapped (caller should signal background thread)
     /// Returns false if another thread is already flushing (skip signaling)
-    pub(crate) fn try_swap_memtable(&self) -> Result<bool> {
+    pub(crate) fn try_swap_memtable(&self) -> bool {
         // Try to acquire flush lock - if another thread is flushing, return false
         let Ok(_flush_lock) = self.flush_mutex.try_lock() else {
-            return Ok(false); // Another thread is flushing
+            return false; // Another thread is flushing
         };
 
         // Check if immutable_memtables is occupied (LOCK-FREE!)
@@ -497,7 +497,7 @@ impl DB {
 
         if immut_occupied {
             // Another thread's flush is still in progress
-            return Ok(false);
+            return false;
         }
 
         // Safe to swap - immutable_memtables is None
@@ -518,6 +518,6 @@ impl DB {
         self.immutable_memtables
             .store(Arc::new(Some(Arc::new(flushing_partitions))));
 
-        Ok(true) // Successfully swapped
+        true // Successfully swapped
     }
 }

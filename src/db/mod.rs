@@ -243,6 +243,7 @@ impl DB {
     /// - [`DBError::Io`]: Failed to create directory or open files
     /// - [`DBError::Wal`]: WAL corruption detected during recovery
     /// - [`DBError::SSTable`]: `SSTable` checksum validation failed
+    #[allow(clippy::needless_pass_by_value)] // Options read extensively then stored
     pub fn open(options: DBOptions) -> Result<Self> {
         info!(
             path = ?options.data_dir,
@@ -778,6 +779,7 @@ impl DB {
     /// - Data bypasses WAL (not crash-safe during load, but `SSTables` are durable once written)
     /// - If `options.already_sorted` is false, all entries are collected and sorted in memory
     /// - For very large datasets, consider loading in chunks or pre-sorting data
+    #[allow(clippy::needless_pass_by_value)] // Small struct, convenient API
     pub fn bulk_load<I, K, V>(&self, entries: I, options: BulkLoadOptions) -> Result<BulkLoadStats>
     where
         I: IntoIterator<Item = (K, V)>,

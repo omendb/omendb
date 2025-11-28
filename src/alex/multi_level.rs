@@ -166,7 +166,7 @@ impl MultiLevelAlexTree {
 
         // For now, just build a single inner node pointing to all leaves
         // This avoids the stack overflow issue
-        let node = InnerNode::build_simple_root(&leaf_keys)?;
+        let node = InnerNode::build_simple_root(&leaf_keys);
 
         Ok(Box::new(node))
     }
@@ -255,7 +255,7 @@ impl MultiLevelAlexTree {
 
         // Update inner nodes if they exist
         if let Some(root) = &mut self.root {
-            root.handle_leaf_split(leaf_idx, split_key, self.leaves.len() - 1)?;
+            root.handle_leaf_split(leaf_idx, split_key, self.leaves.len() - 1);
         }
 
         Ok(())
@@ -288,7 +288,7 @@ impl MultiLevelAlexTree {
 
 impl InnerNode {
     /// Build a simple root node pointing to all leaves
-    fn build_simple_root(leaf_keys: &[(i64, usize)]) -> Result<Self> {
+    fn build_simple_root(leaf_keys: &[(i64, usize)]) -> Self {
         // Train linear model on leaf positions
         let mut model = LinearModel::new();
         model.train(leaf_keys);
@@ -302,13 +302,13 @@ impl InnerNode {
             split_keys.push(leaf_key.0);
         }
 
-        Ok(Self {
+        Self {
             model,
             children: InnerNodeChildren::Leaves(leaf_indices),
             split_keys,
             _num_keys: leaf_keys.len(),
             _level: 0,
-        })
+        }
     }
 
     /// Build inner node from leaf metadata (recursive version - currently unused)
@@ -436,12 +436,7 @@ impl InnerNode {
     }
 
     /// Handle a leaf split by updating the routing structure
-    fn handle_leaf_split(
-        &mut self,
-        old_leaf: usize,
-        split_key: i64,
-        new_leaf: usize,
-    ) -> Result<()> {
+    fn handle_leaf_split(&mut self, old_leaf: usize, split_key: i64, new_leaf: usize) {
         // This is simplified - full implementation would update routing
         // and potentially trigger inner node splits
         match &mut self.children {
@@ -466,8 +461,6 @@ impl InnerNode {
                 // Simplified for initial implementation
             }
         }
-
-        Ok(())
     }
 }
 
