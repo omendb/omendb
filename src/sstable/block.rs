@@ -560,7 +560,7 @@ impl Block {
         entries.get(idx).cloned()
     }
 
-    /// Find first entry whose user_key >= target (strips 8-byte `InternalKey` trailer).
+    /// Find first entry whose `user_key` >= target (strips 8-byte `InternalKey` trailer).
     #[inline]
     pub fn find_lower_bound_by_user_key(&self, user_key: &[u8]) -> Option<(Bytes, Bytes)> {
         let entries = self

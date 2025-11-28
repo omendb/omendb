@@ -531,13 +531,13 @@ impl SSTable {
         Ok(Some((found_key, entry_value)))
     }
 
-    /// Whether this SSTable uses MVCC (has sequence numbers).
+    /// Whether this `SSTable` uses MVCC (has sequence numbers).
     #[inline]
     const fn is_mvcc(&self) -> bool {
         self.max_sequence > 0
     }
 
-    /// Extract user_key from potentially-encoded `InternalKey` bytes.
+    /// Extract `user_key` from potentially-encoded `InternalKey` bytes.
     #[inline]
     fn extract_user_key(key: &[u8]) -> &[u8] {
         if key.len() >= 8 { &key[..key.len() - 8] } else { key }
