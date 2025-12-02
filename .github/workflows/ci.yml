@@ -66,14 +66,23 @@ jobs:
             target
           key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run clippy (no simd)
+      - name: Run clippy (lib)
         run: |
-          cargo clippy --workspace --no-default-features --lib --tests -- \
+          cargo clippy --workspace --no-default-features --lib -- \
             -D clippy::correctness \
             -W clippy::suspicious \
             -W clippy::complexity \
+            -W clippy::pedantic \
             -A clippy::too_many_arguments \
             -A clippy::type_complexity \
+            -A dead_code \
+            -A unused_imports
+
+      - name: Run clippy (tests)
+        run: |
+          cargo clippy --workspace --no-default-features --tests -- \
+            -D clippy::correctness \
+            -W clippy::suspicious \
             -A dead_code \
             -A unused_imports
 

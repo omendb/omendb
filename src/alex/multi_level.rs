@@ -212,30 +212,27 @@ impl MultiLevelAlexTree {
 
     /// Route to the leaf that should contain the key
     fn route_to_leaf(&self, key: i64) -> Result<usize> {
-        // If no inner nodes, route directly
-        if self.root.is_none() {
-            if self.leaves.len() == 1 {
-                return Ok(0);
-            }
+        // If inner nodes exist, traverse them
+        if let Some(root) = &self.root {
+            return root.route_to_leaf(key);
+        }
 
-            // Binary search on leaf boundaries
-            for (i, leaf) in self.leaves.iter().enumerate() {
-                if let Some(max_key) = leaf.max_key() {
-                    if key <= max_key {
-                        return Ok(i);
-                    }
+        // No inner nodes - route directly to leaves
+        if self.leaves.len() == 1 {
+            return Ok(0);
+        }
+
+        // Binary search on leaf boundaries
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            if let Some(max_key) = leaf.max_key() {
+                if key <= max_key {
+                    return Ok(i);
                 }
             }
-
-            // Key goes in last leaf
-            Ok(self.leaves.len() - 1)
-        } else {
-            // Traverse inner nodes
-            self.root
-                .as_ref()
-                .expect("root node exists")
-                .route_to_leaf(key)
         }
+
+        // Key goes in last leaf
+        Ok(self.leaves.len() - 1)
     }
 
     /// Split a leaf node when it's full
