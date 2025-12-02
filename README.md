@@ -12,7 +12,7 @@ Embedded key-value storage integrating learned indexes (ALEX), key-value separat
 
 ```toml
 [dependencies]
-seerdb = "0.0.2"
+seerdb = "0.0.3"
 ```
 
 Requires nightly Rust:
