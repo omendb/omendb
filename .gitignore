@@ -1,6 +1,9 @@
 /target
 fuzz_sstable.log
 
+# Local cargo config (target-cpu=native breaks CI)
+.cargo/config.toml
+
 # Coverage reports
 /coverage
 
