@@ -1,6 +1,6 @@
 [package]
 name = "seerdb"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["seerdb contributors"]
@@ -62,7 +62,9 @@ rocksdb = { version = "0.22", optional = true }
 sled = { version = "0.34", optional = true }
 fjall = { version = "2.3", optional = true }
 anyhow = "1.0.100"
-tikv-jemallocator = "0.6.1"
+# jemalloc with disable_initial_exec_tls to work with Python extensions on Linux
+tikv-jemallocator = { version = "0.6.1" }
+tikv-jemalloc-sys = { version = "0.6.0", features = ["disable_initial_exec_tls"] }
 
 # Optional cloud storage support (S3, GCS, Azure)
 object_store = { version = "0.11", optional = true, default-features = false, features = ["aws", "gcp", "azure"] }
