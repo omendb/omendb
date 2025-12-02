@@ -11,9 +11,65 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Fast checks first (no build deps needed)
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Lint checks
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy (lib)
+        run: |
+          cargo clippy --workspace --no-default-features --lib -- \
+            -D clippy::correctness \
+            -W clippy::suspicious \
+            -W clippy::complexity \
+            -W clippy::pedantic \
+            -A clippy::too_many_arguments \
+            -A clippy::type_complexity \
+            -A dead_code \
+            -A unused_imports
+
+      - name: Clippy (tests)
+        run: |
+          cargo clippy --workspace --no-default-features --tests -- \
+            -D clippy::correctness \
+            -W clippy::suspicious \
+            -A dead_code \
+            -A unused_imports
+
+  # Full test suite
   test:
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    needs: clippy
     strategy:
       matrix:
         include:
@@ -26,13 +82,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -40,77 +97,23 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.toolchain }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Run tests
+        run: cargo test ${{ matrix.features }}
 
-      - name: Run library tests
-        run: cargo test --lib ${{ matrix.features }}
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run clippy (lib)
-        run: |
-          cargo clippy --workspace --no-default-features --lib -- \
-            -D clippy::correctness \
-            -W clippy::suspicious \
-            -W clippy::complexity \
-            -W clippy::pedantic \
-            -A clippy::too_many_arguments \
-            -A clippy::type_complexity \
-            -A dead_code \
-            -A unused_imports
-
-      - name: Run clippy (tests)
-        run: |
-          cargo clippy --workspace --no-default-features --tests -- \
-            -D clippy::correctness \
-            -W clippy::suspicious \
-            -A dead_code \
-            -A unused_imports
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
+  # Documentation
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    needs: fmt
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
