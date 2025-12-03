@@ -242,6 +242,10 @@ impl DB {
         // Build SSTable from sorted entries (MVCC-aware)
         self.build_sstable_from_internal(&sstable_path, all_entries.iter(), flush_sequence)?;
 
+        // Failpoint: crash after SSTable write but before any metadata updates
+        // Test: SSTable orphaned on disk, WAL intact, recovery replays WAL
+        crate::fail_point!("flush::after_sstable_write");
+
         let size = std::fs::metadata(&sstable_path)?.len();
 
         // Track physical bytes written to SSTable
@@ -262,6 +266,10 @@ impl DB {
 
         // Clear immutable partitions + WAL after successful flush (LOCK-FREE!)
         self.immutable_memtables.store(Arc::new(None));
+
+        // Failpoint: crash after SSTable in LSM, before WAL clear
+        // Test: data safe in SSTable, WAL replay is idempotent (finds data already exists)
+        crate::fail_point!("flush::before_wal_clear");
 
         // Now safe to clear WAL (all records written to disk)
         // Note: With PipelinedWAL, we don't need a barrier because put() blocks until WAL write.

@@ -252,6 +252,10 @@ impl WAL {
                 SyncPolicy::SyncData => file.sync_data()?,
                 SyncPolicy::None => {}
             }
+
+            // Failpoint: crash after WAL sync, before returning to caller
+            // Test: WAL data durable, but caller doesn't know - recovery replays
+            crate::fail_point!("wal::after_sync");
         }
 
         Ok(offsets)

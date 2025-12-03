@@ -140,6 +140,10 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Failpoint support for deterministic crash testing (must be first for macro availability)
+#[doc(hidden)]
+pub mod failpoint;
+
 // Internal modules (not re-exported, but accessible for tests)
 #[doc(hidden)]
 pub mod alex;

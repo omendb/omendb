@@ -73,6 +73,9 @@ futures = { version = "0.3", optional = true }
 parking_lot = "0.12.5"
 dashmap = "6.1.0"
 
+# Failpoints for deterministic crash testing (test-only)
+fail = { version = "0.5", optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"
@@ -98,6 +101,8 @@ object-store = ["dep:object_store", "dep:url", "dep:futures"]
 baseline-benchmarks = ["dep:rocksdb", "dep:sled", "dep:fjall"]
 # Enable dhat heap profiling (disables jemalloc to avoid conflicts)
 dhat-heap = []
+# Enable failpoints for deterministic crash testing
+failpoints = ["dep:fail"]
 # Note: io_uring support can be added later as opt-in (security concerns)
 
 [[bench]]

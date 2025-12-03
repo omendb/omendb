@@ -1174,6 +1174,10 @@ impl DB {
             )?
         };
 
+        // Failpoint: crash after compaction output written, before LSM update
+        // Test: output orphaned, inputs still in LSM, recovery sees duplicates (idempotent)
+        crate::fail_point!("compaction::after_output_write");
+
         // Track physical bytes written during compaction
         metrics.record_physical_bytes(size);
 
@@ -1310,6 +1314,10 @@ impl DB {
             filter.clone(),
             oldest_snapshot,
         )?;
+
+        // Failpoint: crash after compaction output written, before LSM update
+        // Test: output orphaned, inputs still in LSM, recovery sees duplicates (idempotent)
+        crate::fail_point!("compaction::after_output_write");
 
         // Track physical bytes written during compaction
         metrics.record_physical_bytes(size);
