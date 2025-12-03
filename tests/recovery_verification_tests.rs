@@ -23,7 +23,8 @@ struct VerificationResult {
     missing_keys: Vec<String>,
     extra_keys: Vec<String>,
     corrupted_values: Vec<String>,
-    orphan_files: Vec<PathBuf>,
+    /// SST files when count exceeds tracked SSTables (potential orphans)
+    potential_orphan_files: Vec<PathBuf>,
 }
 
 impl VerificationResult {
@@ -47,7 +48,7 @@ fn verify_state(
         missing_keys: Vec::new(),
         extra_keys: Vec::new(),
         corrupted_values: Vec::new(),
-        orphan_files: Vec::new(),
+        potential_orphan_files: Vec::new(),
     };
 
     // Check all expected keys exist with correct values
@@ -92,7 +93,7 @@ fn verify_state(
             if !expected.contains_key(key) {
                 result
                     .extra_keys
-                    .push(String::from_utf8_lossy(&key).to_string());
+                    .push(String::from_utf8_lossy(key).to_string());
             }
         }
 
@@ -114,7 +115,7 @@ fn verify_state(
         let stats = db.stats();
         if sst_files.len() > stats.total_sstables {
             // More files than tracked - potential orphans
-            result.orphan_files = sst_files;
+            result.potential_orphan_files = sst_files;
         }
     }
 

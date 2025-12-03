@@ -159,6 +159,15 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         header
     }
 
+    /// Insert key into bloom filters (both main and prefix bloom if applicable)
+    #[inline]
+    fn insert_bloom(&mut self, user_key: &[u8]) {
+        self.bloom.insert(user_key);
+        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
+            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
+        }
+    }
+
     pub const fn with_vlog_threshold(mut self, threshold: usize) -> Self {
         self.vlog_threshold = Some(threshold);
         self
@@ -263,10 +272,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         // Extract user key from encoded InternalKey for bloom filter
         // This allows get_mvcc(user_key) to find the entry
         let user_key = InternalKey::extract_user_key(&key);
-        self.bloom.insert(&user_key);
-        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
-        }
+        self.insert_bloom(&user_key);
 
         if !self.data_block.add(&key, &encoded_value) {
             self.flush_data_block()?;
@@ -287,10 +293,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
     }
 
     pub fn add_with_vlog(&mut self, key: Bytes, value: Bytes, vlog: &mut VLog) -> Result<()> {
-        self.bloom.insert(&key);
-        if self.prefix_len > 0 && key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&key[..self.prefix_len]);
-        }
+        self.insert_bloom(&key);
 
         // Use shared helper for vLog handling
         let (data, flag) = handle_vlog_value(&key, value, vlog, self.vlog_threshold)?;
@@ -318,10 +321,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         // Extract user key from encoded InternalKey for bloom filter
         // This allows get_mvcc(user_key) to find the tombstone
         let user_key = InternalKey::extract_user_key(&key);
-        self.bloom.insert(&user_key);
-        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
-        }
+        self.insert_bloom(&user_key);
         let entry = self.encode_entry(&key, FLAG_TOMBSTONE, &[]);
 
         if !self.data_block.add(&key, &entry) {
@@ -345,10 +345,7 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
         // Extract user key from encoded InternalKey for bloom filter
         // This allows get_mvcc(user_key) to find the merge operand
         let user_key = InternalKey::extract_user_key(&key);
-        self.bloom.insert(&user_key);
-        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
-        }
+        self.insert_bloom(&user_key);
         let entry = self.encode_entry(&key, FLAG_MERGE, &operand);
 
         if !self.data_block.add(&key, &entry) {

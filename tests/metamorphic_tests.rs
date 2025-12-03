@@ -317,8 +317,8 @@ fn test_metamorphic_compaction_preserves_results() {
         db.flush().unwrap();
     }
 
-    // Collect state before potential compaction
-    let _before_compaction = collect_all(&db);
+    // Collect state before adding more data
+    let before_more_data = collect_all(&db);
 
     // Force more flushes to potentially trigger compaction
     for batch in 5..10 {
@@ -330,7 +330,18 @@ fn test_metamorphic_compaction_preserves_results() {
         db.flush().unwrap();
     }
 
-    // Verify original keys still correct
+    // Verify original keys still correct (data from before_more_data preserved)
+    let after_more_data = collect_all(&db);
+    for (key, value) in &before_more_data {
+        assert_eq!(
+            after_more_data.get(key),
+            Some(value),
+            "Original key {:?} was lost or corrupted after adding more data",
+            String::from_utf8_lossy(key)
+        );
+    }
+
+    // Also verify via point lookups
     for batch in 0..5 {
         for i in 0..20 {
             let key = format!("key_{:02}_{:04}", batch, i);

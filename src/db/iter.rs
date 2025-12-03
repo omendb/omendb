@@ -168,7 +168,7 @@ impl DB {
         let mut sstables = Vec::new();
 
         // Collect SSTables from all levels using cache
-        // CRITICAL: Iterate L0 SSTables in reverse order (newest first)
+        // CRITICAL: Iterate SSTables in reverse order (newest first) at all levels.
         // This ensures newer SSTables have lower indices in K-way merge,
         // so tombstones in newer SSTables correctly shadow values in older ones.
         for level_idx in 0..lsm_arc.num_levels() {

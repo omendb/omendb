@@ -125,9 +125,8 @@ fn compare_final_state(seerdb_dir: &TempDir, rocksdb_dir: &TempDir, keys: &[Vec<
     };
     let seerdb = SeerDB::open(seer_opts).expect("Failed to reopen seerdb");
 
-    // Reopen RocksDB
-    let mut rocks_opts = Options::default();
-    rocks_opts.create_if_missing(true);
+    // Reopen RocksDB (database must already exist from prior run)
+    let rocks_opts = Options::default();
     let rocksdb = RocksDB::open(&rocks_opts, rocksdb_dir.path()).expect("Failed to reopen RocksDB");
 
     // Compare all keys
