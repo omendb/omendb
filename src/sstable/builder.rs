@@ -315,9 +315,12 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
     }
 
     pub fn add_tombstone(&mut self, key: Bytes) -> Result<()> {
-        self.bloom.insert(&key);
-        if self.prefix_len > 0 && key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&key[..self.prefix_len]);
+        // Extract user key from encoded InternalKey for bloom filter
+        // This allows get_mvcc(user_key) to find the tombstone
+        let user_key = InternalKey::extract_user_key(&key);
+        self.bloom.insert(&user_key);
+        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
+            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
         }
         let entry = self.encode_entry(&key, FLAG_TOMBSTONE, &[]);
 
@@ -339,9 +342,12 @@ impl<W: Read + Write + Seek> SSTableBuilder<W> {
     }
 
     pub fn add_merge(&mut self, key: Bytes, operand: Bytes) -> Result<()> {
-        self.bloom.insert(&key);
-        if self.prefix_len > 0 && key.len() >= self.prefix_len {
-            self.prefix_bloom.insert(&key[..self.prefix_len]);
+        // Extract user key from encoded InternalKey for bloom filter
+        // This allows get_mvcc(user_key) to find the merge operand
+        let user_key = InternalKey::extract_user_key(&key);
+        self.bloom.insert(&user_key);
+        if self.prefix_len > 0 && user_key.len() >= self.prefix_len {
+            self.prefix_bloom.insert(&user_key[..self.prefix_len]);
         }
         let entry = self.encode_entry(&key, FLAG_MERGE, &operand);
 
