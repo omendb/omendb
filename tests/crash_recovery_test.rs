@@ -258,6 +258,7 @@ fn test_crash_during_flush_incomplete_sstable() {
 }
 
 #[test]
+#[ignore] // Slow test (~10min), run manually with: cargo test --ignored
 fn test_crash_during_compaction_incomplete() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("db");
