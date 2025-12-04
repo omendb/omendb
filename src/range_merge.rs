@@ -130,7 +130,10 @@ where
             // Fallback: return the newest merge operand as if it were a value?
             // Or just fail? existing get() returns the raw bytes.
             if let Some(first) = self.pending_operands.first() {
-                Entry::Merge(vec![first.clone()])
+                Entry::Merge {
+                    base: None,
+                    operands: vec![first.clone()],
+                }
             } else {
                 Entry::Tombstone
             }
@@ -189,11 +192,21 @@ where
                     }
                     return Some(Ok((entry.key, entry.entry)));
                 }
-                Entry::Merge(operand) => {
+                Entry::Merge { base, operands } => {
                     // Newest version is a Merge.
                     // We must accumulate all merge operands for this key from older versions.
+                    // Keep newest-first order; resolve_merges will reverse to oldest-first
                     self.pending_operands.clear();
-                    self.pending_operands.extend(operand.iter().rev().cloned());
+                    self.pending_operands.extend(operands.iter().cloned());
+
+                    // If this merge entry already has a base, we can resolve immediately
+                    if let Some(base_val) = base {
+                        let resolved = self.resolve_merges(&current_key, Some(&base_val));
+                        if let Entry::Tombstone = resolved {
+                            continue;
+                        }
+                        return Some(Ok((current_key, resolved)));
+                    }
 
                     // Look ahead in the heap for older versions of THIS key
                     let mut base_found = false;
@@ -245,9 +258,20 @@ where
                                 base_found = true;
                                 break;
                             }
-                            Entry::Merge(op) => {
+                            Entry::Merge {
+                                base: merge_base,
+                                operands: ops,
+                            } => {
                                 // Another merge operand (older). Stack it.
-                                self.pending_operands.extend(op.iter().rev().cloned());
+                                // Keep newest-first order; resolve_merges will reverse
+                                self.pending_operands.extend(ops.iter().cloned());
+                                // If this merge has a base, use it
+                                if let Some(val) = merge_base {
+                                    resolved_entry =
+                                        Some(self.resolve_merges(&current_key, Some(&val)));
+                                    base_found = true;
+                                    break;
+                                }
                             }
                         }
                     } // end inner loop
@@ -381,7 +405,10 @@ where
                 None => Entry::Tombstone,
             }
         } else if let Some(first) = self.pending_operands.first() {
-            Entry::Merge(vec![first.clone()])
+            Entry::Merge {
+                base: None,
+                operands: vec![first.clone()],
+            }
         } else {
             Entry::Tombstone
         }
@@ -434,10 +461,20 @@ where
                     }
                     return Some(Ok((entry.key, entry.entry)));
                 }
-                Entry::Merge(operand) => {
+                Entry::Merge { base, operands } => {
                     // Identical merge logic
+                    // Keep newest-first order; resolve_merges will reverse to oldest-first
                     self.pending_operands.clear();
-                    self.pending_operands.extend(operand.iter().rev().cloned());
+                    self.pending_operands.extend(operands.iter().cloned());
+
+                    // If this merge entry already has a base, we can resolve immediately
+                    if let Some(base_val) = base {
+                        let resolved = self.resolve_merges(&current_key, Some(&base_val));
+                        if let Entry::Tombstone = resolved {
+                            continue;
+                        }
+                        return Some(Ok((current_key, resolved)));
+                    }
 
                     let mut base_found = false;
                     let mut resolved_entry: Option<Entry> = None;
@@ -484,8 +521,19 @@ where
                                 base_found = true;
                                 break;
                             }
-                            Entry::Merge(op) => {
-                                self.pending_operands.extend(op.iter().rev().cloned());
+                            Entry::Merge {
+                                base: merge_base,
+                                operands: ops,
+                            } => {
+                                // Keep newest-first order; resolve_merges will reverse
+                                self.pending_operands.extend(ops.iter().cloned());
+                                // If this merge has a base, use it
+                                if let Some(val) = merge_base {
+                                    resolved_entry =
+                                        Some(self.resolve_merges(&current_key, Some(&val)));
+                                    base_found = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -555,11 +603,17 @@ mod tests {
 
         let iter1 = ok_iter(vec![(
             Bytes::from("a"),
-            Entry::Merge(vec![Bytes::from("op1")]),
+            Entry::Merge {
+                base: None,
+                operands: vec![Bytes::from("op1")],
+            },
         )]);
         let iter2 = ok_iter(vec![(
             Bytes::from("a"),
-            Entry::Merge(vec![Bytes::from("op2")]),
+            Entry::Merge {
+                base: None,
+                operands: vec![Bytes::from("op2")],
+            },
         )]);
 
         let mut merge = KWayMergeIterator::new(vec![iter1, iter2], None).unwrap();
@@ -567,11 +621,11 @@ mod tests {
         // Logic with no operator: returns newest merge operand (op1) as Merge entry
         let result = merge.next().unwrap().unwrap();
         assert_eq!(result.0, Bytes::from("a"));
-        // Our fallback logic returns Entry::Merge(vec!["op1"])
+        // Our fallback logic returns Entry::Merge with operands vec!["op1"]
         match result.1 {
-            Entry::Merge(val) => {
-                assert_eq!(val.len(), 1);
-                assert_eq!(val[0], Bytes::from("op1"));
+            Entry::Merge { base: _, operands } => {
+                assert_eq!(operands.len(), 1);
+                assert_eq!(operands[0], Bytes::from("op1"));
             }
             _ => panic!("Expected Merge entry"),
         }

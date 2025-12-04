@@ -129,19 +129,25 @@ fn apply_merge(
                 if let Some(merged) = op.full_merge(&key, Some(&v), &operands) {
                     Entry::Value(Bytes::from(merged))
                 } else {
-                    // Merge failed, fallback to stack (overwrites value with merge list)
-                    Entry::Merge(vec![operand])
+                    // Merge failed, fallback to stack
+                    Entry::Merge {
+                        base: Some(v),
+                        operands: vec![operand],
+                    }
                 }
             } else {
-                Entry::Merge(vec![operand])
+                Entry::Merge {
+                    base: Some(v),
+                    operands: vec![operand],
+                }
             }
         }
-        Some(Entry::Merge(mut ops)) => {
+        Some(Entry::Merge { base, mut operands }) => {
             if let Some(op) = merge_operator {
-                let pushed = if let Some(last) = ops.last() {
+                let pushed = if let Some(last) = operands.last() {
                     if let Some(merged) = op.partial_merge(&key, last, &operand) {
-                        ops.pop();
-                        ops.push(Bytes::from(merged));
+                        operands.pop();
+                        operands.push(Bytes::from(merged));
                         true
                     } else {
                         false
@@ -150,14 +156,17 @@ fn apply_merge(
                     false
                 };
                 if !pushed {
-                    ops.push(operand);
+                    operands.push(operand);
                 }
             } else {
-                ops.push(operand);
+                operands.push(operand);
             }
-            Entry::Merge(ops)
+            Entry::Merge { base, operands }
         }
-        Some(Entry::Tombstone) | None => Entry::Merge(vec![operand]),
+        Some(Entry::Tombstone) | None => Entry::Merge {
+            base: None,
+            operands: vec![operand],
+        },
     };
     mt.put_entry(key, new_entry);
 }

@@ -28,8 +28,22 @@ impl DB {
             match entry {
                 Entry::Value(v) => return Ok(self.resolve_merge(key, Some(v), &operands, start)),
                 Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
-                Entry::Merge(ops) => {
-                    operands.extend(ops.iter().rev().cloned());
+                Entry::Merge {
+                    base: Some(v),
+                    operands: ops,
+                } => {
+                    // Found base in memtable - resolve immediately
+                    // Keep newest-first order; resolve_merge will reverse to oldest-first
+                    operands.extend(ops.iter().cloned());
+                    return Ok(self.resolve_merge(key, Some(v), &operands, start));
+                }
+                Entry::Merge {
+                    base: None,
+                    operands: ops,
+                } => {
+                    // No base yet - continue searching
+                    // Keep newest-first order; resolve_merge will reverse to oldest-first
+                    operands.extend(ops.iter().cloned());
                 }
             }
         }
@@ -44,8 +58,20 @@ impl DB {
                         return Ok(self.resolve_merge(key, Some(v), &operands, start))
                     }
                     Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
-                    Entry::Merge(ops) => {
-                        operands.extend(ops.iter().rev().cloned());
+                    Entry::Merge {
+                        base: Some(v),
+                        operands: ops,
+                    } => {
+                        // Keep newest-first order; resolve_merge will reverse to oldest-first
+                        operands.extend(ops.iter().cloned());
+                        return Ok(self.resolve_merge(key, Some(v), &operands, start));
+                    }
+                    Entry::Merge {
+                        base: None,
+                        operands: ops,
+                    } => {
+                        // Keep newest-first order; resolve_merge will reverse to oldest-first
+                        operands.extend(ops.iter().cloned());
                     }
                 }
             }
@@ -100,8 +126,37 @@ impl DB {
 
                                 for (k, entry) in iter.flatten() {
                                     if k == key {
-                                        if let Entry::Merge(ops) = entry {
-                                            operands.extend(ops.iter().rev().cloned());
+                                        match entry {
+                                            Entry::Value(v) => {
+                                                // Found base value in SSTable
+                                                return Ok(self.resolve_merge(
+                                                    key,
+                                                    Some(v),
+                                                    &operands,
+                                                    start,
+                                                ));
+                                            }
+                                            Entry::Merge {
+                                                base,
+                                                operands: ops,
+                                            } => {
+                                                // Keep newest-first order; resolve_merge will reverse
+                                                operands.extend(ops.iter().cloned());
+                                                if let Some(v) = base {
+                                                    return Ok(self.resolve_merge(
+                                                        key,
+                                                        Some(v),
+                                                        &operands,
+                                                        start,
+                                                    ));
+                                                }
+                                            }
+                                            Entry::Tombstone => {
+                                                // Found tombstone - resolve with no base
+                                                return Ok(
+                                                    self.resolve_merge(key, None, &operands, start)
+                                                );
+                                            }
                                         }
                                     }
                                 }

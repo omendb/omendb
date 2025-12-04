@@ -187,9 +187,13 @@ pub(crate) fn run_background_flush_partitioned(
                         Entry::Tombstone => {
                             builder.add_tombstone(key.clone())?;
                         }
-                        Entry::Merge(ops) => {
-                            // Store merge operands as individual merge entries
-                            for op in ops {
+                        Entry::Merge { base, operands } => {
+                            // Write base value first if present
+                            if let Some(v) = base {
+                                builder.add_with_vlog(key.clone(), v.clone(), vlog_ref)?;
+                            }
+                            // Then store merge operands
+                            for op in operands {
                                 builder.add_merge(key.clone(), op.clone())?;
                             }
                         }
@@ -229,8 +233,11 @@ pub(crate) fn run_background_flush_partitioned(
                     Entry::Tombstone => {
                         builder.add_tombstone(key.clone())?;
                     }
-                    Entry::Merge(ops) => {
-                        for op in ops {
+                    Entry::Merge { base, operands } => {
+                        if let Some(v) = base {
+                            builder.add_with_vlog(key.clone(), v.clone(), vlog_ref)?;
+                        }
+                        for op in operands {
                             builder.add_merge(key.clone(), op.clone())?;
                         }
                     }
@@ -260,9 +267,11 @@ pub(crate) fn run_background_flush_partitioned(
                         Entry::Tombstone => {
                             builder.add_tombstone(key.clone())?;
                         }
-                        Entry::Merge(ops) => {
-                            // Store merge operands as individual merge entries
-                            for op in ops {
+                        Entry::Merge { base, operands } => {
+                            if let Some(v) = base {
+                                builder.add(key.clone(), v.clone())?;
+                            }
+                            for op in operands {
                                 builder.add_merge(key.clone(), op.clone())?;
                             }
                         }
@@ -297,8 +306,11 @@ pub(crate) fn run_background_flush_partitioned(
                     Entry::Tombstone => {
                         builder.add_tombstone(key.clone())?;
                     }
-                    Entry::Merge(ops) => {
-                        for op in ops {
+                    Entry::Merge { base, operands } => {
+                        if let Some(v) = base {
+                            builder.add(key.clone(), v.clone())?;
+                        }
+                        for op in operands {
                             builder.add_merge(key.clone(), op.clone())?;
                         }
                     }

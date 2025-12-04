@@ -12,7 +12,11 @@ use crate::types::{InternalKey, ValueType};
 pub enum Entry {
     Value(Bytes),
     Tombstone,
-    Merge(Vec<Bytes>),
+    /// Merge operands with optional base value found in same source
+    Merge {
+        base: Option<Bytes>,
+        operands: Vec<Bytes>,
+    },
 }
 
 /// In-memory sorted table for recent writes.
@@ -122,14 +126,21 @@ impl Memtable {
                     if merges.is_empty() {
                         return Some(Entry::Value(entry.value().clone()));
                     }
-                    // Value implies base.
-                    return Some(Entry::Merge(merges));
+                    // Value is the base for merge operands
+                    return Some(Entry::Merge {
+                        base: Some(entry.value().clone()),
+                        operands: merges,
+                    });
                 }
                 ValueType::Deletion => {
                     if merges.is_empty() {
                         return Some(Entry::Tombstone);
                     }
-                    return Some(Entry::Merge(merges));
+                    // Tombstone stops merge chain - no base value
+                    return Some(Entry::Merge {
+                        base: None,
+                        operands: merges,
+                    });
                 }
                 ValueType::Merge => {
                     merges.push(entry.value().clone());
@@ -139,7 +150,11 @@ impl Memtable {
         }
 
         if !merges.is_empty() {
-            return Some(Entry::Merge(merges));
+            // No base found in this memtable - caller should continue searching
+            return Some(Entry::Merge {
+                base: None,
+                operands: merges,
+            });
         }
 
         None
@@ -157,13 +172,13 @@ impl Memtable {
         match entry {
             Entry::Value(v) => self.put(key, v, seq),
             Entry::Tombstone => self.delete(key, seq),
-            Entry::Merge(ops) => {
-                // This is tricky. Writing multiple merges?
-                // Or does db.rs imply resolving them?
-                // If we are putting a resolved Merge, it usually becomes a Value?
-                // But if we put Merge(ops), we write them back.
-                // We'll write them in order.
-                for op in ops {
+            Entry::Merge { base, operands } => {
+                // Write base value first if present
+                if let Some(v) = base {
+                    self.put(key.clone(), v, seq);
+                }
+                // Then write merge operands
+                for op in operands {
                     self.merge(key.clone(), op, seq);
                 }
             }
@@ -260,7 +275,20 @@ impl Memtable {
             if current_user_key.as_ref() != Some(&user_key) {
                 if let Some(uk) = current_user_key.take() {
                     if !merge_operands.is_empty() {
-                        result.push((uk, Entry::Merge(std::mem::take(&mut merge_operands))));
+                        let base = current_entry.take().and_then(|e| {
+                            if let Entry::Value(v) = e {
+                                Some(v)
+                            } else {
+                                None
+                            }
+                        });
+                        result.push((
+                            uk,
+                            Entry::Merge {
+                                base,
+                                operands: std::mem::take(&mut merge_operands),
+                            },
+                        ));
                     } else if let Some(e) = current_entry.take() {
                         result.push((uk, e));
                     }
@@ -270,23 +298,37 @@ impl Memtable {
                 merge_operands.clear();
             }
 
-            // Only take the first (highest seq) entry for each type
-            if current_entry.is_none() && merge_operands.is_empty() {
+            // Process entries for this user key:
+            // - Collect all Merge operands until we find a Value/Tombstone
+            // - Value/Tombstone becomes the base (first one wins, which is newest)
+            if current_entry.is_none() {
                 match ikey.kind {
                     ValueType::Value => current_entry = Some(Entry::Value(entry.value().clone())),
                     ValueType::Deletion => current_entry = Some(Entry::Tombstone),
                     ValueType::Merge => merge_operands.push(entry.value().clone()),
                     ValueType::Log => {}
                 }
-            } else if matches!(ikey.kind, ValueType::Merge) {
-                merge_operands.push(entry.value().clone());
             }
+            // Once we have a base (Value/Tombstone), stop collecting - older entries are superseded
         }
 
         // Emit last key
         if let Some(uk) = current_user_key {
             if !merge_operands.is_empty() {
-                result.push((uk, Entry::Merge(merge_operands)));
+                let base = current_entry.and_then(|e| {
+                    if let Entry::Value(v) = e {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+                result.push((
+                    uk,
+                    Entry::Merge {
+                        base,
+                        operands: merge_operands,
+                    },
+                ));
             } else if let Some(e) = current_entry {
                 result.push((uk, e));
             }
@@ -311,7 +353,20 @@ impl Memtable {
             if current_user_key.as_ref() != Some(&user_key) {
                 if let Some(uk) = current_user_key.take() {
                     if !merge_operands.is_empty() {
-                        result.push((uk, Entry::Merge(std::mem::take(&mut merge_operands))));
+                        let base = current_entry.take().and_then(|e| {
+                            if let Entry::Value(v) = e {
+                                Some(v)
+                            } else {
+                                None
+                            }
+                        });
+                        result.push((
+                            uk,
+                            Entry::Merge {
+                                base,
+                                operands: std::mem::take(&mut merge_operands),
+                            },
+                        ));
                     } else if let Some(e) = current_entry.take() {
                         result.push((uk, e));
                     }
@@ -321,21 +376,36 @@ impl Memtable {
                 merge_operands.clear();
             }
 
-            if current_entry.is_none() && merge_operands.is_empty() {
+            // Process entries for this user key:
+            // - Collect all Merge operands until we find a Value/Tombstone
+            // - Value/Tombstone becomes the base (first one wins, which is newest)
+            if current_entry.is_none() {
                 match ikey.kind {
                     ValueType::Value => current_entry = Some(Entry::Value(entry.value().clone())),
                     ValueType::Deletion => current_entry = Some(Entry::Tombstone),
                     ValueType::Merge => merge_operands.push(entry.value().clone()),
                     ValueType::Log => {}
                 }
-            } else if matches!(ikey.kind, ValueType::Merge) {
-                merge_operands.push(entry.value().clone());
             }
+            // Once we have a base (Value/Tombstone), stop collecting - older entries are superseded
         }
 
         if let Some(uk) = current_user_key {
             if !merge_operands.is_empty() {
-                result.push((uk, Entry::Merge(merge_operands)));
+                let base = current_entry.and_then(|e| {
+                    if let Entry::Value(v) = e {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                });
+                result.push((
+                    uk,
+                    Entry::Merge {
+                        base,
+                        operands: merge_operands,
+                    },
+                ));
             } else if let Some(e) = current_entry {
                 result.push((uk, e));
             }

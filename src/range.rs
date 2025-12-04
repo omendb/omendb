@@ -109,7 +109,13 @@ impl Iterator for RangeIterator {
         let result = self.inner.next().map(|res| {
             res.map(|(key, entry)| match entry {
                 Entry::Value(val) => (key, val),
-                Entry::Merge(val) => (key, val.last().cloned().unwrap_or_default()), // Return last raw operand if unresolved
+                Entry::Merge { base, operands } => {
+                    // Return base if present, otherwise last operand
+                    (
+                        key,
+                        base.unwrap_or_else(|| operands.last().cloned().unwrap_or_default()),
+                    )
+                }
                 Entry::Tombstone => (key, Bytes::new()), // Should be filtered out
             })
             .map_err(|e| e as Box<dyn std::error::Error>)
@@ -196,7 +202,13 @@ impl Iterator for RangeIteratorRev {
         self.inner.next().map(|res| {
             res.map(|(key, entry)| match entry {
                 Entry::Value(val) => (key, val),
-                Entry::Merge(val) => (key, val.last().cloned().unwrap_or_default()),
+                Entry::Merge { base, operands } => {
+                    // Return base if present, otherwise last operand
+                    (
+                        key,
+                        base.unwrap_or_else(|| operands.last().cloned().unwrap_or_default()),
+                    )
+                }
                 Entry::Tombstone => (key, Bytes::new()),
             })
             .map_err(|e| e as Box<dyn std::error::Error>)

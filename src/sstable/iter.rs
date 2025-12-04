@@ -275,7 +275,10 @@ impl Iterator for SSTableRangeIterator {
                         }
                     }
                     FLAG_TOMBSTONE => Entry::Tombstone,
-                    FLAG_MERGE => Entry::Merge(vec![data]),
+                    FLAG_MERGE => Entry::Merge {
+                        base: None,
+                        operands: vec![data],
+                    },
                     _ => continue,
                 };
 
