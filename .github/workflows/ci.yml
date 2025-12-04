@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -65,7 +65,7 @@ jobs:
             -A dead_code \
             -A unused_imports
 
-  # Full test suite
+  # Unit tests (fast, every commit)
   test:
     name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -97,8 +97,9 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.toolchain }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests
-        run: cargo test ${{ matrix.features }}
+      - name: Run unit tests
+        run: cargo test --lib ${{ matrix.features }}
+        timeout-minutes: 10
 
   # Documentation
   docs:
