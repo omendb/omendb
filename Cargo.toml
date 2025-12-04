@@ -81,6 +81,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"
 tempfile = "3.14"
 rand = "0.8"              # Random data generation for soak tests
+libc = "0.2"              # For is_root() check in power failure tests
 
 # Stress testing
 sysinfo = "0.29"          # Resource monitoring (memory, CPU, fd)

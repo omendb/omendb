@@ -26,8 +26,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -413,7 +412,7 @@ fn test_crash_during_compaction() {
         use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
-            memtable_size: 1024 * 64, // 64KB memtable for faster flushes
+            memtable_capacity: 1024 * 64, // 64KB memtable for faster flushes
             ..Default::default()
         };
         let db = DB::open(opts).expect("Failed to open DB");
@@ -473,7 +472,7 @@ fn verify_db_state(data_path: &Path) -> Result<(usize, usize), String> {
         ..Default::default()
     };
 
-    let db = DB::open(opts).map_err(|e| format!("Failed to open DB: {}", e))?;
+    let _db = DB::open(opts).map_err(|e| format!("Failed to open DB: {}", e))?;
 
     // Count SST files
     let sst_count = fs::read_dir(data_path)
