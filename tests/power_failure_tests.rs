@@ -26,6 +26,7 @@
 
 #![cfg(target_os = "linux")]
 
+use seerdb::{DBOptions, DB};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +55,20 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr)
         ))
     }
+}
+
+/// Get device size in sectors
+fn get_sectors(loop_dev: &str) -> Result<u64, String> {
+    let output = run_cmd("blockdev", &["--getsz", loop_dev])?;
+    output
+        .trim()
+        .parse()
+        .map_err(|e| format!("Failed to parse sector count: {}", e))
+}
+
+/// Convert PathBuf to &str with error handling
+fn path_str(path: &Path) -> Result<&str, String> {
+    path.to_str().ok_or_else(|| "Invalid path".to_string())
 }
 
 /// dm-flakey test harness
@@ -102,19 +117,12 @@ impl DmFlakeyHarness {
             .map_err(|e| format!("Failed to set file size: {}", e))?;
 
         // Set up loop device
-        let output = run_cmd(
-            "losetup",
-            &["-f", "--show", self.backing_file.to_str().unwrap()],
-        )?;
+        let output = run_cmd("losetup", &["-f", "--show", path_str(&self.backing_file)?])?;
         let loop_dev = output.trim().to_string();
         self.loop_device = Some(loop_dev.clone());
 
         // Get device size in sectors
-        let size_output = run_cmd("blockdev", &["--getsz", &loop_dev])?;
-        let sectors: u64 = size_output
-            .trim()
-            .parse()
-            .map_err(|e| format!("Failed to parse sector count: {}", e))?;
+        let sectors = get_sectors(&loop_dev)?;
 
         // Create dm-flakey device (starts in normal mode)
         // Table: "0 <sectors> flakey <dev> 0 <up_interval> <down_interval>"
@@ -129,7 +137,7 @@ impl DmFlakeyHarness {
         // Create and mount
         fs::create_dir_all(&self.mount_point)
             .map_err(|e| format!("Failed to create mount point: {}", e))?;
-        run_cmd("mount", &[&dm_path, self.mount_point.to_str().unwrap()])?;
+        run_cmd("mount", &[&dm_path, path_str(&self.mount_point)?])?;
 
         Ok(())
     }
@@ -146,15 +154,11 @@ impl DmFlakeyHarness {
         }
 
         // Unmount first (simulates dirty unmount)
-        let _ = run_cmd("umount", &["-l", self.mount_point.to_str().unwrap()]);
+        let _ = run_cmd("umount", &["-l", path_str(&self.mount_point)?]);
 
         // Reload dm-flakey with drop_writes
         let loop_dev = self.loop_device.as_ref().ok_or("No loop device")?;
-        let size_output = run_cmd("blockdev", &["--getsz", loop_dev])?;
-        let sectors: u64 = size_output
-            .trim()
-            .parse()
-            .map_err(|e| format!("Failed to parse sector count: {}", e))?;
+        let sectors = get_sectors(loop_dev)?;
 
         // Switch to drop_writes mode
         let table = format!("0 {} flakey {} 0 0 3600 1 drop_writes", sectors, loop_dev);
@@ -174,11 +178,7 @@ impl DmFlakeyHarness {
 
         // Reload dm-flakey in normal mode
         let loop_dev = self.loop_device.as_ref().ok_or("No loop device")?;
-        let size_output = run_cmd("blockdev", &["--getsz", loop_dev])?;
-        let sectors: u64 = size_output
-            .trim()
-            .parse()
-            .map_err(|e| format!("Failed to parse sector count: {}", e))?;
+        let sectors = get_sectors(loop_dev)?;
 
         let table = format!("0 {} flakey {} 0 3600 0", sectors, loop_dev);
         run_cmd("dmsetup", &["reload", &self.dm_name, "--table", &table])?;
@@ -187,7 +187,7 @@ impl DmFlakeyHarness {
 
         // Remount
         let dm_path = format!("/dev/mapper/{}", self.dm_name);
-        run_cmd("mount", &[&dm_path, self.mount_point.to_str().unwrap()])?;
+        run_cmd("mount", &[&dm_path, path_str(&self.mount_point)?])?;
 
         self.in_crash_mode = false;
         Ok(())
@@ -195,8 +195,10 @@ impl DmFlakeyHarness {
 
     /// Clean up all resources
     fn cleanup(&mut self) {
-        // Best-effort cleanup
-        let _ = run_cmd("umount", &["-l", self.mount_point.to_str().unwrap()]);
+        // Best-effort cleanup (ignore errors, path_str failure just skips that step)
+        if let Ok(mount_path) = path_str(&self.mount_point) {
+            let _ = run_cmd("umount", &["-l", mount_path]);
+        }
         let _ = run_cmd("dmsetup", &["remove", &self.dm_name]);
         if let Some(ref loop_dev) = self.loop_device {
             let _ = run_cmd("losetup", &["-d", loop_dev]);
@@ -229,7 +231,6 @@ fn test_crash_during_put() {
 
     // Phase 1: Write some data
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -256,7 +257,6 @@ fn test_crash_during_put() {
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -287,9 +287,8 @@ fn test_crash_during_flush() {
     let mut harness = DmFlakeyHarness::new("crash_flush").expect("Failed to create harness");
     harness.setup().expect("Failed to setup harness");
 
-    // Phase 1: Start a flush operation
+    // Phase 1: Write data and flush
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -297,13 +296,14 @@ fn test_crash_during_flush() {
         let db = DB::open(opts).expect("Failed to open DB");
 
         // Write data
+        let value = vec![b'v'; 100];
         for i in 0..200 {
-            db.put(format!("key_{:04}", i).as_bytes(), &vec![b'v'; 100])
+            db.put(format!("key_{:04}", i).as_bytes(), &value)
                 .expect("Put failed");
         }
 
-        // Crash during flush (simulated by crashing right after flush call)
-        // In a real test, we'd use failpoints to crash mid-flush
+        // Crash after flush completes (tests post-flush recovery)
+        // For true mid-flush crash testing, use failpoints
         db.flush().expect("Flush failed");
         harness.simulate_crash().expect("Failed to simulate crash");
     }
@@ -311,7 +311,6 @@ fn test_crash_during_flush() {
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -352,7 +351,6 @@ fn test_repeated_crash_recovery() {
     for cycle in 0..5 {
         // Write phase
         {
-            use seerdb::{DBOptions, DB};
             let opts = DBOptions {
                 data_dir: harness.data_path(),
                 ..Default::default()
@@ -373,7 +371,6 @@ fn test_repeated_crash_recovery() {
 
     // Final verification
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -409,7 +406,6 @@ fn test_crash_during_compaction() {
 
     // Phase 1: Create multiple SSTables to trigger compaction
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             memtable_capacity: 1024 * 64, // 64KB memtable for faster flushes
@@ -418,24 +414,23 @@ fn test_crash_during_compaction() {
         let db = DB::open(opts).expect("Failed to open DB");
 
         // Write enough data to trigger multiple flushes and compaction
+        let value = vec![b'v'; 100];
         for batch in 0..10 {
             for i in 0..100 {
                 let key = format!("batch{}_{:04}", batch, i);
-                db.put(key.as_bytes(), &vec![b'v'; 100])
-                    .expect("Put failed");
+                db.put(key.as_bytes(), &value).expect("Put failed");
             }
             db.flush().expect("Flush failed");
         }
 
-        // Trigger compaction and crash
-        // Note: This may not catch mid-compaction state without failpoints
+        // Crash after flushes (may catch post-compaction state)
+        // For true mid-compaction crash testing, use failpoints
         harness.simulate_crash().expect("Failed to simulate crash");
     }
 
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        use seerdb::{DBOptions, DB};
         let opts = DBOptions {
             data_dir: harness.data_path(),
             ..Default::default()
@@ -465,8 +460,6 @@ fn test_crash_during_compaction() {
 /// Verify helper: print summary of db state after crash
 #[allow(dead_code)]
 fn verify_db_state(data_path: &Path) -> Result<(usize, usize), String> {
-    use seerdb::{DBOptions, DB};
-
     let opts = DBOptions {
         data_dir: data_path.to_path_buf(),
         ..Default::default()

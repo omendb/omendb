@@ -2224,6 +2224,7 @@ dependencies = [
  "foldhash",
  "futures",
  "hdrhistogram",
+ "libc",
  "lz4_flex",
  "object_store",
  "parking_lot 0.12.5",
