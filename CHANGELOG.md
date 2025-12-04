@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **Merge operator bug**: `Put` + `Merge` operations returned incorrect values. Fixed handling of base values in SSTable reads and merge operand ordering throughout the read path.
 - **Tombstone bloom filter bug**: Tombstones and merge operands were incorrectly inserting internal keys (with sequence numbers) into bloom filters, but reads lookup by user key. This caused false negatives where deleted keys could return stale data.
 - **L0 SSTable iteration order**: L0 SSTables were iterated in wrong order during scans, causing tombstones in newer SSTables to not shadow values in older ones. Deleted keys could incorrectly return old values.
 

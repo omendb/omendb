@@ -4,6 +4,7 @@ Research-grade LSM storage engine with learned data structures.
 
 [![Crates.io](https://img.shields.io/crates/v/seerdb.svg)](https://crates.io/crates/seerdb)
 [![Docs.rs](https://docs.rs/seerdb/badge.svg)](https://docs.rs/seerdb)
+[![CI](https://github.com/omendb/seerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/omendb/seerdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 Embedded key-value storage integrating learned indexes (ALEX), key-value separation (WiscKey), and workload-aware compaction from recent systems research.
@@ -12,7 +13,7 @@ Embedded key-value storage integrating learned indexes (ALEX), key-value separat
 
 ```toml
 [dependencies]
-seerdb = "0.0.3"
+seerdb = "0.0.4"
 ```
 
 Requires nightly Rust:
@@ -59,11 +60,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **Learned indexes** (ALEX) for adaptive key distribution
 - **Key-value separation** (WiscKey) for reduced write amplification
+- **Merge operators** for atomic read-modify-write (counters, lists)
 - **OCC transactions** with snapshot isolation
 - **Point-in-time snapshots**
 - **Range queries** and prefix scans
 - **Tiered storage** with S3/GCS/Azure support
 - **Compression** (ZSTD/LZ4) and SIMD optimizations
+
+## Architecture
+
+seerdb is a 7-level LSM tree with:
+
+- **Memtable**: Partitioned skip list (16 partitions) with lock-free reads via `ArcSwap`
+- **WAL**: Write-ahead log with configurable sync policies
+- **SSTable**: Two-level index with ALEX learned index for data blocks, bloom filters, LZ4/ZSTD compression
+- **VLog**: Optional WiscKey-style value log for large values (reduces write amplification)
+- **Compaction**: Dostoevsky-inspired tiered/leveled hybrid with lazy leveling
+
+## Benchmarks
+
+Run benchmarks with:
+
+```bash
+cargo bench                              # All benchmarks
+cargo bench --bench ycsb_benchmark       # YCSB workloads
+cargo bench --bench mixed_workload       # Read/write mix
+```
+
+## Testing
+
+```bash
+cargo test --lib                         # Unit tests (213 tests)
+cargo test                               # All tests including integration
+cargo test --features failpoints         # Crash/recovery tests
+```
 
 ## License
 
