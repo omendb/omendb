@@ -1357,7 +1357,7 @@ fn test_db_with_cloud_storage_backend() {
 
     let options = DBOptions::default()
         .memtable_capacity(1000) // Small to trigger flushes
-        .storage_config(Some(StorageConfig::Custom(store.clone())))
+        .storage_config(StorageConfig::Custom(store.clone()))
         .vlog_threshold(None); // Disable vLog to test non-vLog path
 
     let db = options.open(dir.path()).unwrap();
@@ -1413,7 +1413,7 @@ fn test_db_cloud_storage_with_vlog() {
 
     let options = DBOptions::default()
         .memtable_capacity(1000) // Small to trigger flushes
-        .storage_config(Some(StorageConfig::Custom(store.clone())))
+        .storage_config(StorageConfig::Custom(store.clone()))
         .vlog_threshold(Some(100)); // Enable vLog for large values
 
     let db = options.open(dir.path()).unwrap();
@@ -1484,7 +1484,7 @@ fn test_tiered_storage_cold_tier_compaction() {
         .base_level_size(500) // Very small to trigger compaction quickly
         .size_ratio(2) // Small ratio to trigger compaction faster
         .cold_tier_level(Some(2)) // L2+ goes to cold storage
-        .cold_storage(Some(StorageConfig::Custom(cold_store.clone())))
+        .cold_storage(StorageConfig::Custom(cold_store.clone()))
         .vlog_threshold(None); // Disable vLog for simplicity
 
     let db = options.open(dir.path()).unwrap();
@@ -1545,9 +1545,7 @@ fn test_tiered_storage_options_validation() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
 
-    let options = DBOptions::default()
-        .cold_tier_level(Some(4)) // Set level but no cold storage
-        .cold_storage(None); // No cold storage configured
+    let options = DBOptions::default().cold_tier_level(Some(4)); // Set level but no cold storage configured
 
     // Should open without error (cold tier config is ignored without backend)
     let db = options.open(dir.path()).unwrap();
