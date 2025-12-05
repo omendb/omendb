@@ -157,6 +157,19 @@ fn increment_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Panic Policy
+///
+/// The database uses `expect()` on mutex locks with the intent to panic if a mutex
+/// is poisoned. A poisoned mutex indicates a thread panicked while holding the lock,
+/// which may have left internal data structures in an inconsistent state.
+///
+/// **Rationale**: For a storage engine, data integrity is paramount. If a critical
+/// section panics, continuing with potentially corrupt data could lead to silent
+/// data loss. Crashing immediately allows the database to recover cleanly on restart.
+///
+/// If you need to handle mutex poisoning gracefully (e.g., in a test harness), you
+/// can catch the panic at the thread boundary.
 pub struct DB {
     pub(crate) options: DBOptions,
     pub(crate) wal: Arc<Mutex<WAL>>,

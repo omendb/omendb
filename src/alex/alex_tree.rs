@@ -183,11 +183,18 @@ impl AlexTree {
     /// - leaf[0]: keys < `split_keys`[0]
     /// - leaf[i]: keys in [`split_keys`[i-1], `split_keys`[i])
     /// - leaf[n-1]: keys >= `split_keys`[n-2]
+    ///
+    /// Example with split_keys=[50, 75]:
+    /// - key=40 → Err(0) → leaf 0 (keys < 50)
+    /// - key=50 → Ok(0)  → leaf 1 (keys in [50, 75))
+    /// - key=60 → Err(1) → leaf 1 (keys in [50, 75))
+    /// - key=75 → Ok(1)  → leaf 2 (keys >= 75)
+    /// - key=80 → Err(2) → leaf 2 (keys >= 75)
     fn find_leaf_index(&self, key: i64) -> usize {
         // Binary search for first split_key > key
         match self.split_keys.binary_search(&key) {
             Ok(idx) => idx + 1, // key == split_keys[idx] → in leaf[idx+1]
-            Err(idx) => idx,    // key should be inserted at idx → in leaf[idx]
+            Err(idx) => idx,    // key < split_keys[idx] → in leaf[idx]
         }
     }
 

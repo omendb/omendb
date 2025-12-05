@@ -9,6 +9,7 @@ impl DB {
     /// Apply WAL records to memtable (used by pipelined WAL)
     ///
     /// It applies all records in the batch to the memtable.
+    /// Errors are logged but not propagated since this runs in the commit path.
     pub(crate) fn apply_wal_records(&self, records: &[Record]) {
         for record in records {
             self.apply_single_record(record);
@@ -16,14 +17,20 @@ impl DB {
     }
 
     /// Apply a single WAL record to memtable (used by direct WAL path)
+    ///
+    /// Logs warnings on failure to aid debugging without crashing the write path.
     #[inline]
     fn apply_single_record(&self, record: &Record) {
         match record {
             Record::Put { key, value, seq } => {
-                let _ = self.put_internal(key.clone(), value.clone(), *seq);
+                if let Err(e) = self.put_internal(key.clone(), value.clone(), *seq) {
+                    tracing::warn!(seq = seq, error = %e, "Failed to apply WAL Put record");
+                }
             }
             Record::Delete { key, seq } => {
-                let _ = self.delete_internal(key.clone(), *seq);
+                if let Err(e) = self.delete_internal(key.clone(), *seq) {
+                    tracing::warn!(seq = seq, error = %e, "Failed to apply WAL Delete record");
+                }
             }
             Record::Batch {
                 base_seq,
@@ -31,22 +38,27 @@ impl DB {
             } => {
                 let mut current_seq = *base_seq;
                 for op in operations {
-                    match op {
+                    let result = match op {
                         crate::wal::BatchOp::Put { key, value } => {
-                            let _ = self.put_internal(key.clone(), value.clone(), current_seq);
+                            self.put_internal(key.clone(), value.clone(), current_seq)
                         }
                         crate::wal::BatchOp::Delete { key } => {
-                            let _ = self.delete_internal(key.clone(), current_seq);
+                            self.delete_internal(key.clone(), current_seq)
                         }
                         crate::wal::BatchOp::Merge { key, operand } => {
-                            let _ = self.merge_internal(key.clone(), operand.clone(), current_seq);
+                            self.merge_internal(key.clone(), operand.clone(), current_seq)
                         }
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(seq = current_seq, error = %e, "Failed to apply WAL batch operation");
                     }
                     current_seq += 1;
                 }
             }
             Record::Merge { key, operand, seq } => {
-                let _ = self.merge_internal(key.clone(), operand.clone(), *seq);
+                if let Err(e) = self.merge_internal(key.clone(), operand.clone(), *seq) {
+                    tracing::warn!(seq = seq, error = %e, "Failed to apply WAL Merge record");
+                }
             }
         }
     }
@@ -56,9 +68,23 @@ impl DB {
     /// Implements two types of backpressure:
     /// 1. **L0 Backpressure**: Slows down or stops writes when L0 has too many files (compaction lag)
     /// 2. **Memtable Backpressure**: Stops writes when memtables are full and flush is in progress
+    ///
+    /// Has a timeout to prevent indefinite hangs if background workers fail.
     fn check_write_stall(&self) {
-        // Loop until backpressure is relieved
+        const MAX_STALL_ITERATIONS: u32 = 6000; // ~60 seconds at 10ms sleep
+        let mut iterations = 0;
+
+        // Loop until backpressure is relieved or timeout
         loop {
+            iterations += 1;
+            if iterations > MAX_STALL_ITERATIONS {
+                tracing::error!(
+                    iterations = iterations,
+                    "Write stall timeout exceeded - proceeding to avoid deadlock"
+                );
+                break;
+            }
+
             // Check worker health
             if !self.compaction_healthy.load(Ordering::SeqCst) {
                 tracing::error!(
@@ -185,7 +211,19 @@ impl DB {
 
         // Memory budget enforcement (if configured)
         if let Some(max_memory) = self.options.max_memory_bytes {
+            const MAX_MEMORY_WAIT_ITERATIONS: u32 = 3000; // ~30 seconds at 10ms sleep
+            let mut iterations = 0;
+
             loop {
+                iterations += 1;
+                if iterations > MAX_MEMORY_WAIT_ITERATIONS {
+                    tracing::error!(
+                        iterations = iterations,
+                        "Memory pressure wait timeout - proceeding to avoid deadlock"
+                    );
+                    break;
+                }
+
                 let current_memory = self.estimate_memory_usage();
                 let memory_pressure = (current_memory as f64) / (max_memory as f64);
 

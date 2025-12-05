@@ -76,8 +76,20 @@ impl DB {
         //   - flush() waits for background flush to complete
         //   - DEADLOCK!
         if self.options.background_flush {
+            const MAX_FLUSH_WAIT_ITERATIONS: u32 = 6000; // ~60 seconds at 10ms sleep
+            let mut iterations = 0;
+
             // Wait for any in-progress background flush to complete
             loop {
+                iterations += 1;
+                if iterations > MAX_FLUSH_WAIT_ITERATIONS {
+                    warn!(
+                        iterations = iterations,
+                        "Background flush wait timeout - proceeding anyway"
+                    );
+                    break;
+                }
+
                 let immut_arc = self.immutable_memtables.load();
                 if immut_arc.is_none() {
                     // Background flush completed - safe to proceed
@@ -225,6 +237,10 @@ impl DB {
         }
 
         // Collect entries from ALL partitions FIRST (MVCC-aware: preserves all versions)
+        // NOTE: This collects all entries into memory before sorting. For large memtables
+        // (256MB+), this can cause significant peak memory usage. A streaming k-way merge
+        // would be more memory-efficient since partitions are already sorted.
+        // TODO: Consider streaming k-way merge for memory-constrained environments.
         let mut all_entries: Vec<(InternalKey, Bytes)> = Vec::new();
         for partition_mt in &flushing_partitions {
             for (ikey, value) in partition_mt.iter() {

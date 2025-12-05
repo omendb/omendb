@@ -173,11 +173,21 @@ impl BufferShard {
         global_id - self.frame_offset
     }
 
+    /// Allocate a frame, returning it already pinned to prevent race conditions.
+    ///
+    /// The caller receives a frame with pin_count=1, preventing other threads
+    /// from evicting it before the caller can use it.
     fn allocate_frame(&self) -> Option<FrameId> {
         // 1. Free list
         {
             let mut free = self.free_list.lock();
             if let Some(id) = free.pop() {
+                // Pin before returning to prevent race
+                let local_id = id - self.frame_offset;
+                self.frames[local_id]
+                    .header
+                    .pin_count
+                    .fetch_add(1, Ordering::SeqCst);
                 return Some(id);
             }
         }
@@ -204,6 +214,9 @@ impl BufferShard {
                     continue;
                 }
 
+                // Pin while holding lock to prevent race
+                slot.header.pin_count.fetch_add(1, Ordering::SeqCst);
+
                 // Remove from page table
                 if let Some(old_pid) = *pid_guard {
                     self.page_table.remove(&old_pid);
@@ -211,7 +224,7 @@ impl BufferShard {
 
                 *pid_guard = None; // Mark as invalid/being setup
 
-                // Return global frame ID
+                // Return global frame ID (already pinned)
                 return Some(self.frame_offset + local_victim_id);
             }
         }
@@ -292,18 +305,16 @@ impl BufferPool {
             return Ok(frame_ref);
         }
 
-        // 2. Miss - Allocate frame
+        // 2. Miss - Allocate frame (returned already pinned to prevent race)
         let Some(frame_id) = shard.allocate_frame() else {
             return Err(self.make_capacity_error::<E>());
         };
-
-        // CRITICAL: Pin frame immediately to prevent eviction from stealing it
-        self.pin_frame(frame_id);
+        // Frame is already pinned by allocate_frame - no need to pin again
 
         // 3. Double check page_table (race condition check)
         if let Some(frame_ref) = self.lookup(shard, page_id) {
+            self.unpin(frame_id); // Release our pin
             shard.free_frame(frame_id);
-            self.unpin(frame_id);
             return Ok(frame_ref);
         }
 

@@ -90,11 +90,21 @@ impl LearnedBloomFilter {
 
         self.model = Some(model);
 
-        // Add all positive examples to backup filter to guarantee no false negatives
-        // The model may not learn perfectly with hash-based features, so the backup
-        // filter ensures correctness while the model provides space savings
+        // Only add uncertain/misclassified positives to backup filter for space savings.
+        // The model handles confident predictions, backup catches uncertain cases.
         for key in positive_examples {
-            self.backup_filter.insert(key);
+            let should_add_to_backup =
+                if let Some((prediction, confidence)) = self.predict_with_confidence(key) {
+                    // Add to backup if model predicts "not in set" or has low confidence
+                    !prediction || confidence < self.threshold
+                } else {
+                    // No prediction available - add to be safe
+                    true
+                };
+
+            if should_add_to_backup {
+                self.backup_filter.insert(key);
+            }
         }
     }
 
