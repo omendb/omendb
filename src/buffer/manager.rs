@@ -175,7 +175,7 @@ impl BufferShard {
 
     /// Allocate a frame, returning it already pinned to prevent race conditions.
     ///
-    /// The caller receives a frame with pin_count=1, preventing other threads
+    /// The caller receives a frame with `pin_count=1`, preventing other threads
     /// from evicting it before the caller can use it.
     fn allocate_frame(&self) -> Option<FrameId> {
         // 1. Free list

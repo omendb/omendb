@@ -184,7 +184,7 @@ impl AlexTree {
     /// - leaf[i]: keys in [`split_keys`[i-1], `split_keys`[i])
     /// - leaf[n-1]: keys >= `split_keys`[n-2]
     ///
-    /// Example with split_keys=[50, 75]:
+    /// Example with `split_keys=[50, 75]`:
     /// - key=40 → Err(0) → leaf 0 (keys < 50)
     /// - key=50 → Ok(0)  → leaf 1 (keys in [50, 75))
     /// - key=60 → Err(1) → leaf 1 (keys in [50, 75))
