@@ -4,23 +4,21 @@
 //!
 //! Run with: cargo run --release --example profile_transaction
 
-use seerdb::{DBOptions, SyncPolicy, DB};
-use std::time::{Duration, Instant};
+use seerdb::{DBOptions, SyncPolicy};
+use std::time::Instant;
 use tempfile::tempdir;
 
 fn main() {
     println!("=== Transaction Commit Profiling ===\n");
 
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 128 * 1024 * 1024,
-        wal_sync_policy: SyncPolicy::None,
-        background_compaction: true,
-        background_flush: true,
-        ..Default::default()
-    };
-    let db = DB::open(options).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(128 * 1024 * 1024)
+        .sync_policy(SyncPolicy::None)
+        .background_compaction(true)
+        .background_flush(true)
+        .open(dir.path())
+        .unwrap();
 
     // Pre-populate some data
     for i in 0..1000 {

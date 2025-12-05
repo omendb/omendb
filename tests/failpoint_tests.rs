@@ -13,8 +13,7 @@
 
 #![cfg(feature = "failpoints")]
 
-use seerdb::{DBOptions, SyncPolicy, DB};
-use std::path::PathBuf;
+use seerdb::{DBOptions, SyncPolicy};
 use tempfile::TempDir;
 
 /// Test recovery after crash during flush (after SSTable write, before WAL clear)
@@ -31,14 +30,12 @@ fn test_failpoint_flush_after_sstable_write() {
 
     // Phase 1: Write data and trigger crash during flush
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         // Write some data
         for i in 0..100 {
@@ -61,13 +58,11 @@ fn test_failpoint_flush_after_sstable_write() {
 
     // Phase 2: Recovery - data should be present (from SSTable or WAL replay)
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         // All data should be recoverable
         for i in 0..100 {
@@ -94,14 +89,12 @@ fn test_failpoint_flush_before_wal_clear() {
 
     // Phase 1: Write data and crash before WAL clear
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -120,13 +113,11 @@ fn test_failpoint_flush_before_wal_clear() {
 
     // Phase 2: Recovery - should be idempotent
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         // All data should be present (no duplicates, correct values)
         for i in 0..50 {
@@ -150,15 +141,13 @@ fn test_failpoint_compaction_after_output_write() {
 
     // Phase 1: Create SSTables and trigger compaction crash
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            memtable_capacity: 4096, // Small to trigger compaction
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .memtable_capacity(4096) // Small to trigger compaction
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         // Write and flush multiple batches to create L0 SSTables
         for batch in 0..5 {
@@ -186,13 +175,11 @@ fn test_failpoint_compaction_after_output_write() {
 
     // Phase 2: Recovery - all data should be present
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            background_flush: false,
-            background_compaction: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_flush(false)
+            .background_compaction(false)
+            .open(&db_path)
+            .unwrap();
 
         // All data should be present (from original SSTables or compaction output)
         for batch in 0..5 {
@@ -213,13 +200,11 @@ fn test_failpoint_wal_after_sync() {
 
     // Write data with failpoint after WAL sync
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .background_flush(false)
+            .open(&db_path)
+            .unwrap();
 
         // Write first key normally
         db.put(b"key1", b"value1").unwrap();
@@ -237,12 +222,10 @@ fn test_failpoint_wal_after_sync() {
 
     // Recovery - key2 should be durable (sync completed before panic)
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_flush(false)
+            .open(&db_path)
+            .unwrap();
 
         assert!(db.get(b"key1").unwrap().is_some(), "key1 should exist");
         // key2 might or might not exist depending on exact panic timing

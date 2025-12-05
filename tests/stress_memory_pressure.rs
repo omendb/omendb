@@ -3,7 +3,7 @@
 // Critical for preventing OOM in production
 // Added Nov 14, 2025 for production validation
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -14,15 +14,12 @@ fn test_memory_pressure_80_percent_trigger() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(100 * 1024 * 1024), // 100MB budget
-        memtable_capacity: 20 * 1024 * 1024,       // 20MB per memtable
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(100 * 1024 * 1024))
+        .memtable_capacity(20 * 1024 * 1024)
+        .background_flush(true)
+        .open(&data_dir)
+        .unwrap();
 
     let initial_memory = db.estimate_memory_usage();
     println!("Initial memory: {} bytes", initial_memory);
@@ -149,15 +146,12 @@ fn test_memory_pressure_no_oom() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(50 * 1024 * 1024), // 50MB budget (small)
-        memtable_capacity: 10 * 1024 * 1024,      // 10MB per memtable
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(50 * 1024 * 1024))
+        .memtable_capacity(10 * 1024 * 1024)
+        .background_flush(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write 200K operations (should trigger many flushes)
     let mut max_memory_seen = 0;
@@ -198,15 +192,12 @@ fn test_memory_pressure_recovery() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(80 * 1024 * 1024), // 80MB budget
-        memtable_capacity: 15 * 1024 * 1024,      // 15MB per memtable
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(80 * 1024 * 1024))
+        .memtable_capacity(15 * 1024 * 1024)
+        .background_flush(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Phase 1: Build up memory pressure
     for i in 0..50_000 {
@@ -251,13 +242,10 @@ fn test_memory_pressure_disabled() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: None, // No memory limit
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(None)
+        .open(&data_dir)
+        .unwrap();
 
     // Should be able to write freely
     for i in 0..50_000 {

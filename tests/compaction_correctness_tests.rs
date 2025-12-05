@@ -2,7 +2,7 @@
 // Tests that compaction doesn't lose, duplicate, or corrupt data
 // Critical for data integrity - compaction is the most complex operation
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,15 +19,12 @@ fn test_compaction_no_data_loss() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024, // 512KB memtable (small for faster compaction)
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(512 * 1024) // 512KB memtable (small for faster compaction)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write enough data to trigger multiple flushes and compaction
     let num_keys = 10000;
@@ -66,15 +63,12 @@ fn test_compaction_no_duplicates() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(512 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write data with updates (same key multiple times)
     for round in 0..5 {
@@ -117,15 +111,12 @@ fn test_compaction_preserves_key_ordering() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(512 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write keys in random order
     let keys: Vec<_> = (0..5000).map(|i| format!("key_{:05}", i)).collect();
@@ -158,15 +149,12 @@ fn test_compaction_handles_tombstones() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(512 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write keys
     for i in 0..1000 {
@@ -211,15 +199,12 @@ fn test_compaction_updates_supersede_old_values() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024, // Small for multiple flushes
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(256 * 1024) // Small for multiple flushes
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write initial values
     for i in 0..500 {
@@ -269,15 +254,12 @@ fn test_compaction_across_multiple_levels() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024, // Small to force multi-level
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(256 * 1024) // Small to force multi-level
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write enough data to create multiple levels
     // Each batch goes to a different SSTable
@@ -315,15 +297,12 @@ fn test_compaction_with_overlapping_key_ranges() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(256 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write overlapping key ranges
     // Range 1: key_0000 to key_1000
@@ -378,15 +357,12 @@ fn test_compaction_merges_adjacent_sstables() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(256 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Create multiple small SSTables with adjacent key ranges
     for batch in 0..5 {
@@ -419,15 +395,12 @@ fn test_compaction_handles_empty_levels() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(512 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write data
     for i in 0..1000 {
@@ -451,15 +424,12 @@ fn test_compaction_with_single_key_per_level() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(256 * 1024)
+        .background_flush(true)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
 
     // Write single key, flush, repeat
     for i in 0..10 {
@@ -501,15 +471,14 @@ fn test_compaction_concurrent_reads() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(256 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
 
     // Pre-populate data
     for i in 0..5000 {
@@ -555,15 +524,14 @@ fn test_compaction_concurrent_writes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(256 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
 
     // Pre-populate to trigger compaction
     for i in 0..5000 {
@@ -607,15 +575,14 @@ fn test_compaction_concurrent_deletes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(256 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
 
     // Pre-populate
     for i in 0..5000 {
@@ -658,15 +625,14 @@ fn test_compaction_concurrent_flushes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(256 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
 
     // Trigger initial compaction
     for i in 0..5000 {
@@ -706,15 +672,14 @@ fn test_compaction_concurrent_scans() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 256 * 1024,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(256 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
 
     // Pre-populate
     for i in 0..5000 {

@@ -1,19 +1,16 @@
 use bytes::Bytes;
-use seerdb::{DBOptions, MergeOperator, StringAppendOperator, DB};
+use seerdb::{DBOptions, StringAppendOperator};
 use std::sync::Arc;
 use tempfile::tempdir;
 
 #[test]
 fn test_merge_resolution_in_range_scan() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    // Configure Merge Operator (append with comma)
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .merge_operator(Arc::new(StringAppendOperator::new(',')))
+        .open(dir.path())
+        .unwrap();
 
     // 1. Put base value
     db.put(b"key1", b"val").unwrap();
@@ -43,13 +40,11 @@ fn test_merge_resolution_in_range_scan() {
 #[test]
 fn test_merge_stacking_in_range_scan() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .merge_operator(Arc::new(StringAppendOperator::new(',')))
+        .open(dir.path())
+        .unwrap();
 
     // 1. Merge (no base)
     db.merge(b"list", b"item1").unwrap();

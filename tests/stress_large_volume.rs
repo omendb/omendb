@@ -3,7 +3,7 @@
 // Critical for production scale validation
 // Added Nov 14, 2025 for production validation
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -13,12 +13,7 @@ fn test_500k_sequential_operations() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&data_dir).unwrap();
 
     println!("Writing 250K operations...");
     let write_count = 250_000;
@@ -72,12 +67,7 @@ fn test_many_batches() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&data_dir).unwrap();
 
     println!("Writing 10K batches (50 ops each)...");
 
@@ -121,14 +111,11 @@ fn test_many_flushes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 5 * 1024 * 1024, // 5MB (triggers frequent flushes)
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(5 * 1024 * 1024)
+        .background_flush(true)
+        .open(&data_dir)
+        .unwrap();
 
     println!("Writing 200K operations to trigger multiple flushes...");
 
@@ -181,13 +168,10 @@ fn test_large_keys_and_values() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        vlog_threshold: Some(4096), // Enable vlog for large values
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .vlog_threshold(Some(4096))
+        .open(&data_dir)
+        .unwrap();
 
     println!("Writing 10K large operations...");
 
@@ -226,12 +210,7 @@ fn test_mixed_operations_at_scale() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&data_dir).unwrap();
 
     println!("Running mixed operations at scale...");
 
@@ -292,12 +271,7 @@ fn test_reopens_at_scale() {
     println!("Phase 1: Write 100K operations");
 
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..100_000 {
             let key = format!("reopen_test_{:010}", i);
@@ -311,12 +285,7 @@ fn test_reopens_at_scale() {
     println!("Phase 2: Reopen and write 100K more");
 
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Verify old data
         assert!(db.get(b"reopen_test_0000000000").unwrap().is_some());
@@ -335,12 +304,7 @@ fn test_reopens_at_scale() {
     println!("Phase 3: Final reopen and verify all 200K");
 
     {
-        let opts = DBOptions {
-            data_dir,
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Verify all data (spot check every 10000)
         for i in (0..200_000).step_by(10_000) {

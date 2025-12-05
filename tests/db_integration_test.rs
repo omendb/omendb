@@ -2,21 +2,17 @@
 // Tests full lifecycle: open, write, read, flush, compact, close, recover
 
 use bytes::Bytes;
-use seerdb::wal::SyncPolicy;
+use seerdb::SyncPolicy;
 use seerdb::{DBOptions, DB};
 use tempfile::tempdir;
 
 #[test]
 fn test_db_full_lifecycle() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     // Phase 1: Create DB and write data
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Write 1000 entries
         for i in 0..1000 {
@@ -35,7 +31,7 @@ fn test_db_full_lifecycle() {
 
     // Phase 2: Reopen and verify data persisted
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // All data should be recovered
         for i in 0..1000 {
@@ -49,13 +45,9 @@ fn test_db_full_lifecycle() {
 #[test]
 fn test_db_with_deletes() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Write 100 entries
         for i in 0..100 {
@@ -82,7 +74,7 @@ fn test_db_with_deletes() {
 
     // Reopen and verify deletions persisted
     {
-        let db = DB::open(options).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         for i in 0..100 {
             let key = format!("key_{}", i);
@@ -98,13 +90,9 @@ fn test_db_with_deletes() {
 #[test]
 fn test_db_overwrites() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Write initial values
         for i in 0..50 {
@@ -130,7 +118,7 @@ fn test_db_overwrites() {
 
     // Reopen and verify overwrites persisted
     {
-        let db = DB::open(options).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         for i in 0..50 {
             let key = format!("key_{}", i);
@@ -145,14 +133,12 @@ fn test_db_overwrites() {
 #[test]
 fn test_db_multiple_flushes() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 10 * 1024, // 10KB - small enough to trigger flushes
-        ..Default::default()
-    };
 
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(10 * 1024) // 10KB - small enough to trigger flushes
+            .open(dir.path())
+            .unwrap();
 
         // Write enough data to trigger multiple flushes
         for i in 0..200 {
@@ -171,7 +157,7 @@ fn test_db_multiple_flushes() {
 
     // Reopen and verify data
     {
-        let db = DB::open(options).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         for i in 0..200 {
             let key = format!("key_{:04}", i);
@@ -184,13 +170,9 @@ fn test_db_multiple_flushes() {
 #[test]
 fn test_db_large_values() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Write large values (simulating vector embeddings)
         for i in 0..100 {
@@ -211,15 +193,13 @@ fn test_db_large_values() {
 #[test]
 fn test_db_crash_recovery_with_uncommitted_data() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        wal_sync_policy: SyncPolicy::SyncData,
-        ..Default::default()
-    };
 
     // Simulate crash: write data but don't close cleanly
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData)
+            .open(dir.path())
+            .unwrap();
 
         for i in 0..200 {
             let key = format!("key_{}", i);
@@ -233,7 +213,7 @@ fn test_db_crash_recovery_with_uncommitted_data() {
 
     // Recover from crash
     {
-        let db = DB::open(options).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // All data should be recovered from WAL
         for i in 0..200 {
@@ -252,13 +232,9 @@ fn test_db_crash_recovery_with_uncommitted_data() {
 #[test]
 fn test_db_mixed_operations() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Mixed workload: puts, gets, deletes, overwrites
         for i in 0..100 {
@@ -296,12 +272,8 @@ fn test_db_mixed_operations() {
 #[test]
 fn test_db_empty_database() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Empty database
     assert_eq!(db.get(b"nonexistent").unwrap(), None);
@@ -313,14 +285,10 @@ fn test_db_empty_database() {
 #[ignore] // TODO: Background compaction + reopen - investigate snapshot isolation
 fn test_db_reopen_multiple_times() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
     // Open and close 5 times, accumulating data
     for round in 0..5 {
-        let db = DB::open(options.clone()).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Write 20 keys per round
         for i in 0..20 {
@@ -346,7 +314,7 @@ fn test_db_reopen_multiple_times() {
     }
 
     // Final verification: all 100 keys should exist
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
     for round in 0..5 {
         for i in 0..20 {
             let key = format!("round_{}_{}", round, i);
@@ -359,12 +327,8 @@ fn test_db_reopen_multiple_times() {
 #[test]
 fn test_db_sequential_vs_random_keys() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
 
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Sequential keys
     for i in 0..100 {

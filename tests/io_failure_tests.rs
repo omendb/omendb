@@ -14,11 +14,7 @@ fn test_flush_failure_readonly_directory() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     // Write data
     for i in 0..100 {
@@ -64,11 +60,7 @@ fn test_recovery_after_flush_failure() {
 
     // Write data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -93,11 +85,7 @@ fn test_recovery_after_flush_failure() {
 
     // Reopen - data should be recovered from WAL
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..50 {
             assert!(
@@ -118,12 +106,10 @@ fn test_corrupted_sstable_skipped() {
 
     // Write and flush multiple SSTables
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            memtable_capacity: 1024, // Small to force flushes
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024) // Small to force flushes
+            .open(&data_dir)
+            .unwrap();
 
         // Write first batch
         for i in 0..100 {
@@ -150,11 +136,7 @@ fn test_corrupted_sstable_skipped() {
 
     // Reopen - should handle corrupted SSTable
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         match result {
             Ok(db) => {
@@ -186,11 +168,7 @@ fn test_partial_wal_recovery() {
 
     // Write data without flushing
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -212,11 +190,7 @@ fn test_partial_wal_recovery() {
 
     // Reopen - should recover partial data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         match result {
             Ok(db) => {
@@ -250,11 +224,7 @@ fn test_write_data_despite_wal_issues() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     // Normal writes should work
     for i in 0..50 {
@@ -277,11 +247,7 @@ fn test_operations_after_failed_flush() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     // Write initial data
     for i in 0..50 {
@@ -362,11 +328,7 @@ fn test_missing_sstable_file() {
 
     // Create and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -393,11 +355,7 @@ fn test_missing_sstable_file() {
 
     // Reopen - should handle missing file
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         match result {
             Ok(db) => {
@@ -432,11 +390,7 @@ fn test_error_propagation() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     db.put(b"key", b"value").unwrap();
 

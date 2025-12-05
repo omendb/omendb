@@ -24,11 +24,7 @@ fn test_detect_corrupted_sstable() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -50,12 +46,8 @@ fn test_detect_corrupted_sstable() {
 
     // Reopen - should detect corruption
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
         // DB::open may detect corruption immediately (preferred)
-        match DB::open(opts) {
+        match DB::open(&data_dir) {
             Ok(db) => {
                 // If open succeeded, attempt to read - may detect corruption here
                 let result = db.get(b"key_050");
@@ -86,11 +78,7 @@ fn test_sstable_validate_method() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), &vec![b'v'; 100])
@@ -159,11 +147,7 @@ fn test_corrupted_wal_detection() {
 
     // Write data without flushing
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -185,11 +169,7 @@ fn test_corrupted_wal_detection() {
 
     // Reopen - MUST detect WAL corruption since header is invalid
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         // WAL header validation should fail
         assert!(
@@ -206,11 +186,7 @@ fn test_truncated_sstable() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), &vec![b'v'; 100])
@@ -235,11 +211,7 @@ fn test_truncated_sstable() {
 
     // Reopen - should detect truncation
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         match result {
             Ok(db) => {
@@ -272,11 +244,7 @@ fn test_missing_footer() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         db.put(b"key", b"value").unwrap();
         db.flush().unwrap();
@@ -297,11 +265,7 @@ fn test_missing_footer() {
 
     // Reopen - should fail to load SSTable
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         // Should fail or skip corrupted SSTable
         match result {
@@ -323,11 +287,7 @@ fn test_corrupted_block_header() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -349,13 +309,8 @@ fn test_corrupted_block_header() {
 
     // Try to read - corruption may be detected at open or during reads
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-
         // DB::open may detect corruption immediately (preferred)
-        match DB::open(opts) {
+        match DB::open(&data_dir) {
             Ok(db) => {
                 // If open succeeded, reads may fail
                 for i in 0..100 {
@@ -378,11 +333,7 @@ fn test_wrong_magic_number() {
 
     // Write and flush data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         db.put(b"key", b"value").unwrap();
         db.flush().unwrap();
@@ -400,11 +351,7 @@ fn test_wrong_magic_number() {
 
     // Reopen - should reject file with wrong magic
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DB::open(&data_dir);
 
         // Should fail or skip file with wrong magic
         // This should be caught by SSTable::open()
@@ -431,11 +378,7 @@ fn test_recovery_mode_best_effort_skips_corrupted_wal_records() {
 
     // Write data and simulate crash (no graceful shutdown)
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         // Write 50 records - these go to WAL
         for i in 0..50 {
@@ -465,12 +408,9 @@ fn test_recovery_mode_best_effort_skips_corrupted_wal_records() {
 
     // Reopen with BestEffort - should recover records before corruption
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            recovery_mode: RecoveryMode::BestEffort,
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DBOptions::default()
+            .recovery_mode(RecoveryMode::BestEffort)
+            .open(&data_dir);
 
         assert!(
             result.is_ok(),
@@ -508,11 +448,7 @@ fn test_recovery_mode_strict_fails_on_corrupted_wal() {
 
     // Write data and simulate crash (no graceful shutdown)
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -538,12 +474,9 @@ fn test_recovery_mode_strict_fails_on_corrupted_wal() {
 
     // Reopen with Strict mode - should fail on corruption
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            recovery_mode: RecoveryMode::Strict,
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DBOptions::default()
+            .recovery_mode(RecoveryMode::Strict)
+            .open(&data_dir);
 
         // Should fail on corruption
         match result {
@@ -582,11 +515,7 @@ fn test_recovery_mode_strict_succeeds_on_clean_wal() {
 
     // Write data and simulate crash (no graceful shutdown)
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -598,12 +527,9 @@ fn test_recovery_mode_strict_succeeds_on_clean_wal() {
 
     // Reopen with Strict mode - should succeed with clean WAL
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            recovery_mode: RecoveryMode::Strict,
-            ..Default::default()
-        };
-        let result = DB::open(opts);
+        let result = DBOptions::default()
+            .recovery_mode(RecoveryMode::Strict)
+            .open(&data_dir);
 
         assert!(result.is_ok(), "Strict mode should succeed on clean WAL");
 

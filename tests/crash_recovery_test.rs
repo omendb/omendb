@@ -5,7 +5,7 @@
 // instead of spawning processes (which is complex and flaky)
 
 use bytes::Bytes;
-use seerdb::{DBOptions, SyncPolicy, DB};
+use seerdb::{DBOptions, SyncPolicy};
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -35,11 +35,7 @@ fn test_corrupted_sstable_detected() {
 
     // Create database and write data
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&db_path).unwrap();
 
         // Write enough data to trigger flush
         for i in 0..1000 {
@@ -66,11 +62,7 @@ fn test_corrupted_sstable_detected() {
     corrupt_file(&sstable_path, 100, &[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
 
     // Try to reopen database - should detect corruption
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let result = DB::open(opts);
+    let result = DBOptions::default().open(&db_path);
 
     // Verify corruption was detected
     assert!(
@@ -86,11 +78,7 @@ fn test_corrupted_wal_detected() {
 
     // Create database and write data (without flush - stays in WAL)
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&db_path).unwrap();
 
         for i in 0..100 {
             db.put(
@@ -112,11 +100,7 @@ fn test_corrupted_wal_detected() {
     corrupt_file(&wal_path, 0, b"BAAD").unwrap();
 
     // Try to reopen database - should detect corruption
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let result = DB::open(opts);
+    let result = DBOptions::default().open(&db_path);
 
     // Header corruption must be detected - DB::open should fail
     assert!(
@@ -132,11 +116,7 @@ fn test_truncated_wal_recovery() {
 
     // Create database and write data
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&db_path).unwrap();
 
         for i in 0..50 {
             db.put(
@@ -161,12 +141,7 @@ fn test_truncated_wal_recovery() {
     // - May fail entirely if truncation detection is strict
     // - May recover no data if truncation corrupts critical metadata
     // All outcomes are acceptable as long as we don't panic or corrupt silently
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-
-    match DB::open(opts) {
+    match DBOptions::default().open(&db_path) {
         Ok(db) => {
             // Recovery succeeded - check how much data we recovered
             let count = (0..50)
@@ -192,12 +167,10 @@ fn test_crash_during_flush_incomplete_sstable() {
 
     // Create database and write data
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         for i in 0..500 {
             db.put(
@@ -218,12 +191,10 @@ fn test_crash_during_flush_incomplete_sstable() {
 
     // Write more data (will be in WAL)
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         for i in 500..600 {
             db.put(
@@ -236,11 +207,7 @@ fn test_crash_during_flush_incomplete_sstable() {
     }
 
     // Reopen and verify recovery
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     // All data should be recovered
     for i in 0..600 {
@@ -265,13 +232,10 @@ fn test_crash_during_compaction_incomplete() {
 
     // Create database with multiple SSTables at L0
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            memtable_capacity: 1024, // Small capacity to trigger multiple flushes
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024) // Small capacity to trigger multiple flushes
+            .open(&db_path)
+            .unwrap();
 
         // Write data in batches to create multiple SSTables
         for batch in 0..5 {
@@ -298,11 +262,7 @@ fn test_crash_during_compaction_incomplete() {
 
     // Reopen database (triggers compaction if L0 has 4+ SSTables)
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&db_path).unwrap();
 
         // Verify all data is still accessible
         for batch in 0..5 {
@@ -324,11 +284,7 @@ fn test_crash_during_compaction_incomplete() {
     }
 
     // Verify data integrity after potential compaction
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     for batch in 0..5 {
         for i in 0..100 {

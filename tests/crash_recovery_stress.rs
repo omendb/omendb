@@ -62,11 +62,7 @@ fn test_rapid_crash_cycles() {
     let data_dir = PathBuf::from(temp_dir.path());
 
     for cycle in 0..10 {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Write 10 keys per cycle with cycle-specific values
         for i in 0..10 {
@@ -80,11 +76,7 @@ fn test_rapid_crash_cycles() {
         drop(db);
 
         // Verify all data from this and previous cycles exists
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for c in 0..=cycle {
             for i in 0..10 {
@@ -120,12 +112,12 @@ fn test_concurrent_writes_crash_recovery() {
 
     // Phase 1: Concurrent writes
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = Arc::new(DB::open(opts).unwrap());
+        let db = Arc::new(
+            DBOptions::default()
+                .sync_policy(SyncPolicy::SyncData)
+                .open(&data_dir)
+                .unwrap(),
+        );
 
         let mut handles = vec![];
         for thread_id in 0..4 {
@@ -154,11 +146,7 @@ fn test_concurrent_writes_crash_recovery() {
 
     // Phase 2: Recover and verify
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         let mut found = 0;
         for thread_id in 0..4 {
@@ -195,12 +183,10 @@ fn test_batch_recovery() {
 
     // Write several batches
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData)
+            .open(&data_dir)
+            .unwrap();
 
         for batch_id in 0..10 {
             let mut batch = db.batch();
@@ -217,11 +203,7 @@ fn test_batch_recovery() {
 
     // Recover and verify batches are complete
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for batch_id in 0..10 {
             let mut batch_keys_found = 0;
@@ -251,12 +233,10 @@ fn test_transaction_crash_recovery() {
 
     // Write some committed and uncommitted transactions
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData)
+            .open(&data_dir)
+            .unwrap();
 
         // Committed transaction
         {
@@ -284,11 +264,7 @@ fn test_transaction_crash_recovery() {
 
     // Recover and verify
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Committed should exist
         for i in 0..50 {
@@ -325,13 +301,11 @@ fn test_mixed_operations_stress() {
 
     // Reduced iterations for faster CI (fsync-heavy test)
     for round in 0..2 {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            use_direct_wal: true,
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .direct_wal(true)
+            .sync_policy(SyncPolicy::SyncData)
+            .open(&data_dir)
+            .unwrap();
 
         // Random operations
         for _ in 0..20 {
@@ -389,11 +363,7 @@ fn test_mixed_operations_stress() {
 
         // Verify after last round
         if round == 1 {
-            let opts = DBOptions {
-                data_dir: data_dir.clone(),
-                ..Default::default()
-            };
-            let db = DB::open(opts).unwrap();
+            let db = DBOptions::default().open(&data_dir).unwrap();
             expected
                 .verify(&db)
                 .expect(&format!("Verification failed at round {}", round));
@@ -401,11 +371,7 @@ fn test_mixed_operations_stress() {
     }
 
     // Final verification
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&data_dir).unwrap();
     expected.verify(&db).expect("Final verification failed");
 }
 
@@ -418,13 +384,11 @@ fn test_large_value_recovery() {
     let large_value = vec![0xAB; 1024 * 1024]; // 1MB value
 
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::SyncData,
-            vlog_threshold: Some(1024), // Enable vlog for large values
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData)
+            .vlog_threshold(Some(1024)) // Enable vlog for large values
+            .open(&data_dir)
+            .unwrap();
 
         for i in 0..10 {
             db.put(format!("large_{}", i).as_bytes(), &large_value)
@@ -436,12 +400,10 @@ fn test_large_value_recovery() {
 
     // Recover
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            vlog_threshold: Some(1024),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .vlog_threshold(Some(1024))
+            .open(&data_dir)
+            .unwrap();
 
         for i in 0..10 {
             let value = db
@@ -464,13 +426,11 @@ fn test_recovery_under_memory_pressure() {
     let data_dir = PathBuf::from(temp_dir.path());
 
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            memtable_capacity: 64 * 1024, // 64KB - triggers frequent flushes
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(64 * 1024) // 64KB - triggers frequent flushes
+            .sync_policy(SyncPolicy::SyncData)
+            .open(&data_dir)
+            .unwrap();
 
         // Write enough to trigger multiple flushes
         for i in 0..5000 {
@@ -484,11 +444,7 @@ fn test_recovery_under_memory_pressure() {
 
     // Recover
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..5000 {
             let key = format!("pressure_{:05}", i);

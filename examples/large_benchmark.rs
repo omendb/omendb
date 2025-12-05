@@ -1,5 +1,5 @@
 // Large workload benchmark to test background flush effectiveness
-use seerdb::{DBOptions, SyncPolicy, DB};
+use seerdb::{DBOptions, SyncPolicy};
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -10,17 +10,14 @@ fn bench_writes(name: &str, background_flush: bool) {
     println!("=== {} ===", name);
 
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        memtable_capacity: 128 * 1024 * 1024, // 128MB (triggers ~8 flushes for 1GB)
-        background_flush,
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::None,
-        vlog_threshold: Some(4096),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(128 * 1024 * 1024) // 128MB (triggers ~8 flushes for 1GB)
+        .background_flush(background_flush)
+        .background_compaction(true)
+        .sync_policy(SyncPolicy::None)
+        .vlog_threshold(Some(4096))
+        .open(temp_dir.path())
+        .unwrap();
     let value = vec![0u8; VALUE_SIZE];
 
     println!("Writing {} operations...", NUM_OPERATIONS);
@@ -57,17 +54,14 @@ fn bench_mixed(name: &str, background_flush: bool) {
     println!("=== {} (Mixed 50/50) ===", name);
 
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        memtable_capacity: 128 * 1024 * 1024,
-        background_flush,
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::None,
-        vlog_threshold: Some(4096),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(128 * 1024 * 1024)
+        .background_flush(background_flush)
+        .background_compaction(true)
+        .sync_policy(SyncPolicy::None)
+        .vlog_threshold(Some(4096))
+        .open(temp_dir.path())
+        .unwrap();
     let value = vec![0u8; VALUE_SIZE];
 
     // Pre-populate

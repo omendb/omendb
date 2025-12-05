@@ -34,12 +34,10 @@ fn test_wal_truncated_record_recovery() {
 
     // Write data to WAL
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         // Write 100 records
         for i in 0..100 {
@@ -62,12 +60,7 @@ fn test_wal_truncated_record_recovery() {
     }
 
     // Recovery should succeed and recover most records
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-
-    match DB::open(opts) {
+    match DB::open(&db_path) {
         Ok(db) => {
             // Count recovered records
             let recovered = (0..100)
@@ -110,12 +103,10 @@ fn test_wal_record_body_corruption() {
 
     // Write data
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         for i in 0..50 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -139,12 +130,7 @@ fn test_wal_record_body_corruption() {
     // - May recover records before corruption
     // - May fail entirely
     // - Should NOT silently return corrupted data
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-
-    match DB::open(opts) {
+    match DB::open(&db_path) {
         Ok(db) => {
             // Verify no corrupted values returned
             for i in 0..50 {
@@ -175,12 +161,10 @@ fn test_wal_batch_atomicity() {
 
     // Write batch
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         // Use Batch for atomic write
         let mut batch = db.batch();
@@ -191,11 +175,7 @@ fn test_wal_batch_atomicity() {
     }
 
     // Reopen and verify batch atomicity
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     let present: Vec<bool> = (0..10)
         .map(|i| {
@@ -237,12 +217,10 @@ fn test_flush_sstable_before_wal_clear() {
 
     // Write and flush
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .open(&db_path)
+            .unwrap();
 
         for i in 0..1000 {
             db.put(format!("key_{:04}", i).as_bytes(), b"value")
@@ -261,11 +239,7 @@ fn test_flush_sstable_before_wal_clear() {
     assert!(sstable_exists, "SSTable should exist after flush");
 
     // Reopen and verify all data present
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     for i in 0..1000 {
         assert!(
@@ -287,13 +261,13 @@ fn test_concurrent_flush_sequence_monotonic() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 1024,      // Small to trigger frequent flushes
-        background_compaction: false, // Disable to isolate flush behavior
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(1024) // Small to trigger frequent flushes
+            .background_compaction(false) // Disable to isolate flush behavior
+            .open(&db_path)
+            .unwrap(),
+    );
 
     let write_count = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -335,11 +309,7 @@ fn test_concurrent_flush_sequence_monotonic() {
     drop(db);
 
     // Reopen and verify data integrity
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     // Count recovered keys
     let mut recovered = 0;
@@ -379,13 +349,11 @@ fn test_tombstone_shadows_across_levels() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 1024,     // Small to trigger flushes
-        background_compaction: true, // Enable to trigger compaction
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024) // Small to trigger flushes
+        .background_compaction(true) // Enable to trigger compaction
+        .open(&db_path)
+        .unwrap();
 
     // Write key and flush to L0 (will eventually move to L1+)
     db.put(b"shadowed_key", b"original_value").unwrap();
@@ -415,12 +383,10 @@ fn test_tombstone_shadows_across_levels() {
 
     // Reopen and verify still deleted
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true)
+        .open(&db_path)
+        .unwrap();
 
     assert!(
         db.get(b"shadowed_key").unwrap().is_none(),
@@ -437,13 +403,11 @@ fn test_compaction_preserves_all_data() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 2048,
-        background_compaction: true, // Enable compaction
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(2048)
+        .background_compaction(true) // Enable compaction
+        .open(&db_path)
+        .unwrap();
 
     // Create multiple SSTables with overlapping key ranges
     for batch in 0..5 {
@@ -478,11 +442,7 @@ fn test_compaction_preserves_all_data() {
 
     // Reopen and verify again
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     for batch in 0..5 {
         for i in 0..100 {
@@ -509,12 +469,12 @@ fn test_read_during_memtable_swap() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 4096, // Small to trigger swaps
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(4096) // Small to trigger swaps
+            .open(&db_path)
+            .unwrap(),
+    );
 
     // Pre-populate some keys
     for i in 0..100 {
@@ -583,11 +543,7 @@ fn test_concurrent_put_delete_same_key() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(&db_path).unwrap());
 
     let iterations = 1000;
 
@@ -628,11 +584,7 @@ fn test_concurrent_put_delete_same_key() {
     db.flush().unwrap();
     drop(db);
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     // State should still be consistent
     match db.get(b"contested_key").unwrap() {
@@ -656,13 +608,11 @@ fn test_empty_value_full_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 2048,
-        background_compaction: true, // Enable compaction
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(2048)
+        .background_compaction(true) // Enable compaction
+        .open(&db_path)
+        .unwrap();
 
     // Put empty value
     db.put(b"empty_value_key", b"").unwrap();
@@ -703,11 +653,7 @@ fn test_empty_value_full_lifecycle() {
 
     // Reopen and verify
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     let value = db.get(b"empty_value_key").unwrap();
     assert!(value.is_some(), "Empty value should exist after reopen");
@@ -727,11 +673,7 @@ fn test_key_with_null_bytes() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     // Key with embedded nulls
     let key_with_nulls = b"key\x00with\x00nulls";
@@ -750,11 +692,7 @@ fn test_key_with_null_bytes() {
 
     // Reopen and verify
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     let retrieved = db.get(key_with_nulls).unwrap().unwrap();
     assert_eq!(retrieved.as_ref(), value);
@@ -771,12 +709,10 @@ fn test_value_at_vlog_threshold() {
 
     let threshold = 1024; // 1KB threshold
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        vlog_threshold: Some(threshold),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .vlog_threshold(Some(threshold))
+        .open(&db_path)
+        .unwrap();
 
     // Value exactly at threshold
     let value_at = vec![b'a'; threshold];
@@ -806,12 +742,10 @@ fn test_value_at_vlog_threshold() {
 
     // Reopen and verify
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        vlog_threshold: Some(threshold),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .vlog_threshold(Some(threshold))
+        .open(&db_path)
+        .unwrap();
 
     assert_eq!(db.get(b"key_at").unwrap().unwrap().as_ref(), &value_at[..]);
     assert_eq!(
@@ -833,13 +767,11 @@ fn test_many_versions_same_key() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        memtable_capacity: 4096,
-        background_compaction: true, // Enable compaction
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(4096)
+        .background_compaction(true) // Enable compaction
+        .open(&db_path)
+        .unwrap();
 
     // Write many versions (reduced from 1000 for faster CI)
     for version in 0..100 {
@@ -867,11 +799,7 @@ fn test_many_versions_same_key() {
 
     // Reopen and verify
     drop(db);
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&db_path).unwrap();
 
     let value = db.get(b"versioned_key").unwrap().unwrap();
     assert_eq!(
@@ -894,11 +822,7 @@ fn test_snapshot_consistency_during_writes() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(&db_path).unwrap());
 
     // Write initial data
     for i in 0..100 {
@@ -949,14 +873,12 @@ fn test_persistence_100_keys() {
 
     // Write 100 keys
     {
-        let options = DBOptions {
-            data_dir: path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(options).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&path)
+            .unwrap();
 
         for i in 0..100 {
             let key = format!("v:{}", i);
@@ -968,13 +890,11 @@ fn test_persistence_100_keys() {
 
     // Reopen and verify
     {
-        let options = DBOptions {
-            data_dir: path.clone(),
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(options).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&path)
+            .unwrap();
 
         let mut missing = Vec::new();
         for i in 0..100 {
@@ -1004,14 +924,12 @@ fn test_persistence_multiple_prefixes() {
 
     // Write 100 items with 3 keys each (300 total keys)
     {
-        let options = DBOptions {
-            data_dir: path.clone(),
-            wal_sync_policy: SyncPolicy::SyncAll,
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(options).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncAll)
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&path)
+            .unwrap();
 
         for i in 0..100u64 {
             // Vector data prefix
@@ -1045,13 +963,11 @@ fn test_persistence_multiple_prefixes() {
 
     // Reopen and verify all 300 keys present
     {
-        let options = DBOptions {
-            data_dir: path.clone(),
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(options).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&path)
+            .unwrap();
 
         let mut missing_v = Vec::new();
         let mut missing_m = Vec::new();

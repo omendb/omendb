@@ -1,4 +1,4 @@
-use seerdb::{DBOptions, MergeOperator, DB};
+use seerdb::{DBOptions, MergeOperator};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -46,17 +46,13 @@ impl MergeOperator for StringAppendOperator {
 #[test]
 fn test_merge_lifecycle_integration() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1024 * 1024, // Small
-        ..Default::default()
-    };
-
-    // Register merge operator
-    opts.merge_operator = Some(Arc::new(StringAppendOperator));
 
     {
-        let db = DB::open(opts.clone()).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024 * 1024)
+            .merge_operator(Arc::new(StringAppendOperator))
+            .open(dir.path())
+            .unwrap();
 
         // 1. Initial Put
         db.put(b"key1", b"A").unwrap();
@@ -111,7 +107,11 @@ fn test_merge_lifecycle_integration() {
 
     // 6. Reopen and Verify
     {
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024 * 1024)
+            .merge_operator(Arc::new(StringAppendOperator))
+            .open(dir.path())
+            .unwrap();
         assert_eq!(
             db.get(b"key1").unwrap(),
             Some(bytes::Bytes::from("A,B,C,D"))

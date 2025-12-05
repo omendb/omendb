@@ -1,8 +1,7 @@
 // Stress tests for new APIs: snapshots, iter(), prefix()
 // Tests stability and correctness under load
 
-use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
+use seerdb::DBOptions;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,11 +10,7 @@ use tempfile::TempDir;
 #[test]
 fn test_snapshot_isolation_under_concurrent_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(temp_dir.path()).unwrap());
 
     // Initial data: 100 keys with value "v1"
     for i in 0..100 {
@@ -84,11 +79,7 @@ fn test_snapshot_isolation_under_concurrent_writes() {
 #[test]
 fn test_multiple_snapshots_under_load() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(temp_dir.path()).unwrap());
 
     // Create multiple snapshots at different points
     let mut snapshots = vec![];
@@ -137,11 +128,7 @@ fn test_multiple_snapshots_under_load() {
 #[test]
 fn test_iter_large_dataset() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(temp_dir.path()).unwrap();
 
     // Insert 10K keys
     let num_keys = 10_000;
@@ -177,11 +164,7 @@ fn test_iter_large_dataset() {
 #[test]
 fn test_prefix_scan_correctness() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(temp_dir.path()).unwrap();
 
     // Create keys with different prefixes
     for i in 0..100 {
@@ -214,11 +197,7 @@ fn test_prefix_scan_correctness() {
 #[test]
 fn test_prefix_edge_cases() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(temp_dir.path()).unwrap();
 
     // Test with 0xFF bytes (edge case for increment_bytes)
     db.put(&[0xFF, 0xFF, 0x01], b"val1").unwrap();
@@ -238,11 +217,7 @@ fn test_prefix_edge_cases() {
 #[test]
 fn test_snapshot_range_under_load() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(temp_dir.path()).unwrap());
 
     // Insert ordered data
     for i in 0..1000 {
@@ -281,11 +256,7 @@ fn test_snapshot_range_under_load() {
 #[test]
 fn test_many_concurrent_snapshots() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(temp_dir.path()).unwrap());
 
     // Initial data
     for i in 0..100 {
@@ -328,11 +299,7 @@ fn test_many_concurrent_snapshots() {
 #[test]
 fn test_iter_concurrent_with_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(temp_dir.path()).unwrap());
 
     // Initial data
     for i in 0..500 {
@@ -393,12 +360,10 @@ fn test_iter_concurrent_with_writes() {
 #[test]
 fn test_snapshot_memory_pressure() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024 * 1024, // Small memtable
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024 * 1024)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Create many snapshots (tests memory management)
     let mut snapshots = vec![];

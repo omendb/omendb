@@ -10,7 +10,7 @@
 //! where each operation appears to take effect atomically at some point between
 //! its invocation and response.
 
-use seerdb::{DBOptions, DB};
+use seerdb::DB;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -374,11 +374,7 @@ fn verify_per_key_linearizability(history: &[HistoryEntry]) -> Result<(), String
 #[test]
 fn test_linearizability_single_key_2_threads() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Small test: 2 threads, 10 ops each, 1 key
     let history = run_concurrent_test(&db, 2, 10, 1);
@@ -398,11 +394,7 @@ fn test_linearizability_single_key_2_threads() {
 #[test]
 fn test_linearizability_few_keys_4_threads() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Medium test: 4 threads, 20 ops each, 5 keys
     let history = run_concurrent_test(&db, 4, 20, 5);
@@ -419,11 +411,7 @@ fn test_linearizability_few_keys_4_threads() {
 #[test]
 fn test_linearizability_many_keys_8_threads() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Larger test: 8 threads, 50 ops each, 20 keys
     let history = run_concurrent_test(&db, 8, 50, 20);
@@ -444,11 +432,7 @@ fn test_linearizability_many_keys_8_threads() {
 #[test]
 fn test_linearizability_with_flush() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // First batch of operations
     let history1 = run_concurrent_test(&db, 4, 25, 10);
@@ -475,11 +459,7 @@ fn test_linearizability_with_flush() {
 #[test]
 fn test_linearizability_delete_heavy() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Pre-populate some keys
     for i in 0..5 {

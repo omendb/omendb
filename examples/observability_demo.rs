@@ -1,7 +1,7 @@
 // Demonstration of seerdb observability features
 // Shows metrics collection, structured logging, and health monitoring
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -20,14 +20,11 @@ fn main() {
     let data_dir = PathBuf::from(temp_dir.path());
 
     println!("1. Opening database with observability enabled...");
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        memtable_capacity: 1024 * 1024, // 1MB memtable (triggers frequent flushes)
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024 * 1024) // 1MB memtable (triggers frequent flushes)
+        .background_compaction(true)
+        .open(&data_dir)
+        .unwrap();
     println!("   ✅ Database opened\n");
 
     // === METRICS DEMO ===

@@ -3,7 +3,6 @@
 // Critical for correctness: concurrent writes must not affect in-progress reads
 
 use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -12,11 +11,7 @@ use tempfile::TempDir;
 #[test]
 fn test_read_isolation_during_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Initial state: key exists with value "v1"
     db.put(b"key", b"v1").unwrap();
@@ -69,12 +64,12 @@ fn test_read_isolation_during_writes() {
 #[ignore = "Flaky in CI due to timing sensitivity"]
 fn test_read_isolation_across_flush() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024 * 1024,
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(1024 * 1024)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Populate memtable
     for i in 0..100 {
@@ -124,11 +119,7 @@ fn test_read_isolation_across_flush() {
 #[test]
 fn test_snapshot_isolation_multiple_keys() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Initial state: keys 0-99 exist
     for i in 0..100 {
@@ -195,11 +186,7 @@ fn test_snapshot_isolation_multiple_keys() {
           // See: ai/research/LSM_MVCC_CONCURRENCY_RESEARCH.md
 fn test_concurrent_reads_consistent() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Write initial data
     for i in 0..100 {
@@ -271,11 +258,7 @@ fn test_concurrent_reads_consistent() {
 #[test]
 fn test_delete_snapshot_consistency() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Write keys
     for i in 0..100 {
@@ -333,11 +316,7 @@ fn test_delete_snapshot_consistency() {
 fn test_memtable_atomicity() {
     // Test that memtable updates are atomic - readers see full update or none
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     db.put(b"counter", b"0").unwrap();
 
@@ -381,11 +360,7 @@ fn test_memtable_atomicity() {
 #[test]
 fn test_no_stale_reads_after_flush() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Write and flush
     db.put(b"key", b"v1").unwrap();
@@ -406,11 +381,7 @@ fn test_no_stale_reads_after_flush() {
 #[test]
 fn test_no_stale_reads_after_delete() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Write and flush to SSTable
     db.put(b"key", b"value").unwrap();
@@ -440,11 +411,7 @@ fn test_no_stale_reads_after_delete() {
 fn test_point_in_time_consistency() {
     // Test that a sequence of operations sees consistent point-in-time state
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Initial state: account balances
     db.put(b"account_a", b"100").unwrap();

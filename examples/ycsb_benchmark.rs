@@ -146,16 +146,13 @@ fn setup_db(name: &str) -> (DB, PathBuf) {
     let path = PathBuf::from(format!("/tmp/seerdb_{}", name));
     let _ = std::fs::remove_dir_all(&path);
 
-    let opts = DBOptions {
-        data_dir: path.clone(),
-        memtable_capacity: 64 * 1024 * 1024, // 64MB
-        wal_sync_policy: seerdb::SyncPolicy::None,
-        background_compaction: true,
-        vlog_threshold: Some(4096), // Enable vLog for large values
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).expect("Failed to open database");
+    let db = DBOptions::default()
+        .memtable_capacity(64 * 1024 * 1024) // 64MB
+        .sync_policy(seerdb::SyncPolicy::None)
+        .background_compaction(true)
+        .vlog_threshold(Some(4096)) // Enable vLog for large values
+        .open(&path)
+        .expect("Failed to open database");
     (db, path)
 }
 

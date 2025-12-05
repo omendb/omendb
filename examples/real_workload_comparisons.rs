@@ -15,7 +15,7 @@ use fjall::Config as FjallConfig;
 #[cfg(feature = "baseline-benchmarks")]
 use rocksdb::{Options as RocksDBOptions, DB as RocksDBInstance};
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 
 const WARMUP_OPS: usize = 1_000;
 
@@ -23,13 +23,11 @@ const WARMUP_OPS: usize = 1_000;
 
 fn benchmark_graph_seerdb() -> (Duration, Duration, f64) {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 64 * 1024 * 1024, // 64MB
-        block_cache_capacity: 16_384,
-        ..Default::default()
-    };
-    let db = DB::open(options).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(64 * 1024 * 1024) // 64MB
+        .block_cache_capacity(16_384)
+        .open(dir.path())
+        .unwrap();
 
     // Setup: 10K nodes × 32 edges/node = 320K entries
     let nodes = 10_000;
@@ -164,13 +162,11 @@ fn benchmark_graph_fjall() -> (Duration, Duration) {
 
 fn benchmark_timeseries_seerdb() -> (Duration, Duration, f64) {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 64 * 1024 * 1024,
-        block_cache_capacity: 16_384,
-        ..Default::default()
-    };
-    let db = DB::open(options).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(64 * 1024 * 1024)
+        .block_cache_capacity(16_384)
+        .open(dir.path())
+        .unwrap();
 
     // Setup: 1M time series entries (timestamp → sensor data)
     let entries = 1_000_000;
@@ -338,13 +334,11 @@ fn benchmark_timeseries_fjall() -> (Duration, Duration) {
 
 fn benchmark_random_seerdb() -> (Duration, Duration, f64) {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 64 * 1024 * 1024,
-        block_cache_capacity: 16_384,
-        ..Default::default()
-    };
-    let db = DB::open(options).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(64 * 1024 * 1024)
+        .block_cache_capacity(16_384)
+        .open(dir.path())
+        .unwrap();
 
     // Setup: 500K random key-value pairs
     let entries = 500_000;

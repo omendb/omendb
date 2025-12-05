@@ -18,13 +18,10 @@ fn test_batch_single_wal_record() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        background_flush: false,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(false)
+        .open(&data_dir)
+        .unwrap();
 
     // Create batch with multiple operations
     let mut batch = db.batch();
@@ -39,12 +36,7 @@ fn test_batch_single_wal_record() {
     drop(db);
 
     // Reopen and verify all operations are present (atomicity)
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     assert_eq!(db.get(b"key1").unwrap().as_deref(), Some(&b"value1"[..]));
     assert_eq!(db.get(b"key2").unwrap().as_deref(), Some(&b"value2"[..]));
@@ -56,14 +48,8 @@ fn test_batch_single_wal_record() {
 fn test_batch_mixed_put_delete() {
     // Test batch with mixed put/delete operations
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Pre-populate some keys
     db.put(b"existing1", b"old_value1").unwrap();
@@ -104,14 +90,8 @@ fn test_batch_mixed_put_delete() {
 fn test_batch_empty_handling() {
     // Test that empty batch is a no-op
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Write some data
     db.put(b"key1", b"value1").unwrap();
@@ -130,13 +110,10 @@ fn test_batch_large_1000_operations() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        background_flush: false,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(false)
+        .open(&data_dir)
+        .unwrap();
 
     // Create large batch
     let mut batch = db.batch();
@@ -152,12 +129,7 @@ fn test_batch_large_1000_operations() {
     drop(db);
 
     // Reopen and verify all 1000 keys are present (atomicity)
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     for i in 0..1000 {
         let key = format!("key_{:04}", i);
@@ -180,12 +152,7 @@ fn test_batch_recovery_after_crash() {
 
     // Write batch and simulate crash
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         let mut batch = db.batch();
         batch.put(b"batch_key1", b"batch_value1");
@@ -200,12 +167,7 @@ fn test_batch_recovery_after_crash() {
 
     // Reopen and verify batch was fully recovered
     {
-        let opts = DBOptions {
-            data_dir,
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         // All batch operations should be present
         assert_eq!(
@@ -232,14 +194,8 @@ fn test_batch_recovery_after_crash() {
 fn test_batch_concurrent_multiple_threads() {
     // Test multiple threads submitting batches concurrently
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Spawn 10 threads, each writing 100 batches
     let mut handles = vec![];
@@ -285,14 +241,8 @@ fn test_batch_concurrent_multiple_threads() {
 fn test_batch_interleaved_with_individual_operations() {
     // Test batch operations interleaved with individual put/delete/get
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Spawn threads doing different operations
     let db1 = Arc::clone(&db);
@@ -341,16 +291,14 @@ fn test_batch_interleaved_with_individual_operations() {
 fn test_batch_during_flush() {
     // Test batch write during memtable flush
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 1024 * 1024, // 1MB memtable
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(1024 * 1024)
+            .background_flush(true)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Write enough data to trigger flush
     for i in 0..10000 {
@@ -381,17 +329,15 @@ fn test_batch_during_flush() {
 fn test_batch_during_compaction() {
     // Test batch write during background compaction
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 512 * 1024, // 512KB memtable
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(512 * 1024)
+            .background_flush(true)
+            .background_compaction(true)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Write enough data to trigger compaction
     for i in 0..20000 {
@@ -426,16 +372,12 @@ fn test_batch_write_amplification() {
     // Verify that batch operations are more efficient than individual operations
     // (single WAL write for entire batch)
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 1024 * 1024, // 1MB memtable
-        background_flush: false,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024 * 1024)
+        .background_flush(false)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write 1000 operations as batch (single WAL write)
     let mut batch = db.batch();
@@ -459,12 +401,7 @@ fn test_batch_write_amplification() {
     // Verify batch is atomic - reopen DB to confirm WAL recovery works
     drop(db);
 
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // All 1000 keys should still be present after reopen
     for i in 0..1000 {
@@ -486,16 +423,12 @@ fn test_batch_write_amplification() {
 fn test_batch_larger_than_memtable() {
     // Test batch larger than memtable capacity (should trigger multiple flushes)
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 100 * 1024, // 100KB memtable (small)
-        background_flush: false,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(100 * 1024)
+        .background_flush(false)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Create batch larger than memtable (200KB of data)
     let mut batch = db.batch();
@@ -523,14 +456,8 @@ fn test_batch_larger_than_memtable() {
 fn test_batch_duplicate_keys() {
     // Test batch with duplicate keys (last write wins)
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Batch with duplicate keys
     let mut batch = db.batch();
@@ -562,14 +489,8 @@ fn test_batch_duplicate_keys() {
 fn test_batch_size_limits() {
     // Test that very large batches are handled correctly
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Create 10,000 operation batch (very large)
     let mut batch = db.batch();
@@ -590,16 +511,12 @@ fn test_batch_size_limits() {
 fn test_batch_memory_accounting() {
     // Test that batch memory usage is properly accounted for
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(50 * 1024 * 1024), // 50MB limit
-        background_flush: false,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(50 * 1024 * 1024))
+        .background_flush(false)
+        .open(temp_dir.path())
+        .unwrap();
 
     let mem_before = db.estimate_memory_usage();
 
@@ -628,14 +545,8 @@ fn test_batch_memory_accounting() {
 fn test_batch_with_zero_length_keys() {
     // Test edge case: batch with empty keys
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     let mut batch = db.batch();
     batch.put(b"", b"empty_key_value"); // Empty key

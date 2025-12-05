@@ -2,7 +2,7 @@
 // Tests WAL replay after simulated crashes
 // Critical for durability: data must survive crashes
 
-use seerdb::{DBOptions, SyncPolicy, DB};
+use seerdb::{DBOptions, SyncPolicy};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -13,11 +13,7 @@ fn test_recovery_after_clean_shutdown() {
 
     // Write data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..100 {
             db.put(format!("key_{:03}", i).as_bytes(), b"value")
@@ -29,11 +25,7 @@ fn test_recovery_after_clean_shutdown() {
 
     // Reopen and verify data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..100 {
             assert!(
@@ -54,11 +46,7 @@ fn test_wal_replay_unflushed_writes() {
 
     // Write data WITHOUT flushing
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..50 {
             db.put(
@@ -73,11 +61,7 @@ fn test_wal_replay_unflushed_writes() {
 
     // Reopen and verify WAL replay recovered data
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..50 {
             let value = db
@@ -101,11 +85,7 @@ fn test_wal_replay_with_deletes() {
 
     // Write then delete some keys
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Write 100 keys
         for i in 0..100 {
@@ -123,11 +103,7 @@ fn test_wal_replay_with_deletes() {
 
     // Reopen and verify deletes were replayed
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // First 50 should be deleted
         for i in 0..50 {
@@ -160,11 +136,7 @@ fn test_wal_replay_with_overwrites() {
 
     // Write, overwrite, then crash
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Initial write
         for i in 0..50 {
@@ -181,11 +153,7 @@ fn test_wal_replay_with_overwrites() {
 
     // Reopen and verify latest value is preserved
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..50 {
             let value = db.get(format!("key_{:03}", i).as_bytes()).unwrap().unwrap();
@@ -205,11 +173,7 @@ fn test_recovery_after_flush() {
 
     // Write, flush, write more, crash
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Write and flush
         for i in 0..50 {
@@ -229,11 +193,7 @@ fn test_recovery_after_flush() {
 
     // Reopen and verify both sets
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Flushed data should be in SSTables
         for i in 0..50 {
@@ -263,12 +223,10 @@ fn test_sync_policy_none_may_lose_data() {
 
     // Write with no fsync
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::None,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::None)
+            .open(&data_dir)
+            .unwrap();
 
         db.put(b"key", b"value").unwrap();
 
@@ -277,11 +235,7 @@ fn test_sync_policy_none_may_lose_data() {
 
     // Reopen - data may or may not be present
     // This is acceptable behavior for SyncPolicy::None (performance over durability)
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let _db = DB::open(opts).unwrap();
+    let _db = DBOptions::default().open(&data_dir).unwrap();
 
     // We don't assert data exists because SyncPolicy::None makes no guarantees
     // This test just documents the behavior
@@ -294,12 +248,10 @@ fn test_sync_policy_sync_data_guarantees() {
 
     // Write with SyncData (fsync)
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            wal_sync_policy: SyncPolicy::SyncData,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData)
+            .open(&data_dir)
+            .unwrap();
 
         db.put(b"key", b"value").unwrap();
 
@@ -308,11 +260,7 @@ fn test_sync_policy_sync_data_guarantees() {
 
     // Reopen - data MUST be present
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         assert!(
             db.get(b"key").unwrap().is_some(),
@@ -328,11 +276,7 @@ fn test_multiple_open_close_cycles() {
 
     // Multiple open/close cycles accumulate data
     for cycle in 0..10 {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         // Write data specific to this cycle
         for i in 0..10 {
@@ -350,11 +294,7 @@ fn test_multiple_open_close_cycles() {
 
     // Final reopen - all data should be present
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for cycle in 0..10 {
             for i in 0..10 {
@@ -377,11 +317,7 @@ fn test_recovery_preserves_ordering() {
 
     // Write operations in specific order
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         db.put(b"key", b"v1").unwrap();
         db.put(b"key", b"v2").unwrap();
@@ -393,11 +329,7 @@ fn test_recovery_preserves_ordering() {
 
     // Reopen and verify final state
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         let value = db.get(b"key").unwrap().unwrap();
         assert_eq!(
@@ -416,12 +348,10 @@ fn test_large_wal_replay() {
 
     // Write many operations without flushing
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            memtable_capacity: 10 * 1024 * 1024, // Large to prevent auto-flush
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(10 * 1024 * 1024) // Large to prevent auto-flush
+            .open(&data_dir)
+            .unwrap();
 
         for i in 0..10000 {
             db.put(format!("key_{:05}", i).as_bytes(), &vec![b'v'; 100])
@@ -433,11 +363,7 @@ fn test_large_wal_replay() {
 
     // Reopen and verify all data recovered
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default().open(&data_dir).unwrap();
 
         for i in 0..10000 {
             assert!(

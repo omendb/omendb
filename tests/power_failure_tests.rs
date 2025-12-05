@@ -231,11 +231,7 @@ fn test_crash_during_put() {
 
     // Phase 1: Write some data
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to open DB");
+        let db = DB::open(&harness.data_path()).expect("Failed to open DB");
 
         // Write committed data
         for i in 0..100 {
@@ -257,11 +253,7 @@ fn test_crash_during_put() {
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to reopen DB after crash");
+        let db = DB::open(&harness.data_path()).expect("Failed to reopen DB after crash");
 
         // Committed data should be present
         for i in 0..100 {
@@ -289,11 +281,7 @@ fn test_crash_during_flush() {
 
     // Phase 1: Write data and flush
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to open DB");
+        let db = DB::open(&harness.data_path()).expect("Failed to open DB");
 
         // Write data
         let value = vec![b'v'; 100];
@@ -311,11 +299,7 @@ fn test_crash_during_flush() {
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to reopen DB after crash");
+        let db = DB::open(&harness.data_path()).expect("Failed to reopen DB after crash");
 
         // Count recovered keys
         let mut recovered = 0;
@@ -351,11 +335,7 @@ fn test_repeated_crash_recovery() {
     for cycle in 0..5 {
         // Write phase
         {
-            let opts = DBOptions {
-                data_dir: harness.data_path(),
-                ..Default::default()
-            };
-            let db = DB::open(opts).expect("Failed to open DB");
+            let db = DB::open(&harness.data_path()).expect("Failed to open DB");
 
             for i in 0..50 {
                 let key = format!("cycle{}_{:04}", cycle, i);
@@ -371,11 +351,7 @@ fn test_repeated_crash_recovery() {
 
     // Final verification
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to open DB");
+        let db = DB::open(&harness.data_path()).expect("Failed to open DB");
 
         // All flushed data from all cycles should be present
         for cycle in 0..5 {
@@ -406,12 +382,10 @@ fn test_crash_during_compaction() {
 
     // Phase 1: Create multiple SSTables to trigger compaction
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            memtable_capacity: 1024 * 64, // 64KB memtable for faster flushes
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to open DB");
+        let db = DBOptions::default()
+            .memtable_capacity(1024 * 64) // 64KB memtable for faster flushes
+            .open(&harness.data_path())
+            .expect("Failed to open DB");
 
         // Write enough data to trigger multiple flushes and compaction
         let value = vec![b'v'; 100];
@@ -431,11 +405,7 @@ fn test_crash_during_compaction() {
     // Phase 2: Recover and verify
     harness.recover().expect("Failed to recover");
     {
-        let opts = DBOptions {
-            data_dir: harness.data_path(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).expect("Failed to reopen DB after crash");
+        let db = DB::open(&harness.data_path()).expect("Failed to reopen DB after crash");
 
         // Verify all data is intact
         let mut found = 0;
@@ -460,12 +430,7 @@ fn test_crash_during_compaction() {
 /// Verify helper: print summary of db state after crash
 #[allow(dead_code)]
 fn verify_db_state(data_path: &Path) -> Result<(usize, usize), String> {
-    let opts = DBOptions {
-        data_dir: data_path.to_path_buf(),
-        ..Default::default()
-    };
-
-    let _db = DB::open(opts).map_err(|e| format!("Failed to open DB: {}", e))?;
+    let _db = DB::open(data_path).map_err(|e| format!("Failed to open DB: {}", e))?;
 
     // Count SST files
     let sst_count = fs::read_dir(data_path)

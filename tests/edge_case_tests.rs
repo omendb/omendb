@@ -1,15 +1,10 @@
 use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
 fn test_empty_value() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Empty value should be valid
     db.put(b"key", b"").unwrap();
@@ -20,11 +15,7 @@ fn test_empty_value() {
     db.flush().unwrap();
     drop(db);
 
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
     let result = db.get(b"key").unwrap();
     assert_eq!(result.as_ref().map(|v| v.as_ref()), Some(&b""[..]));
 }
@@ -32,11 +23,7 @@ fn test_empty_value() {
 #[test]
 fn test_single_byte_key() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Single byte key should work
     db.put(b"k", b"value").unwrap();
@@ -47,11 +34,7 @@ fn test_single_byte_key() {
 #[test]
 fn test_large_key() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // 64KB key (maximum recommended size)
     let large_key = vec![b'k'; 64 * 1024];
@@ -63,11 +46,7 @@ fn test_large_key() {
 #[test]
 fn test_large_value() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // 1MB value
     let large_value = vec![b'v'; 1024 * 1024];
@@ -79,11 +58,7 @@ fn test_large_value() {
 #[test]
 fn test_binary_data_with_null_bytes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Key and value with null bytes
     let key = b"key\x00with\x00nulls";
@@ -97,11 +72,7 @@ fn test_binary_data_with_null_bytes() {
     db.flush().unwrap();
     drop(db);
 
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
     let result = db.get(key).unwrap();
     assert_eq!(result.as_ref().map(|v| v.as_ref()), Some(&value[..]));
 }
@@ -109,11 +80,7 @@ fn test_binary_data_with_null_bytes() {
 #[test]
 fn test_special_characters() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Various special characters
     let test_cases = vec![
@@ -138,11 +105,7 @@ fn test_special_characters() {
 #[test]
 fn test_utf8_and_non_utf8() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Valid UTF-8
     let utf8_key = "键🔑".as_bytes();
@@ -161,11 +124,7 @@ fn test_utf8_and_non_utf8() {
 #[test]
 fn test_all_zero_bytes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     let zero_key = vec![0u8; 32];
     let zero_value = vec![0u8; 64];
@@ -178,11 +137,7 @@ fn test_all_zero_bytes() {
 #[test]
 fn test_all_max_bytes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     let max_key = vec![0xFFu8; 32];
     let max_value = vec![0xFFu8; 64];
@@ -195,11 +150,7 @@ fn test_all_max_bytes() {
 #[test]
 fn test_sequential_bytes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Test all possible byte values
     let key: Vec<u8> = (0..=255).collect();
@@ -213,11 +164,7 @@ fn test_sequential_bytes() {
 #[test]
 fn test_many_small_kvs() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // 10,000 small key-value pairs
     for i in 0..10_000 {
@@ -243,11 +190,7 @@ fn test_many_small_kvs() {
 #[test]
 fn test_overwrite_many_times() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Overwrite the same key 1000 times
     for i in 0..1000 {
@@ -264,11 +207,7 @@ fn test_overwrite_many_times() {
 #[test]
 fn test_delete_nonexistent() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Deleting a non-existent key should not error
     db.delete(b"nonexistent").unwrap();
@@ -281,11 +220,7 @@ fn test_delete_nonexistent() {
 #[test]
 fn test_delete_then_reinsert() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Put, delete, put again
     db.put(b"key", b"value1").unwrap();
@@ -299,11 +234,7 @@ fn test_delete_then_reinsert() {
     db.flush().unwrap();
     drop(db);
 
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
     let result = db.get(b"key").unwrap();
     assert_eq!(result.as_ref().map(|v| v.as_ref()), Some(&b"value2"[..]));
 }
@@ -311,11 +242,7 @@ fn test_delete_then_reinsert() {
 #[test]
 fn test_rapid_put_delete_cycles() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Rapidly cycle put/delete 100 times
     for i in 0..100 {
@@ -336,12 +263,10 @@ fn test_rapid_put_delete_cycles() {
 #[test]
 fn test_boundary_flush_sizes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024, // Very small memtable
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024) // Very small memtable
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write enough to trigger multiple flushes
     for i in 0..100 {
@@ -360,11 +285,7 @@ fn test_boundary_flush_sizes() {
 #[test]
 fn test_identical_keys_different_cases() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Keys are case-sensitive (binary comparison)
     db.put(b"Key", b"value1").unwrap();
@@ -388,11 +309,7 @@ fn test_identical_keys_different_cases() {
 #[test]
 fn test_similar_keys() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Keys that differ by one character
     db.put(b"user:1", b"alice").unwrap();

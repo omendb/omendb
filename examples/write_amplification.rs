@@ -1,7 +1,7 @@
 // Measures write amplification with and without vLog (WiscKey value separation)
 // Write amplification = (Bytes written to disk) / (Logical bytes written by user)
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::path::PathBuf;
 
 fn main() {
@@ -59,16 +59,13 @@ fn run_benchmark(num_ops: usize, value_size: usize, vlog_threshold: Option<usize
     let path = PathBuf::from(&temp_dir);
     let _ = std::fs::remove_dir_all(&path);
 
-    let opts = DBOptions {
-        data_dir: path.clone(),
-        memtable_capacity: 4 * 1024 * 1024, // 4MB memtable (smaller to trigger more flushes/compactions)
-        wal_sync_policy: seerdb::SyncPolicy::None, // Fast benchmark mode
-        background_compaction: false,       // Synchronous compaction for deterministic results
-        vlog_threshold,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).expect("Failed to open database");
+    let db = DBOptions::default()
+        .memtable_capacity(4 * 1024 * 1024) // 4MB memtable (smaller to trigger more flushes/compactions)
+        .sync_policy(seerdb::SyncPolicy::None) // Fast benchmark mode
+        .background_compaction(false) // Synchronous compaction for deterministic results
+        .vlog_threshold(vlog_threshold)
+        .open(&path)
+        .expect("Failed to open database");
 
     // Write sequential keys with fixed-size values
     let value = "x".repeat(value_size);

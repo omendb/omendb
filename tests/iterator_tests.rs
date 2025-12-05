@@ -2,17 +2,12 @@
 // Tests: basic iteration, range scans, seeking, edge cases, concurrent modifications
 
 use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
 fn test_empty_iteration() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Empty database should have no entries
     let mut iter = db.iter().unwrap();
@@ -22,11 +17,7 @@ fn test_empty_iteration() {
 #[test]
 fn test_single_item_iteration() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
 
@@ -40,11 +31,7 @@ fn test_single_item_iteration() {
 #[test]
 fn test_ordered_iteration() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Insert out of order
     db.put(b"key3", b"value3").unwrap();
@@ -62,11 +49,7 @@ fn test_ordered_iteration() {
 #[test]
 fn test_range_scan() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Insert keys a-z
     for i in b'a'..=b'z' {
@@ -132,12 +115,10 @@ fn test_seek_to_nonexistent() {
 #[test]
 fn test_iteration_across_sstables() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024, // Small memtable to force multiple SSTables
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write enough data to span multiple SSTables
     for i in 0..1000 {
@@ -156,11 +137,7 @@ fn test_iteration_across_sstables() {
 #[test]
 fn test_iteration_includes_memtable() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Write to SSTable
     db.put(b"key1", b"value1").unwrap();
@@ -177,11 +154,7 @@ fn test_iteration_includes_memtable() {
 #[test]
 fn test_iteration_with_deletes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
     db.put(b"key2", b"value2").unwrap();
@@ -199,11 +172,7 @@ fn test_iteration_with_deletes() {
 #[test]
 fn test_concurrent_iteration_and_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Pre-populate
     for i in 0..100 {
@@ -230,13 +199,11 @@ fn test_concurrent_iteration_and_writes() {
 #[test]
 fn test_iteration_during_compaction() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024,
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024)
+        .background_compaction(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write enough to trigger compaction
     for i in 0..5000 {
@@ -274,11 +241,7 @@ fn test_reverse_iteration() {
 #[test]
 fn test_iterator_invalidation_on_flush() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
 

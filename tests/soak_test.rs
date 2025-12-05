@@ -13,7 +13,7 @@
 //   - test_24hour_soak_extreme: 24 hours continuous operation
 //   - test_100gb_dataset_extreme: 100GB dataset
 
-use seerdb::{DBOptions, SyncPolicy, DB};
+use seerdb::{DBOptions, SyncPolicy};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -96,16 +96,15 @@ fn test_2hour_soak() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::SyncData,
-        memtable_capacity: 16 * 1024 * 1024, // 16MB memtable
-        vlog_threshold: Some(512),           // Use vLog for values >512 bytes
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .background_compaction(true)
+            .sync_policy(SyncPolicy::SyncData)
+            .memtable_capacity(16 * 1024 * 1024) // 16MB memtable
+            .vlog_threshold(Some(512)) // Use vLog for values >512 bytes
+            .open(&db_path)
+            .unwrap(),
+    );
 
     // Shared state for monitoring
     let running = Arc::new(AtomicBool::new(true));
@@ -257,16 +256,15 @@ fn test_24hour_soak_extreme() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::SyncData,
-        memtable_capacity: 16 * 1024 * 1024, // 16MB memtable
-        vlog_threshold: Some(512),           // Use vLog for values >512 bytes
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .background_compaction(true)
+            .sync_policy(SyncPolicy::SyncData)
+            .memtable_capacity(16 * 1024 * 1024) // 16MB memtable
+            .vlog_threshold(Some(512)) // Use vLog for values >512 bytes
+            .open(&db_path)
+            .unwrap(),
+    );
 
     // Shared state for monitoring
     let running = Arc::new(AtomicBool::new(true));
@@ -419,16 +417,13 @@ fn test_1gb_dataset() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::SyncData,
-        memtable_capacity: 64 * 1024 * 1024, // 64MB memtable for faster writes
-        vlog_threshold: Some(512),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true)
+        .sync_policy(SyncPolicy::SyncData)
+        .memtable_capacity(64 * 1024 * 1024) // 64MB memtable for faster writes
+        .vlog_threshold(Some(512))
+        .open(&db_path)
+        .unwrap();
 
     let value = vec![b'x'; VALUE_SIZE];
 
@@ -550,16 +545,13 @@ fn test_10gb_dataset() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::SyncData,
-        memtable_capacity: 64 * 1024 * 1024, // 64MB memtable for faster writes
-        vlog_threshold: Some(512),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true)
+        .sync_policy(SyncPolicy::SyncData)
+        .memtable_capacity(64 * 1024 * 1024) // 64MB memtable for faster writes
+        .vlog_threshold(Some(512))
+        .open(&db_path)
+        .unwrap();
 
     let value = vec![b'x'; VALUE_SIZE];
 
@@ -683,16 +675,13 @@ fn test_100gb_dataset_extreme() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        wal_sync_policy: SyncPolicy::SyncData,
-        memtable_capacity: 64 * 1024 * 1024, // 64MB memtable for faster writes
-        vlog_threshold: Some(512),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true)
+        .sync_policy(SyncPolicy::SyncData)
+        .memtable_capacity(64 * 1024 * 1024) // 64MB memtable for faster writes
+        .vlog_threshold(Some(512))
+        .open(&db_path)
+        .unwrap();
 
     let value = vec![b'x'; VALUE_SIZE];
 

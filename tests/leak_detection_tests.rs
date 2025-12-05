@@ -1,5 +1,4 @@
 use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessExt, System, SystemExt};
 use tempfile::TempDir;
@@ -97,13 +96,11 @@ fn get_thread_count() -> usize {
 #[test]
 fn test_no_memory_leak_sequential_writes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 4 * 1024 * 1024, // 4MB memtable
-        background_compaction: true,        // Enable to avoid blocking on compaction
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(4 * 1024 * 1024) // 4MB memtable
+        .background_compaction(true) // Enable to avoid blocking on compaction
+        .open(temp_dir.path())
+        .unwrap();
 
     // Baseline memory
     let baseline_memory = get_memory_usage();
@@ -158,13 +155,11 @@ fn test_no_memory_leak_sequential_writes() {
 #[ignore = "Resource monitoring flaky in CI"]
 fn test_no_memory_leak_repeated_flushes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024 * 1024, // 1MB memtable (small, triggers frequent flushes)
-        background_compaction: true,    // Enable to avoid blocking on each flush
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(1024 * 1024) // 1MB memtable (small, triggers frequent flushes)
+        .background_compaction(true) // Enable to avoid blocking on each flush
+        .open(temp_dir.path())
+        .unwrap();
 
     let baseline_memory = get_memory_usage();
     println!("Baseline memory: {} MB", baseline_memory / 1024 / 1024);
@@ -229,12 +224,10 @@ fn test_no_memory_leak_repeated_flushes() {
 #[ignore] // Flaky under tarpaulin coverage instrumentation
 fn test_no_memory_leak_put_delete_cycles() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        background_compaction: true, // Enable to avoid blocking
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true) // Enable to avoid blocking
+        .open(temp_dir.path())
+        .unwrap();
 
     let baseline_memory = get_memory_usage();
     let mut memory_samples = vec![baseline_memory];
@@ -288,13 +281,9 @@ fn test_no_fd_leak_db_open_close() {
     // Open and close DB 20 times
     for i in 0..20 {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
 
         {
-            let db = DB::open(opts).unwrap();
+            let db = DB::open(temp_dir.path()).unwrap();
 
             // Write some data
             for j in 0..100 {
@@ -333,15 +322,11 @@ fn test_no_fd_leak_db_open_close() {
 #[ignore = "Resource monitoring flaky in CI"]
 fn test_no_fd_leak_multiple_flushes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
 
     let baseline_fds = get_fd_count();
     println!("Baseline FD count: {}", baseline_fds);
 
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // After opening, expect some FDs (WAL, data dir)
     let db_open_fds = get_fd_count();
@@ -390,13 +375,11 @@ fn test_no_thread_leak_db_lifecycle() {
     // Open DB with background compaction disabled (simpler case first)
     {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            background_compaction: false,
-            ..Default::default()
-        };
 
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(false)
+            .open(temp_dir.path())
+            .unwrap();
 
         for i in 0..1000 {
             db.put(format!("key{}", i).as_bytes(), b"value").unwrap();
@@ -437,13 +420,11 @@ fn test_no_thread_leak_background_compaction() {
 
     {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            background_compaction: true, // Enable background thread
-            ..Default::default()
-        };
 
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(true) // Enable background thread
+            .open(temp_dir.path())
+            .unwrap();
 
         let during_threads = get_thread_count();
         println!("Thread count with DB open: {}", during_threads);
@@ -482,15 +463,10 @@ fn test_no_thread_leak_background_compaction() {
 #[ignore = "Resource monitoring flaky in CI"]
 fn test_memory_stable_after_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let db_path = PathBuf::from(temp_dir.path());
 
     // First session: write data
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         for i in 0..10_000 {
             db.put(format!("key{:05}", i).as_bytes(), b"value").unwrap();
@@ -503,11 +479,7 @@ fn test_memory_stable_after_reopen() {
 
     // Second session: reopen and read
     {
-        let opts = DBOptions {
-            data_dir: db_path.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         // Read all data
         for i in 0..10_000 {

@@ -2,7 +2,6 @@
 // Tests complex interactions: flush during read, compact during write, etc.
 
 use seerdb::{DBOptions, SyncPolicy, DB};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -12,12 +11,12 @@ use tempfile::TempDir;
 #[test]
 fn test_reads_during_flush() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 1024 * 1024, // 1MB
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(1024 * 1024) // 1MB
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Pre-populate with data
     for i in 0..1000 {
@@ -58,13 +57,13 @@ fn test_reads_during_flush() {
 #[test]
 fn test_writes_during_compaction() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 64 * 1024, // 64KB - small to trigger compactions
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(64 * 1024) // 64KB - small to trigger compactions
+            .background_compaction(true)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Write enough to trigger multiple levels and compactions
     for i in 0..5000 {
@@ -106,11 +105,7 @@ fn test_writes_during_compaction() {
 #[test]
 fn test_concurrent_flushes() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Populate data
     for i in 0..100 {
@@ -139,11 +134,7 @@ fn test_concurrent_flushes() {
 #[test]
 fn test_delete_during_read() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Pre-populate
     for i in 0..1000 {
@@ -199,11 +190,7 @@ fn test_delete_during_read() {
 #[test]
 fn test_overwrite_during_read() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     db.put(b"key", b"original_value").unwrap();
 
@@ -247,13 +234,13 @@ fn test_overwrite_during_read() {
 #[test]
 fn test_heavy_concurrent_mixed_operations() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 128 * 1024, // 128KB
-        background_compaction: false,  // Disable to avoid compaction removing tombstones
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(128 * 1024) // 128KB
+            .background_compaction(false) // Disable to avoid compaction removing tombstones
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     let write_barrier = Arc::new(Barrier::new(2));
     let delete_barrier = Arc::new(Barrier::new(2));
@@ -360,13 +347,13 @@ fn test_heavy_concurrent_mixed_operations() {
 #[test]
 fn test_flush_during_wal_write() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        wal_sync_policy: SyncPolicy::SyncData, // Force WAL sync
-        memtable_capacity: 64 * 1024,
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .sync_policy(SyncPolicy::SyncData) // Force WAL sync
+            .memtable_capacity(64 * 1024)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     let barrier = Arc::new(Barrier::new(2));
 
@@ -407,13 +394,11 @@ fn test_flush_during_wal_write() {
 fn test_compaction_consistency() {
     // This tests that compaction doesn't lose data or create duplicates
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: PathBuf::from(temp_dir.path()),
-        memtable_capacity: 32 * 1024, // Small to force many SSTables
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .memtable_capacity(32 * 1024) // Small to force many SSTables
+        .background_compaction(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write unique values for each key
     for i in 0..1000 {

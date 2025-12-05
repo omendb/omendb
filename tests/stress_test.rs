@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use rand::Rng;
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -127,11 +127,7 @@ fn test_stress_sequential_writes() {
     let db_path = dir.path().join("db");
     let test_size = get_test_size();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     let mut metrics = StressMetrics::new();
 
@@ -179,11 +175,7 @@ fn test_stress_random_writes() {
     let db_path = dir.path().join("db");
     let test_size = get_test_size();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     let mut metrics = StressMetrics::new();
     let mut rng = rand::thread_rng();
@@ -241,12 +233,12 @@ fn test_stress_concurrent_access() {
     let num_threads = 4;
     let ops_per_thread = test_size / num_threads;
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true, // Enable background compaction for concurrent test
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .background_compaction(true)
+            .open(&db_path)
+            .unwrap(),
+    );
 
     println!(
         "\n🔥 Concurrent access stress test ({} threads x {} ops)",
@@ -344,11 +336,7 @@ fn test_stress_read_heavy_workload() {
     let test_size = get_test_size();
     let num_keys = 10_000;
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     // Populate database with initial data
     println!(
@@ -424,12 +412,10 @@ fn test_stress_mixed_workload() {
     let db_path = dir.path().join("db");
     let test_size = get_test_size();
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(true)
+        .open(&db_path)
+        .unwrap();
 
     println!("\n🔥 Mixed workload stress test ({} ops)", test_size);
     println!("Workload: 70% reads, 20% writes, 10% deletes");
@@ -517,11 +503,7 @@ fn test_stress_1m_sequential_writes() {
     let db_path = dir.path().join("db");
     let test_size = 1_000_000;
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default().open(&db_path).unwrap();
 
     println!("\n🔥 LARGE: 1M sequential write stress test");
 
@@ -564,12 +546,12 @@ fn test_stress_1m_concurrent_8_threads() {
     let num_threads = 8;
     let ops_per_thread = total_ops / num_threads;
 
-    let opts = DBOptions {
-        data_dir: db_path.clone(),
-        background_compaction: true,
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .background_compaction(true)
+            .open(&db_path)
+            .unwrap(),
+    );
 
     println!(
         "\n🔥 LARGE: Concurrent stress test ({} threads x {} ops = {} total)",

@@ -2,7 +2,7 @@
 // Validates seerdb at massive scale (100M, 500M, 1B keys)
 // Run on Fedora (i9-13900KF, 32GB) for SOTA performance validation
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,11 +85,7 @@ fn run_scale_test(
     println!("{}", "=".repeat(60));
 
     // Use default options for reliability
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts)?);
+    let db = Arc::new(DBOptions::default().open(data_dir)?);
 
     let written = Arc::new(AtomicU64::new(0));
     let start = Instant::now();

@@ -29,14 +29,12 @@ fn collect_all(db: &DB) -> BTreeMap<Vec<u8>, Vec<u8>> {
 
 /// Helper to create a test database
 fn create_db(temp_dir: &TempDir) -> DB {
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        background_compaction: false,
-        background_flush: false,
-        memtable_capacity: 4096, // Small to trigger flushes
-        ..Default::default()
-    };
-    DB::open(opts).expect("Failed to open database")
+    DBOptions::default()
+        .background_compaction(false)
+        .background_flush(false)
+        .memtable_capacity(4096) // Small to trigger flushes
+        .open(temp_dir.path())
+        .expect("Failed to open database")
 }
 
 // =============================================================================
@@ -142,13 +140,11 @@ fn test_metamorphic_insert_delete_reopen_is_empty() {
 
     // Phase 2: Reopen and verify empty
     {
-        let opts = DBOptions {
-            data_dir: db_path,
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&db_path)
+            .unwrap();
 
         for key in &keys {
             assert!(
@@ -298,14 +294,12 @@ fn test_metamorphic_multiple_flushes_idempotent() {
 #[test]
 fn test_metamorphic_compaction_preserves_results() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        background_compaction: false,
-        background_flush: false,
-        memtable_capacity: 1024, // Very small to trigger many flushes
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_compaction(false)
+        .background_flush(false)
+        .memtable_capacity(1024) // Very small to trigger many flushes
+        .open(temp_dir.path())
+        .unwrap();
 
     // Create multiple SSTables by flushing repeatedly
     for batch in 0..5 {
@@ -385,13 +379,11 @@ fn test_metamorphic_reopen_preserves_results() {
 
     // Phase 2: Reopen and compare
     {
-        let opts = DBOptions {
-            data_dir: db_path,
-            background_compaction: false,
-            background_flush: false,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .background_compaction(false)
+            .background_flush(false)
+            .open(&db_path)
+            .unwrap();
         let actual = collect_all(&db);
         assert_eq!(expected, actual, "Data changed after reopen");
     }

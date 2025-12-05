@@ -4,7 +4,7 @@
 //! Tests concurrent conflicts, crash recovery, and snapshot interaction.
 
 use bytes::Bytes;
-use seerdb::{DBError, DBOptions, DB};
+use seerdb::{DBError, DB};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -14,11 +14,7 @@ use tempfile::TempDir;
 #[test]
 fn test_concurrent_transaction_conflicts() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Initialize a shared counter key
     db.put(b"counter", b"0").unwrap();
@@ -121,11 +117,7 @@ fn test_concurrent_transaction_conflicts() {
 #[test]
 fn test_concurrent_transactions_no_false_conflicts() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     let num_threads = 10;
     let ops_per_thread = 100;
@@ -199,11 +191,7 @@ fn test_transaction_crash_recovery() {
 
     // Phase 1: Write data via transaction, commit, then "crash" (drop without clean shutdown)
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         let mut txn = db.begin_transaction();
         txn.put(b"txn_key_1", b"txn_value_1").unwrap();
@@ -218,11 +206,7 @@ fn test_transaction_crash_recovery() {
 
     // Phase 2: Reopen and verify data recovered
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         assert_eq!(
             db.get(b"txn_key_1").unwrap(),
@@ -252,11 +236,7 @@ fn test_uncommitted_transaction_not_recovered() {
 
     // Phase 1: Start transaction but don't commit, then "crash"
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         // Write some committed data first
         db.put(b"committed_key", b"committed_value").unwrap();
@@ -273,11 +253,7 @@ fn test_uncommitted_transaction_not_recovered() {
 
     // Phase 2: Reopen and verify uncommitted data is NOT there
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         assert_eq!(
             db.get(b"committed_key").unwrap(),
@@ -299,11 +275,7 @@ fn test_uncommitted_transaction_not_recovered() {
 #[test]
 fn test_transaction_snapshot_isolation() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     // Initialize
     db.put(b"key1", b"initial1").unwrap();
@@ -349,11 +321,7 @@ fn test_transaction_snapshot_isolation() {
 #[test]
 fn test_transaction_and_snapshot_coexist() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Initial data
     db.put(b"shared_key", b"v1").unwrap();
@@ -404,11 +372,7 @@ fn test_transaction_and_snapshot_coexist() {
 #[test]
 fn test_write_only_transactions_no_conflict() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(temp_dir.path()).unwrap());
 
     db.put(b"key", b"initial").unwrap();
 
@@ -460,11 +424,7 @@ fn test_write_only_transactions_no_conflict() {
 #[test]
 fn test_large_transaction_many_keys() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     let num_keys = 10_000;
 
@@ -515,11 +475,7 @@ fn test_large_transaction_many_keys() {
 #[test]
 fn test_partial_key_overlap_conflict() {
     let temp_dir = TempDir::new().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Initialize keys
     db.put(b"key_a", b"a").unwrap();

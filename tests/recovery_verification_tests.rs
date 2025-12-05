@@ -124,25 +124,21 @@ fn verify_state(
 
 /// Helper to create database with sync policy
 fn create_db(temp_dir: &TempDir, sync: SyncPolicy) -> DB {
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        wal_sync_policy: sync,
-        background_compaction: false,
-        background_flush: false,
-        ..Default::default()
-    };
-    DB::open(opts).expect("Failed to open database")
+    DBOptions::default()
+        .sync_policy(sync)
+        .background_compaction(false)
+        .background_flush(false)
+        .open(temp_dir.path())
+        .expect("Failed to open database")
 }
 
 /// Helper to reopen database
 fn reopen_db(path: PathBuf) -> DB {
-    let opts = DBOptions {
-        data_dir: path,
-        background_compaction: false,
-        background_flush: false,
-        ..Default::default()
-    };
-    DB::open(opts).expect("Failed to reopen database")
+    DBOptions::default()
+        .background_compaction(false)
+        .background_flush(false)
+        .open(&path)
+        .expect("Failed to reopen database")
 }
 
 // =============================================================================

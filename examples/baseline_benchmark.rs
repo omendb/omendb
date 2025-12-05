@@ -341,22 +341,19 @@ fn benchmark_fjall() {
 
 #[cfg(feature = "baseline-benchmarks")]
 fn benchmark_seerdb() {
-    use seerdb::{DBOptions, DB};
+    use seerdb::DBOptions;
     use std::path::PathBuf;
 
     let path = PathBuf::from("/tmp/bench_seerdb");
     let _ = std::fs::remove_dir_all(&path);
 
-    let opts = DBOptions {
-        data_dir: path.clone(),
-        memtable_capacity: 64 * 1024 * 1024, // 64MB memtable (same as RocksDB)
-        wal_sync_policy: seerdb::SyncPolicy::None, // Fast benchmark mode
-        background_compaction: true,
-        vlog_threshold: Some(4096), // Enable vLog for values >4KB
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).expect("Failed to open seerdb");
+    let db = DBOptions::default()
+        .memtable_capacity(64 * 1024 * 1024) // 64MB memtable (same as RocksDB)
+        .sync_policy(seerdb::SyncPolicy::None) // Fast benchmark mode
+        .background_compaction(true)
+        .vlog_threshold(Some(4096)) // Enable vLog for values >4KB
+        .open(&path)
+        .expect("Failed to open seerdb");
 
     // Workload 1: Sequential Writes
     println!("Workload 1: Sequential Writes ({} ops)", NUM_OPERATIONS);

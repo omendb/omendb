@@ -56,13 +56,11 @@ fn generate_ops(seed: u64, count: usize, key_space: usize) -> Vec<Op> {
 
 /// Run operations against seerdb, return final state
 fn run_seerdb(ops: &[Op], temp_dir: &TempDir) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        background_compaction: false,
-        background_flush: false,
-        ..Default::default()
-    };
-    let db = SeerDB::open(opts).expect("Failed to open seerdb");
+    let db = DBOptions::default()
+        .background_compaction(false)
+        .background_flush(false)
+        .open(temp_dir.path())
+        .expect("Failed to open seerdb");
 
     let mut results = BTreeMap::new();
 
@@ -117,13 +115,11 @@ fn run_rocksdb(ops: &[Op], temp_dir: &TempDir) -> BTreeMap<Vec<u8>, Option<Vec<u
 /// Compare final state of both databases
 fn compare_final_state(seerdb_dir: &TempDir, rocksdb_dir: &TempDir, keys: &[Vec<u8>]) {
     // Reopen seerdb
-    let seer_opts = DBOptions {
-        data_dir: seerdb_dir.path().to_path_buf(),
-        background_compaction: false,
-        background_flush: false,
-        ..Default::default()
-    };
-    let seerdb = SeerDB::open(seer_opts).expect("Failed to reopen seerdb");
+    let seerdb = DBOptions::default()
+        .background_compaction(false)
+        .background_flush(false)
+        .open(seerdb_dir.path())
+        .expect("Failed to reopen seerdb");
 
     // Reopen RocksDB (database must already exist from prior run)
     let rocks_opts = Options::default();

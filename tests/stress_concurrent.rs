@@ -3,7 +3,7 @@
 // Critical for production multi-threaded workloads
 // Added Nov 14, 2025 for production validation
 
-use seerdb::{DBOptions, DB};
+use seerdb::DBOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -15,12 +15,7 @@ fn test_concurrent_20_writers() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(&data_dir).unwrap());
     let barrier = Arc::new(Barrier::new(20));
 
     let mut handles = vec![];
@@ -85,12 +80,7 @@ fn test_concurrent_mixed_workload() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(&data_dir).unwrap());
 
     // Pre-populate some data
     println!("Pre-populating database...");
@@ -169,12 +159,7 @@ fn test_concurrent_hot_keys() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(&data_dir).unwrap());
     let barrier = Arc::new(Barrier::new(20));
 
     println!("Testing hot key contention: 20 threads updating 100 keys");
@@ -223,12 +208,7 @@ fn test_concurrent_deletes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DBOptions::default().open(&data_dir).unwrap());
 
     // Pre-populate
     for i in 0..5000 {
@@ -301,14 +281,13 @@ fn test_concurrent_flushes() {
     let temp_dir = TempDir::new().unwrap();
     let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        memtable_capacity: 5 * 1024 * 1024, // 5MB (small to trigger flushes)
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(5 * 1024 * 1024)
+            .background_flush(true)
+            .open(&data_dir)
+            .unwrap(),
+    );
     let barrier = Arc::new(Barrier::new(15));
     let mut handles = vec![];
 

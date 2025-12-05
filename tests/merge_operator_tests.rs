@@ -1,19 +1,16 @@
 use bytes::Bytes;
-use seerdb::{DBOptions, MergeOperator, StringAppendOperator, DB};
+use seerdb::{DBOptions, StringAppendOperator};
 use std::sync::Arc;
 use tempfile::tempdir;
 
 #[test]
 fn test_merge_in_memory() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    // Configure Merge Operator (append with comma)
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .merge_operator(Arc::new(StringAppendOperator::new(',')))
+        .open(dir.path())
+        .unwrap();
 
     // 1. Put base value
     db.put(b"key1", b"val").unwrap();
@@ -29,13 +26,11 @@ fn test_merge_in_memory() {
 #[test]
 fn test_merge_stacking() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .merge_operator(Arc::new(StringAppendOperator::new(',')))
+        .open(dir.path())
+        .unwrap();
 
     // 1. Merge (no base)
     db.merge(b"list", b"item1").unwrap();
@@ -56,15 +51,13 @@ fn test_merge_stacking() {
 #[test]
 fn test_merge_flush_and_recovery() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1024, // Small
-        ..Default::default()
-    };
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
     {
-        let db = DB::open(opts.clone()).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024)
+            .merge_operator(Arc::new(StringAppendOperator::new(',')))
+            .open(dir.path())
+            .unwrap();
         db.put(b"key", b"base").unwrap();
         db.merge(b"key", b"op1").unwrap();
         db.flush().unwrap(); // Flush to SSTable
@@ -78,7 +71,11 @@ fn test_merge_flush_and_recovery() {
 
     // Reopen (Recovery)
     {
-        let db = DB::open(opts).unwrap();
+        let db = DBOptions::default()
+            .memtable_capacity(1024)
+            .merge_operator(Arc::new(StringAppendOperator::new(',')))
+            .open(dir.path())
+            .unwrap();
         assert_eq!(db.get(b"key").unwrap(), Some(Bytes::from("base,op1,op2")));
     }
 }
@@ -86,13 +83,11 @@ fn test_merge_flush_and_recovery() {
 #[test]
 fn test_merge_with_delete() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-    opts.merge_operator = Some(Arc::new(StringAppendOperator::new(',')));
 
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .merge_operator(Arc::new(StringAppendOperator::new(',')))
+        .open(dir.path())
+        .unwrap();
 
     db.put(b"key", b"val1").unwrap();
     db.delete(b"key").unwrap();

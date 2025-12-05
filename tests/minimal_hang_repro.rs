@@ -10,16 +10,12 @@ fn test_minimal_db_open() {
     let temp_dir = TempDir::new().unwrap();
     eprintln!("TempDir created");
 
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        background_flush: false,
-        background_compaction: false,
-        ..Default::default()
-    };
-    eprintln!("Options created");
-
     eprintln!("Calling DB::open...");
-    let _db = DB::open(opts).unwrap();
+    let _db = DBOptions::default()
+        .background_flush(false)
+        .background_compaction(false)
+        .open(temp_dir.path())
+        .unwrap();
     eprintln!("DB opened!");
 
     eprintln!("TEST COMPLETE");

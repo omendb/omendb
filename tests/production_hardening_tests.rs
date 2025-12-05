@@ -3,7 +3,6 @@
 // These validate the production-readiness features added in Nov 2025
 
 use seerdb::{DBError, DBOptions, DB};
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -17,17 +16,13 @@ use tempfile::TempDir;
 fn test_memory_budget_early_flush() {
     // Test that memory pressure >80% triggers early flush
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(50 * 1024 * 1024), // 50MB limit
-        memtable_capacity: 10 * 1024 * 1024,      // 10MB per memtable
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(50 * 1024 * 1024)) // 50MB limit
+        .memtable_capacity(10 * 1024 * 1024) // 10MB per memtable
+        .background_flush(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write data to approach 80% threshold (~40MB)
     // Each write: key (20 bytes) + value (1KB) ≈ 1044 bytes
@@ -66,17 +61,13 @@ fn test_memory_budget_early_flush() {
 fn test_memory_budget_write_blocking() {
     // Test that memory pressure >95% blocks writes temporarily
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        max_memory_bytes: Some(30 * 1024 * 1024), // 30MB limit (smaller for faster test)
-        memtable_capacity: 20 * 1024 * 1024,      // 20MB per memtable
-        background_flush: false,                  // Disable auto flush to test blocking
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .max_memory_bytes(Some(30 * 1024 * 1024)) // 30MB limit (smaller for faster test)
+        .memtable_capacity(20 * 1024 * 1024) // 20MB per memtable
+        .background_flush(false) // Disable auto flush to test blocking
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write enough to approach 95% (~28.5MB)
     // This should trigger backpressure (writes blocked with sleep)
@@ -107,15 +98,11 @@ fn test_memory_budget_write_blocking() {
 fn test_memory_estimation_accuracy() {
     // Test that memory estimation is reasonably accurate
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        background_flush: false, // Disable flush to keep data in memtable
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(false) // Disable flush to keep data in memtable
+        .open(temp_dir.path())
+        .unwrap();
 
     let initial_mem = db.estimate_memory_usage();
 
@@ -146,15 +133,11 @@ fn test_memory_estimation_accuracy() {
 fn test_disk_space_validation_on_write() {
     // Test that writes are rejected when disk space insufficient
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        min_disk_space_bytes: Some(1_000_000_000_000), // 1TB (impossible threshold)
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .min_disk_space_bytes(Some(1_000_000_000_000)) // 1TB (impossible threshold)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write should fail with DiskSpaceFull error
     let result = db.put(b"key", b"value");
@@ -176,16 +159,12 @@ fn test_disk_space_validation_on_write() {
 fn test_disk_space_configurable_threshold() {
     // Test that disk space threshold is configurable
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
     // Set reasonable threshold (100MB)
-    let opts = DBOptions {
-        data_dir,
-        min_disk_space_bytes: Some(100 * 1024 * 1024),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .min_disk_space_bytes(Some(100 * 1024 * 1024))
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write should succeed if disk has >100MB free
     let result = db.put(b"key", b"value");
@@ -204,15 +183,11 @@ fn test_disk_space_configurable_threshold() {
 fn test_disk_space_no_limit_when_unconfigured() {
     // Test that disk space checks are disabled when not configured
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        min_disk_space_bytes: None, // No limit
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .min_disk_space_bytes(None) // No limit
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write should succeed regardless of disk space
     db.put(b"key", b"value").unwrap();
@@ -232,14 +207,8 @@ fn test_wal_panic_detection() {
     // We test the health check mechanism instead
 
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Normal operation should have healthy WAL
     db.put(b"key1", b"value1").unwrap();
@@ -254,15 +223,11 @@ fn test_wal_panic_detection() {
 fn test_flush_thread_health_tracking() {
     // Test that flush thread health is tracked
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        background_flush: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Trigger flush by writing data
     for i in 0..1000 {
@@ -279,16 +244,12 @@ fn test_flush_thread_health_tracking() {
 fn test_compaction_thread_health_tracking() {
     // Test that compaction thread health is tracked
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(true)
+        .background_compaction(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write enough data to trigger compaction
     for i in 0..10000 {
@@ -310,14 +271,8 @@ fn test_compaction_thread_health_tracking() {
 fn test_health_status_propagation() {
     // Test that health status is checked on every write
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Normal writes should succeed
     for i in 0..100 {
@@ -333,16 +288,12 @@ fn test_graceful_degradation_on_panic() {
     // This is a safety test - DB should not crash the process
 
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        background_flush: true,
-        background_compaction: true,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .background_flush(true)
+        .background_compaction(true)
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write some data
     for i in 0..100 {
@@ -362,14 +313,8 @@ fn test_graceful_degradation_on_panic() {
 fn test_fd_usage_reasonable() {
     // Test that FD usage is reasonable for small DB
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(temp_dir.path()).unwrap();
 
     // Write some data
     for i in 0..1000 {
@@ -389,13 +334,7 @@ fn test_multiple_db_instances_fd_limits() {
 
     let dbs: Vec<_> = temp_dirs
         .iter()
-        .map(|dir| {
-            let opts = DBOptions {
-                data_dir: PathBuf::from(dir.path()),
-                ..Default::default()
-            };
-            DB::open(opts).unwrap()
-        })
+        .map(|dir| DB::open(dir.path()).unwrap())
         .collect();
 
     // Write to all DBs
@@ -414,14 +353,9 @@ fn test_multiple_db_instances_fd_limits() {
 fn test_sstable_fsync_on_flush() {
     // Test that SSTables are fsync'd on creation
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
+    let data_dir = temp_dir.path().to_path_buf();
 
-    let opts = DBOptions {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     // Write data
     for i in 0..1000 {
@@ -435,12 +369,7 @@ fn test_sstable_fsync_on_flush() {
     drop(db);
 
     // Reopen - data should be durable (fsync ensures this)
-    let opts = DBOptions {
-        data_dir,
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(&data_dir).unwrap();
 
     for i in 0..1000 {
         assert!(
@@ -456,16 +385,11 @@ fn test_sstable_fsync_on_flush() {
 fn test_sstable_durability_after_crash() {
     // Test that flushed SSTables survive simulated crash
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
+    let data_dir = temp_dir.path().to_path_buf();
 
     // Write and flush
     {
-        let opts = DBOptions {
-            data_dir: data_dir.clone(),
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..500 {
             db.put(format!("key_{:04}", i).as_bytes(), b"durable")
@@ -479,12 +403,7 @@ fn test_sstable_durability_after_crash() {
 
     // Reopen and verify data
     {
-        let opts = DBOptions {
-            data_dir,
-            ..Default::default()
-        };
-
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(&data_dir).unwrap();
 
         for i in 0..500 {
             let value = db.get(format!("key_{:04}", i).as_bytes()).unwrap();
@@ -502,15 +421,11 @@ fn test_sstable_durability_after_crash() {
 fn test_disk_space_check_caching() {
     // Test that disk space checking uses caching and doesn't call sysinfo on every write
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        min_disk_space_bytes: Some(1024 * 1024), // 1MB minimum
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .min_disk_space_bytes(Some(1024 * 1024)) // 1MB minimum
+        .open(temp_dir.path())
+        .unwrap();
 
     // Write multiple values - disk space should be checked but cached
     for i in 0..100 {
@@ -526,15 +441,11 @@ fn test_disk_space_check_caching() {
 fn test_disk_space_check_disabled_when_not_configured() {
     // Test that disk space checking is skipped when min_disk_space_bytes is None
     let temp_dir = TempDir::new().unwrap();
-    let data_dir = PathBuf::from(temp_dir.path());
 
-    let opts = DBOptions {
-        data_dir,
-        min_disk_space_bytes: None, // Disabled
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DBOptions::default()
+        .min_disk_space_bytes(None) // Disabled
+        .open(temp_dir.path())
+        .unwrap();
 
     // Writes should succeed without any disk space checks
     for i in 0..50 {

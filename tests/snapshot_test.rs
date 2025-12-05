@@ -6,10 +6,8 @@ use tempfile::tempdir;
 #[test]
 fn test_snapshot_isolation_basic() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
 
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // 1. Write initial data
     db.put(b"key1", b"value1").unwrap();
@@ -49,10 +47,8 @@ fn test_snapshot_isolation_basic() {
 #[test]
 fn test_snapshot_range_iteration() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
 
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // 1. Write data: key1, key3
     db.put(b"key1", b"value1").unwrap();
@@ -78,11 +74,13 @@ fn test_snapshot_range_iteration() {
 #[test]
 fn test_concurrent_snapshot() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-    opts.background_flush = true; // Enable background flush to stress test locking
 
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .background_flush(true) // Enable background flush to stress test locking
+            .open(dir.path())
+            .unwrap(),
+    );
 
     let db_clone = db.clone();
     let handle = thread::spawn(move || {

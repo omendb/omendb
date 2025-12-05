@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use proptest::prelude::*;
-use seerdb::{DBOptions, DB};
-use std::path::PathBuf;
+use seerdb::DB;
 use tempfile::TempDir;
 
 proptest! {
@@ -15,11 +14,7 @@ proptest! {
         value in prop::collection::vec(any::<u8>(), 0..1024),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         db.put(&key, &value).unwrap();
         let result = db.get(&key).unwrap();
@@ -37,11 +32,7 @@ proptest! {
         value in prop::collection::vec(any::<u8>(), 0..1024),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         // Put the key first
         db.put(&key, &value).unwrap();
@@ -62,11 +53,7 @@ proptest! {
         key in prop::collection::vec(any::<u8>(), 1..64),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         let result = db.get(&key).unwrap();
         prop_assert_eq!(result, None);
@@ -83,11 +70,7 @@ proptest! {
         value2 in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         db.put(&key, &value1).unwrap();
         db.put(&key, &value2).unwrap();
@@ -111,11 +94,7 @@ proptest! {
         ),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         // Put all key-value pairs
         for (key, value) in keys.iter().zip(values.iter()) {
@@ -148,14 +127,10 @@ proptest! {
         ),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = PathBuf::from(temp_dir.path());
+        let db_path = temp_dir.path();
 
         {
-            let opts = DBOptions {
-                data_dir: db_path.clone(),
-                ..Default::default()
-            };
-            let db = DB::open(opts).unwrap();
+            let db = DB::open(db_path).unwrap();
 
             // Put all key-value pairs
             for (key, value) in keys.iter().zip(values.iter()) {
@@ -169,11 +144,7 @@ proptest! {
         }
 
         // Reopen database
-        let opts = DBOptions {
-            data_dir: db_path,
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(db_path).unwrap();
 
         // All keys should still exist
         for (key, value) in keys.iter().zip(values.iter()) {
@@ -190,11 +161,7 @@ proptest! {
         key in prop::collection::vec(any::<u8>(), 1..64),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         db.put(&key, []).unwrap();
         let result = db.get(&key).unwrap();
@@ -212,11 +179,7 @@ proptest! {
         value in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let temp_dir = TempDir::new().unwrap();
-        let opts = DBOptions {
-            data_dir: PathBuf::from(temp_dir.path()),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(temp_dir.path()).unwrap();
 
         db.put(&key, &value).unwrap();
         let result = db.get(&key).unwrap();
