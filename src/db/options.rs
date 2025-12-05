@@ -308,7 +308,7 @@ impl DBOptions {
         self
     }
 
-    /// Set the compression type for SSTables.
+    /// Set the compression type for `SSTables`.
     #[must_use]
     pub const fn compression(mut self, compression: crate::sstable::CompressionType) -> Self {
         self.compression = compression;

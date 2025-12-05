@@ -116,8 +116,7 @@ fn test_skip_wal_batch_writes() {
 #[test]
 fn test_bulk_load_basic() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(None); // Disable vLog for simplicity
+    let opts = DBOptions::default().vlog_threshold(None); // Disable vLog for simplicity
     let db = opts.open(dir.path()).unwrap();
 
     // Create test entries (unsorted to test sorting)
@@ -146,8 +145,7 @@ fn test_bulk_load_basic() {
 #[test]
 fn test_bulk_load_with_vlog() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(Some(10)); // Small threshold to test vLog
+    let opts = DBOptions::default().vlog_threshold(Some(10)); // Small threshold to test vLog
     let db = opts.open(dir.path()).unwrap();
 
     // Create entries with large values
@@ -179,8 +177,7 @@ fn test_bulk_load_with_vlog() {
 #[test]
 fn test_bulk_load_multiple_sstables() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(None);
+    let opts = DBOptions::default().vlog_threshold(None);
     let db = opts.open(dir.path()).unwrap();
 
     // Create many entries
@@ -217,8 +214,7 @@ fn test_bulk_load_multiple_sstables() {
 #[test]
 fn test_bulk_load_already_sorted() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(None);
+    let opts = DBOptions::default().vlog_threshold(None);
     let db = opts.open(dir.path()).unwrap();
 
     // Pre-sorted entries
@@ -242,8 +238,7 @@ fn test_bulk_load_already_sorted() {
 #[test]
 fn test_bulk_load_target_level() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(None);
+    let opts = DBOptions::default().vlog_threshold(None);
     let db = opts.open(dir.path()).unwrap();
 
     let entries = vec![(b"key".to_vec(), b"value".to_vec())];
@@ -260,8 +255,7 @@ fn test_bulk_load_target_level() {
 #[test]
 fn test_bulk_load_empty() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .vlog_threshold(None);
+    let opts = DBOptions::default().vlog_threshold(None);
     let db = opts.open(dir.path()).unwrap();
 
     let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![];
@@ -312,8 +306,7 @@ fn test_db_overwrite() {
 #[test]
 fn test_db_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default()
-        .memtable_capacity(100); // Small capacity to trigger flush
+    let options = DBOptions::default().memtable_capacity(100); // Small capacity to trigger flush
 
     let db = options.open(dir.path()).unwrap();
 
@@ -415,8 +408,7 @@ fn test_db_recovery_with_overwrites() {
 #[test]
 fn test_db_recovery_with_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default()
-        .memtable_capacity(100); // Small to trigger flush during recovery
+    let options = DBOptions::default().memtable_capacity(100); // Small to trigger flush during recovery
 
     // Write enough data to trigger flush on recovery
     {
@@ -460,7 +452,7 @@ fn test_db_recovery_empty_wal() {
 fn test_db_with_kv_separation() {
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
-        .memtable_capacity(200)   // Small enough to trigger flush
+        .memtable_capacity(200) // Small enough to trigger flush
         .vlog_threshold(Some(50)); // 50 byte threshold
 
     let db = options.open(dir.path()).unwrap();
@@ -500,8 +492,7 @@ fn test_db_with_kv_separation() {
 #[test]
 fn test_db_with_kv_separation_recovery() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default()
-        .vlog_threshold(Some(50)); // 50 byte threshold
+    let options = DBOptions::default().vlog_threshold(Some(50)); // 50 byte threshold
 
     // Write data with large values
     {
@@ -526,7 +517,7 @@ fn test_db_background_compaction() {
 
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
-        .memtable_capacity(100)      // Small to trigger flushes
+        .memtable_capacity(100) // Small to trigger flushes
         .background_compaction(true); // Enable background compaction
 
     let db = options.open(dir.path()).unwrap();
@@ -739,7 +730,7 @@ fn test_range_scan_with_deletes() {
 fn test_memory_budget_enforcement() {
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
-        .memtable_capacity(1024 * 1024)            // 1MB per partition
+        .memtable_capacity(1024 * 1024) // 1MB per partition
         .max_memory_bytes(Some(200 * 1024 * 1024)); // 200MB budget (won't be triggered in test)
 
     let db = options.open(dir.path()).unwrap();
@@ -764,8 +755,7 @@ fn test_memory_budget_enforcement() {
 #[test]
 fn test_estimate_memory_usage() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default()
-        .memtable_capacity(1024);
+    let options = DBOptions::default().memtable_capacity(1024);
 
     let db = options.open(dir.path()).unwrap();
 
@@ -1093,8 +1083,7 @@ fn test_increment_bytes_helper() {
 #[test]
 fn test_prefix_with_sstables() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .memtable_capacity(1024); // Small memtable to force flush
+    let opts = DBOptions::default().memtable_capacity(1024); // Small memtable to force flush
 
     let db = opts.open(dir.path()).unwrap();
 
@@ -1228,7 +1217,7 @@ fn test_global_block_cache_hits() {
     // Test that global block cache provides cache hits on repeated reads
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
-        .memtable_capacity(1024)   // Small to force flush
+        .memtable_capacity(1024) // Small to force flush
         .block_cache_capacity(100); // Small cache (100 blocks)
 
     let db = options.open(dir.path()).unwrap();
@@ -1283,8 +1272,7 @@ fn test_global_block_cache_hits() {
 fn test_block_cache_stats_in_dbstats() {
     // Test that block cache metrics are properly exposed in DBStats
     let dir = tempdir().unwrap();
-    let options = DBOptions::default()
-        .block_cache_capacity(500); // 500 blocks
+    let options = DBOptions::default().block_cache_capacity(500); // 500 blocks
 
     let db = options.open(dir.path()).unwrap();
 
@@ -1309,7 +1297,7 @@ fn test_block_cache_shared_across_sstables() {
     // Test that global cache is shared across multiple SSTables
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
-        .memtable_capacity(2048)    // Small to force multiple flushes
+        .memtable_capacity(2048) // Small to force multiple flushes
         .block_cache_capacity(1000); // Enough to cache blocks from multiple SSTables
 
     let db = options.open(dir.path()).unwrap();
@@ -1492,9 +1480,9 @@ fn test_tiered_storage_cold_tier_compaction() {
     let _guard = rt.enter();
 
     let options = DBOptions::default()
-        .memtable_capacity(1000)  // Very small to trigger frequent flushes
-        .base_level_size(500)     // Very small to trigger compaction quickly
-        .size_ratio(2)            // Small ratio to trigger compaction faster
+        .memtable_capacity(1000) // Very small to trigger frequent flushes
+        .base_level_size(500) // Very small to trigger compaction quickly
+        .size_ratio(2) // Small ratio to trigger compaction faster
         .cold_tier_level(Some(2)) // L2+ goes to cold storage
         .cold_storage(Some(StorageConfig::Custom(cold_store.clone())))
         .vlog_threshold(None); // Disable vLog for simplicity
@@ -1559,7 +1547,7 @@ fn test_tiered_storage_options_validation() {
 
     let options = DBOptions::default()
         .cold_tier_level(Some(4)) // Set level but no cold storage
-        .cold_storage(None);       // No cold storage configured
+        .cold_storage(None); // No cold storage configured
 
     // Should open without error (cold tier config is ignored without backend)
     let db = options.open(dir.path()).unwrap();

@@ -9,14 +9,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 impl DB {
-    /// Get an SSTable handle, loading from disk if not cached.
+    /// Get an `SSTable` handle, loading from disk if not cached.
     ///
-    /// This is the canonical way to access SSTables for reads. Uses a cache-aside
+    /// This is the canonical way to access `SSTables` for reads. Uses a cache-aside
     /// pattern: check cache first, load on miss.
     ///
     /// # Caching behavior
     /// - Cache hit: Returns cached `Arc<Mutex<SSTable>>` (fast path)
-    /// - Cache miss: Opens SSTable, configures buffer pool/vLog, caches it
+    /// - Cache miss: Opens `SSTable`, configures buffer pool/`vLog`, caches it
     ///
     /// # Thread safety
     /// The returned handle is wrapped in `Arc<Mutex<>>` for safe concurrent access.
