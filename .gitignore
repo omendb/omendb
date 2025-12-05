@@ -17,3 +17,4 @@ flamegraph*.svg
 # AI session context (local only)
 /ai/
 ai/
+.beads/.local_version
