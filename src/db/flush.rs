@@ -76,7 +76,9 @@ impl DB {
         //   - flush() waits for background flush to complete
         //   - DEADLOCK!
         if self.options.background_flush {
-            const MAX_FLUSH_WAIT_ITERATIONS: u32 = 6000; // ~60 seconds at 10ms sleep
+            // 60 seconds at 10ms sleep. Prevents deadlock if background worker dies.
+            // Tested via stress tests under high-contention flush scenarios.
+            const MAX_FLUSH_WAIT_ITERATIONS: u32 = 6000;
             let mut iterations = 0;
 
             // Wait for any in-progress background flush to complete

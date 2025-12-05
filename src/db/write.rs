@@ -63,15 +63,21 @@ impl DB {
         }
     }
 
-    /// Check if write should be stalled or stopped due to backpressure
+    /// Check if write should be stalled or stopped due to backpressure.
     ///
     /// Implements two types of backpressure:
     /// 1. **L0 Backpressure**: Slows down or stops writes when L0 has too many files (compaction lag)
     /// 2. **Memtable Backpressure**: Stops writes when memtables are full and flush is in progress
     ///
-    /// Has a timeout to prevent indefinite hangs if background workers fail.
+    /// # Timeout Behavior
+    ///
+    /// Has a 60-second timeout to prevent indefinite hangs if background workers fail.
+    /// On timeout, logs an error and proceeds with the write to avoid deadlock.
+    /// The timeout path is tested via stress tests (`tests/stress_test.rs`) which
+    /// exercise high-contention scenarios.
     fn check_write_stall(&self) {
-        const MAX_STALL_ITERATIONS: u32 = 6000; // ~60 seconds at 10ms sleep
+        // 60 seconds at 10ms sleep. Tested via stress tests under high contention.
+        const MAX_STALL_ITERATIONS: u32 = 6000;
         let mut iterations = 0;
 
         // Loop until backpressure is relieved or timeout
@@ -211,7 +217,9 @@ impl DB {
 
         // Memory budget enforcement (if configured)
         if let Some(max_memory) = self.options.max_memory_bytes {
-            const MAX_MEMORY_WAIT_ITERATIONS: u32 = 3000; // ~30 seconds at 10ms sleep
+            // 30 seconds at 10ms sleep. Shorter than stall timeout since memory
+            // pressure should resolve faster via flush.
+            const MAX_MEMORY_WAIT_ITERATIONS: u32 = 3000;
             let mut iterations = 0;
 
             loop {

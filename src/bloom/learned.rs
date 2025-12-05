@@ -128,8 +128,20 @@ impl LearnedBloomFilter {
         false
     }
 
-    /// Predict if item is in set, with confidence score
-    /// Returns (prediction, confidence) where prediction is true/false and confidence is 0.0-1.0
+    /// Predict if item is in set, with confidence score.
+    ///
+    /// Returns `(prediction, confidence)` where prediction is true/false and confidence is 0.0-1.0.
+    ///
+    /// # Confidence Model Limitation
+    ///
+    /// Decision trees provide binary predictions without probability estimates.
+    /// We return a fixed confidence of 0.9 for all predictions. This is acceptable because:
+    ///
+    /// 1. The backup bloom filter catches all false negatives (no correctness impact)
+    /// 2. Uncertain positives are added to backup during training (see `train()`)
+    /// 3. The confidence threshold primarily affects space optimization, not correctness
+    ///
+    /// For true probability estimates, consider using random forests or gradient boosting.
     fn predict_with_confidence<T: Hash>(&self, item: &T) -> Option<(bool, f64)> {
         let model = self.model.as_ref()?;
 
@@ -139,12 +151,15 @@ impl LearnedBloomFilter {
         // Predict (1 = in set, 0 = not in set)
         let prediction = model.predict(&x).ok()?;
 
-        // Convert to (prediction, confidence) tuple
-        // Decision trees give binary predictions, so we use high confidence for both
+        // Decision trees give binary predictions without probability estimates.
+        // We use a fixed high confidence; the backup filter ensures correctness.
+        // See doc comment above for rationale.
+        const FIXED_CONFIDENCE: f64 = 0.9;
+
         if prediction[0] == 1 {
-            Some((true, 0.9)) // High confidence "in set"
+            Some((true, FIXED_CONFIDENCE))
         } else {
-            Some((false, 0.9)) // High confidence "not in set"
+            Some((false, FIXED_CONFIDENCE))
         }
     }
 
