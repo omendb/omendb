@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.0.5] - 2025-12-05
+## [0.0.6] - 2025-12-05
 
 ### Fixed
 
@@ -10,6 +10,8 @@
 - **Buffer pool eviction race (P2)**: Frame could be evicted between allocation and pin. Now pins frame inside `allocate_frame()`.
 - **WAL errors silently ignored (P2)**: WAL record application failures were discarded. Now logs warnings with sequence context.
 - **Infinite wait loops (P2)**: Write stall and flush wait could hang forever if workers died. Added 30-60s timeouts.
+
+## [0.0.5] - 2025-12-05
 
 ### Changed
 
