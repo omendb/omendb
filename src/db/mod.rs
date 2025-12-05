@@ -279,7 +279,9 @@ impl DB {
             "Opening database"
         );
 
-        // Create data directory if it doesn't exist
+        // =========================================================================
+        // Phase 1: Directory and WAL Recovery
+        // =========================================================================
         std::fs::create_dir_all(&options.data_dir)?;
 
         let wal_path = options.data_dir.join("wal.log");

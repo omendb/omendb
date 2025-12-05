@@ -4,10 +4,45 @@ use crate::sstable::{SSTable, FLAG_INLINE, FLAG_MERGE, FLAG_POINTER, FLAG_TOMBST
 use crate::types::InternalKey;
 use crate::vlog::VLog;
 use bytes::Bytes;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 impl DB {
+    /// Get an SSTable handle, loading from disk if not cached.
+    ///
+    /// This is the canonical way to access SSTables for reads. Uses a cache-aside
+    /// pattern: check cache first, load on miss.
+    ///
+    /// # Caching behavior
+    /// - Cache hit: Returns cached `Arc<Mutex<SSTable>>` (fast path)
+    /// - Cache miss: Opens SSTable, configures buffer pool/vLog, caches it
+    ///
+    /// # Thread safety
+    /// The returned handle is wrapped in `Arc<Mutex<>>` for safe concurrent access.
+    /// Multiple readers can hold references; the mutex serializes actual I/O.
+    fn get_sstable(&self, path: &PathBuf) -> Result<Arc<Mutex<SSTable>>> {
+        self.sstable_cache.get_or_insert_with(path, || {
+            let has_vlog = self.has_vlog.load(std::sync::atomic::Ordering::Relaxed);
+
+            // Choose caching strategy: buffer pool (if configured) or global block cache
+            let mut sstable = if let Some(ref pool) = self.buffer_pool {
+                SSTable::open_with_buffer_pool(path, Some(Arc::clone(pool)))?
+            } else {
+                let global_cache = Some(Arc::clone(&self.global_block_cache));
+                SSTable::open_with_global_cache(path, global_cache)?
+            };
+
+            // Attach vLog for value separation if enabled
+            if has_vlog {
+                let vlog_path = self.options.data_dir.join("values.vlog");
+                sstable = sstable.with_vlog(VLog::open(&vlog_path)?);
+            }
+
+            Ok(Arc::new(Mutex::new(sstable)))
+        })
+    }
+
     /// Get a value by key.
     ///
     /// Returns the value if found, `None` if the key doesn't exist or was deleted.
@@ -77,9 +112,6 @@ impl DB {
             }
         }
 
-        let vlog_path = self.options.data_dir.join("values.vlog");
-        let has_vlog = self.has_vlog.load(std::sync::atomic::Ordering::Relaxed);
-
         // 3. Check SSTables in LSM tree
         let lsm_arc = self.lsm.load();
         for level_num in 0..lsm_arc.num_levels() {
@@ -87,27 +119,7 @@ impl DB {
                 let sstables: Vec<_> = level.sstables().iter().rev().collect();
 
                 for sstable_path in sstables {
-                    let cached_sstable = self.sstable_cache.get_or_insert_with(
-                        sstable_path,
-                        || -> Result<Arc<Mutex<SSTable>>> {
-                            let global_cache = Some(Arc::clone(&self.global_block_cache));
-                            let buffer_pool = self.buffer_pool.clone();
-
-                            let mut sstable = if let Some(pool) = buffer_pool {
-                                SSTable::open_with_buffer_pool(sstable_path, Some(pool))?
-                            } else {
-                                SSTable::open_with_global_cache(sstable_path, global_cache)?
-                            };
-
-                            if has_vlog {
-                                let vlog = VLog::open(&vlog_path)?;
-                                sstable = sstable.with_vlog(vlog);
-                            }
-
-                            Ok(Arc::new(Mutex::new(sstable)))
-                        },
-                    )?;
-
+                    let cached_sstable = self.get_sstable(sstable_path)?;
                     let mut sstable = cached_sstable.lock().expect("SSTable lock poisoned");
                     let result = sstable.get_entry_mvcc(key, u64::MAX)?;
 
@@ -194,31 +206,10 @@ impl DB {
         }
 
         let lsm_arc = self.lsm.load();
-        let has_vlog = self.options.vlog_threshold.is_some();
-        let vlog_path = self.options.data_dir.join("values.vlog");
-
         for level_num in 0..lsm_arc.num_levels() {
             if let Some(level) = lsm_arc.level(level_num) {
-                let sstables: Vec<_> = level.sstables().iter().rev().collect();
-                for sstable_path in sstables {
-                    let cached_sstable = self.sstable_cache.get_or_insert_with(
-                        sstable_path,
-                        || -> Result<Arc<Mutex<SSTable>>> {
-                            let global_cache = Some(Arc::clone(&self.global_block_cache));
-                            let buffer_pool = self.buffer_pool.clone();
-                            let mut sstable = if let Some(pool) = buffer_pool {
-                                SSTable::open_with_buffer_pool(sstable_path, Some(pool))?
-                            } else {
-                                SSTable::open_with_global_cache(sstable_path, global_cache)?
-                            };
-                            if has_vlog {
-                                let vlog = VLog::open(&vlog_path)?;
-                                sstable = sstable.with_vlog(vlog);
-                            }
-                            Ok(Arc::new(Mutex::new(sstable)))
-                        },
-                    )?;
-
+                for sstable_path in level.sstables().iter().rev() {
+                    let cached_sstable = self.get_sstable(sstable_path)?;
                     let mut sstable = cached_sstable.lock().expect("SSTable lock poisoned");
                     if let Ok(Some(value)) = sstable.get_mvcc(key, snapshot_seq) {
                         if value.is_empty() {
@@ -250,31 +241,10 @@ impl DB {
         }
 
         let lsm_arc = self.lsm.load();
-        let has_vlog = self.options.vlog_threshold.is_some();
-        let vlog_path = self.options.data_dir.join("values.vlog");
-
         for level_num in 0..lsm_arc.num_levels() {
             if let Some(level) = lsm_arc.level(level_num) {
-                let sstables: Vec<_> = level.sstables().iter().rev().collect();
-                for sstable_path in sstables {
-                    let cached_sstable = self.sstable_cache.get_or_insert_with(
-                        sstable_path,
-                        || -> Result<Arc<Mutex<SSTable>>> {
-                            let global_cache = Some(Arc::clone(&self.global_block_cache));
-                            let buffer_pool = self.buffer_pool.clone();
-                            let mut sstable = if let Some(pool) = buffer_pool {
-                                SSTable::open_with_buffer_pool(sstable_path, Some(pool))?
-                            } else {
-                                SSTable::open_with_global_cache(sstable_path, global_cache)?
-                            };
-                            if has_vlog {
-                                let vlog = VLog::open(&vlog_path)?;
-                                sstable = sstable.with_vlog(vlog);
-                            }
-                            Ok(Arc::new(Mutex::new(sstable)))
-                        },
-                    )?;
-
+                for sstable_path in level.sstables().iter().rev() {
+                    let cached_sstable = self.get_sstable(sstable_path)?;
                     let mut sstable = cached_sstable.lock().expect("SSTable lock poisoned");
                     if let Ok(Some((encoded_key, _value))) = sstable.get_raw_entry(key) {
                         if let Some(ikey) = InternalKey::decode(encoded_key) {
