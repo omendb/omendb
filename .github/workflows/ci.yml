@@ -9,9 +9,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Pin nightly for reproducibility (update monthly)
+  RUST_NIGHTLY: nightly-2024-12-01
 
 jobs:
-  # Fast checks first (no build deps needed)
+  # ==========================================================================
+  # Stage 1: Fast checks (parallel, no deps needed)
+  # ==========================================================================
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -20,109 +25,124 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: cargo fmt --all --check
 
-  # Lint checks
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    needs: fmt
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
-
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy (lib)
         run: |
           cargo clippy --workspace --no-default-features --lib -- \
+            -D warnings \
             -D clippy::correctness \
             -W clippy::suspicious \
-            -W clippy::complexity \
             -W clippy::pedantic \
             -A clippy::too_many_arguments \
             -A clippy::type_complexity \
-            -A dead_code \
-            -A unused_imports
-
+            -A clippy::module_name_repetitions
       - name: Clippy (tests)
         run: |
           cargo clippy --workspace --no-default-features --tests -- \
             -D clippy::correctness \
-            -W clippy::suspicious \
-            -A dead_code \
-            -A unused_imports
+            -W clippy::suspicious
 
-  # Unit tests (fast, every commit)
-  test:
-    name: Test (${{ matrix.name }})
-    runs-on: ubuntu-latest
-    needs: clippy
-    strategy:
-      matrix:
-        include:
-          - name: stable
-            toolchain: stable
-            features: --no-default-features
-          - name: nightly+simd
-            toolchain: nightly
-            features: --all-features
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.toolchain }}
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.toolchain }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run unit tests
-        run: cargo test --lib ${{ matrix.features }}
-        timeout-minutes: 10
-
-  # Documentation
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    needs: fmt
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-docs-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build documentation
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
         run: cargo doc --workspace --no-default-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # ==========================================================================
+  # Stage 2: Security checks
+  # ==========================================================================
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # ==========================================================================
+  # Stage 3: Tests (after format/lint pass)
+  # ==========================================================================
+
+  test-stable:
+    name: Test (stable)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests
+        run: cargo test --lib --no-default-features
+        timeout-minutes: 10
+
+  test-nightly:
+    name: Test (nightly + SIMD)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests with SIMD
+        run: cargo test --lib --all-features
+        timeout-minutes: 10
+
+  test-failpoints:
+    name: Test (failpoints)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Failpoint tests
+        run: cargo test --features failpoints failpoint
+        timeout-minutes: 5
+
+  # ==========================================================================
+  # Stage 4: Property-based tests (longer running)
+  # ==========================================================================
+
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    needs: [test-stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Property-based tests
+        run: cargo test --lib proptest
+        timeout-minutes: 15
+        env:
+          PROPTEST_CASES: 500
