@@ -2,6 +2,15 @@
 
 ## [0.0.5] - 2025-12-05
 
+### Fixed
+
+- **Transaction sequence race (P1)**: Concurrent transactions could get overlapping sequence numbers due to load/store race. Fixed with atomic `fetch_add` before writes.
+- **Merge operator data loss (P1)**: Merge failure incorrectly converted to tombstone, losing operands. Now preserves operands on merge failure.
+- **Memtable snapshot isolation bypass (P1)**: `put_entry` used internal sequence counter, bypassing transaction isolation. Added explicit sequence parameter.
+- **Buffer pool eviction race (P2)**: Frame could be evicted between allocation and pin. Now pins frame inside `allocate_frame()`.
+- **WAL errors silently ignored (P2)**: WAL record application failures were discarded. Now logs warnings with sequence context.
+- **Infinite wait loops (P2)**: Write stall and flush wait could hang forever if workers died. Added 30-60s timeouts.
+
 ### Changed
 
 - **BREAKING: API redesign following `std::fs` pattern**
