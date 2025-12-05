@@ -160,15 +160,10 @@ impl Memtable {
         None
     }
 
-    /// Put an Entry (used for compaction/merge resolution)
-    /// Uses a default sequence number (`u64::MAX`) since this is usually for
-    /// memory-only compaction or immediate updates?
-    /// WARNING: This bypasses normal seq assignment.
-    pub fn put_entry(&self, key: Bytes, entry: Entry) {
-        // Using u64::MAX to ensure it is "latest"
-        // But this might mess up snapshot isolation if not careful.
-        // db.rs seems to use this for "repair" or atomic replacement.
-        let seq = u64::MAX;
+    /// Put an Entry with explicit sequence number (used for WAL recovery/merge resolution)
+    ///
+    /// The caller must provide a valid sequence number to maintain MVCC ordering.
+    pub fn put_entry(&self, key: Bytes, entry: Entry, seq: u64) {
         match entry {
             Entry::Value(v) => self.put(key, v, seq),
             Entry::Tombstone => self.delete(key, seq),

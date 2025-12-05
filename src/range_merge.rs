@@ -123,7 +123,11 @@ where
 
             match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
                 Some(res) => Entry::Value(Bytes::from(res)),
-                None => Entry::Tombstone,
+                // Preserve operands on merge failure to prevent data loss
+                None => Entry::Merge {
+                    base: base.cloned(),
+                    operands: self.pending_operands.clone(),
+                },
             }
         } else {
             // No merge operator - can't resolve.
@@ -402,7 +406,11 @@ where
 
             match op.full_merge(key, base.map(std::convert::AsRef::as_ref), &ops) {
                 Some(res) => Entry::Value(Bytes::from(res)),
-                None => Entry::Tombstone,
+                // Preserve operands on merge failure to prevent data loss
+                None => Entry::Merge {
+                    base: base.cloned(),
+                    operands: self.pending_operands.clone(),
+                },
             }
         } else if let Some(first) = self.pending_operands.first() {
             Entry::Merge {

@@ -62,21 +62,16 @@ pub(crate) fn recover_partitioned(
                                         key,
                                         operand,
                                         merge_operator,
+                                        current_seq,
                                     );
                                 }
                             }
                             current_seq += 1;
                         }
                     }
-                    Record::Merge {
-                        key,
-                        operand,
-                        seq: _,
-                    } => {
-                        // Note: apply_merge currently uses u64::MAX internally via put_entry
-                        // Ideally it should use the record seq.
+                    Record::Merge { key, operand, seq } => {
                         let partition = partition_for_key(&key);
-                        apply_merge(&memtables[partition], key, operand, merge_operator);
+                        apply_merge(&memtables[partition], key, operand, merge_operator, seq);
                     }
                 }
                 records_recovered += 1;
@@ -121,6 +116,7 @@ fn apply_merge(
     key: Bytes,
     operand: Bytes,
     merge_operator: Option<&Arc<dyn MergeOperator>>,
+    seq: u64,
 ) {
     let new_entry = match mt.get_entry(&key) {
         Some(Entry::Value(v)) => {
@@ -168,7 +164,7 @@ fn apply_merge(
             operands: vec![operand],
         },
     };
-    mt.put_entry(key, new_entry);
+    mt.put_entry(key, new_entry, seq);
 }
 
 /// Clean up old `SSTable` deletion queue

@@ -223,10 +223,11 @@ impl<'db> Transaction<'db> {
             return Ok(());
         }
 
-        // Get base sequence number (don't increment yet - see below)
-        // commit_lock ensures only one commit at a time, so this is safe
+        // Allocate sequence numbers BEFORE writing to memtable.
+        // Using fetch_add atomically reserves the range, preventing race where
+        // a new transaction starts with start_seq in our range before we update next_seq.
         let op_count = wal_ops.len() as u64;
-        let base_seq = self.db.next_seq.load(Ordering::SeqCst);
+        let base_seq = self.db.next_seq.fetch_add(op_count, Ordering::SeqCst);
 
         // Atomic batch write
         let batch_record = Record::Batch {
@@ -240,13 +241,6 @@ impl<'db> Transaction<'db> {
                 self.db.apply_wal_records(records);
             })
             .map_err(DBError::Wal)?;
-
-        // Increment next_seq AFTER memtable write completes.
-        // This prevents a race where a new transaction could start with
-        // start_seq > our commit seq, causing it to miss our writes in validation.
-        self.db
-            .next_seq
-            .store(base_seq + op_count, Ordering::SeqCst);
 
         // Lock released here when _commit_guard drops
         Ok(())
