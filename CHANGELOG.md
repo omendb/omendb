@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.0.5] - 2025-12-05
+
+### Changed
+
+- **BREAKING: API redesign following `std::fs` pattern**
+  - `DB::open(path)` - simple open with defaults (like `File::open`)
+  - `DBOptions::default()...open(path)` - configured open (like `OpenOptions`)
+  - Path is now passed to `open()`, not stored in options
+  - Builder methods renamed: `with_memtable_capacity()` → `memtable_capacity()`, etc.
+  - Profile constructors no longer take path: `DBOptions::embedded()`, `high_throughput()`, `large_scale()`
+  - `DBOptions::open(&self, path)` takes `&self` for reusability (matches `OpenOptions::open`)
+  - Complete builder API: all options now have builder methods (no struct literals needed)
+
+### Migration
+
+```rust
+// Before (0.0.4)
+let db = DB::open(DBOptions { data_dir: path, ..Default::default() })?;
+let db = DB::open(DBOptions::embedded(path))?;
+let db = DB::open(DBOptions::default().with_memtable_capacity(64_MB))?;
+
+// After (0.0.5)
+let db = DB::open(path)?;
+let db = DBOptions::embedded().open(path)?;
+let db = DBOptions::default().memtable_capacity(64_MB).open(path)?;
+```
+
 ## [0.0.4] - 2025-12-03
 
 ### Fixed

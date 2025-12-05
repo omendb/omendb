@@ -88,7 +88,16 @@ Commands to verify correctness (must pass):
 ```rust
 use seerdb::{DB, DBOptions};
 
-let db = DB::open(DBOptions::default())?;
+// Simple (std::fs::File pattern)
+let db = DB::open("./my_db")?;
+
+// Configured (std::fs::OpenOptions pattern)
+let db = DBOptions::default()
+    .memtable_capacity(64 * 1024 * 1024)
+    .background_compaction(true)
+    .open("./my_db")?;
+
+// Operations
 db.put(b"key", b"value")?;
 db.get(b"key")?;
 db.delete(b"key")?;

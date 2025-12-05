@@ -235,11 +235,7 @@ mod tests {
     #[test]
     fn test_batch_basic() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         let mut batch = db.batch();
         batch.put(b"key1", b"value1");
@@ -259,11 +255,7 @@ mod tests {
     #[test]
     fn test_batch_empty() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         let batch = db.batch();
         assert!(batch.is_empty());
@@ -276,11 +268,7 @@ mod tests {
     #[test]
     fn test_batch_with_capacity() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         let mut batch = db.batch_with_capacity(100);
         for i in 0..100 {

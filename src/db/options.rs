@@ -54,9 +54,29 @@ impl ReadOptions {
 }
 
 /// Database configuration options.
+///
+/// Use the builder pattern to configure options, then call [`open()`](Self::open)
+/// to create the database. For simple cases, use [`DB::open()`](super::DB::open).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use seerdb::DBOptions;
+///
+/// // Simple: use DB::open directly
+/// let db = seerdb::DB::open("./my_db")?;
+///
+/// // Configured: use builder pattern
+/// let db = DBOptions::default()
+///     .memtable_capacity(64 * 1024 * 1024)
+///     .background_compaction(true)
+///     .open("./my_db")?;
+/// # Ok::<(), seerdb::DBError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct DBOptions {
-    pub data_dir: PathBuf,
+    /// Internal: set by `open()` or `open_with()`, not by users directly.
+    pub(crate) data_dir: PathBuf,
     pub memtable_capacity: usize,
     pub wal_sync_policy: SyncPolicy,
     pub recovery_mode: RecoveryMode,
@@ -93,7 +113,7 @@ pub struct DBOptions {
 impl Default for DBOptions {
     fn default() -> Self {
         Self {
-            data_dir: PathBuf::from("./seerdb_data"),
+            data_dir: PathBuf::new(), // Set by open()/open_with()
             memtable_capacity: 256 * 1024 * 1024,
             max_open_files: None,
             wal_sync_policy: SyncPolicy::SyncData,
@@ -130,11 +150,47 @@ impl Default for DBOptions {
 }
 
 impl DBOptions {
-    /// Configuration profile for embedded/single-process applications.
+    /// Create a new options builder with default values.
     #[must_use]
-    pub fn embedded(data_dir: PathBuf) -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open a database with these options at the given path.
+    ///
+    /// This is the primary way to open a configured database. For simple cases
+    /// with default options, use [`DB::open()`](super::DB::open) instead.
+    ///
+    /// Options can be reused to open multiple databases with the same configuration:
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use seerdb::DBOptions;
+    ///
+    /// let opts = DBOptions::default()
+    ///     .memtable_capacity(128 * 1024 * 1024)
+    ///     .background_compaction(true);
+    ///
+    /// let db1 = opts.open("./db1")?;
+    /// let db2 = opts.open("./db2")?;  // Reuse same options
+    /// # Ok::<(), seerdb::DBError>(())
+    /// ```
+    pub fn open(&self, path: impl AsRef<std::path::Path>) -> super::Result<super::DB> {
+        super::DB::open_with(path, self.clone())
+    }
+
+    /// Configuration profile for embedded/single-process applications.
+    ///
+    /// Optimized for lower memory usage and simpler operation:
+    /// - 64MB memtable
+    /// - Smaller block cache
+    /// - Direct WAL writes
+    /// - Metrics disabled
+    /// - Synchronous compaction
+    #[must_use]
+    pub fn embedded() -> Self {
         Self {
-            data_dir,
             memtable_capacity: 64 * 1024 * 1024,
             block_cache_capacity: 4_096,
             use_direct_wal: true,
@@ -146,10 +202,15 @@ impl DBOptions {
     }
 
     /// Configuration profile for high-throughput server workloads.
+    ///
+    /// Optimized for write-heavy workloads:
+    /// - 512MB memtable
+    /// - Large block cache
+    /// - Background compaction and flush
+    /// - Adaptive compaction enabled
     #[must_use]
-    pub fn high_throughput(data_dir: PathBuf) -> Self {
+    pub fn high_throughput() -> Self {
         Self {
-            data_dir,
             memtable_capacity: 512 * 1024 * 1024,
             block_cache_capacity: 65_536,
             background_compaction: true,
@@ -162,10 +223,15 @@ impl DBOptions {
     }
 
     /// Configuration profile for large-scale deployments (1B+ keys).
+    ///
+    /// Optimized for very large datasets:
+    /// - 1GB memtable
+    /// - Maximum block cache
+    /// - Aggressive vLog threshold for large values
+    /// - All background operations enabled
     #[must_use]
-    pub fn large_scale(data_dir: PathBuf) -> Self {
+    pub fn large_scale() -> Self {
         Self {
-            data_dir,
             memtable_capacity: 1024 * 1024 * 1024,
             block_cache_capacity: 131_072,
             base_level_size: 64 * 1024 * 1024,
@@ -179,56 +245,205 @@ impl DBOptions {
         }
     }
 
-    pub fn with_data_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.data_dir = path.into();
-        self
-    }
-
+    /// Set the memtable capacity in bytes.
     #[must_use]
-    pub const fn with_memtable_capacity(mut self, bytes: usize) -> Self {
+    pub const fn memtable_capacity(mut self, bytes: usize) -> Self {
         self.memtable_capacity = bytes;
         self
     }
 
+    /// Set the block cache capacity (number of blocks).
     #[must_use]
-    pub const fn with_block_cache_capacity(mut self, num_blocks: usize) -> Self {
+    pub const fn block_cache_capacity(mut self, num_blocks: usize) -> Self {
         self.block_cache_capacity = num_blocks;
         self
     }
 
+    /// Set the WAL sync policy.
     #[must_use]
-    pub const fn with_sync_policy(mut self, policy: SyncPolicy) -> Self {
+    pub const fn sync_policy(mut self, policy: SyncPolicy) -> Self {
         self.wal_sync_policy = policy;
         self
     }
 
+    /// Enable or disable background compaction.
     #[must_use]
-    pub const fn with_background_compaction(mut self, enabled: bool) -> Self {
+    pub const fn background_compaction(mut self, enabled: bool) -> Self {
         self.background_compaction = enabled;
         self
     }
 
+    /// Enable or disable background flush.
     #[must_use]
-    pub const fn with_background_flush(mut self, enabled: bool) -> Self {
+    pub const fn background_flush(mut self, enabled: bool) -> Self {
         self.background_flush = enabled;
         self
     }
 
+    /// Enable or disable metrics collection.
     #[must_use]
-    pub const fn with_metrics(mut self, enabled: bool) -> Self {
+    pub const fn metrics(mut self, enabled: bool) -> Self {
         self.disable_metrics = !enabled;
         self
     }
 
+    /// Enable or disable direct WAL writes.
     #[must_use]
-    pub const fn with_direct_wal(mut self, enabled: bool) -> Self {
+    pub const fn direct_wal(mut self, enabled: bool) -> Self {
         self.use_direct_wal = enabled;
         self
     }
 
+    /// Enable or disable WAL entirely.
     #[must_use]
-    pub const fn with_skip_wal(mut self, enabled: bool) -> Self {
+    pub const fn skip_wal(mut self, enabled: bool) -> Self {
         self.skip_wal = enabled;
+        self
+    }
+
+    /// Set the value size threshold for vLog separation.
+    #[must_use]
+    pub const fn vlog_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.vlog_threshold = threshold;
+        self
+    }
+
+    /// Set the compression type for SSTables.
+    #[must_use]
+    pub const fn compression(mut self, compression: crate::sstable::CompressionType) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Set the merge operator for read-modify-write operations.
+    #[must_use]
+    pub fn merge_operator(mut self, operator: Arc<dyn MergeOperator>) -> Self {
+        self.merge_operator = Some(operator);
+        self
+    }
+
+    /// Set the recovery mode for WAL replay.
+    #[must_use]
+    pub const fn recovery_mode(mut self, mode: RecoveryMode) -> Self {
+        self.recovery_mode = mode;
+        self
+    }
+
+    /// Set the base level size for LSM compaction (bytes).
+    #[must_use]
+    pub const fn base_level_size(mut self, bytes: u64) -> Self {
+        self.base_level_size = bytes;
+        self
+    }
+
+    /// Set the size ratio between LSM levels.
+    #[must_use]
+    pub const fn size_ratio(mut self, ratio: u64) -> Self {
+        self.size_ratio = ratio;
+        self
+    }
+
+    /// Set the number of LSM levels.
+    #[must_use]
+    pub const fn num_levels(mut self, levels: usize) -> Self {
+        self.num_levels = levels;
+        self
+    }
+
+    /// Enable or disable adaptive compaction.
+    #[must_use]
+    pub const fn adaptive_compaction(mut self, enabled: bool) -> Self {
+        self.adaptive_compaction = enabled;
+        self
+    }
+
+    /// Set the maximum memory budget in bytes.
+    #[must_use]
+    pub const fn max_memory_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.max_memory_bytes = bytes;
+        self
+    }
+
+    /// Set the minimum disk space threshold in bytes.
+    #[must_use]
+    pub const fn min_disk_space_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.min_disk_space_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum number of open files.
+    #[must_use]
+    pub const fn max_open_files(mut self, max: Option<usize>) -> Self {
+        self.max_open_files = max;
+        self
+    }
+
+    /// Set the buffer pool capacity.
+    #[must_use]
+    pub const fn buffer_pool_capacity(mut self, capacity: Option<usize>) -> Self {
+        self.buffer_pool_capacity = capacity;
+        self
+    }
+
+    /// Set the group commit delay in microseconds.
+    #[must_use]
+    pub const fn group_commit_delay_us(mut self, us: u64) -> Self {
+        self.group_commit_delay_us = us;
+        self
+    }
+
+    /// Set the maximum batch size for group commits.
+    #[must_use]
+    pub const fn group_commit_max_batch_size(mut self, size: usize) -> Self {
+        self.group_commit_max_batch_size = size;
+        self
+    }
+
+    /// Set the L0 file count that triggers write slowdown.
+    #[must_use]
+    pub const fn l0_slowdown_writes_trigger(mut self, count: usize) -> Self {
+        self.l0_slowdown_writes_trigger = count;
+        self
+    }
+
+    /// Set the L0 file count that stops writes entirely.
+    #[must_use]
+    pub const fn l0_stop_writes_trigger(mut self, count: usize) -> Self {
+        self.l0_stop_writes_trigger = count;
+        self
+    }
+
+    /// Set a compaction filter for custom key filtering during compaction.
+    #[must_use]
+    pub fn compaction_filter(
+        mut self,
+        filter: Arc<dyn crate::compaction::CompactionFilter>,
+    ) -> Self {
+        self.compaction_filter = Some(filter);
+        self
+    }
+
+    /// Set the storage backend configuration (requires `object-store` feature).
+    #[cfg(feature = "object-store")]
+    #[must_use]
+    pub fn storage_config(mut self, config: StorageConfig) -> Self {
+        self.storage_config = Some(config);
+        self
+    }
+
+    /// Set the LSM level at which data moves to cold storage (requires `object-store` feature).
+    #[cfg(feature = "object-store")]
+    #[must_use]
+    pub const fn cold_tier_level(mut self, level: Option<usize>) -> Self {
+        self.cold_tier_level = level;
+        self
+    }
+
+    /// Set the cold storage backend configuration (requires `object-store` feature).
+    #[cfg(feature = "object-store")]
+    #[must_use]
+    pub fn cold_storage(mut self, config: StorageConfig) -> Self {
+        self.cold_storage = Some(config);
         self
     }
 }

@@ -319,11 +319,7 @@ mod tests {
     #[test]
     fn test_transaction_read_write() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         // Pre-populate
         db.put(b"key1", b"value1").unwrap();
@@ -352,11 +348,7 @@ mod tests {
     #[test]
     fn test_transaction_delete() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         db.put(b"key1", b"value1").unwrap();
 
@@ -378,11 +370,7 @@ mod tests {
     #[test]
     fn test_transaction_abort() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         let mut txn = db.begin_transaction();
         txn.put(b"key1", b"value1").unwrap();
@@ -395,11 +383,7 @@ mod tests {
     #[test]
     fn test_transaction_conflict() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         db.put(b"balance", b"100").unwrap();
 
@@ -427,11 +411,7 @@ mod tests {
     #[test]
     fn test_transaction_no_conflict_on_unread_keys() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         db.put(b"key1", b"value1").unwrap();
         db.put(b"key2", b"value2").unwrap();
@@ -455,11 +435,7 @@ mod tests {
     #[test]
     fn test_transaction_empty_commit() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         let txn = db.begin_transaction();
         // Empty transaction should succeed
@@ -469,11 +445,7 @@ mod tests {
     #[test]
     fn test_transaction_write_only_no_conflict() {
         let dir = tempdir().unwrap();
-        let opts = DBOptions {
-            data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let db = DB::open(opts).unwrap();
+        let db = DB::open(dir.path()).unwrap();
 
         db.put(b"key1", b"value1").unwrap();
 

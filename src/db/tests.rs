@@ -4,12 +4,7 @@ use tempfile::tempdir;
 #[test]
 fn test_db_open() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
     assert_eq!(db.memtable_size(), 0);
 }
 
@@ -17,32 +12,32 @@ fn test_db_open() {
 fn test_config_profiles() {
     // Test embedded profile
     let dir = tempdir().unwrap();
-    let opts = DBOptions::embedded(dir.path().to_path_buf());
+    let opts = DBOptions::embedded();
     assert_eq!(opts.memtable_capacity, 64 * 1024 * 1024);
     assert!(opts.use_direct_wal);
     assert!(opts.disable_metrics);
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(Bytes::from("value")));
     drop(db);
 
     // Test high_throughput profile
     let dir = tempdir().unwrap();
-    let opts = DBOptions::high_throughput(dir.path().to_path_buf());
+    let opts = DBOptions::high_throughput();
     assert_eq!(opts.memtable_capacity, 512 * 1024 * 1024);
     assert!(opts.background_compaction);
     assert!(opts.background_flush);
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(Bytes::from("value")));
     drop(db);
 
     // Test large_scale profile
     let dir = tempdir().unwrap();
-    let opts = DBOptions::large_scale(dir.path().to_path_buf());
+    let opts = DBOptions::large_scale();
     assert_eq!(opts.memtable_capacity, 1024 * 1024 * 1024);
     assert_eq!(opts.base_level_size, 64 * 1024 * 1024);
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(Bytes::from("value")));
     drop(db);
@@ -50,14 +45,13 @@ fn test_config_profiles() {
     // Test builder pattern
     let dir = tempdir().unwrap();
     let opts = DBOptions::default()
-        .with_data_dir(dir.path())
-        .with_memtable_capacity(128 * 1024 * 1024)
-        .with_metrics(false)
-        .with_direct_wal(true);
+        .memtable_capacity(128 * 1024 * 1024)
+        .metrics(false)
+        .direct_wal(true);
     assert_eq!(opts.memtable_capacity, 128 * 1024 * 1024);
     assert!(opts.disable_metrics);
     assert!(opts.use_direct_wal);
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
     db.put(b"key", b"value").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(Bytes::from("value")));
 }
@@ -65,12 +59,10 @@ fn test_config_profiles() {
 #[test]
 fn test_skip_wal_single_writes() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .with_data_dir(dir.path())
-        .with_skip_wal(true);
+    let opts = DBOptions::default().skip_wal(true);
 
     assert!(opts.skip_wal);
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Write some data (no WAL)
     for i in 0..100 {
@@ -100,11 +92,9 @@ fn test_skip_wal_single_writes() {
 #[test]
 fn test_skip_wal_batch_writes() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions::default()
-        .with_data_dir(dir.path())
-        .with_skip_wal(true);
+    let opts = DBOptions::default().skip_wal(true);
 
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Batch write (no WAL)
     let mut batch = db.batch();
@@ -126,12 +116,9 @@ fn test_skip_wal_batch_writes() {
 #[test]
 fn test_bulk_load_basic() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: None, // Disable vLog for simplicity
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(None); // Disable vLog for simplicity
+    let db = opts.open(dir.path()).unwrap();
 
     // Create test entries (unsorted to test sorting)
     let entries = vec![
@@ -159,12 +146,9 @@ fn test_bulk_load_basic() {
 #[test]
 fn test_bulk_load_with_vlog() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: Some(10), // Small threshold to test vLog
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(Some(10)); // Small threshold to test vLog
+    let db = opts.open(dir.path()).unwrap();
 
     // Create entries with large values
     let entries = vec![
@@ -195,12 +179,9 @@ fn test_bulk_load_with_vlog() {
 #[test]
 fn test_bulk_load_multiple_sstables() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: None,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(None);
+    let db = opts.open(dir.path()).unwrap();
 
     // Create many entries
     let entries: Vec<_> = (0..500)
@@ -236,12 +217,9 @@ fn test_bulk_load_multiple_sstables() {
 #[test]
 fn test_bulk_load_already_sorted() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: None,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(None);
+    let db = opts.open(dir.path()).unwrap();
 
     // Pre-sorted entries
     let entries = vec![
@@ -264,12 +242,9 @@ fn test_bulk_load_already_sorted() {
 #[test]
 fn test_bulk_load_target_level() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: None,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(None);
+    let db = opts.open(dir.path()).unwrap();
 
     let entries = vec![(b"key".to_vec(), b"value".to_vec())];
 
@@ -285,12 +260,9 @@ fn test_bulk_load_target_level() {
 #[test]
 fn test_bulk_load_empty() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: None,
-        ..Default::default()
-    };
-    let db = DB::open(opts).unwrap();
+    let opts = DBOptions::default()
+        .vlog_threshold(None);
+    let db = opts.open(dir.path()).unwrap();
 
     let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![];
     let stats = db.bulk_load(entries, BulkLoadOptions::default()).unwrap();
@@ -303,12 +275,7 @@ fn test_bulk_load_empty() {
 #[test]
 fn test_db_put_get() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
     db.put(b"key2", b"value2").unwrap();
@@ -321,12 +288,7 @@ fn test_db_put_get() {
 #[test]
 fn test_db_delete() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
     assert_eq!(db.get(b"key1").unwrap(), Some(Bytes::from("value1")));
@@ -338,12 +300,7 @@ fn test_db_delete() {
 #[test]
 fn test_db_overwrite() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"key1", b"old_value").unwrap();
     assert_eq!(db.get(b"key1").unwrap(), Some(Bytes::from("old_value")));
@@ -355,13 +312,10 @@ fn test_db_overwrite() {
 #[test]
 fn test_db_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 100, // Small capacity to trigger flush
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(100); // Small capacity to trigger flush
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write enough data to trigger flush
     for i in 0..10 {
@@ -396,14 +350,11 @@ fn test_db_flush() {
 #[test]
 fn test_db_recovery_basic() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
+    let options = DBOptions::default();
 
     // Write some data
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         db.put(b"key1", b"value1").unwrap();
         db.put(b"key2", b"value2").unwrap();
         db.put(b"key3", b"value3").unwrap();
@@ -412,7 +363,7 @@ fn test_db_recovery_basic() {
 
     // Reopen and verify data recovered from WAL
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         assert_eq!(db.get(b"key1").unwrap(), Some(Bytes::from("value1")));
         assert_eq!(db.get(b"key2").unwrap(), Some(Bytes::from("value2")));
         assert_eq!(db.get(b"key3").unwrap(), Some(Bytes::from("value3")));
@@ -422,14 +373,11 @@ fn test_db_recovery_basic() {
 #[test]
 fn test_db_recovery_with_deletes() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
+    let options = DBOptions::default();
 
     // Write and delete some data
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         db.put(b"key1", b"value1").unwrap();
         db.put(b"key2", b"value2").unwrap();
         db.delete(b"key1").unwrap(); // Delete key1
@@ -438,7 +386,7 @@ fn test_db_recovery_with_deletes() {
 
     // Reopen and verify recovery
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         assert_eq!(db.get(b"key1").unwrap(), None); // Deleted
         assert_eq!(db.get(b"key2").unwrap(), Some(Bytes::from("value2")));
         assert_eq!(db.get(b"key3").unwrap(), Some(Bytes::from("value3")));
@@ -448,21 +396,18 @@ fn test_db_recovery_with_deletes() {
 #[test]
 fn test_db_recovery_with_overwrites() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
+    let options = DBOptions::default();
 
     // Write with overwrites
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         db.put(b"key1", b"old_value").unwrap();
         db.put(b"key1", b"new_value").unwrap(); // Overwrite
     }
 
     // Reopen and verify newest value recovered
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         assert_eq!(db.get(b"key1").unwrap(), Some(Bytes::from("new_value")));
     }
 }
@@ -470,15 +415,12 @@ fn test_db_recovery_with_overwrites() {
 #[test]
 fn test_db_recovery_with_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 100, // Small to trigger flush during recovery
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(100); // Small to trigger flush during recovery
 
     // Write enough data to trigger flush on recovery
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         for i in 0..20 {
             let key = format!("key_{}", i);
             let value = format!("value_with_long_data_{}", i);
@@ -488,7 +430,7 @@ fn test_db_recovery_with_flush() {
 
     // Reopen (recovery should trigger flush due to small memtable)
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         for i in 0..20 {
             let key = format!("key_{}", i);
             let value = format!("value_with_long_data_{}", i);
@@ -500,19 +442,16 @@ fn test_db_recovery_with_flush() {
 #[test]
 fn test_db_recovery_empty_wal() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
+    let options = DBOptions::default();
 
     // Create DB (no data written)
     {
-        let _db = DB::open(options.clone()).unwrap();
+        let _db = options.open(dir.path()).unwrap();
     }
 
     // Reopen (WAL exists but is empty)
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         assert_eq!(db.get(b"key1").unwrap(), None);
     }
 }
@@ -520,14 +459,11 @@ fn test_db_recovery_empty_wal() {
 #[test]
 fn test_db_with_kv_separation() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 200,   // Small enough to trigger flush
-        vlog_threshold: Some(50), // 50 byte threshold
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(200)   // Small enough to trigger flush
+        .vlog_threshold(Some(50)); // 50 byte threshold
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Small value (stored inline in SSTable after flush)
     db.put(b"small_key", b"tiny_value").unwrap();
@@ -564,15 +500,12 @@ fn test_db_with_kv_separation() {
 #[test]
 fn test_db_with_kv_separation_recovery() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        vlog_threshold: Some(50), // 50 byte threshold
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .vlog_threshold(Some(50)); // 50 byte threshold
 
     // Write data with large values
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         db.put(b"key1", b"small_value").unwrap();
         let large_value = vec![b'Y'; 200];
         db.put(b"key2", &large_value).unwrap();
@@ -580,7 +513,7 @@ fn test_db_with_kv_separation_recovery() {
 
     // Reopen and verify recovery works with vLog
     {
-        let db = DB::open(options.clone()).unwrap();
+        let db = options.open(dir.path()).unwrap();
         assert_eq!(db.get(b"key1").unwrap(), Some(Bytes::from("small_value")));
         let expected_large = vec![b'Y'; 200];
         assert_eq!(db.get(b"key2").unwrap(), Some(Bytes::from(expected_large)));
@@ -592,14 +525,11 @@ fn test_db_background_compaction() {
     use std::time::Duration;
 
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 100,      // Small to trigger flushes
-        background_compaction: true, // Enable background compaction
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(100)      // Small to trigger flushes
+        .background_compaction(true); // Enable background compaction
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write enough data to trigger multiple flushes and compaction
     for i in 0..100 {
@@ -629,22 +559,16 @@ fn test_db_sync_vs_async_compaction() {
     let dir_sync = tempdir().unwrap();
     let dir_async = tempdir().unwrap();
 
-    let options_sync = DBOptions {
-        data_dir: dir_sync.path().to_path_buf(),
-        memtable_capacity: 100,
-        background_compaction: false, // Synchronous
-        ..Default::default()
-    };
+    let options_sync = DBOptions::default()
+        .memtable_capacity(100)
+        .background_compaction(false); // Synchronous
 
-    let options_async = DBOptions {
-        data_dir: dir_async.path().to_path_buf(),
-        memtable_capacity: 100,
-        background_compaction: true, // Asynchronous
-        ..Default::default()
-    };
+    let options_async = DBOptions::default()
+        .memtable_capacity(100)
+        .background_compaction(true); // Asynchronous
 
-    let db_sync = DB::open(options_sync).unwrap();
-    let db_async = DB::open(options_async).unwrap();
+    let db_sync = options_sync.open(dir_sync.path()).unwrap();
+    let db_async = options_async.open(dir_async.path()).unwrap();
 
     // Write same data to both
     for i in 0..50 {
@@ -675,12 +599,7 @@ fn test_db_sync_vs_async_compaction() {
 #[test]
 fn test_db_health_checks() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Perform some operations
     for i in 0..10 {
@@ -709,12 +628,11 @@ fn test_db_health_checks() {
 #[test]
 fn test_range_scan_with_sstables() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-    opts.memtable_capacity = 1024; // Small memtable to force flush
-    opts.background_compaction = false;
+    let opts = DBOptions::default()
+        .memtable_capacity(1024) // Small memtable to force flush
+        .background_compaction(false);
 
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Insert enough data to trigger flush to SSTables
     for i in 0..100 {
@@ -745,12 +663,11 @@ fn test_range_scan_with_sstables() {
 #[test]
 fn test_range_scan_with_overwrites() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-    opts.memtable_capacity = 1024;
-    opts.background_compaction = false;
+    let opts = DBOptions::default()
+        .memtable_capacity(1024)
+        .background_compaction(false);
 
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Write initial data
     for i in 0..50 {
@@ -785,12 +702,11 @@ fn test_range_scan_with_overwrites() {
 #[test]
 fn test_range_scan_with_deletes() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-    opts.memtable_capacity = 1024;
-    opts.background_compaction = false;
+    let opts = DBOptions::default()
+        .memtable_capacity(1024)
+        .background_compaction(false);
 
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Write data
     for i in 0..50 {
@@ -822,14 +738,11 @@ fn test_range_scan_with_deletes() {
 #[test]
 fn test_memory_budget_enforcement() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1024 * 1024,            // 1MB per partition
-        max_memory_bytes: Some(200 * 1024 * 1024), // 200MB budget (won't be triggered in test)
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1024 * 1024)            // 1MB per partition
+        .max_memory_bytes(Some(200 * 1024 * 1024)); // 200MB budget (won't be triggered in test)
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Verify memory estimation works
     let initial_memory = db.estimate_memory_usage();
@@ -851,13 +764,10 @@ fn test_memory_budget_enforcement() {
 #[test]
 fn test_estimate_memory_usage() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1024,
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1024);
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Initial memory should include cache overhead
     let initial = db.estimate_memory_usage();
@@ -880,12 +790,7 @@ fn test_estimate_memory_usage() {
 #[test]
 fn test_snapshot_basic_isolation() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Write initial data
     db.put(b"key1", b"value1").unwrap();
@@ -913,12 +818,7 @@ fn test_snapshot_basic_isolation() {
 #[test]
 fn test_snapshot_range_isolation() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Write initial data
     db.put(b"a", b"1").unwrap();
@@ -962,12 +862,7 @@ fn test_snapshot_during_concurrent_writes() {
     use std::thread;
 
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(options).unwrap());
+    let db = Arc::new(DB::open(dir.path()).unwrap());
 
     // Write initial data
     for i in 0..100 {
@@ -1019,12 +914,7 @@ fn test_snapshot_during_concurrent_writes() {
 #[test]
 fn test_snapshot_sequence_number() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"key1", b"value1").unwrap();
     db.flush().unwrap(); // Force flush to increment sequence
@@ -1044,12 +934,7 @@ fn test_snapshot_sequence_number() {
 #[test]
 fn test_multiple_snapshots() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Initial state
     db.put(b"key", b"v1").unwrap();
@@ -1081,12 +966,7 @@ fn test_multiple_snapshots() {
 #[test]
 fn test_snapshot_with_tombstones() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Write and delete
     db.put(b"key1", b"value1").unwrap();
@@ -1111,12 +991,7 @@ fn test_snapshot_with_tombstones() {
 #[test]
 fn test_iter_all_keys() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Write some keys
     db.put(b"a", b"1").unwrap();
@@ -1139,12 +1014,7 @@ fn test_iter_all_keys() {
 #[test]
 fn test_db_iter_rev() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
@@ -1161,12 +1031,7 @@ fn test_db_iter_rev() {
 #[test]
 fn test_prefix_scan() {
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(options).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     // Write keys with different prefixes
     db.put(b"user:1", b"alice").unwrap();
@@ -1228,11 +1093,10 @@ fn test_increment_bytes_helper() {
 #[test]
 fn test_prefix_with_sstables() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-    opts.memtable_capacity = 1024; // Small memtable to force flush
+    let opts = DBOptions::default()
+        .memtable_capacity(1024); // Small memtable to force flush
 
-    let db = DB::open(opts).unwrap();
+    let db = opts.open(dir.path()).unwrap();
 
     // Write enough data to trigger flush
     for i in 0..20 {
@@ -1262,10 +1126,7 @@ fn test_prefix_with_sstables() {
 #[test]
 fn test_prefix_batch_basic() {
     let dir = tempdir().unwrap();
-    let mut opts = DBOptions::default();
-    opts.data_dir = dir.path().to_path_buf();
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"user:1", b"alice").unwrap();
     db.put(b"user:2", b"bob").unwrap();
@@ -1293,12 +1154,7 @@ fn test_prefix_batch_basic() {
 #[test]
 fn test_prefix_batch_empty() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     let prefixes: Vec<&[u8]> = vec![];
     let results = db.prefix_batch(&prefixes).unwrap();
@@ -1308,12 +1164,7 @@ fn test_prefix_batch_empty() {
 #[test]
 fn test_prefix_batch_no_matches() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"user:1", b"alice").unwrap();
 
@@ -1326,12 +1177,7 @@ fn test_prefix_batch_no_matches() {
 #[test]
 fn test_prefix_batch_ordering() {
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = DB::open(opts).unwrap();
+    let db = DB::open(dir.path()).unwrap();
 
     db.put(b"a:1", b"1").unwrap();
     db.put(b"b:1", b"2").unwrap();
@@ -1351,12 +1197,7 @@ fn test_prefix_batch_concurrent() {
     use std::thread;
 
     let dir = tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(DB::open(dir.path()).unwrap());
 
     db.put(b"user:1", b"alice").unwrap();
     db.put(b"user:2", b"bob").unwrap();
@@ -1386,14 +1227,11 @@ fn test_prefix_batch_concurrent() {
 fn test_global_block_cache_hits() {
     // Test that global block cache provides cache hits on repeated reads
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1024,   // Small to force flush
-        block_cache_capacity: 100, // Small cache (100 blocks)
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1024)   // Small to force flush
+        .block_cache_capacity(100); // Small cache (100 blocks)
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write data to create SSTable
     for i in 0..50 {
@@ -1445,13 +1283,10 @@ fn test_global_block_cache_hits() {
 fn test_block_cache_stats_in_dbstats() {
     // Test that block cache metrics are properly exposed in DBStats
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        block_cache_capacity: 500, // 500 blocks
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .block_cache_capacity(500); // 500 blocks
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Check initial cache stats
     let stats = db.stats();
@@ -1473,14 +1308,11 @@ fn test_block_cache_stats_in_dbstats() {
 fn test_block_cache_shared_across_sstables() {
     // Test that global cache is shared across multiple SSTables
     let dir = tempdir().unwrap();
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 2048,    // Small to force multiple flushes
-        block_cache_capacity: 1000, // Enough to cache blocks from multiple SSTables
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(2048)    // Small to force multiple flushes
+        .block_cache_capacity(1000); // Enough to cache blocks from multiple SSTables
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write first batch and flush to create SSTable 1
     for i in 0..20 {
@@ -1535,15 +1367,12 @@ fn test_db_with_cloud_storage_backend() {
     let store = std::sync::Arc::new(InMemory::new());
     let _guard = rt.enter();
 
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1000, // Small to trigger flushes
-        storage_config: Some(StorageConfig::Custom(store.clone())),
-        vlog_threshold: None, // Disable vLog to test non-vLog path
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1000) // Small to trigger flushes
+        .storage_config(Some(StorageConfig::Custom(store.clone())))
+        .vlog_threshold(None); // Disable vLog to test non-vLog path
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write enough data to trigger flush
     for i in 0..50 {
@@ -1594,15 +1423,12 @@ fn test_db_cloud_storage_with_vlog() {
     let store = std::sync::Arc::new(InMemory::new());
     let _guard = rt.enter();
 
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1000, // Small to trigger flushes
-        storage_config: Some(StorageConfig::Custom(store.clone())),
-        vlog_threshold: Some(100), // Enable vLog for large values
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1000) // Small to trigger flushes
+        .storage_config(Some(StorageConfig::Custom(store.clone())))
+        .vlog_threshold(Some(100)); // Enable vLog for large values
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write mixed data: small and large values
     for i in 0..30 {
@@ -1665,18 +1491,15 @@ fn test_tiered_storage_cold_tier_compaction() {
     let cold_store = std::sync::Arc::new(InMemory::new());
     let _guard = rt.enter();
 
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        memtable_capacity: 1000,  // Very small to trigger frequent flushes
-        base_level_size: 500,     // Very small to trigger compaction quickly
-        size_ratio: 2,            // Small ratio to trigger compaction faster
-        cold_tier_level: Some(2), // L2+ goes to cold storage
-        cold_storage: Some(StorageConfig::Custom(cold_store.clone())),
-        vlog_threshold: None, // Disable vLog for simplicity
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .memtable_capacity(1000)  // Very small to trigger frequent flushes
+        .base_level_size(500)     // Very small to trigger compaction quickly
+        .size_ratio(2)            // Small ratio to trigger compaction faster
+        .cold_tier_level(Some(2)) // L2+ goes to cold storage
+        .cold_storage(Some(StorageConfig::Custom(cold_store.clone())))
+        .vlog_threshold(None); // Disable vLog for simplicity
 
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
 
     // Write enough data to trigger multiple flushes and compactions to L2+
     for i in 0..100 {
@@ -1734,15 +1557,12 @@ fn test_tiered_storage_options_validation() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
 
-    let options = DBOptions {
-        data_dir: dir.path().to_path_buf(),
-        cold_tier_level: Some(4), // Set level but no cold storage
-        cold_storage: None,       // No cold storage configured
-        ..Default::default()
-    };
+    let options = DBOptions::default()
+        .cold_tier_level(Some(4)) // Set level but no cold storage
+        .cold_storage(None);       // No cold storage configured
 
     // Should open without error (cold tier config is ignored without backend)
-    let db = DB::open(options).unwrap();
+    let db = options.open(dir.path()).unwrap();
     db.put(b"test_key", b"test_value").unwrap();
     assert_eq!(
         db.get(b"test_key").unwrap(),

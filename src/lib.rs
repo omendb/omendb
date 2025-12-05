@@ -46,11 +46,11 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use seerdb::{DB, DBOptions};
+//! use seerdb::DB;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Open database with default options
-//! let db = DB::open(DBOptions::default())?;
+//! let db = DB::open("./my_database")?;
 //!
 //! // Write data
 //! db.put(b"hello", b"world")?;
@@ -68,20 +68,20 @@
 //! # Advanced Configuration
 //!
 //! ```rust,no_run
-//! use seerdb::{DB, DBOptions, SyncPolicy};
-//! use std::path::PathBuf;
+//! use seerdb::{DBOptions, SyncPolicy};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let opts = DBOptions {
-//!     data_dir: PathBuf::from("./my_database"),
-//!     memtable_capacity: 64 * 1024 * 1024,  // 64MB memtable
-//!     wal_sync_policy: SyncPolicy::SyncData, // fsync data on each write
-//!     background_compaction: true,            // Enable async compaction
-//!     vlog_threshold: Some(4096),            // Use vLog for values >4KB
-//!     ..Default::default()
-//! };
+//! // Using builder pattern (recommended)
+//! let db = DBOptions::default()
+//!     .memtable_capacity(64 * 1024 * 1024)  // 64MB memtable
+//!     .sync_policy(SyncPolicy::SyncData)     // fsync data on each write
+//!     .background_compaction(true)           // Enable async compaction
+//!     .vlog_threshold(Some(4096))            // Use vLog for values >4KB
+//!     .open("./my_database")?;
 //!
-//! let db = DB::open(opts)?;
+//! // Or using configuration profiles
+//! let db = DBOptions::high_throughput()
+//!     .open("./my_database")?;
 //! # Ok(())
 //! # }
 //! ```

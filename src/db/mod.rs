@@ -112,11 +112,11 @@ fn increment_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use seerdb::{DB, DBOptions};
+/// use seerdb::DB;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // Open database
-/// let db = DB::open(DBOptions::default())?;
+/// let db = DB::open("./my_db")?;
 ///
 /// // Write
 /// db.put(b"user:1:name", b"Alice")?;
@@ -142,10 +142,10 @@ fn increment_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
 /// ```rust,no_run
 /// use std::sync::Arc;
 /// use std::thread;
-/// use seerdb::{DB, DBOptions};
+/// use seerdb::DB;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let db = Arc::new(DB::open(DBOptions::default())?);
+/// let db = Arc::new(DB::open("./my_db")?);
 ///
 /// let db_clone = db.clone();
 /// let handle = thread::spawn(move || {
@@ -202,38 +202,51 @@ pub struct DB {
 }
 
 impl DB {
-    /// Open or create a database
+    /// Open or create a database with default options.
+    ///
+    /// This is the simplest way to open a database. For custom configuration,
+    /// use [`DBOptions`] with the builder pattern.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use seerdb::DB;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = DB::open("./my_db")?;
+    /// db.put(b"key", b"value")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`DBError::Io`]: Failed to create directory or open files
+    /// - [`DBError::Wal`]: WAL corruption detected during recovery
+    /// - [`DBError::SSTable`]: `SSTable` checksum validation failed
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, DBOptions::default())
+    }
+
+    /// Open or create a database with custom options.
     ///
     /// Opens an existing database or creates a new one at the specified path.
     /// If a WAL exists, it will be replayed to recover uncommitted writes.
-    ///
-    /// # Arguments
-    ///
-    /// * `options` - Database configuration (see [`DBOptions`])
-    ///
-    /// # Returns
-    ///
-    /// Returns a [`DB`] instance or an error if:
-    /// - Directory creation fails
-    /// - WAL recovery fails (corruption detected)
-    /// - Existing `SSTables` are corrupted (checksum mismatch)
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// use seerdb::{DB, DBOptions};
-    /// use std::path::PathBuf;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// // Open with default settings
-    /// let db = DB::open(DBOptions::default())?;
+    /// // Using builder pattern (preferred)
+    /// let db = DBOptions::default()
+    ///     .memtable_capacity(128 * 1024 * 1024)
+    ///     .background_compaction(true)
+    ///     .open("./my_db")?;
     ///
-    /// // Open with custom path
-    /// let opts = DBOptions {
-    ///     data_dir: PathBuf::from("/var/lib/myapp/db"),
-    ///     ..Default::default()
-    /// };
-    /// let db = DB::open(opts)?;
+    /// // Or using open_with directly
+    /// let db = DB::open_with("./my_db", DBOptions::embedded())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -244,7 +257,8 @@ impl DB {
     /// - [`DBError::Wal`]: WAL corruption detected during recovery
     /// - [`DBError::SSTable`]: `SSTable` checksum validation failed
     #[allow(clippy::needless_pass_by_value)] // Options read extensively then stored
-    pub fn open(options: DBOptions) -> Result<Self> {
+    pub fn open_with(path: impl AsRef<Path>, mut options: DBOptions) -> Result<Self> {
+        options.data_dir = path.as_ref().to_path_buf();
         info!(
             path = ?options.data_dir,
             memtable_capacity_mb = options.memtable_capacity / (1024 * 1024),
