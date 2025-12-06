@@ -3,6 +3,8 @@
 //! Uses `std::simd` with runtime dispatch via `multiversion`:
 //! - `x86_64`: AVX-512 (8 i64) → AVX2 (4 i64) → SSE4.1 (2 i64)
 //! - `aarch64`: NEON (2 i64)
+//!
+//! Note: SVE support will be added when Rust gains native SVE support.
 
 use multiversion::multiversion;
 use std::simd::{cmp::SimdPartialEq, LaneCount, Simd, SupportedLaneCount};
@@ -13,7 +15,7 @@ use std::simd::{cmp::SimdPartialEq, LaneCount, Simd, SupportedLaneCount};
 /// Runtime dispatch selects optimal SIMD width for the CPU.
 ///
 /// Returns `Some(index)` if found, `None` otherwise.
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 pub fn simd_search_i64(keys: &[Option<i64>], key: i64) -> Option<usize> {
     if keys.is_empty() {
         return None;
@@ -32,6 +34,11 @@ pub fn simd_search_i64(keys: &[Option<i64>], key: i64) -> Option<usize> {
 }
 
 /// SIMD search with variable lane count.
+///
+/// Returns `Option<Option<usize>>` for cascade pattern:
+/// - `None`: not enough elements for this lane width, try smaller
+/// - `Some(None)`: searched all elements, key not found
+/// - `Some(Some(idx))`: found key at index
 #[inline]
 fn search_simd<const N: usize>(keys: &[Option<i64>], key: i64) -> Option<Option<usize>>
 where

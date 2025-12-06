@@ -5,6 +5,8 @@
 //! - `x86_64`: AVX-512 (64 bytes) → AVX2 (32 bytes) → SSE4.1 (16 bytes)
 //! - `aarch64`: NEON (16 bytes)
 //!
+//! Note: SVE support will be added when Rust gains native SVE support.
+//!
 //! When the `simd` feature is disabled, falls back to scalar code.
 
 use std::cmp::Ordering;
@@ -26,9 +28,10 @@ pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ord
 
 /// Compare two byte slices with explicit lengths.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
-    // Try 32-lane (AVX2/AVX-512), then 16-lane (SSE/NEON), then scalar
+    // Cascade: try wider SIMD first, fall back to narrower, then scalar.
+    // Returns None if key length < lane width, triggering next fallback.
     compare_keys_simd::<32>(a, len_a, b, len_b)
         .or_else(|| compare_keys_simd::<16>(a, len_a, b, len_b))
         .unwrap_or_else(|| compare_keys_scalar(a, len_a, b, len_b))
@@ -103,10 +106,10 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Calculate shared prefix length between two keys.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 #[must_use]
 pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    // Try 32-lane, then 16-lane, then scalar
+    // Cascade: try wider SIMD first, fall back to narrower, then scalar.
     shared_prefix_simd::<32>(a, b)
         .or_else(|| shared_prefix_simd::<16>(a, b))
         .unwrap_or_else(|| shared_prefix_scalar(a, b))
@@ -169,7 +172,7 @@ fn shared_prefix_scalar(a: &[u8], b: &[u8]) -> usize {
 ///
 /// Returns `(value, bytes_read)` if successful.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 #[must_use]
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
@@ -181,7 +184,7 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
         return Some((u64::from(data[0]), 1));
     }
 
-    // SIMD path: find terminator byte using 16-byte vectors
+    // Fixed 16-lane SIMD: varints are max 10 bytes, wider SIMD provides no benefit
     if data.len() >= 16 {
         let v = Simd::<u8, 16>::from_slice(&data[..16]);
         let mask = v.simd_lt(Simd::<u8, 16>::splat(128));
