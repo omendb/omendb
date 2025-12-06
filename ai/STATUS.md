@@ -37,11 +37,19 @@ Systematic review and optimization pass to address potential perf regressions.
 |-----------|--------|-------|--------|
 | compare_keys (28B) | 11ns | 8.8ns | **-20%** |
 
-### Not Fixed (Requires Architectural Change)
+### Remaining: Memtable Lookup Allocation
 
-| Issue | Reason |
-|-------|--------|
-| Memtable lookup alloc | crossbeam_skiplist requires owned keys; needs thread-local or key borrowing |
+**Research completed Dec 6** - see `ai/PERF_ISSUES.md` for full analysis.
+
+| Option | Priority | Notes |
+|--------|----------|-------|
+| **crossbeam-skiplist-fd** | **P1 Best** | Zero alloc via `Comparable` trait, ~40ns/get savings |
+| Thread-Local Buffer | P2 Fallback | ~20ns/get savings, easy to implement |
+| SKL crate | P3 | Arena-based, major refactor (overkill) |
+| SSO | Skip | Doubles InternalKey size, hurts cache |
+| Arena (bumpalo) | Skip | Overhead exceeds benefit for single get() |
+
+**Recommended**: Switch to `crossbeam-skiplist-fd` and implement `Comparable<InternalKey>` for `InternalKeyRef<'a>`
 
 ### Reverted Changes
 
