@@ -1,7 +1,53 @@
 # STATUS - seerdb
 
-**Last Updated**: December 5, 2025
+**Last Updated**: December 6, 2025
 **Version**: 0.0.7
+
+---
+
+## Performance Optimization (Dec 6)
+
+Systematic review and optimization pass to address potential perf regressions.
+
+### Fixes Applied
+
+| Issue | Location | Impact |
+|-------|----------|--------|
+| **write_varint Vec alloc** | `block.rs:81` | Eliminated per-entry heap allocation |
+| **Vec::new on every get** | `read.rs:57` | Lazy-init, no alloc for non-merge paths |
+| **Vec collect per level** | `read.rs:120` | Iterate directly, no intermediate Vec |
+| **Key reconstruction alloc** | `block.rs:654` | Reuse buffer instead of per-key alloc |
+| **range_rev per-SSTable alloc** | `iter.rs:356` | Pre-allocate once, clone Bytes (O(1)) |
+| delete/merge WAL opts | `write.rs` | Added `skip_wal`/`use_direct_wal` paths |
+
+### Results
+
+**Mac (M3 Max) - Criterion benchmark:**
+
+| Operation | Before | After | Change |
+|-----------|--------|-------|--------|
+| put/64 | ~8ms | ~4.5ms | **-44%** |
+| put/1024 | ~8.5ms | ~4.5ms | **-46%** |
+| put/4096 | ~8.5ms | ~4.6ms | **-45%** |
+| shared_prefix | 6.3ns | 5.9ns | **-5%** |
+
+**Fedora (Intel 13900KF):**
+
+| Operation | Before | After | Change |
+|-----------|--------|-------|--------|
+| compare_keys (28B) | 11ns | 8.8ns | **-20%** |
+
+### Not Fixed (Requires Architectural Change)
+
+| Issue | Reason |
+|-------|--------|
+| Memtable lookup alloc | crossbeam_skiplist requires owned keys; needs thread-local or key borrowing |
+
+### Reverted Changes
+
+| Change | Reason |
+|--------|--------|
+| SIMD cascade optimization | Hurt Intel perf (~70% worse for 64B keys) |
 
 ---
 

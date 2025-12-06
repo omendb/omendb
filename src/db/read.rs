@@ -54,31 +54,32 @@ impl DB {
         self.read_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let mut operands: Vec<Bytes> = Vec::new();
+        // Lazy-init operands only when merge ops are encountered (rare case)
+        let mut operands: Option<Vec<Bytes>> = None;
 
         // 1. Check correct partition first
         let partition = partition_for_key(key);
         let mt = self.memtables[partition].load();
         if let Some(entry) = mt.get_entry(key) {
             match entry {
-                Entry::Value(v) => return Ok(self.resolve_merge(key, Some(v), &operands, start)),
-                Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
+                Entry::Value(v) => {
+                    return Ok(self.resolve_merge_opt(key, Some(v), &operands, start))
+                }
+                Entry::Tombstone => return Ok(self.resolve_merge_opt(key, None, &operands, start)),
                 Entry::Merge {
                     base: Some(v),
                     operands: ops,
                 } => {
                     // Found base in memtable - resolve immediately
-                    // Keep newest-first order; resolve_merge will reverse to oldest-first
-                    operands.extend(ops.iter().cloned());
-                    return Ok(self.resolve_merge(key, Some(v), &operands, start));
+                    operands.get_or_insert_with(Vec::new).extend(ops);
+                    return Ok(self.resolve_merge_opt(key, Some(v), &operands, start));
                 }
                 Entry::Merge {
                     base: None,
                     operands: ops,
                 } => {
                     // No base yet - continue searching
-                    // Keep newest-first order; resolve_merge will reverse to oldest-first
-                    operands.extend(ops.iter().cloned());
+                    operands.get_or_insert_with(Vec::new).extend(ops);
                 }
             }
         }
@@ -90,23 +91,23 @@ impl DB {
             if let Some(entry) = partition_mt.get_entry(key) {
                 match entry {
                     Entry::Value(v) => {
-                        return Ok(self.resolve_merge(key, Some(v), &operands, start))
+                        return Ok(self.resolve_merge_opt(key, Some(v), &operands, start))
                     }
-                    Entry::Tombstone => return Ok(self.resolve_merge(key, None, &operands, start)),
+                    Entry::Tombstone => {
+                        return Ok(self.resolve_merge_opt(key, None, &operands, start))
+                    }
                     Entry::Merge {
                         base: Some(v),
                         operands: ops,
                     } => {
-                        // Keep newest-first order; resolve_merge will reverse to oldest-first
-                        operands.extend(ops.iter().cloned());
-                        return Ok(self.resolve_merge(key, Some(v), &operands, start));
+                        operands.get_or_insert_with(Vec::new).extend(ops);
+                        return Ok(self.resolve_merge_opt(key, Some(v), &operands, start));
                     }
                     Entry::Merge {
                         base: None,
                         operands: ops,
                     } => {
-                        // Keep newest-first order; resolve_merge will reverse to oldest-first
-                        operands.extend(ops.iter().cloned());
+                        operands.get_or_insert_with(Vec::new).extend(ops);
                     }
                 }
             }
@@ -116,9 +117,8 @@ impl DB {
         let lsm_arc = self.lsm.load();
         for level_num in 0..lsm_arc.num_levels() {
             if let Some(level) = lsm_arc.level(level_num) {
-                let sstables: Vec<_> = level.sstables().iter().rev().collect();
-
-                for sstable_path in sstables {
+                // Iterate directly in reverse - no Vec allocation needed
+                for sstable_path in level.sstables().iter().rev() {
                     let cached_sstable = self.get_sstable(sstable_path)?;
                     let mut sstable = cached_sstable.lock().expect("SSTable lock poisoned");
                     let result = sstable.get_entry_mvcc(key, u64::MAX)?;
@@ -126,10 +126,15 @@ impl DB {
                     if let Some((data, flag)) = result {
                         match flag {
                             FLAG_INLINE | FLAG_POINTER => {
-                                return Ok(self.resolve_merge(key, Some(data), &operands, start));
+                                return Ok(self.resolve_merge_opt(
+                                    key,
+                                    Some(data),
+                                    &operands,
+                                    start,
+                                ));
                             }
                             FLAG_TOMBSTONE => {
-                                return Ok(self.resolve_merge(key, None, &operands, start));
+                                return Ok(self.resolve_merge_opt(key, None, &operands, start));
                             }
                             FLAG_MERGE => {
                                 let end_key_vec = increment_bytes(key);
@@ -140,8 +145,7 @@ impl DB {
                                     if k == key {
                                         match entry {
                                             Entry::Value(v) => {
-                                                // Found base value in SSTable
-                                                return Ok(self.resolve_merge(
+                                                return Ok(self.resolve_merge_opt(
                                                     key,
                                                     Some(v),
                                                     &operands,
@@ -152,10 +156,9 @@ impl DB {
                                                 base,
                                                 operands: ops,
                                             } => {
-                                                // Keep newest-first order; resolve_merge will reverse
-                                                operands.extend(ops.iter().cloned());
+                                                operands.get_or_insert_with(Vec::new).extend(ops);
                                                 if let Some(v) = base {
-                                                    return Ok(self.resolve_merge(
+                                                    return Ok(self.resolve_merge_opt(
                                                         key,
                                                         Some(v),
                                                         &operands,
@@ -164,10 +167,9 @@ impl DB {
                                                 }
                                             }
                                             Entry::Tombstone => {
-                                                // Found tombstone - resolve with no base
-                                                return Ok(
-                                                    self.resolve_merge(key, None, &operands, start)
-                                                );
+                                                return Ok(self.resolve_merge_opt(
+                                                    key, None, &operands, start,
+                                                ));
                                             }
                                         }
                                     }
@@ -180,7 +182,7 @@ impl DB {
             }
         }
 
-        Ok(self.resolve_merge(key, None, &operands, start))
+        Ok(self.resolve_merge_opt(key, None, &operands, start))
     }
 
     /// Get a value at a specific sequence number (snapshot isolation).
@@ -256,6 +258,33 @@ impl DB {
         }
 
         Ok(None)
+    }
+
+    /// Resolve merge with Option<Vec<Bytes>> - avoids allocation when no merges
+    #[inline]
+    pub(crate) fn resolve_merge_opt(
+        &self,
+        key: &[u8],
+        base: Option<Bytes>,
+        operands: &Option<Vec<Bytes>>,
+        start: Instant,
+    ) -> Option<Bytes> {
+        match operands {
+            None => {
+                // Fast path: no merge operands (common case)
+                if !self.options.disable_metrics {
+                    self.metrics.record_get(start.elapsed());
+                }
+                base
+            }
+            Some(ops) if ops.is_empty() => {
+                if !self.options.disable_metrics {
+                    self.metrics.record_get(start.elapsed());
+                }
+                base
+            }
+            Some(ops) => self.resolve_merge(key, base, ops, start),
+        }
     }
 
     pub(crate) fn resolve_merge(

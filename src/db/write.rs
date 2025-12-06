@@ -327,15 +327,27 @@ impl DB {
         // Assign sequence number
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
-        // Write to WAL (durability) - lock-free via channel
+        // Create record
         let record = Record::Delete { key, seq };
 
-        // Pipelined Group Commit (WAL + Memtable)
-        self.pipelined_wal
-            .put(record, |batch| {
-                self.apply_wal_records(batch);
-            })
-            .map_err(DBError::Wal)?;
+        if self.options.skip_wal {
+            // Skip WAL entirely: maximum write speed, no durability until flush
+            self.apply_single_record(&record);
+        } else if self.options.use_direct_wal {
+            // Direct WAL path: bypass pipelined WAL for single-threaded workloads
+            {
+                let mut wal = self.wal.lock().expect("WAL mutex poisoned");
+                wal.write(&record).map_err(DBError::Wal)?;
+            }
+            self.apply_single_record(&record);
+        } else {
+            // Pipelined Group Commit (WAL + Memtable)
+            self.pipelined_wal
+                .put(record, |batch| {
+                    self.apply_wal_records(batch);
+                })
+                .map_err(DBError::Wal)?;
+        }
 
         // Record latency
         if !self.options.disable_metrics {
@@ -364,12 +376,24 @@ impl DB {
 
         let record = Record::Merge { key, operand, seq };
 
-        // Pipelined Group Commit
-        self.pipelined_wal
-            .put(record, |batch| {
-                self.apply_wal_records(batch);
-            })
-            .map_err(DBError::Wal)?;
+        if self.options.skip_wal {
+            // Skip WAL entirely
+            self.apply_single_record(&record);
+        } else if self.options.use_direct_wal {
+            // Direct WAL path
+            {
+                let mut wal = self.wal.lock().expect("WAL mutex poisoned");
+                wal.write(&record).map_err(DBError::Wal)?;
+            }
+            self.apply_single_record(&record);
+        } else {
+            // Pipelined Group Commit
+            self.pipelined_wal
+                .put(record, |batch| {
+                    self.apply_wal_records(batch);
+                })
+                .map_err(DBError::Wal)?;
+        }
 
         // Metrics (reuse put metric for now or add new one)
         if !self.options.disable_metrics {
