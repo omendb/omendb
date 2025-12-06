@@ -57,10 +57,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sysinfo = "0.29"  # System information (disk space, memory, etc.)
 
-# Optional baseline systems for benchmarking (only compiled when baseline-benchmarks feature is enabled)
-rocksdb = { version = "0.22", optional = true }
-sled = { version = "0.34", optional = true }
-fjall = { version = "2.3", optional = true }
 anyhow = "1.0.100"
 # jemalloc with disable_initial_exec_tls to work with Python extensions on Linux
 tikv-jemallocator = { version = "0.6.1" }
@@ -97,9 +93,6 @@ simd = []
 # Default: LocalStorage only (zero overhead)
 # With feature: ObjectStoreBackend + cloud providers
 object-store = ["dep:object_store", "dep:url", "dep:futures"]
-# Enable baseline benchmark dependencies (RocksDB, sled, fjall)
-# Only needed when running comparative benchmarks, not for regular tests
-baseline-benchmarks = ["dep:rocksdb", "dep:sled", "dep:fjall"]
 # Enable dhat heap profiling (disables jemalloc to avoid conflicts)
 dhat-heap = []
 # Enable failpoints for deterministic crash testing
@@ -186,11 +179,6 @@ harness = false
 [[bench]]
 name = "transaction_bench"
 harness = false
-
-# Examples that require optional features
-[[example]]
-name = "baseline_benchmark"
-required-features = ["baseline-benchmarks"]
 
 [profile.release]
 opt-level = 3
