@@ -1,4 +1,6 @@
 #![cfg_attr(feature = "simd", feature(portable_simd))] // SIMD optimizations (nightly-only)
+// Allow retpoline cfg values from multiversion crate's target feature detection
+#![allow(unexpected_cfgs)]
 // Pedantic allows for systems code
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
