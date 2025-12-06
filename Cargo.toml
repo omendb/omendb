@@ -183,6 +183,10 @@ harness = false
 name = "transaction_bench"
 harness = false
 
+[[bench]]
+name = "quick_regression"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true
