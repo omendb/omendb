@@ -1,7 +1,7 @@
 # STATUS - seerdb
 
 **Last Updated**: December 5, 2025
-**Version**: 0.0.7 (pending release)
+**Version**: 0.0.7
 
 ---
 
