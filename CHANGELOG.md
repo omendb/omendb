@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.0.7] - 2025-12-05
+
+### Added
+
+- **Runtime SIMD dispatch**: Added `multiversion` crate for automatic CPU feature detection and optimal code path selection at runtime.
+- **SVE support**: Added aarch64 SVE (Scalable Vector Extension) target for ARM processors with variable-width SIMD.
+- **Cascade pattern**: SIMD functions now try wider lanes first, falling back to narrower lanes, then scalar.
+
+### Changed
+
+- **SIMD targets**: Runtime dispatch now selects optimal instruction set:
+  - x86_64: AVX-512 (64 bytes) → AVX2 (32 bytes) → SSE4.1 (16 bytes)
+  - aarch64: SVE (variable) → NEON (16 bytes)
+
 ## [0.0.6] - 2025-12-05
 
 ### Fixed
