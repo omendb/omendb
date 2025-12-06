@@ -2,9 +2,7 @@
 //!
 //! Uses `std::simd` with runtime dispatch via `multiversion`:
 //! - `x86_64`: AVX-512 (8 i64) → AVX2 (4 i64) → SSE4.1 (2 i64)
-//! - `aarch64`: NEON (2 i64)
-//!
-//! Note: SVE support will be added when Rust gains native SVE support.
+//! - `aarch64`: SVE (variable) → NEON (2 i64)
 
 use multiversion::multiversion;
 use std::simd::{cmp::SimdPartialEq, LaneCount, Simd, SupportedLaneCount};
@@ -15,7 +13,13 @@ use std::simd::{cmp::SimdPartialEq, LaneCount, Simd, SupportedLaneCount};
 /// Runtime dispatch selects optimal SIMD width for the CPU.
 ///
 /// Returns `Some(index)` if found, `None` otherwise.
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[multiversion(targets(
+    "x86_64+avx512f",
+    "x86_64+avx2",
+    "x86_64+sse4.1",
+    "aarch64+sve",
+    "aarch64+neon"
+))]
 pub fn simd_search_i64(keys: &[Option<i64>], key: i64) -> Option<usize> {
     if keys.is_empty() {
         return None;

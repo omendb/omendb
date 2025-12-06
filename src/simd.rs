@@ -3,9 +3,7 @@
 //! Uses `std::simd` (portable SIMD) for cross-platform acceleration.
 //! Runtime dispatch via `multiversion` selects optimal ISA:
 //! - `x86_64`: AVX-512 (64 bytes) → AVX2 (32 bytes) → SSE4.1 (16 bytes)
-//! - `aarch64`: NEON (16 bytes)
-//!
-//! Note: SVE support will be added when Rust gains native SVE support.
+//! - `aarch64`: SVE (variable) → NEON (16 bytes)
 //!
 //! When the `simd` feature is disabled, falls back to scalar code.
 
@@ -21,15 +19,21 @@ use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, LaneCount, Simd, Suppor
 /// Strips the 8-byte trailer from `internal_key` before comparing.
 #[inline]
 #[must_use]
-pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ordering {
+pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> std::cmp::Ordering {
     let internal_user_len = internal_key.len().saturating_sub(8);
     compare_keys_with_len(internal_key, internal_user_len, user_key, user_key.len())
 }
 
 /// Compare two byte slices with explicit lengths.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
-fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
+#[multiversion(targets(
+    "x86_64+avx512f",
+    "x86_64+avx2",
+    "x86_64+sse4.1",
+    "aarch64+sve",
+    "aarch64+neon"
+))]
+fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> std::cmp::Ordering {
     // Cascade: try wider SIMD first, fall back to narrower, then scalar.
     // Returns None if key length < lane width, triggering next fallback.
     compare_keys_simd::<32>(a, len_a, b, len_b)
@@ -106,7 +110,13 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Calculate shared prefix length between two keys.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[multiversion(targets(
+    "x86_64+avx512f",
+    "x86_64+avx2",
+    "x86_64+sse4.1",
+    "aarch64+sve",
+    "aarch64+neon"
+))]
 #[must_use]
 pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
     // Cascade: try wider SIMD first, fall back to narrower, then scalar.
@@ -172,7 +182,13 @@ fn shared_prefix_scalar(a: &[u8], b: &[u8]) -> usize {
 ///
 /// Returns `(value, bytes_read)` if successful.
 #[cfg(feature = "simd")]
-#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[multiversion(targets(
+    "x86_64+avx512f",
+    "x86_64+avx2",
+    "x86_64+sse4.1",
+    "aarch64+sve",
+    "aarch64+neon"
+))]
 #[must_use]
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
