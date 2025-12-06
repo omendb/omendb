@@ -128,7 +128,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Failpoint tests
-        run: cargo test --features failpoints failpoint
+        # Failpoints use global state, must run serially
+        run: cargo test --features failpoints --test failpoint_tests -- --test-threads=1
         timeout-minutes: 5
 
   # ==========================================================================

@@ -3,7 +3,7 @@
 //! These tests use the `fail` crate to inject failures at specific points
 //! in the code, verifying that recovery works correctly after crashes.
 //!
-//! Run with: `cargo test --features failpoints failpoint`
+//! Run with: `cargo test --features failpoints --test failpoint_tests`
 //!
 //! Available failpoints:
 //! - `flush::after_sstable_write` - After SSTable written, before metadata update
@@ -14,6 +14,7 @@
 #![cfg(feature = "failpoints")]
 
 use seerdb::{DBOptions, SyncPolicy};
+use std::mem::forget;
 use tempfile::TempDir;
 
 /// Test recovery after crash during flush (after SSTable write, before WAL clear)
@@ -52,8 +53,11 @@ fn test_failpoint_flush_after_sstable_write() {
         }));
         assert!(result.is_err(), "Flush should have panicked at failpoint");
 
-        // Remove failpoint
+        // Remove failpoint before forget to avoid issues
         fail::remove("flush::after_sstable_write");
+
+        // Simulate crash: don't run Drop (which would try to flush again with poisoned locks)
+        forget(db);
     }
 
     // Phase 2: Recovery - data should be present (from SSTable or WAL replay)
@@ -109,6 +113,9 @@ fn test_failpoint_flush_before_wal_clear() {
         assert!(result.is_err(), "Flush should have panicked at failpoint");
 
         fail::remove("flush::before_wal_clear");
+
+        // Simulate crash: don't run Drop
+        forget(db);
     }
 
     // Phase 2: Recovery - should be idempotent
@@ -171,6 +178,9 @@ fn test_failpoint_compaction_after_output_write() {
         }));
 
         fail::remove("compaction::after_output_write");
+
+        // Simulate crash: don't run Drop
+        forget(db);
     }
 
     // Phase 2: Recovery - all data should be present
@@ -218,6 +228,9 @@ fn test_failpoint_wal_after_sync() {
         assert!(result.is_err(), "Put should have panicked at failpoint");
 
         fail::remove("wal::after_sync");
+
+        // Simulate crash: don't run Drop
+        forget(db);
     }
 
     // Recovery - key2 should be durable (sync completed before panic)

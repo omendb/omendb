@@ -103,7 +103,8 @@ baseline-benchmarks = ["dep:rocksdb", "dep:sled", "dep:fjall"]
 # Enable dhat heap profiling (disables jemalloc to avoid conflicts)
 dhat-heap = []
 # Enable failpoints for deterministic crash testing
-failpoints = ["dep:fail"]
+# Must enable fail/failpoints or fail_point! macros compile to no-ops
+failpoints = ["dep:fail", "fail/failpoints"]
 # Note: io_uring support can be added later as opt-in (security concerns)
 
 [[bench]]
