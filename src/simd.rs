@@ -19,7 +19,7 @@ use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, LaneCount, Simd, Suppor
 /// Strips the 8-byte trailer from `internal_key` before comparing.
 #[inline]
 #[must_use]
-pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> std::cmp::Ordering {
+pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ordering {
     let internal_user_len = internal_key.len().saturating_sub(8);
     compare_keys_with_len(internal_key, internal_user_len, user_key, user_key.len())
 }
