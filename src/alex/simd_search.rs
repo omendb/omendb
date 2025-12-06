@@ -1,54 +1,86 @@
-use std::simd::{cmp::SimdPartialEq, i64x4};
+//! SIMD-accelerated search for ALEX index nodes.
+//!
+//! Uses `std::simd` with runtime dispatch via `multiversion`:
+//! - `x86_64`: AVX-512 (8 i64) → AVX2 (4 i64) → SSE4.1 (2 i64)
+//! - `aarch64`: NEON (2 i64)
 
-/// SIMD-optimized search for key in `Option<i64>` array
+use multiversion::multiversion;
+use std::simd::{cmp::SimdPartialEq, LaneCount, Simd, SupportedLaneCount};
+
+/// SIMD-optimized search for key in `Option<i64>` array.
 ///
-/// Searches for first occurrence of Some(key) in the slice.
-/// Uses `std::simd` to compare 4 values at once.
+/// Searches for first occurrence of `Some(key)` in the slice.
+/// Runtime dispatch selects optimal SIMD width for the CPU.
 ///
-/// Returns Some(index) if found, None otherwise.
-#[inline]
+/// Returns `Some(index)` if found, `None` otherwise.
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
 pub fn simd_search_i64(keys: &[Option<i64>], key: i64) -> Option<usize> {
-    const LANES: usize = 4; // Process 4 i64 values at once
-    let len = keys.len();
-
-    if len == 0 {
+    if keys.is_empty() {
         return None;
     }
 
-    // Fast path: Check first element (common case after model prediction)
+    // Fast path: check first element (common case after model prediction)
     if keys[0] == Some(key) {
         return Some(0);
     }
 
-    let key_vec = i64x4::splat(key);
+    // Try 8-lane (AVX-512), then 4-lane (AVX2), then 2-lane (SSE/NEON), then scalar
+    search_simd::<8>(keys, key)
+        .or_else(|| search_simd::<4>(keys, key))
+        .or_else(|| search_simd::<2>(keys, key))
+        .unwrap_or_else(|| search_scalar(keys, key))
+}
+
+/// SIMD search with variable lane count.
+#[inline]
+fn search_simd<const N: usize>(keys: &[Option<i64>], key: i64) -> Option<Option<usize>>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    let len = keys.len();
+    if len < N {
+        return None; // Not enough elements for this lane count
+    }
+
+    let key_vec = Simd::<i64, N>::splat(key);
     let mut i = 0;
 
-    // SIMD path: Process 4 values at once
-    while i + LANES <= len {
-        // Extract 4 Option<i64> values
-        let mut values = [i64::MAX; LANES]; // Use MAX as sentinel for None
-        for j in 0..LANES {
+    while i + N <= len {
+        // Extract N i64 values, using MAX as sentinel for None
+        let mut values = [i64::MAX; N];
+        for j in 0..N {
             values[j] = keys[i + j].unwrap_or(i64::MAX);
         }
 
-        let vec = i64x4::from_array(values);
+        let vec = Simd::<i64, N>::from_array(values);
         let mask = vec.simd_eq(key_vec);
 
-        // Check if any lane matched
         if mask.any() {
             // Find which lane matched
-            for j in 0..LANES {
+            for j in 0..N {
                 if keys[i + j] == Some(key) {
-                    return Some(i + j);
+                    return Some(Some(i + j));
                 }
             }
         }
 
-        i += LANES;
+        i += N;
     }
 
-    // Scalar fallback for remaining elements
-    (i..len).find(|&j| keys[j] == Some(key))
+    // Check remaining elements with scalar
+    for (j, &k) in keys[i..len].iter().enumerate() {
+        if k == Some(key) {
+            return Some(Some(i + j));
+        }
+    }
+
+    Some(None) // Searched everything, not found
+}
+
+/// Scalar fallback search.
+#[inline]
+fn search_scalar(keys: &[Option<i64>], key: i64) -> Option<usize> {
+    keys.iter().position(|&k| k == Some(key))
 }
 
 #[cfg(test)]
@@ -100,6 +132,14 @@ mod tests {
     }
 
     #[test]
+    fn test_simd_search_very_long_array() {
+        // Test with array > 8 elements (AVX-512 width)
+        let mut keys = vec![Some(0); 100];
+        keys[77] = Some(42);
+        assert_eq!(simd_search_i64(&keys, 42), Some(77));
+    }
+
+    #[test]
     fn test_simd_search_all_gaps() {
         let keys = vec![None, None, None, None];
         assert_eq!(simd_search_i64(&keys, 42), None);
@@ -113,6 +153,7 @@ mod tests {
             vec![None, Some(1), None, Some(2), None],
             vec![Some(10), Some(20), Some(30), Some(40)],
             vec![Some(1); 10],
+            vec![Some(1); 100], // Test larger arrays
         ];
 
         for keys in test_cases {

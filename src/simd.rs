@@ -1,15 +1,18 @@
-//! SIMD-accelerated utilities with scalar fallbacks.
+//! SIMD-accelerated utilities with runtime CPU feature dispatch.
 //!
-//! When the `simd` feature is enabled (default), uses portable SIMD for
-//! key comparison and varint decoding. Otherwise falls back to scalar code.
+//! Uses `std::simd` (portable SIMD) for cross-platform acceleration.
+//! Runtime dispatch via `multiversion` selects optimal ISA:
+//! - `x86_64`: AVX-512 (64 bytes) → AVX2 (32 bytes) → SSE4.1 (16 bytes)
+//! - `aarch64`: NEON (16 bytes)
+//!
+//! When the `simd` feature is disabled, falls back to scalar code.
 
 use std::cmp::Ordering;
 
 #[cfg(feature = "simd")]
-use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, u8x16};
-
+use multiversion::multiversion;
 #[cfg(feature = "simd")]
-const SIMD_WIDTH: usize = 16;
+use std::simd::{cmp::SimdPartialEq, cmp::SimdPartialOrd, LaneCount, Simd, SupportedLaneCount};
 
 /// Compare `user_key` portion of an `InternalKey` against a `user_key`.
 ///
@@ -22,44 +25,73 @@ pub fn compare_internal_to_user_key(internal_key: &[u8], user_key: &[u8]) -> Ord
 }
 
 /// Compare two byte slices with explicit lengths.
+#[cfg(feature = "simd")]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
+    // Try 32-lane (AVX2/AVX-512), then 16-lane (SSE/NEON), then scalar
+    compare_keys_simd::<32>(a, len_a, b, len_b)
+        .or_else(|| compare_keys_simd::<16>(a, len_a, b, len_b))
+        .unwrap_or_else(|| compare_keys_scalar(a, len_a, b, len_b))
+}
+
+#[cfg(not(feature = "simd"))]
 #[inline]
 fn compare_keys_with_len(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
-    #[cfg(feature = "simd")]
-    {
-        let min_len = len_a.min(len_b);
-        let mut i = 0;
+    a[..len_a].cmp(&b[..len_b])
+}
 
-        while i + SIMD_WIDTH <= min_len {
-            let a_vec = u8x16::from_slice(&a[i..i + SIMD_WIDTH]);
-            let b_vec = u8x16::from_slice(&b[i..i + SIMD_WIDTH]);
-            let eq = a_vec.simd_eq(b_vec);
+/// SIMD key comparison with variable lane count.
+#[cfg(feature = "simd")]
+#[inline]
+fn compare_keys_simd<const N: usize>(
+    a: &[u8],
+    len_a: usize,
+    b: &[u8],
+    len_b: usize,
+) -> Option<Ordering>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    let min_len = len_a.min(len_b);
+    if min_len < N {
+        return None;
+    }
 
-            if !eq.all() {
-                for j in 0..SIMD_WIDTH {
-                    let pos = i + j;
-                    match a[pos].cmp(&b[pos]) {
-                        Ordering::Equal => {}
-                        other => return other,
-                    }
+    let mut i = 0;
+    while i + N <= min_len {
+        let a_vec = Simd::<u8, N>::from_slice(&a[i..i + N]);
+        let b_vec = Simd::<u8, N>::from_slice(&b[i..i + N]);
+        let eq = a_vec.simd_eq(b_vec);
+
+        if !eq.all() {
+            // Find first difference
+            for j in 0..N {
+                let pos = i + j;
+                match a[pos].cmp(&b[pos]) {
+                    Ordering::Equal => {}
+                    other => return Some(other),
                 }
             }
-            i += SIMD_WIDTH;
         }
-
-        while i < min_len {
-            match a[i].cmp(&b[i]) {
-                Ordering::Equal => i += 1,
-                other => return other,
-            }
-        }
-
-        len_a.cmp(&len_b)
+        i += N;
     }
 
-    #[cfg(not(feature = "simd"))]
-    {
-        a[..len_a].cmp(&b[..len_b])
+    // Handle remaining bytes with scalar
+    while i < min_len {
+        match a[i].cmp(&b[i]) {
+            Ordering::Equal => i += 1,
+            other => return Some(other),
+        }
     }
+
+    Some(len_a.cmp(&len_b))
+}
+
+/// Scalar fallback for key comparison.
+#[cfg(feature = "simd")]
+#[inline]
+fn compare_keys_scalar(a: &[u8], len_a: usize, b: &[u8], len_b: usize) -> Ordering {
+    a[..len_a].cmp(&b[..len_b])
 }
 
 /// Compare two byte slices.
@@ -70,120 +102,140 @@ pub fn compare_keys(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 /// Calculate shared prefix length between two keys.
+#[cfg(feature = "simd")]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
+#[must_use]
+pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    // Try 32-lane, then 16-lane, then scalar
+    shared_prefix_simd::<32>(a, b)
+        .or_else(|| shared_prefix_simd::<16>(a, b))
+        .unwrap_or_else(|| shared_prefix_scalar(a, b))
+}
+
+#[cfg(not(feature = "simd"))]
 #[inline]
 #[must_use]
 pub fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    #[cfg(feature = "simd")]
-    {
-        let min_len = a.len().min(b.len());
-        let mut i = 0;
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
 
-        while i + SIMD_WIDTH <= min_len {
-            let a_vec = u8x16::from_slice(&a[i..i + SIMD_WIDTH]);
-            let b_vec = u8x16::from_slice(&b[i..i + SIMD_WIDTH]);
-            let eq = a_vec.simd_eq(b_vec);
-
-            if eq.all() {
-                i += SIMD_WIDTH;
-                continue;
-            }
-
-            for j in 0..SIMD_WIDTH {
-                if a[i + j] != b[i + j] {
-                    return i + j;
-                }
-            }
-        }
-
-        while i < min_len && a[i] == b[i] {
-            i += 1;
-        }
-
-        i
+/// SIMD shared prefix calculation with variable lane count.
+#[cfg(feature = "simd")]
+#[inline]
+fn shared_prefix_simd<const N: usize>(a: &[u8], b: &[u8]) -> Option<usize>
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    let min_len = a.len().min(b.len());
+    if min_len < N {
+        return None;
     }
 
-    #[cfg(not(feature = "simd"))]
-    {
-        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    let mut i = 0;
+    while i + N <= min_len {
+        let a_vec = Simd::<u8, N>::from_slice(&a[i..i + N]);
+        let b_vec = Simd::<u8, N>::from_slice(&b[i..i + N]);
+        let eq = a_vec.simd_eq(b_vec);
+
+        if eq.all() {
+            i += N;
+            continue;
+        }
+
+        // Find first mismatch
+        for j in 0..N {
+            if a[i + j] != b[i + j] {
+                return Some(i + j);
+            }
+        }
     }
+
+    // Handle remaining bytes
+    while i < min_len && a[i] == b[i] {
+        i += 1;
+    }
+
+    Some(i)
+}
+
+/// Scalar fallback for shared prefix.
+#[cfg(feature = "simd")]
+#[inline]
+fn shared_prefix_scalar(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 /// Decode a varint from a byte slice.
 ///
 /// Returns `(value, bytes_read)` if successful.
-#[inline]
+#[cfg(feature = "simd")]
+#[multiversion(targets("x86_64+avx512f", "x86_64+avx2", "x86_64+sse4.1", "aarch64+neon",))]
 #[must_use]
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
         return None;
     }
 
-    // Fast path for single-byte varints
+    // Fast path for single-byte varints (most common)
     if data[0] < 128 {
-        return Some((data[0] as u64, 1));
+        return Some((u64::from(data[0]), 1));
     }
 
-    #[cfg(feature = "simd")]
+    // SIMD path: find terminator byte using 16-byte vectors
     if data.len() >= 16 {
-        let v = u8x16::from_slice(&data[..16]);
-        let mask = v.simd_lt(u8x16::splat(128));
+        let v = Simd::<u8, 16>::from_slice(&data[..16]);
+        let mask = v.simd_lt(Simd::<u8, 16>::splat(128));
         let bitmask = mask.to_bitmask();
 
         if bitmask == 0 {
-            return None;
+            return None; // No terminator in first 16 bytes = invalid
         }
 
         let len = bitmask.trailing_zeros() as usize + 1;
         if len > 10 {
-            return None;
+            return None; // varint64 max is 10 bytes
         }
 
-        let mut value: u64 = 0;
-        match len {
-            1 => return Some((data[0] as u64, 1)),
-            2 => {
-                value = (data[0] & 0x7F) as u64;
-                value |= (data[1] as u64) << 7;
-                return Some((value, 2));
-            }
-            3 => {
-                value = (data[0] & 0x7F) as u64;
-                value |= ((data[1] & 0x7F) as u64) << 7;
-                value |= (data[2] as u64) << 14;
-                return Some((value, 3));
-            }
-            4 => {
-                value = (data[0] & 0x7F) as u64;
-                value |= ((data[1] & 0x7F) as u64) << 7;
-                value |= ((data[2] & 0x7F) as u64) << 14;
-                value |= (data[3] as u64) << 21;
-                return Some((value, 4));
-            }
-            5 => {
-                value = (data[0] & 0x7F) as u64;
-                value |= ((data[1] & 0x7F) as u64) << 7;
-                value |= ((data[2] & 0x7F) as u64) << 14;
-                value |= ((data[3] & 0x7F) as u64) << 21;
-                value |= (data[4] as u64) << 28;
-                return Some((value, 5));
-            }
-            _ => {
-                let mut shift = 0;
-                for (i, val) in data.iter().enumerate().take(len) {
-                    let byte = *val;
-                    if i == len - 1 {
-                        value |= (byte as u64) << shift;
-                    } else {
-                        value |= ((byte & 0x7F) as u64) << shift;
-                    }
-                    shift += 7;
-                }
-                return Some((value, len));
-            }
-        }
+        return decode_varint_known_len(data, len);
     }
 
-    // Scalar fallback
+    // Scalar fallback for short buffers
+    decode_varint_scalar(data)
+}
+
+#[cfg(not(feature = "simd"))]
+#[inline]
+#[must_use]
+pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
+    decode_varint_scalar(data)
+}
+
+/// Decode varint with known length (from SIMD scan).
+#[inline]
+fn decode_varint_known_len(data: &[u8], len: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    for (i, &byte) in data.iter().enumerate().take(len) {
+        if i == len - 1 {
+            value |= u64::from(byte) << shift;
+        } else {
+            value |= u64::from(byte & 0x7F) << shift;
+        }
+        shift += 7;
+    }
+    Some((value, len))
+}
+
+/// Scalar varint decoding fallback.
+#[inline]
+fn decode_varint_scalar(data: &[u8]) -> Option<(u64, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    if data[0] < 128 {
+        return Some((u64::from(data[0]), 1));
+    }
+
     let mut value: u64 = 0;
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
@@ -191,10 +243,10 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
             return None;
         }
         if byte < 128 {
-            value |= (byte as u64) << shift;
+            value |= u64::from(byte) << shift;
             return Some((value, i + 1));
         }
-        value |= ((byte & 0x7F) as u64) << shift;
+        value |= u64::from(byte & 0x7F) << shift;
         shift += 7;
     }
     None
@@ -233,6 +285,17 @@ mod tests {
 
         let b = b"this is a very long key that exceeds 16 bytez";
         assert_eq!(compare_keys(a, b), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_keys_very_long() {
+        // Test with keys > 32 bytes to exercise AVX2 path
+        let a = b"this is an extremely long key that definitely exceeds 32 bytes for AVX2";
+        let b = b"this is an extremely long key that definitely exceeds 32 bytes for AVX2";
+        assert_eq!(compare_keys(a, b), Ordering::Equal);
+
+        let c = b"this is an extremely long key that definitely exceeds 32 bytes for AVX3";
+        assert_eq!(compare_keys(a, c), Ordering::Less);
     }
 
     #[test]
@@ -280,6 +343,16 @@ mod tests {
         assert_eq!(shared_prefix_len(b"user:123:name", b"user:123:email"), 9);
         assert_eq!(shared_prefix_len(b"hello", b"hello world"), 5);
         assert_eq!(shared_prefix_len(b"", b"hello"), 0);
+    }
+
+    #[test]
+    fn test_shared_prefix_len_long() {
+        // Test with keys > 32 bytes
+        let a = b"prefix_that_is_shared_for_many_bytes_then_differs_here";
+        let b = b"prefix_that_is_shared_for_many_bytes_then_differs_nope";
+        // Shared: "prefix_that_is_shared_for_many_bytes_then_differs_" (50 chars)
+        // First diff at position 50: 'h' vs 'n'
+        assert_eq!(shared_prefix_len(a, b), 50);
     }
 
     #[test]
