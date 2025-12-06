@@ -1,4 +1,5 @@
-#![cfg_attr(feature = "simd", feature(portable_simd))] // SIMD optimizations (nightly-only)
+// SIMD optimizations (nightly-only)
+#![cfg_attr(feature = "simd", feature(portable_simd))]
 // Allow retpoline cfg values from multiversion crate's target feature detection
 #![allow(unexpected_cfgs)]
 // Pedantic allows for systems code

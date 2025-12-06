@@ -210,12 +210,13 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
             return None; // No terminator in first 16 bytes = invalid
         }
 
-        let len = bitmask.trailing_zeros() as usize + 1;
-        if len > 10 {
+        let terminator_pos = bitmask.trailing_zeros() as usize + 1;
+        if terminator_pos > 10 {
             return None; // varint64 max is 10 bytes
         }
 
-        return decode_varint_known_len(data, len);
+        // Use slice bounded by SIMD-detected length for faster scalar decode
+        return decode_varint_scalar(&data[..terminator_pos]);
     }
 
     // Scalar fallback for short buffers
@@ -227,22 +228,6 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 #[must_use]
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     decode_varint_scalar(data)
-}
-
-/// Decode varint with known length (from SIMD scan).
-#[inline]
-fn decode_varint_known_len(data: &[u8], len: usize) -> Option<(u64, usize)> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in data.iter().enumerate().take(len) {
-        if i == len - 1 {
-            value |= u64::from(byte) << shift;
-        } else {
-            value |= u64::from(byte & 0x7F) << shift;
-        }
-        shift += 7;
-    }
-    Some((value, len))
 }
 
 /// Scalar varint decoding fallback.
