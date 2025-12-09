@@ -1,19 +1,18 @@
 // Benchmark to measure impact of micro-optimizations on read performance
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use seerdb::{DBOptions, DB};
 use std::sync::Arc;
 use tempfile::TempDir;
 
 fn setup_db(num_keys: usize) -> (Arc<DB>, TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let opts = DBOptions {
-        data_dir: temp_dir.path().to_path_buf(),
-        memtable_capacity: 4 * 1024 * 1024,
-        ..Default::default()
-    };
-
-    let db = Arc::new(DB::open(opts).unwrap());
+    let db = Arc::new(
+        DBOptions::default()
+            .memtable_capacity(4 * 1024 * 1024)
+            .open(temp_dir.path())
+            .unwrap(),
+    );
 
     // Write test data
     for i in 0..num_keys {
