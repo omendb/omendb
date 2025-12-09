@@ -255,8 +255,9 @@ impl Memtable {
         // InternalKey sorts by UserKey ASC, Seq DESC
         // For start: use u64::MAX so we get the first entry for start_key
         // For end: use u64::MAX so all entries for end_key come AFTER the bound (excluded)
-        let start_key = InternalKey::new(Bytes::copy_from_slice(start), u64::MAX, ValueType::Value);
-        let end_key = InternalKey::new(Bytes::copy_from_slice(end), u64::MAX, ValueType::Value);
+        // Zero-allocation: use InternalKeyRef for range bounds
+        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
+        let end_key = InternalKeyRef::new(end, u64::MAX, ValueType::Value);
 
         let mut result = Vec::new();
         let mut current_user_key: Option<Bytes> = None;
@@ -335,7 +336,8 @@ impl Memtable {
 
     /// Forward range scan from start key to end, returning (`user_key`, Entry) pairs.
     pub fn range_from(&self, start: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
-        let start_key = InternalKey::new(Bytes::copy_from_slice(start), u64::MAX, ValueType::Value);
+        // Zero-allocation: use InternalKeyRef for range bound
+        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
 
         let mut result = Vec::new();
         let mut current_user_key: Option<Bytes> = None;
