@@ -1,6 +1,6 @@
 # DECISIONS - seerdb
 
-**Last Updated**: December 3, 2025
+**Last Updated**: December 9, 2025
 
 ---
 
@@ -23,20 +23,42 @@
 
 ---
 
-### ADR-002: crossbeam-skiplist for Memtable
+### ADR-002: crossbeam-skiplist-fd for Memtable
 
 **Context**: Need concurrent sorted data structure
 
-**Decision**: crossbeam-skiplist over BTreeMap+RwLock
+**Decision**: crossbeam-skiplist-fd (fork with Comparable trait)
 
 **Rationale**:
 - Lock-free concurrent reads
-- Better cache locality than B-tree
-- Proven in production (sled, etc.)
+- Heterogeneous lookup via `Comparable` trait (zero-alloc queries)
+- 7.4M ops/sec proven performance
+- Minimal fork of battle-tested crossbeam code
 
 **Tradeoffs**:
 - Not compatible with Loom (can't exhaustively test concurrency)
 - Higher memory overhead than BTreeMap
+- Per-entry allocation (not arena-based)
+
+**Alternatives considered (Dec 2025):**
+| Option | Status | Why not |
+|--------|--------|---------|
+| SKL (arena-based) | Rejected | 2000x regression, unstable |
+| crossbeam-skiplist-mvcc | Rejected | Adds overhead, no arena benefit |
+| Custom arena skiplist | Implemented, deferred | 64% slower scans (see below) |
+
+**Custom arena skiplist findings (Dec 2025):**
+Branch `feat/arena-skiplist` has working implementation with 249 tests passing.
+- GET 5% faster (better cache locality)
+- PUT 6% slower (encoding overhead)
+- SCAN 64% slower (length-prefix encoding breaks lex order, requires O(n)+sort)
+
+Root cause: Variable-length keys need length-prefix for correct MVCC ordering,
+but this breaks byte-wise comparison for range scans. Fix requires custom
+comparator in skiplist (adds bug risk for storage engine).
+
+**Future**: May revisit if scan-heavy workloads aren't critical, or implement
+custom comparator with extensive property-based testing.
 
 ---
 
