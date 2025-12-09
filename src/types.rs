@@ -185,6 +185,20 @@ impl<'a> InternalKeyRef<'a> {
             kind: ValueType::Value,
         }
     }
+
+    /// Encode the `InternalKeyRef` into a Vec for SSTable lookups.
+    /// Avoids `Bytes::copy_from_slice` allocation on the hot path.
+    #[inline]
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.user_key.len() + 8);
+        buf.extend_from_slice(self.user_key);
+
+        // Same encoding as InternalKey::encode()
+        let packed = (self.seq << 8) | (self.kind as u64);
+        let inverted = !packed;
+        buf.extend_from_slice(&inverted.to_be_bytes());
+        buf
+    }
 }
 
 impl PartialOrd for InternalKeyRef<'_> {
