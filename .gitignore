@@ -18,3 +18,4 @@ flamegraph*.svg
 /ai/
 ai/
 .beads/.local_version
+.hhg/

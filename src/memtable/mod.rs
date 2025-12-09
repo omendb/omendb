@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use crossbeam_skiplist::SkipMap;
+use crossbeam_skiplist_fd::SkipMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::sstable::SSTableBuilder;
-use crate::types::{InternalKey, ValueType};
+use crate::types::{InternalKey, InternalKeyRef, ValueType};
 
 /// Entry type for high-level operations
 #[derive(Debug, Clone, PartialEq)]
@@ -77,8 +77,8 @@ impl Memtable {
     /// Returns None if not found or deleted
     #[inline]
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Option<(Bytes, u64)> {
-        let lookup_key =
-            InternalKey::new(Bytes::copy_from_slice(key), snapshot_seq, ValueType::Value);
+        // Zero-allocation lookup using InternalKeyRef with Comparable trait
+        let lookup_key = InternalKeyRef::for_lookup(key, snapshot_seq);
 
         // range(lookup_key..) will find the first key >= lookup_key
         // Since InternalKeys are sorted by UserKey ASC, Seq DESC:
@@ -111,7 +111,8 @@ impl Memtable {
     /// Assuming this retrieves the LATEST state for merge resolution.
     #[inline]
     pub fn get_entry(&self, key: &[u8]) -> Option<Entry> {
-        let lookup_key = InternalKey::new(Bytes::copy_from_slice(key), u64::MAX, ValueType::Value);
+        // Zero-allocation lookup using InternalKeyRef
+        let lookup_key = InternalKeyRef::new(key, u64::MAX, ValueType::Value);
 
         let mut merges = Vec::new();
 
@@ -254,8 +255,9 @@ impl Memtable {
         // InternalKey sorts by UserKey ASC, Seq DESC
         // For start: use u64::MAX so we get the first entry for start_key
         // For end: use u64::MAX so all entries for end_key come AFTER the bound (excluded)
-        let start_key = InternalKey::new(Bytes::copy_from_slice(start), u64::MAX, ValueType::Value);
-        let end_key = InternalKey::new(Bytes::copy_from_slice(end), u64::MAX, ValueType::Value);
+        // Zero-allocation: use InternalKeyRef for range bounds
+        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
+        let end_key = InternalKeyRef::new(end, u64::MAX, ValueType::Value);
 
         let mut result = Vec::new();
         let mut current_user_key: Option<Bytes> = None;
@@ -334,7 +336,8 @@ impl Memtable {
 
     /// Forward range scan from start key to end, returning (`user_key`, Entry) pairs.
     pub fn range_from(&self, start: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
-        let start_key = InternalKey::new(Bytes::copy_from_slice(start), u64::MAX, ValueType::Value);
+        // Zero-allocation: use InternalKeyRef for range bound
+        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
 
         let mut result = Vec::new();
         let mut current_user_key: Option<Bytes> = None;
@@ -443,8 +446,9 @@ impl Memtable {
             None => Bound::Unbounded,
         };
 
+        // Explicit type annotation for query type to disambiguate Comparable impls
         self.data
-            .range((start_bound, end_bound))
+            .range::<InternalKey, _>((start_bound, end_bound))
             .rev()
             .map(|entry| (entry.key().clone(), entry.value().clone()))
     }

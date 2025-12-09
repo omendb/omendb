@@ -1,7 +1,56 @@
 # STATUS - seerdb
 
-**Last Updated**: December 5, 2025
-**Version**: 0.0.7
+**Last Updated**: December 8, 2025
+**Version**: 0.0.8
+
+---
+
+## v0.0.8 Performance Release (Dec 8)
+
+Major performance optimization release eliminating hot path allocations.
+
+### Changes
+
+| Commit | Description |
+|--------|-------------|
+| `a6c0c4b` | Eliminate hot path allocations (write_varint, Vec, key reconstruction) |
+| `1cca6da` | Zero-allocation memtable lookups via crossbeam-skiplist-fd |
+
+### Performance Improvements
+
+**Write path (Mac M3 Max):**
+
+| Operation | Before | After | Change |
+|-----------|--------|-------|--------|
+| put/64 | ~8ms | ~4.5ms | **-44%** |
+| put/1024 | ~8.5ms | ~4.5ms | **-46%** |
+| put/4096 | ~8.5ms | ~4.6ms | **-45%** |
+
+**Read path:**
+
+| Operation | Change | Notes |
+|-----------|--------|-------|
+| compare_keys (28B) | **-20%** | Intel 13900KF |
+| memtable get() | **-40ns** | Zero-alloc via InternalKeyRef |
+
+### Key Technical Changes
+
+1. **crossbeam-skiplist-fd**: Replaced crossbeam-skiplist with fork supporting heterogeneous lookup via `Comparable` trait
+2. **InternalKeyRef**: New borrowed key type for zero-allocation memtable lookups
+3. **Stack-based varint**: Eliminated Vec allocation in write_varint (called 3x per block entry)
+4. **Lazy Vec init**: operands Vec only allocated when merge operations encountered
+5. **Buffer reuse**: Key reconstruction reuses single buffer instead of per-key allocation
+
+### Future: SKL Migration (bead seerdb-wwj)
+
+Research confirms production databases (Pebble, Badger, RocksDB) use arena-based skiplists.
+SKL crate migration planned for future release to eliminate ALL memtable allocations.
+
+### Reverted Changes
+
+| Change | Reason |
+|--------|--------|
+| SIMD cascade optimization | Hurt Intel perf (~70% worse for 64B keys) |
 
 ---
 
@@ -9,7 +58,7 @@
 
 | Metric | Value |
 |--------|-------|
-| **Tests** | 213 unit + 25 integration files + property tests |
+| **Tests** | 216 unit + 25 integration files + property tests |
 | **Clippy** | 0 warnings (standard + pedantic) |
 | **Rustdoc** | 0 warnings |
 | **Lines of Code** | ~28K Rust |

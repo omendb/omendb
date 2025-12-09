@@ -309,12 +309,14 @@ impl DB {
             Box<dyn Iterator<Item = crate::sstable::Result<(Bytes, Entry)>>>,
         > = Vec::new();
 
+        // Pre-allocate Bytes for range bounds (avoid per-SSTable allocation)
+        let start_bytes = Bytes::copy_from_slice(start_key);
+        let end_bytes = end_key.map(Bytes::copy_from_slice);
+
         for level_idx in 0..lsm_arc.num_levels() {
             if let Some(level) = lsm_arc.level(level_idx) {
-                // REVERSE ORDER of SSTables for this level
-                let sstables_rev: Vec<_> = level.sstables().iter().rev().collect();
-
-                for sstable_path in sstables_rev {
+                // Iterate directly in reverse - no intermediate Vec needed
+                for sstable_path in level.sstables().iter().rev() {
                     let sstable_arc = self.sstable_cache.get_or_insert_with(
                         sstable_path,
                         || -> Result<Arc<Mutex<SSTable>>> {
@@ -327,14 +329,6 @@ impl DB {
                         },
                     )?;
 
-                    // We need to lock, create iterator, and then we have a problem:
-                    // The iterator needs to hold the lock or the Arc.
-                    // SSTableIterator holds Arc<Mutex<File>> but NOT Arc<Mutex<SSTable>>.
-                    // BUT we need to call iter_rev() which loads ALL entries into memory.
-                    // This is inefficient but safe given current implementation.
-
-                    // TODO: Make SSTable::iter_rev() lazy like scan_range().
-                    // For now, we load everything.
                     let mut sstable_guard = sstable_arc.lock().expect("SSTable lock poisoned");
 
                     // Check range overlap
@@ -342,35 +336,16 @@ impl DB {
                         continue;
                     }
 
-                    // iter_rev returns Result<impl Iterator>
-                    // We collect it into a Box<dyn Iterator>
                     let iter = sstable_guard.iter_rev()?;
-                    // iter is impl Iterator<Item = Result<(Bytes, Bytes)>>
-                    // But we need Result<(Bytes, Entry)>
-                    // And we need to filter by range!
-
-                    // Map (Bytes, Bytes) -> (Bytes, Entry)
                     let mapped_iter = iter.map(|res| res.map(|(k, v)| (k, Entry::Value(v))));
 
-                    // Filter by range (since we are iterating everything)
-                    let start = Bytes::copy_from_slice(start_key);
-                    let end = end_key.map(Bytes::copy_from_slice);
+                    // Clone Bytes (O(1) - just Arc increment) for this closure
+                    let start = start_bytes.clone();
+                    let end = end_bytes.clone();
 
-                    let filtered_iter = mapped_iter.filter(move |res| {
-                        match res {
-                            Ok((k, _)) => {
-                                if k < &start {
-                                    return false;
-                                }
-                                if let Some(ref e) = end {
-                                    if k >= e {
-                                        return false;
-                                    }
-                                }
-                                true
-                            }
-                            Err(_) => true, // Propagate errors
-                        }
+                    let filtered_iter = mapped_iter.filter(move |res| match res {
+                        Ok((k, _)) => k >= &start && end.as_ref().is_none_or(|e| k < e),
+                        Err(_) => true,
                     });
 
                     sstable_iters.push(Box::new(filtered_iter));

@@ -25,7 +25,6 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 #[cfg(not(feature = "simd"))]
 use varint_rs::VarintReader;
-use varint_rs::VarintWriter;
 
 /// Compression algorithm for `SSTable` blocks
 ///
@@ -77,12 +76,20 @@ impl CompressionType {
     }
 }
 
-/// Helper to write varint to `BytesMut`
+/// Helper to write varint to `BytesMut` (zero-allocation)
+#[inline]
 fn write_varint(buf: &mut BytesMut, value: u64) {
-    let mut temp = Vec::new();
-    temp.write_u64_varint(value)
-        .expect("write to memory failed");
-    buf.extend_from_slice(&temp);
+    // Encode varint directly to stack buffer (max 10 bytes for u64)
+    let mut temp = [0u8; 10];
+    let mut n = value;
+    let mut i = 0;
+    while n >= 0x80 {
+        temp[i] = (n as u8) | 0x80;
+        n >>= 7;
+        i += 1;
+    }
+    temp[i] = n as u8;
+    buf.extend_from_slice(&temp[..=i]);
 }
 
 /// Helper to read varint from slice, advancing offset
@@ -619,7 +626,8 @@ impl Block {
         let raw_data = self.data.as_slice();
         let data = &raw_data[..self.restart_offset];
         let mut offset = 0;
-        let mut last_key = Bytes::new();
+        // Reusable buffer for key reconstruction - avoids per-entry allocation
+        let mut key_buffer = BytesMut::with_capacity(256);
 
         while offset < data.len() {
             // Read prefix length (varint)
@@ -638,23 +646,25 @@ impl Block {
             if offset + suffix_len > data.len() {
                 break;
             }
-            // Use BlockData::slice helper to handle both Owned and Borrowed cases
-            let suffix = self.data.slice(offset..offset + suffix_len);
-            offset += suffix_len;
+            let suffix_start = offset;
+            let suffix_end = offset + suffix_len;
+            offset = suffix_end;
 
             // Reconstruct full key from prefix + suffix
             let key = if prefix_len == 0 {
-                // Restart point: suffix is the full key
-                suffix.clone()
+                // Restart point: suffix is the full key - just slice, no copy
+                key_buffer.clear();
+                key_buffer.extend_from_slice(&data[suffix_start..suffix_end]);
+                key_buffer.clone().freeze()
             } else {
-                // Combine prefix from last_key with suffix
-                if prefix_len > last_key.len() {
+                // Combine prefix from last key with suffix
+                if prefix_len > key_buffer.len() {
                     break; // Invalid format
                 }
-                let mut key_data = BytesMut::with_capacity(prefix_len + suffix_len);
-                key_data.extend_from_slice(&last_key[..prefix_len]);
-                key_data.extend_from_slice(&suffix);
-                key_data.freeze()
+                // Truncate to prefix, then append suffix
+                key_buffer.truncate(prefix_len);
+                key_buffer.extend_from_slice(&data[suffix_start..suffix_end]);
+                key_buffer.clone().freeze()
             };
 
             // Read value length (varint)
@@ -669,9 +679,6 @@ impl Block {
             }
             let value = self.data.slice(offset..offset + value_len);
             offset += value_len;
-
-            // Update last_key for next entry
-            last_key = key.clone();
 
             // Add to decompressed entries
             entries.push((key, value));

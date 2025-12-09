@@ -154,6 +154,79 @@ impl Ord for InternalKey {
     }
 }
 
+/// Borrowed version of `InternalKey` for zero-allocation lookups.
+///
+/// Used with `crossbeam-skiplist-fd`'s `Comparable` trait to enable
+/// heterogeneous lookup without allocating a full `InternalKey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternalKeyRef<'a> {
+    pub user_key: &'a [u8],
+    pub seq: u64,
+    pub kind: ValueType,
+}
+
+impl<'a> InternalKeyRef<'a> {
+    /// Create a new borrowed internal key reference.
+    #[inline]
+    pub const fn new(user_key: &'a [u8], seq: u64, kind: ValueType) -> Self {
+        Self {
+            user_key,
+            seq,
+            kind,
+        }
+    }
+
+    /// Create a lookup key for finding the latest version of a user key.
+    #[inline]
+    pub const fn for_lookup(user_key: &'a [u8], snapshot_seq: u64) -> Self {
+        Self {
+            user_key,
+            seq: snapshot_seq,
+            kind: ValueType::Value,
+        }
+    }
+}
+
+impl PartialOrd for InternalKeyRef<'_> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InternalKeyRef<'_> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Same ordering as InternalKey: UserKey ASC, Seq DESC
+        match self.user_key.cmp(other.user_key) {
+            Ordering::Equal => other.seq.cmp(&self.seq),
+            ord => ord,
+        }
+    }
+}
+
+// Implement Equivalent and Comparable from equivalent-flipped crate
+// These enable heterogeneous lookup in crossbeam-skiplist-fd
+use crossbeam_skiplist_fd::equivalentor::{Comparable, Equivalent};
+
+impl Equivalent<InternalKeyRef<'_>> for InternalKey {
+    #[inline]
+    fn equivalent(&self, query: &InternalKeyRef<'_>) -> bool {
+        self.user_key.as_ref() == query.user_key && self.seq == query.seq && self.kind == query.kind
+    }
+}
+
+impl Comparable<InternalKeyRef<'_>> for InternalKey {
+    #[inline]
+    fn compare(&self, query: &InternalKeyRef<'_>) -> Ordering {
+        // Same ordering: UserKey ASC, Seq DESC
+        match self.user_key.as_ref().cmp(query.user_key) {
+            Ordering::Equal => query.seq.cmp(&self.seq),
+            ord => ord,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
