@@ -156,8 +156,7 @@ impl Ord for InternalKey {
 
 /// Borrowed version of `InternalKey` for zero-allocation lookups.
 ///
-/// Used with `crossbeam-skiplist-fd`'s `Comparable` trait to enable
-/// heterogeneous lookup without allocating a full `InternalKey`.
+/// Used in SSTable lookups to avoid allocating `Bytes` on the hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InternalKeyRef<'a> {
     pub user_key: &'a [u8],
@@ -214,28 +213,6 @@ impl Ord for InternalKeyRef<'_> {
         // Same ordering as InternalKey: UserKey ASC, Seq DESC
         match self.user_key.cmp(other.user_key) {
             Ordering::Equal => other.seq.cmp(&self.seq),
-            ord => ord,
-        }
-    }
-}
-
-// Implement Equivalent and Comparable from equivalent-flipped crate
-// These enable heterogeneous lookup in crossbeam-skiplist-fd
-use crossbeam_skiplist_fd::equivalentor::{Comparable, Equivalent};
-
-impl Equivalent<InternalKeyRef<'_>> for InternalKey {
-    #[inline]
-    fn equivalent(&self, query: &InternalKeyRef<'_>) -> bool {
-        self.user_key.as_ref() == query.user_key && self.seq == query.seq && self.kind == query.kind
-    }
-}
-
-impl Comparable<InternalKeyRef<'_>> for InternalKey {
-    #[inline]
-    fn compare(&self, query: &InternalKeyRef<'_>) -> Ordering {
-        // Same ordering: UserKey ASC, Seq DESC
-        match self.user_key.as_ref().cmp(query.user_key) {
-            Ordering::Equal => query.seq.cmp(&self.seq),
             ord => ord,
         }
     }

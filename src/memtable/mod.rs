@@ -1,11 +1,29 @@
+//! Arena-based memtable using SKL skiplist with MVCC support.
+//!
+//! The memtable uses SKL's `multiple_version` module which provides:
+//! - Arena allocation (reduces per-entry heap allocations)
+//! - Built-in MVCC with version numbers (maps to our sequence numbers)
+//! - Lock-free concurrent access
+
 use bytes::Bytes;
-use crossbeam_skiplist_fd::SkipMap;
+use skl::dynamic::{
+    multiple_version::{sync::SkipMap, Map},
+    Builder,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::sstable::SSTableBuilder;
-use crate::types::{InternalKey, InternalKeyRef, ValueType};
+use crate::types::{InternalKey, ValueType};
+
+/// Value type prefix bytes stored in SKL values
+const VALUE_PREFIX: u8 = 0x01;
+const TOMBSTONE_PREFIX: u8 = 0x02;
+const MERGE_PREFIX: u8 = 0x03;
+
+/// Minimum arena capacity for SKL (internal overhead ~184 bytes + headroom)
+const MIN_ARENA_CAPACITY: usize = 4096;
 
 /// Entry type for high-level operations
 #[derive(Debug, Clone, PartialEq)]
@@ -19,9 +37,9 @@ pub enum Entry {
     },
 }
 
-/// In-memory sorted table for recent writes.
+/// In-memory sorted table for recent writes using arena-based skiplist.
 pub struct Memtable {
-    data: Arc<SkipMap<InternalKey, Bytes>>,
+    data: Arc<SkipMap>,
     size: AtomicUsize,
     capacity: usize,
 }
@@ -29,8 +47,17 @@ pub struct Memtable {
 impl Memtable {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        // SKL requires minimum arena space for internal structures (~184 bytes overhead).
+        // We enforce a minimum of 4KB to ensure basic operations work.
+        let arena_capacity = capacity.max(MIN_ARENA_CAPACITY) as u32;
+
+        let data = Builder::new()
+            .with_capacity(arena_capacity)
+            .alloc::<SkipMap>()
+            .expect("failed to allocate memtable arena");
+
         Self {
-            data: Arc::new(SkipMap::new()),
+            data: Arc::new(data),
             size: AtomicUsize::new(0),
             capacity,
         }
@@ -44,31 +71,41 @@ impl Memtable {
 
     /// Insert a key-value pair with a specific sequence number
     #[inline]
+    #[allow(clippy::needless_pass_by_value)] // Bytes is cheap to clone, API clarity
     pub fn put(&self, key: Bytes, value: Bytes, seq: u64) {
-        let size_delta = key.len() + value.len() + 8; // +8 for seq/type
-        let internal_key = InternalKey::new(key, seq, ValueType::Value);
+        let size_delta = key.len() + value.len() + 1; // +1 for prefix
 
-        self.data.insert(internal_key, value);
+        // Encode value with prefix
+        let mut encoded = Vec::with_capacity(1 + value.len());
+        encoded.push(VALUE_PREFIX);
+        encoded.extend_from_slice(&value);
+
+        let _ = self.data.insert(seq, key.as_ref(), &encoded);
         self.size.fetch_add(size_delta, Ordering::Relaxed);
     }
 
     /// Delete a key (insert tombstone) with a specific sequence number
     #[inline]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn delete(&self, key: Bytes, seq: u64) {
-        let size_delta = key.len() + 8;
-        let internal_key = InternalKey::new(key, seq, ValueType::Deletion);
+        let size_delta = key.len() + 1;
 
-        self.data.insert(internal_key, Bytes::new());
+        let _ = self.data.insert(seq, key.as_ref(), &[TOMBSTONE_PREFIX]);
         self.size.fetch_add(size_delta, Ordering::Relaxed);
     }
 
     /// Insert a merge operand
     #[inline]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn merge(&self, key: Bytes, operand: Bytes, seq: u64) {
-        let size_delta = key.len() + operand.len() + 8;
-        let internal_key = InternalKey::new(key, seq, ValueType::Merge);
+        let size_delta = key.len() + operand.len() + 1;
 
-        self.data.insert(internal_key, operand);
+        // Encode merge operand with prefix
+        let mut encoded = Vec::with_capacity(1 + operand.len());
+        encoded.push(MERGE_PREFIX);
+        encoded.extend_from_slice(&operand);
+
+        let _ = self.data.insert(seq, key.as_ref(), &encoded);
         self.size.fetch_add(size_delta, Ordering::Relaxed);
     }
 
@@ -77,81 +114,79 @@ impl Memtable {
     /// Returns None if not found or deleted
     #[inline]
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Option<(Bytes, u64)> {
-        // Zero-allocation lookup using InternalKeyRef with Comparable trait
-        let lookup_key = InternalKeyRef::for_lookup(key, snapshot_seq);
+        // SKL's get returns the latest version <= snapshot_seq
+        let entry = self.data.get(snapshot_seq, key)?;
+        let value = entry.value();
+        let version = entry.version();
 
-        // range(lookup_key..) will find the first key >= lookup_key
-        // Since InternalKeys are sorted by UserKey ASC, Seq DESC:
-        // Key + Seq(MAX) comes BEFORE Key + Seq(100)
-        // So if we search for Key + snapshot_seq, we will find the first version <= snapshot_seq
-        for entry in self.data.range(lookup_key..) {
-            let ikey = entry.key();
-
-            // Check if we moved to a different user key
-            if ikey.user_key.as_ref() != key {
-                return None;
-            }
-
-            // Since we used range(lookup_key..), and sort is Seq DESC,
-            // this entry MUST have seq <= snapshot_seq.
-
-            match ikey.kind {
-                ValueType::Value => return Some((entry.value().clone(), ikey.seq)),
-                ValueType::Deletion => return None, // Deleted
-                // Skip merge operands and log entries for simple get (needs merge logic)
-                ValueType::Merge | ValueType::Log => {}
-            }
+        if value.is_empty() {
+            return None;
         }
 
-        None
+        match value[0] {
+            VALUE_PREFIX => Some((Bytes::copy_from_slice(&value[1..]), version)),
+            TOMBSTONE_PREFIX => None,
+            MERGE_PREFIX => {
+                // For simple get, skip merge operands (caller should use get_entry)
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Get Entry (Value, Tombstone, or Merge list) for a key.
-    /// This collects all versions/merges visible?
-    /// Assuming this retrieves the LATEST state for merge resolution.
+    /// This collects all versions/merges visible at the latest seq.
     #[inline]
     pub fn get_entry(&self, key: &[u8]) -> Option<Entry> {
-        // Zero-allocation lookup using InternalKeyRef
-        let lookup_key = InternalKeyRef::new(key, u64::MAX, ValueType::Value);
-
+        // Iterate all versions of this key from newest to oldest
         let mut merges = Vec::new();
 
-        for entry in self.data.range(lookup_key..) {
-            let ikey = entry.key();
-            if ikey.user_key.as_ref() != key {
-                break;
+        // Use iter_all to get all versions, then filter to our key
+        for entry in self.data.iter_all(u64::MAX) {
+            let entry_key = entry.key();
+            if entry_key != key {
+                if entry_key > key {
+                    // Past our key in sorted order
+                    break;
+                }
+                continue;
             }
 
-            match ikey.kind {
-                ValueType::Value => {
+            // iter_all returns MaybeTombstone entries, so value() returns Option
+            let Some(value) = entry.value() else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+
+            match value[0] {
+                VALUE_PREFIX => {
                     if merges.is_empty() {
-                        return Some(Entry::Value(entry.value().clone()));
+                        return Some(Entry::Value(Bytes::copy_from_slice(&value[1..])));
                     }
-                    // Value is the base for merge operands
                     return Some(Entry::Merge {
-                        base: Some(entry.value().clone()),
+                        base: Some(Bytes::copy_from_slice(&value[1..])),
                         operands: merges,
                     });
                 }
-                ValueType::Deletion => {
+                TOMBSTONE_PREFIX => {
                     if merges.is_empty() {
                         return Some(Entry::Tombstone);
                     }
-                    // Tombstone stops merge chain - no base value
                     return Some(Entry::Merge {
                         base: None,
                         operands: merges,
                     });
                 }
-                ValueType::Merge => {
-                    merges.push(entry.value().clone());
+                MERGE_PREFIX => {
+                    merges.push(Bytes::copy_from_slice(&value[1..]));
                 }
-                ValueType::Log => {}
+                _ => {}
             }
         }
 
         if !merges.is_empty() {
-            // No base found in this memtable - caller should continue searching
             return Some(Entry::Merge {
                 base: None,
                 operands: merges,
@@ -162,18 +197,14 @@ impl Memtable {
     }
 
     /// Put an Entry with explicit sequence number (used for WAL recovery/merge resolution)
-    ///
-    /// The caller must provide a valid sequence number to maintain MVCC ordering.
     pub fn put_entry(&self, key: Bytes, entry: Entry, seq: u64) {
         match entry {
             Entry::Value(v) => self.put(key, v, seq),
             Entry::Tombstone => self.delete(key, seq),
             Entry::Merge { base, operands } => {
-                // Write base value first if present
                 if let Some(v) = base {
                     self.put(key.clone(), v, seq);
                 }
-                // Then write merge operands
                 for op in operands {
                     self.merge(key.clone(), op, seq);
                 }
@@ -181,10 +212,10 @@ impl Memtable {
         }
     }
 
-    /// Check if key exists (raw check, ignores visibility)
+    /// Check if key exists (raw check at latest version)
     #[inline]
     pub fn contains_raw(&self, key: &InternalKey) -> bool {
-        self.data.contains_key(key)
+        self.data.get(key.seq, key.user_key.as_ref()).is_some()
     }
 
     /// Get current size in bytes (approximate)
@@ -210,20 +241,39 @@ impl Memtable {
     }
 
     /// Iterate over all entries in sorted order (internal representation)
+    /// Returns (InternalKey, Bytes) for compatibility with flush
     pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
-        self.data
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+        self.data.iter_all(u64::MAX).filter_map(|entry| {
+            let key = entry.key();
+            let version = entry.version();
+
+            // iter_all returns MaybeTombstone entries, so value() returns Option
+            let value = entry.value()?;
+
+            // Decode value type from prefix
+            let (kind, data) = if value.is_empty() {
+                (ValueType::Value, Bytes::new())
+            } else {
+                match value[0] {
+                    VALUE_PREFIX => (ValueType::Value, Bytes::copy_from_slice(&value[1..])),
+                    TOMBSTONE_PREFIX => (ValueType::Deletion, Bytes::new()),
+                    MERGE_PREFIX => (ValueType::Merge, Bytes::copy_from_slice(&value[1..])),
+                    _ => (ValueType::Value, Bytes::copy_from_slice(value)),
+                }
+            };
+
+            let internal_key = InternalKey::new(Bytes::copy_from_slice(key), version, kind);
+            Some((internal_key, data))
+        })
     }
 
     /// Iterate over all entries as (`user_key`, Entry) pairs, grouped by user key.
-    /// This is the high-level interface for flush operations.
     pub fn iter_entries(&self) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
         self.range_from(&[])
     }
 
-    /// Clone the skipmap for creating an immutable snapshot
-    pub fn snapshot(&self) -> Arc<SkipMap<InternalKey, Bytes>> {
+    /// Clone reference to underlying data (for immutable snapshot)
+    pub fn snapshot(&self) -> Arc<SkipMap> {
         Arc::clone(&self.data)
     }
 
@@ -231,202 +281,81 @@ impl Memtable {
     pub fn flush(&self, path: impl AsRef<Path>) -> Result<(), crate::sstable::SSTableError> {
         let mut builder = SSTableBuilder::create(path)?;
 
-        // Iterate in sorted order and add to SSTable
-        // Keys are encoded InternalKeys, values are handled based on type
         for (ikey, value) in self.iter() {
             let ikey_bytes = ikey.encode();
             match ikey.kind {
                 ValueType::Value => builder.add(ikey_bytes, value)?,
                 ValueType::Deletion => builder.add_tombstone(ikey_bytes)?,
                 ValueType::Merge => builder.add_merge(ikey_bytes, value)?,
-                ValueType::Log => {} // Skip log entries
+                ValueType::Log => {}
             }
         }
 
         builder.finish()
     }
 
-    // --- Range Iteration Support for RangeIterator ---
+    // --- Range Iteration Support ---
 
     /// Forward range scan returning (`user_key`, Entry) pairs.
-    /// Groups by user key and returns the latest Entry for each.
-    /// End key is exclusive.
+    ///
+    /// SKL's range() at a given version already returns only the latest version
+    /// of each key, so we can stream directly without collecting all versions.
     pub fn range(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
-        // InternalKey sorts by UserKey ASC, Seq DESC
-        // For start: use u64::MAX so we get the first entry for start_key
-        // For end: use u64::MAX so all entries for end_key come AFTER the bound (excluded)
-        // Zero-allocation: use InternalKeyRef for range bounds
-        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
-        let end_key = InternalKeyRef::new(end, u64::MAX, ValueType::Value);
-
-        let mut result = Vec::new();
-        let mut current_user_key: Option<Bytes> = None;
-        let mut current_entry: Option<Entry> = None;
-        let mut merge_operands: Vec<Bytes> = Vec::new();
-
-        for entry in self.data.range(start_key..end_key) {
-            let ikey = entry.key();
-            let user_key = ikey.user_key.clone();
-
-            // New user key - emit previous if any
-            if current_user_key.as_ref() != Some(&user_key) {
-                if let Some(uk) = current_user_key.take() {
-                    if !merge_operands.is_empty() {
-                        let base = current_entry.take().and_then(|e| {
-                            if let Entry::Value(v) = e {
-                                Some(v)
-                            } else {
-                                None
-                            }
-                        });
-                        result.push((
-                            uk,
-                            Entry::Merge {
-                                base,
-                                operands: std::mem::take(&mut merge_operands),
-                            },
-                        ));
-                    } else if let Some(e) = current_entry.take() {
-                        result.push((uk, e));
-                    }
-                }
-                current_user_key = Some(user_key.clone());
-                current_entry = None;
-                merge_operands.clear();
-            }
-
-            // Process entries for this user key:
-            // - Collect all Merge operands until we find a Value/Tombstone
-            // - Value/Tombstone becomes the base (first one wins, which is newest)
-            if current_entry.is_none() {
-                match ikey.kind {
-                    ValueType::Value => current_entry = Some(Entry::Value(entry.value().clone())),
-                    ValueType::Deletion => current_entry = Some(Entry::Tombstone),
-                    ValueType::Merge => merge_operands.push(entry.value().clone()),
-                    ValueType::Log => {}
-                }
-            }
-            // Once we have a base (Value/Tombstone), stop collecting - older entries are superseded
-        }
-
-        // Emit last key
-        if let Some(uk) = current_user_key {
-            if !merge_operands.is_empty() {
-                let base = current_entry.and_then(|e| {
-                    if let Entry::Value(v) = e {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-                result.push((
-                    uk,
-                    Entry::Merge {
-                        base,
-                        operands: merge_operands,
-                    },
-                ));
-            } else if let Some(e) = current_entry {
-                result.push((uk, e));
-            }
-        }
-
-        result.into_iter()
+        // SKL's range() needs the bounds to outlive the iterator.
+        // We collect into a Vec to avoid lifetime issues with the slice references.
+        let entries: Vec<_> = self
+            .data
+            .range(u64::MAX, start..end)
+            .filter_map(|entry| {
+                let user_key = Bytes::copy_from_slice(entry.key());
+                Self::decode_value_to_entry(entry.value()).map(|e| (user_key, e))
+            })
+            .collect();
+        entries.into_iter()
     }
 
-    /// Forward range scan from start key to end, returning (`user_key`, Entry) pairs.
+    /// Forward range scan from start key to end.
     pub fn range_from(&self, start: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
-        // Zero-allocation: use InternalKeyRef for range bound
-        let start_key = InternalKeyRef::new(start, u64::MAX, ValueType::Value);
+        let entries: Vec<_> = self
+            .data
+            .range(u64::MAX, start..)
+            .filter_map(|entry| {
+                let user_key = Bytes::copy_from_slice(entry.key());
+                Self::decode_value_to_entry(entry.value()).map(|e| (user_key, e))
+            })
+            .collect();
+        entries.into_iter()
+    }
 
-        let mut result = Vec::new();
-        let mut current_user_key: Option<Bytes> = None;
-        let mut current_entry: Option<Entry> = None;
-        let mut merge_operands: Vec<Bytes> = Vec::new();
-
-        for entry in self.data.range(start_key..) {
-            let ikey = entry.key();
-            let user_key = ikey.user_key.clone();
-
-            if current_user_key.as_ref() != Some(&user_key) {
-                if let Some(uk) = current_user_key.take() {
-                    if !merge_operands.is_empty() {
-                        let base = current_entry.take().and_then(|e| {
-                            if let Entry::Value(v) = e {
-                                Some(v)
-                            } else {
-                                None
-                            }
-                        });
-                        result.push((
-                            uk,
-                            Entry::Merge {
-                                base,
-                                operands: std::mem::take(&mut merge_operands),
-                            },
-                        ));
-                    } else if let Some(e) = current_entry.take() {
-                        result.push((uk, e));
-                    }
-                }
-                current_user_key = Some(user_key.clone());
-                current_entry = None;
-                merge_operands.clear();
-            }
-
-            // Process entries for this user key:
-            // - Collect all Merge operands until we find a Value/Tombstone
-            // - Value/Tombstone becomes the base (first one wins, which is newest)
-            if current_entry.is_none() {
-                match ikey.kind {
-                    ValueType::Value => current_entry = Some(Entry::Value(entry.value().clone())),
-                    ValueType::Deletion => current_entry = Some(Entry::Tombstone),
-                    ValueType::Merge => merge_operands.push(entry.value().clone()),
-                    ValueType::Log => {}
-                }
-            }
-            // Once we have a base (Value/Tombstone), stop collecting - older entries are superseded
+    /// Decode a value from SKL format to Entry
+    #[inline]
+    fn decode_value_to_entry(value: &[u8]) -> Option<Entry> {
+        if value.is_empty() {
+            return None;
         }
 
-        if let Some(uk) = current_user_key {
-            if !merge_operands.is_empty() {
-                let base = current_entry.and_then(|e| {
-                    if let Entry::Value(v) = e {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
-                result.push((
-                    uk,
-                    Entry::Merge {
-                        base,
-                        operands: merge_operands,
-                    },
-                ));
-            } else if let Some(e) = current_entry {
-                result.push((uk, e));
-            }
+        match value[0] {
+            VALUE_PREFIX => Some(Entry::Value(Bytes::copy_from_slice(&value[1..]))),
+            TOMBSTONE_PREFIX => Some(Entry::Tombstone),
+            MERGE_PREFIX => Some(Entry::Merge {
+                base: None,
+                operands: vec![Bytes::copy_from_slice(&value[1..])],
+            }),
+            _ => None,
         }
-
-        result.into_iter()
     }
 
     /// Reverse range scan returning (`user_key`, Entry) pairs.
     pub fn range_rev(&self, start: &[u8], end: &[u8]) -> impl Iterator<Item = (Bytes, Entry)> + '_ {
-        // Collect forward then reverse (simpler than true reverse iteration with grouping)
         let entries: Vec<_> = self.range(start, end).collect();
         entries.into_iter().rev()
     }
 
-    // --- Internal Iteration Support ---
-
     /// Iterate over all entries in reverse sorted order (internal keys)
     pub fn iter_rev(&self) -> impl Iterator<Item = (InternalKey, Bytes)> + '_ {
-        self.data
-            .iter()
-            .rev()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+        // Collect and reverse since SKL doesn't have direct reverse iter_all
+        let entries: Vec<_> = self.iter().collect();
+        entries.into_iter().rev()
     }
 
     /// Internal range scan in reverse (for internal use)
@@ -435,22 +364,45 @@ impl Memtable {
         start: Option<&'a InternalKey>,
         end: Option<&'a InternalKey>,
     ) -> impl Iterator<Item = (InternalKey, Bytes)> + 'a {
-        use std::ops::Bound;
+        // Filter the full iteration based on bounds
+        let start_key = start.map(|k| k.user_key.as_ref());
+        let end_key = end.map(|k| k.user_key.as_ref());
+        let start_seq = start.map(|k| k.seq);
+        let end_seq = end.map(|k| k.seq);
 
-        let start_bound = match start {
-            Some(k) => Bound::Included(k),
-            None => Bound::Unbounded,
-        };
-        let end_bound = match end {
-            Some(k) => Bound::Excluded(k),
-            None => Bound::Unbounded,
-        };
-
-        // Explicit type annotation for query type to disambiguate Comparable impls
-        self.data
-            .range::<InternalKey, _>((start_bound, end_bound))
+        self.iter()
+            .filter(move |(ikey, _)| {
+                let key_ref = ikey.user_key.as_ref();
+                let in_start = match (start_key, start_seq) {
+                    (Some(sk), Some(ss)) => key_ref > sk || (key_ref == sk && ikey.seq <= ss),
+                    _ => true,
+                };
+                let in_end = match (end_key, end_seq) {
+                    (Some(ek), Some(es)) => key_ref < ek || (key_ref == ek && ikey.seq > es),
+                    _ => true,
+                };
+                in_start && in_end
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
             .rev()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+    }
+}
+
+impl Clone for Memtable {
+    fn clone(&self) -> Self {
+        // Create new memtable with same capacity and copy data
+        let new_mt = Self::new(self.capacity);
+        for (ikey, value) in self.iter() {
+            match ikey.kind {
+                ValueType::Value => new_mt.put(ikey.user_key, value, ikey.seq),
+                ValueType::Deletion => new_mt.delete(ikey.user_key, ikey.seq),
+                ValueType::Merge => new_mt.merge(ikey.user_key, value, ikey.seq),
+                ValueType::Log => {}
+            }
+        }
+        new_mt.size.store(self.size(), Ordering::Relaxed);
+        new_mt
     }
 }
 
@@ -460,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_memtable_mvcc_put_get() {
-        let memtable = Memtable::new(1024);
+        let memtable = Memtable::new(1024 * 1024);
 
         // Write v1 at seq 10
         memtable.put(Bytes::from("key1"), Bytes::from("val1"), 10);
@@ -477,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_memtable_mvcc_delete() {
-        let memtable = Memtable::new(1024);
+        let memtable = Memtable::new(1024 * 1024);
 
         memtable.put(Bytes::from("key1"), Bytes::from("val1"), 10);
         assert_eq!(memtable.get(b"key1", 20), Some((Bytes::from("val1"), 10)));
