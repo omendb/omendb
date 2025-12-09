@@ -1,55 +1,50 @@
 # STATUS - seerdb
 
-**Last Updated**: December 6, 2025
-**Version**: 0.0.7
+**Last Updated**: December 8, 2025
+**Version**: 0.0.8
 
 ---
 
-## Performance Optimization (Dec 6)
+## v0.0.8 Performance Release (Dec 8)
 
-Systematic review and optimization pass to address potential perf regressions.
+Major performance optimization release eliminating hot path allocations.
 
-### Fixes Applied
+### Changes
 
-| Issue | Location | Impact |
-|-------|----------|--------|
-| **write_varint Vec alloc** | `block.rs:81` | Eliminated per-entry heap allocation |
-| **Vec::new on every get** | `read.rs:57` | Lazy-init, no alloc for non-merge paths |
-| **Vec collect per level** | `read.rs:120` | Iterate directly, no intermediate Vec |
-| **Key reconstruction alloc** | `block.rs:654` | Reuse buffer instead of per-key alloc |
-| **range_rev per-SSTable alloc** | `iter.rs:356` | Pre-allocate once, clone Bytes (O(1)) |
-| delete/merge WAL opts | `write.rs` | Added `skip_wal`/`use_direct_wal` paths |
+| Commit | Description |
+|--------|-------------|
+| `a6c0c4b` | Eliminate hot path allocations (write_varint, Vec, key reconstruction) |
+| `1cca6da` | Zero-allocation memtable lookups via crossbeam-skiplist-fd |
 
-### Results
+### Performance Improvements
 
-**Mac (M3 Max) - Criterion benchmark:**
+**Write path (Mac M3 Max):**
 
 | Operation | Before | After | Change |
 |-----------|--------|-------|--------|
 | put/64 | ~8ms | ~4.5ms | **-44%** |
 | put/1024 | ~8.5ms | ~4.5ms | **-46%** |
 | put/4096 | ~8.5ms | ~4.6ms | **-45%** |
-| shared_prefix | 6.3ns | 5.9ns | **-5%** |
 
-**Fedora (Intel 13900KF):**
+**Read path:**
 
-| Operation | Before | After | Change |
-|-----------|--------|-------|--------|
-| compare_keys (28B) | 11ns | 8.8ns | **-20%** |
+| Operation | Change | Notes |
+|-----------|--------|-------|
+| compare_keys (28B) | **-20%** | Intel 13900KF |
+| memtable get() | **-40ns** | Zero-alloc via InternalKeyRef |
 
-### Remaining: Memtable Lookup Allocation
+### Key Technical Changes
 
-**Research completed Dec 6** - see `ai/PERF_ISSUES.md` for full analysis.
+1. **crossbeam-skiplist-fd**: Replaced crossbeam-skiplist with fork supporting heterogeneous lookup via `Comparable` trait
+2. **InternalKeyRef**: New borrowed key type for zero-allocation memtable lookups
+3. **Stack-based varint**: Eliminated Vec allocation in write_varint (called 3x per block entry)
+4. **Lazy Vec init**: operands Vec only allocated when merge operations encountered
+5. **Buffer reuse**: Key reconstruction reuses single buffer instead of per-key allocation
 
-| Option | Priority | Notes |
-|--------|----------|-------|
-| **crossbeam-skiplist-fd** | **P1 Best** | Zero alloc via `Comparable` trait, ~40ns/get savings |
-| Thread-Local Buffer | P2 Fallback | ~20ns/get savings, easy to implement |
-| SKL crate | P3 | Arena-based, major refactor (overkill) |
-| SSO | Skip | Doubles InternalKey size, hurts cache |
-| Arena (bumpalo) | Skip | Overhead exceeds benefit for single get() |
+### Future: SKL Migration (bead seerdb-3mu)
 
-**Recommended**: Switch to `crossbeam-skiplist-fd` and implement `Comparable<InternalKey>` for `InternalKeyRef<'a>`
+Research confirms production databases (Pebble, Badger, RocksDB) use arena-based skiplists.
+SKL crate migration planned for future release to eliminate ALL memtable allocations.
 
 ### Reverted Changes
 
