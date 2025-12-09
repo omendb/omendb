@@ -41,7 +41,7 @@ Major performance optimization release eliminating hot path allocations.
 4. **Lazy Vec init**: operands Vec only allocated when merge operations encountered
 5. **Buffer reuse**: Key reconstruction reuses single buffer instead of per-key allocation
 
-### Future: SKL Migration (bead seerdb-3mu)
+### Future: SKL Migration (bead seerdb-wwj)
 
 Research confirms production databases (Pebble, Badger, RocksDB) use arena-based skiplists.
 SKL crate migration planned for future release to eliminate ALL memtable allocations.
@@ -58,7 +58,7 @@ SKL crate migration planned for future release to eliminate ALL memtable allocat
 
 | Metric | Value |
 |--------|-------|
-| **Tests** | 213 unit + 25 integration files + property tests |
+| **Tests** | 216 unit + 25 integration files + property tests |
 | **Clippy** | 0 warnings (standard + pedantic) |
 | **Rustdoc** | 0 warnings |
 | **Lines of Code** | ~28K Rust |
