@@ -20,6 +20,8 @@ feature-depth = 1
 ignore = [
     # Transitive from object_store - unmaintained but not a vulnerability
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitive from object_store, waiting for upstream fix" },
+    # paste is unmaintained but still functional, used transitively by multiversion
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive from multiversion, no security issue" },
 ]
 
 # =============================================================================
