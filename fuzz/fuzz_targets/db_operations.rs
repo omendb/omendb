@@ -1,22 +1,34 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
-use libfuzzer_sys::arbitrary::{self, Arbitrary, Unstructured};
-use seerdb::{DB, DBOptions, Snapshot};
-use tempfile::TempDir;
 use bytes::Bytes;
+use libfuzzer_sys::arbitrary::{self, Arbitrary, Unstructured};
+use libfuzzer_sys::fuzz_target;
+use seerdb::{Snapshot, DB};
 use std::error::Error;
+use tempfile::TempDir;
 
 #[derive(Debug, Clone)]
 enum DBOp {
-    Put { key: Vec<u8>, value: Vec<u8> },
-    Get { key: Vec<u8> },
-    Delete { key: Vec<u8> },
-    Range { start: Vec<u8>, end: Option<Vec<u8>> },
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Get {
+        key: Vec<u8>,
+    },
+    Delete {
+        key: Vec<u8>,
+    },
+    Range {
+        start: Vec<u8>,
+        end: Option<Vec<u8>>,
+    },
     Flush,
     Snapshot,
     Iter,
-    Prefix { prefix: Vec<u8> },
+    Prefix {
+        prefix: Vec<u8>,
+    },
 }
 
 impl<'a> Arbitrary<'a> for DBOp {
@@ -79,10 +91,7 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    let mut options = DBOptions::default();
-    options.data_dir = temp_dir.path().to_path_buf();
-
-    let db: DB = match DB::open(options) {
+    let db: DB = match DB::open(temp_dir.path()) {
         Ok(db) => db,
         Err(_) => return,
     };
