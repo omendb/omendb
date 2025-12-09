@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write # For creating GitHub releases
+  checks: write # For rustsec/audit-check to create check runs
 
 env:
   CARGO_TERM_COLOR: always
