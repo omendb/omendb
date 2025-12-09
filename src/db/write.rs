@@ -204,16 +204,17 @@ impl DB {
         // Apply backpressure (stall writes if system is overloaded)
         self.check_write_stall();
 
-        let start = Instant::now();
-
         let key = Bytes::copy_from_slice(key.as_ref());
         let value = Bytes::copy_from_slice(value.as_ref());
 
-        // Track logical bytes written (user data)
-        if !self.options.disable_metrics {
+        // Only track metrics if enabled (avoids Instant::now() overhead ~20ns)
+        let start = if self.options.disable_metrics {
+            None
+        } else {
             let logical_bytes = (key.len() + value.len()) as u64;
             self.metrics.record_logical_bytes(logical_bytes);
-        }
+            Some(Instant::now())
+        };
 
         // Memory budget enforcement (if configured)
         if let Some(max_memory) = self.options.max_memory_bytes {
@@ -308,10 +309,10 @@ impl DB {
         }
 
         // Track physical bytes written (WAL bytes if WAL enabled, else 0)
-        if !self.options.disable_metrics {
+        if let Some(s) = start {
             let physical_bytes = if self.options.skip_wal { 0 } else { wal_bytes };
             self.metrics.record_physical_bytes(physical_bytes);
-            self.metrics.record_put(start.elapsed());
+            self.metrics.record_put(s.elapsed());
         }
 
         Ok(())
@@ -321,8 +322,12 @@ impl DB {
         // Apply backpressure (stall writes if system is overloaded)
         self.check_write_stall();
 
-        let start = Instant::now();
         let key = Bytes::copy_from_slice(key.as_ref());
+        let start = if self.options.disable_metrics {
+            None
+        } else {
+            Some(Instant::now())
+        };
 
         // Assign sequence number
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
@@ -350,8 +355,8 @@ impl DB {
         }
 
         // Record latency
-        if !self.options.disable_metrics {
-            self.metrics.record_delete(start.elapsed());
+        if let Some(s) = start {
+            self.metrics.record_delete(s.elapsed());
         }
 
         Ok(())
@@ -367,9 +372,13 @@ impl DB {
     /// * `operand` - The operand to merge
     pub fn merge(&self, key: impl AsRef<[u8]>, operand: impl AsRef<[u8]>) -> Result<()> {
         self.check_write_stall();
-        let start = Instant::now();
         let key = Bytes::copy_from_slice(key.as_ref());
         let operand = Bytes::copy_from_slice(operand.as_ref());
+        let start = if self.options.disable_metrics {
+            None
+        } else {
+            Some(Instant::now())
+        };
 
         // Assign sequence number
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
@@ -396,8 +405,8 @@ impl DB {
         }
 
         // Metrics (reuse put metric for now or add new one)
-        if !self.options.disable_metrics {
-            self.metrics.record_put(start.elapsed());
+        if let Some(s) = start {
+            self.metrics.record_put(s.elapsed());
         }
 
         Ok(())

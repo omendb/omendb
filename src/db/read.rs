@@ -48,7 +48,11 @@ impl DB {
     /// Returns the value if found, `None` if the key doesn't exist or was deleted.
     /// Automatically handles merge operations if a merge operator is configured.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
-        let start = Instant::now();
+        let start = if self.options.disable_metrics {
+            None
+        } else {
+            Some(Instant::now())
+        };
         let key = key.as_ref();
 
         self.read_count
@@ -267,19 +271,19 @@ impl DB {
         key: &[u8],
         base: Option<Bytes>,
         operands: &Option<Vec<Bytes>>,
-        start: Instant,
+        start: Option<Instant>,
     ) -> Option<Bytes> {
         match operands {
             None => {
                 // Fast path: no merge operands (common case)
-                if !self.options.disable_metrics {
-                    self.metrics.record_get(start.elapsed());
+                if let Some(s) = start {
+                    self.metrics.record_get(s.elapsed());
                 }
                 base
             }
             Some(ops) if ops.is_empty() => {
-                if !self.options.disable_metrics {
-                    self.metrics.record_get(start.elapsed());
+                if let Some(s) = start {
+                    self.metrics.record_get(s.elapsed());
                 }
                 base
             }
@@ -292,11 +296,11 @@ impl DB {
         key: &[u8],
         base: Option<Bytes>,
         operands: &[Bytes],
-        start: Instant,
+        start: Option<Instant>,
     ) -> Option<Bytes> {
         if operands.is_empty() {
-            if !self.options.disable_metrics {
-                self.metrics.record_get(start.elapsed());
+            if let Some(s) = start {
+                self.metrics.record_get(s.elapsed());
             }
             return base;
         }
@@ -309,20 +313,18 @@ impl DB {
                 .collect();
             let base_slice = base.as_ref().map(std::convert::AsRef::as_ref);
 
-            if let Some(merged) = op.full_merge(key, base_slice, &ops_reversed) {
-                if !self.options.disable_metrics {
-                    self.metrics.record_get(start.elapsed());
-                }
+            let result = if let Some(merged) = op.full_merge(key, base_slice, &ops_reversed) {
                 Some(Bytes::from(merged))
             } else {
-                if !self.options.disable_metrics {
-                    self.metrics.record_get(start.elapsed());
-                }
                 base
+            };
+            if let Some(s) = start {
+                self.metrics.record_get(s.elapsed());
             }
+            result
         } else {
-            if !self.options.disable_metrics {
-                self.metrics.record_get(start.elapsed());
+            if let Some(s) = start {
+                self.metrics.record_get(s.elapsed());
             }
             base
         }
