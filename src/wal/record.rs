@@ -73,7 +73,7 @@ impl Record {
     }
 
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(self.encoded_len());
 
         match self {
             Self::Put { key, value, seq } => {

@@ -198,8 +198,8 @@ impl WAL {
             return Ok(());
         }
 
-        // Write all batched records
-        let records: Vec<Record> = self.batch.drain(..).collect();
+        // Write all batched records - take() replaces with empty Vec without allocation
+        let records = std::mem::take(&mut self.batch);
         self.write_batch(&records)?;
 
         self.batch_size_bytes = 0;
