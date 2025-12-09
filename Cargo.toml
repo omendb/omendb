@@ -27,8 +27,8 @@ tokio = { version = "1.41", features = ["full"] }
 crc32c = "0.6"
 
 # Memtable (concurrent skiplist + lock-free atomic swap)
-# SKL: arena-based MVCC skiplist designed for LSM memtables
-skl = "0.22"
+# Using -fd fork for heterogeneous lookup (zero-alloc queries via Comparable trait)
+crossbeam-skiplist-fd = "0.1"
 crossbeam-channel = "0.5"
 arc-swap = "1.7"
 
