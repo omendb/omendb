@@ -41,10 +41,16 @@ Major performance optimization release eliminating hot path allocations.
 4. **Lazy Vec init**: operands Vec only allocated when merge operations encountered
 5. **Buffer reuse**: Key reconstruction reuses single buffer instead of per-key allocation
 
-### Future: SKL Migration (bead seerdb-wwj)
+### Arena Skiplist Decision (Dec 8)
 
-Research confirms production databases (Pebble, Badger, RocksDB) use arena-based skiplists.
-SKL crate migration planned for future release to eliminate ALL memtable allocations.
+SKL crate evaluated but **not adopted** due to:
+- 2000x performance regression (GitHub issue #41, commit 37ceb55)
+- Only 2 downstream dependents (both from same author)
+- CI failures in upstream repo
+
+crossbeam-skiplist-fd performs well (7.4M ops/sec). Arena-based allocation deferred to future release when:
+1. SKL 0.23 proves stable, OR
+2. Custom implementation warranted by profiling data
 
 ### Reverted Changes
 

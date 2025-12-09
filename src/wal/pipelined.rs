@@ -17,7 +17,7 @@ struct Writer {
     record: Record,
     thread: Thread,
     /// Result of the WAL write operation (set by leader)
-    /// Uses parking_lot::Mutex for smaller size and no poisoning overhead
+    /// Uses `parking_lot::Mutex` for smaller size and no poisoning overhead
     result: parking_lot::Mutex<Option<Result<u64>>>,
     /// Flag to indicate completion (handles spurious wakeups)
     done: AtomicBool,

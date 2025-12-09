@@ -186,7 +186,7 @@ impl<'a> InternalKeyRef<'a> {
         }
     }
 
-    /// Encode the `InternalKeyRef` into a Vec for SSTable lookups.
+    /// Encode the `InternalKeyRef` into a Vec for `SSTable` lookups.
     /// Avoids `Bytes::copy_from_slice` allocation on the hot path.
     #[inline]
     pub fn encode_to_vec(&self) -> Vec<u8> {
