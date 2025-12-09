@@ -44,6 +44,7 @@ pub fn simd_search_i64(keys: &[Option<i64>], key: i64) -> Option<usize> {
 /// - `Some(None)`: searched all elements, key not found
 /// - `Some(Some(idx))`: found key at index
 #[inline]
+#[allow(clippy::option_option)] // Intentional: distinguishes "can't search" from "not found"
 fn search_simd<const N: usize>(keys: &[Option<i64>], key: i64) -> Option<Option<usize>>
 where
     LaneCount<N>: SupportedLaneCount,
