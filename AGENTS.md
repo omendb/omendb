@@ -75,6 +75,34 @@ Commands to verify correctness (must pass):
 - Clippy: `cargo clippy --lib` (zero warnings with pedantic)
 - Docs: `cargo doc --no-deps` (zero warnings)
 
+## Performance Verification
+
+**CRITICAL: Always profile before and after dependency changes or hot-path modifications.**
+
+```bash
+# Quick profiling test (memtable operations)
+cargo test --lib memtable_profile --release -- --ignored --nocapture
+
+# Expected baselines (Mac M3 Max):
+# - PUT: ~200 ns/op (~5M ops/sec)
+# - GET: ~180 ns/op (~5.5M ops/sec)
+# - GET (miss): ~80 ns/op
+
+# Full regression benchmark (~55s)
+cargo bench --bench quick_regression
+```
+
+**Red flags requiring investigation:**
+- PUT > 1,000 ns/op (expect ~200 ns/op)
+- GET > 500 ns/op (expect ~180 ns/op)
+- Any operation 10x+ slower than baseline
+
+**Dependency evaluation checklist:**
+1. Check GitHub issues for performance regressions
+2. Run profiling test before and after
+3. Compare against documented baselines
+4. Test on both Mac and Linux (Fedora)
+
 ## Architecture
 
 - **Memtable**: Partitioned skiplist (16 partitions) with ArcSwap for lock-free reads

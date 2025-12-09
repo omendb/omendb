@@ -14,7 +14,7 @@ use crate::alex::AlexTree;
 use crate::bloom::BloomFilter;
 use crate::buffer::{BufferPool, PageId};
 use crate::simd;
-use crate::types::{InternalKey, ValueType};
+use crate::types::{InternalKey, InternalKeyRef, ValueType};
 use crate::vlog::{VLog, ValuePointer};
 use block::Block;
 pub use block::CompressionType;
@@ -410,13 +410,9 @@ impl SSTable {
             return Ok(None);
         }
 
-        // Create search key with snapshot_seq for MVCC ordering
-        let search_key = InternalKey::new(
-            Bytes::copy_from_slice(user_key),
-            snapshot_seq,
-            ValueType::Value,
-        );
-        let encoded_search_key = search_key.encode();
+        // Use InternalKeyRef to avoid Bytes::copy_from_slice allocation
+        let search_key_ref = InternalKeyRef::for_lookup(user_key, snapshot_seq);
+        let encoded_search_key = search_key_ref.encode_to_vec();
 
         let Some((index_block_offset, index_block_size)) =
             self.find_index_block(&encoded_search_key)

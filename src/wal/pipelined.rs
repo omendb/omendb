@@ -17,7 +17,8 @@ struct Writer {
     record: Record,
     thread: Thread,
     /// Result of the WAL write operation (set by leader)
-    result: Mutex<Option<Result<u64>>>,
+    /// Uses `parking_lot::Mutex` for smaller size and no poisoning overhead
+    result: parking_lot::Mutex<Option<Result<u64>>>,
     /// Flag to indicate completion (handles spurious wakeups)
     done: AtomicBool,
 }
@@ -27,17 +28,14 @@ impl Writer {
         Self {
             record,
             thread: thread::current(),
-            result: Mutex::new(None),
+            result: parking_lot::Mutex::new(None),
             done: AtomicBool::new(false),
         }
     }
 
     #[inline]
     fn signal_done(&self, res: Result<u64>) {
-        {
-            let mut result = self.result.lock().expect("mutex poisoned");
-            *result = Some(res);
-        }
+        *self.result.lock() = Some(res);
         self.done.store(true, Ordering::Release);
         self.thread.unpark();
     }
@@ -50,7 +48,6 @@ impl Writer {
     fn take_result(&self) -> Result<u64> {
         self.result
             .lock()
-            .expect("mutex poisoned")
             .take()
             .expect("result must be set before waking writer")
     }
@@ -104,7 +101,7 @@ impl PipelineConfig {
 
 /// Pipelined WAL with lock-free queue and adaptive batching
 pub struct PipelinedWAL {
-    wal: Arc<Mutex<WAL>>,
+    wal: Arc<std::sync::Mutex<WAL>>,
     /// Lock-free channel for writer requests
     sender: Sender<Arc<Writer>>,
     receiver: Receiver<Arc<Writer>>,

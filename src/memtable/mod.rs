@@ -491,4 +491,80 @@ mod tests {
         // Get at seq 15 -> Should still see v1
         assert_eq!(memtable.get(b"key1", 15), Some((Bytes::from("val1"), 10)));
     }
+
+    #[test]
+    #[ignore] // Run with: cargo test memtable_profile --release -- --ignored --nocapture
+    fn memtable_profile() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mt = Memtable::new(64 * 1024 * 1024); // 64MB
+        let iterations = 100_000u64;
+
+        println!("\n=== Memtable Profiling (crossbeam-skiplist-fd) ===\n");
+
+        // Profile puts
+        let start = Instant::now();
+        for i in 0..iterations {
+            let key = Bytes::from(format!("key_{:08}", i));
+            let value = Bytes::from(format!("value_{:08}", i));
+            mt.put(key, value, i);
+        }
+        let put_elapsed = start.elapsed();
+        println!(
+            "PUT: {:?} total, {:.2} ns/op, {:.0} ops/sec",
+            put_elapsed,
+            put_elapsed.as_nanos() as f64 / iterations as f64,
+            iterations as f64 / put_elapsed.as_secs_f64()
+        );
+
+        // Profile gets (existing keys)
+        let start = Instant::now();
+        for i in 0..iterations {
+            let key = format!("key_{:08}", i);
+            black_box(mt.get(key.as_bytes(), u64::MAX));
+        }
+        let get_elapsed = start.elapsed();
+        println!(
+            "GET: {:?} total, {:.2} ns/op, {:.0} ops/sec",
+            get_elapsed,
+            get_elapsed.as_nanos() as f64 / iterations as f64,
+            iterations as f64 / get_elapsed.as_secs_f64()
+        );
+
+        // Profile gets (missing keys)
+        let start = Instant::now();
+        for i in 0..iterations {
+            let key = format!("missing_{:08}", i);
+            black_box(mt.get(key.as_bytes(), u64::MAX));
+        }
+        let miss_elapsed = start.elapsed();
+        println!(
+            "GET (miss): {:?} total, {:.2} ns/op",
+            miss_elapsed,
+            miss_elapsed.as_nanos() as f64 / iterations as f64
+        );
+
+        // Profile range scan (bounded)
+        let start = Instant::now();
+        for _ in 0..1000 {
+            let count = mt.range(b"key_00001", b"key_00100").count();
+            black_box(count);
+        }
+        let bounded_elapsed = start.elapsed();
+        println!(
+            "RANGE (bounded, 1000 iters): {:?}, {:.2} ns/iter",
+            bounded_elapsed,
+            bounded_elapsed.as_nanos() as f64 / 1000.0
+        );
+
+        // Profile iter (internal format)
+        let start = Instant::now();
+        let count = mt.iter().count();
+        let iter_elapsed = start.elapsed();
+        println!("ITER (full, {} entries): {:?}", count, iter_elapsed);
+
+        println!("\nMemtable size: {} bytes", mt.size());
+        println!("Memtable len: {} entries", mt.len());
+    }
 }
