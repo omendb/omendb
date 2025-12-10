@@ -91,7 +91,11 @@ impl MultiLevelAlexTree {
             .map(super::gapped_node::GappedNode::num_keys)
             .sum();
         if total_leaf_keys != num_keys {
-            eprintln!("WARNING: Only {total_leaf_keys} of {num_keys} keys inserted into leaves");
+            tracing::warn!(
+                total_leaf_keys,
+                num_keys,
+                "Not all keys inserted into leaves during bulk build"
+            );
         }
 
         // If only one leaf, no inner nodes needed
