@@ -307,7 +307,6 @@ impl Drop for Transaction<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DBOptions;
     use tempfile::tempdir;
 
     #[test]

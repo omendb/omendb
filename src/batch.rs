@@ -229,7 +229,7 @@ impl<'db> Batch<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DBOptions, DB};
+    use crate::DB;
     use tempfile::tempdir;
 
     #[test]

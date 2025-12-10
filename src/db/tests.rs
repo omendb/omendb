@@ -543,6 +543,7 @@ fn test_db_background_compaction() {
 }
 
 #[test]
+#[allow(clippy::similar_names)]
 fn test_db_sync_vs_async_compaction() {
     use std::time::Duration;
 

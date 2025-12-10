@@ -730,7 +730,7 @@ mod tests {
 
         // Write-heavy workload (100:1 write:read) → higher ratio
         // Formula: T = sqrt((1.5 * 100000) / 1000) = sqrt(150) ≈ 12
-        strategy.adjust_for_workload(100000, 1000);
+        strategy.adjust_for_workload(100_000, 1000);
         let ratio = strategy.current_ratio();
         assert!(
             ratio > 8,
@@ -742,7 +742,7 @@ mod tests {
 
         // Read-heavy workload (1:100 write:read) → lower ratio
         // Formula: T = sqrt((1.5 * 101000) / 10100000) ≈ 0.12 → clamped to min_ratio
-        strategy.adjust_for_workload(101000, 10100000);
+        strategy.adjust_for_workload(101_000, 10_100_000);
         let ratio = strategy.current_ratio();
         assert!(ratio < 8, "Read-heavy should decrease ratio, got {}", ratio);
         assert_eq!(ratio, 4, "Should clamp to min_ratio for read-heavy");
@@ -758,7 +758,7 @@ mod tests {
 
         // Simulate write-heavy workload (200:1 write:read)
         // Formula: T = sqrt((1.5 * 200000) / 1000) ≈ 17
-        let adjusted = lsm.adjust_for_workload(200000, 1000);
+        let adjusted = lsm.adjust_for_workload(200_000, 1000);
         assert!(adjusted, "Should adjust on significant workload change");
 
         // Ratio should increase for write-heavy

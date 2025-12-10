@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run with: cargo test memtable_profile --release -- --ignored --nocapture
+    #[ignore = "manual profiling test, run with: cargo test memtable_profile --release -- --ignored --nocapture"]
     fn memtable_profile() {
         use std::hint::black_box;
         use std::time::Instant;
