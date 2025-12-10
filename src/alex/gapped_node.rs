@@ -174,7 +174,7 @@ impl GappedNode {
 
         // Sort entries for cache locality (amortized O(n log n))
         let mut sorted_entries: Vec<(i64, Vec<u8>)> = entries.to_vec();
-        sorted_entries.sort_by_key(|(k, _)| *k);
+        sorted_entries.sort_unstable_by_key(|(k, _)| *k);
 
         // Insert each key
         // Still O(n log error) but with better constants due to:
@@ -441,7 +441,7 @@ impl GappedNode {
             return false;
         }
 
-        data.sort_by_key(|(k, _)| *k);
+        data.sort_unstable_by_key(|(k, _)| *k);
         let current_error = self.model.max_error(&data);
 
         // Retrain if error exceeds 20% of capacity
@@ -465,7 +465,7 @@ impl GappedNode {
 
         if !data.is_empty() {
             // Sort by key - linear regression requires sorted training data
-            data.sort_by_key(|(k, _)| *k);
+            data.sort_unstable_by_key(|(k, _)| *k);
 
             self.model.train(&data);
             self.max_error_bound = self.model.max_error(&data).max(4);
@@ -661,7 +661,7 @@ impl GappedNode {
             })
             .collect();
 
-        pairs.sort_by_key(|(k, _)| *k);
+        pairs.sort_unstable_by_key(|(k, _)| *k);
         pairs
     }
 
@@ -678,7 +678,7 @@ impl GappedNode {
             })
             .collect();
 
-        pairs.sort_by_key(|(k, _)| *k);
+        pairs.sort_unstable_by_key(|(k, _)| *k);
         pairs
     }
 }

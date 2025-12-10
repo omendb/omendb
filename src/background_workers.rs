@@ -104,7 +104,6 @@ pub(crate) fn run_compaction(
 /// NOTE: Memtable swap already happened in `try_swap_memtable()` before signal was sent.
 /// This method just builds the `SSTable` from `immutable_memtable` (slow part).
 pub(crate) fn run_background_flush_partitioned(
-    _memtables: &Arc<[ArcSwap<Memtable>; NUM_PARTITIONS]>,
     immutable_memtables: &Arc<ArcSwap<Option<Arc<Vec<Arc<Memtable>>>>>>,
     wal: &Arc<Mutex<WAL>>,
     lsm: &Arc<ArcSwap<LSMTree>>,
@@ -113,7 +112,6 @@ pub(crate) fn run_background_flush_partitioned(
     sstable_counter: &Arc<Mutex<u64>>,
     data_dir: &Path,
     metrics: &Arc<MetricsCollector>,
-    _memtable_capacity: usize,
     vlog_threshold: Option<usize>,
     flush_mutex: &Arc<Mutex<()>>,
     max_flushed_seq: &Arc<AtomicU64>,
@@ -474,7 +472,6 @@ pub(crate) fn spawn_compaction_worker(
 /// Returns (Option<Sender>, Option<JoinHandle>) for sending tasks and joining the thread
 pub(crate) fn spawn_flush_worker(
     enabled: bool,
-    memtables: Arc<[ArcSwap<Memtable>; NUM_PARTITIONS]>,
     immutable_memtables: Arc<ArcSwap<Option<Arc<Vec<Arc<Memtable>>>>>>,
     wal: Arc<Mutex<WAL>>,
     lsm: Arc<ArcSwap<LSMTree>>,
@@ -483,7 +480,6 @@ pub(crate) fn spawn_flush_worker(
     sstable_counter: Arc<Mutex<u64>>,
     data_dir: PathBuf,
     metrics: Arc<MetricsCollector>,
-    memtable_capacity: usize,
     vlog_threshold: Option<usize>,
     flush_mutex: Arc<Mutex<()>>,
     max_flushed_seq: Arc<AtomicU64>,
@@ -509,7 +505,6 @@ pub(crate) fn spawn_flush_worker(
                             // Perform background flush (now with partitioned memtables)
                             #[cfg(feature = "object-store")]
                             let res = run_background_flush_partitioned(
-                                &memtables,
                                 &immutable_memtables,
                                 &wal,
                                 &lsm,
@@ -518,7 +513,6 @@ pub(crate) fn spawn_flush_worker(
                                 &sstable_counter,
                                 &data_dir,
                                 &metrics,
-                                memtable_capacity,
                                 vlog_threshold,
                                 &flush_mutex,
                                 &max_flushed_seq,
@@ -528,7 +522,6 @@ pub(crate) fn spawn_flush_worker(
 
                             #[cfg(not(feature = "object-store"))]
                             let res = run_background_flush_partitioned(
-                                &memtables,
                                 &immutable_memtables,
                                 &wal,
                                 &lsm,
@@ -537,7 +530,6 @@ pub(crate) fn spawn_flush_worker(
                                 &sstable_counter,
                                 &data_dir,
                                 &metrics,
-                                memtable_capacity,
                                 vlog_threshold,
                                 &flush_mutex,
                                 &max_flushed_seq,

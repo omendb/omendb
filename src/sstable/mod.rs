@@ -100,9 +100,12 @@ pub struct SSTable {
     file: Arc<Mutex<File>>, // File handle kept open for zero-overhead reads
     path: PathBuf,
     top_level_index: Vec<TopLevelIndexEntry>,
+    /// ALEX learned index for top-level lookups (currently unused due to key
+    /// collision issues with long keys sharing prefixes - Bug #9). Binary search
+    /// on `top_level_index` is used instead. Retained for potential future use
+    /// with improved key hashing.
     #[allow(dead_code)]
-    // Disabled due to key collision issues (Bug #9), binary search used instead
-    alex_index: Option<AlexTree>, // ALEX learned index for faster lookups
+    alex_index: Option<AlexTree>,
     bloom: BloomFilter,
     prefix_bloom: Option<BloomFilter>,
     prefix_len: usize,

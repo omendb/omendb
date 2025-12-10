@@ -238,11 +238,7 @@ impl DB {
             flushing_partitions.push(old_arc);
         }
 
-        // Collect entries from ALL partitions FIRST (MVCC-aware: preserves all versions)
-        // NOTE: This collects all entries into memory before sorting. For large memtables
-        // (256MB+), this can cause significant peak memory usage. A streaming k-way merge
-        // would be more memory-efficient since partitions are already sorted.
-        // TODO: Consider streaming k-way merge for memory-constrained environments.
+        // Collect entries from ALL partitions (MVCC-aware: preserves all versions)
         let mut all_entries: Vec<(InternalKey, Bytes)> = Vec::new();
         for partition_mt in &flushing_partitions {
             for (ikey, value) in partition_mt.iter() {

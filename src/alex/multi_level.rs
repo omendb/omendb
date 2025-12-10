@@ -77,7 +77,7 @@ impl MultiLevelAlexTree {
         }
 
         // Ensure data is sorted
-        data.sort_by_key(|(k, _)| *k);
+        data.sort_unstable_by_key(|(k, _)| *k);
 
         let num_keys = data.len();
         let height = Self::calculate_height(num_keys);

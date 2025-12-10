@@ -584,7 +584,6 @@ impl DB {
         #[cfg(feature = "object-store")]
         let (flush_tx, flush_worker) = crate::background_workers::spawn_flush_worker(
             options.background_flush,
-            Arc::clone(&memtables),
             Arc::clone(&immutable_memtables),
             Arc::clone(&wal),
             Arc::clone(&lsm),
@@ -593,7 +592,6 @@ impl DB {
             Arc::clone(&sstable_counter),
             options.data_dir.clone(),
             Arc::clone(&metrics),
-            options.memtable_capacity,
             options.vlog_threshold,
             Arc::clone(&flush_mutex),
             Arc::clone(&max_flushed_seq),
@@ -605,7 +603,6 @@ impl DB {
         #[cfg(not(feature = "object-store"))]
         let (flush_tx, flush_worker) = crate::background_workers::spawn_flush_worker(
             options.background_flush,
-            Arc::clone(&memtables),
             Arc::clone(&immutable_memtables),
             Arc::clone(&wal),
             Arc::clone(&lsm),
@@ -614,7 +611,6 @@ impl DB {
             Arc::clone(&sstable_counter),
             options.data_dir.clone(),
             Arc::clone(&metrics),
-            options.memtable_capacity,
             options.vlog_threshold,
             Arc::clone(&flush_mutex),
             Arc::clone(&max_flushed_seq),
