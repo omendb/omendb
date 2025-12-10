@@ -149,3 +149,29 @@ jobs:
         timeout-minutes: 15
         env:
           PROPTEST_CASES: 500
+
+  # ==========================================================================
+  # Stage 5: MSRV check (only on Cargo.toml changes)
+  # ==========================================================================
+
+  msrv:
+    name: MSRV Check
+    runs-on: ubuntu-latest
+    if: contains(github.event.head_commit.modified, 'Cargo.toml') || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get MSRV from Cargo.toml
+        id: msrv
+        run: |
+          MSRV=$(grep -E "^rust-version" Cargo.toml | sed 's/rust-version = "\(.*\)"/\1/' || echo "")
+          echo "msrv=$MSRV" >> $GITHUB_OUTPUT
+          echo "MSRV: $MSRV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.msrv }}
+        if: steps.msrv.outputs.msrv != ''
+      - uses: Swatinem/rust-cache@v2
+        if: steps.msrv.outputs.msrv != ''
+      - name: Check MSRV builds
+        run: cargo check --lib --no-default-features
+        if: steps.msrv.outputs.msrv != ''
