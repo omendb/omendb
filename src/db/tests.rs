@@ -1370,7 +1370,8 @@ fn test_db_with_cloud_storage_backend() {
     let options = DBOptions::default()
         .memtable_capacity(1000) // Small to trigger flushes
         .storage_config(StorageConfig::Custom(store.clone()))
-        .vlog_threshold(None); // Disable vLog to test non-vLog path
+        .vlog_threshold(None) // Disable vLog to test non-vLog path
+        .background_flush(false); // Synchronous for deterministic testing
 
     let db = options.open(dir.path()).unwrap();
 
@@ -1426,7 +1427,8 @@ fn test_db_cloud_storage_with_vlog() {
     let options = DBOptions::default()
         .memtable_capacity(1000) // Small to trigger flushes
         .storage_config(StorageConfig::Custom(store.clone()))
-        .vlog_threshold(Some(100)); // Enable vLog for large values
+        .vlog_threshold(Some(100)) // Enable vLog for large values
+        .background_flush(false); // Synchronous for deterministic testing
 
     let db = options.open(dir.path()).unwrap();
 
@@ -1497,7 +1499,9 @@ fn test_tiered_storage_cold_tier_compaction() {
         .size_ratio(2) // Small ratio to trigger compaction faster
         .cold_tier_level(Some(2)) // L2+ goes to cold storage
         .cold_storage(StorageConfig::Custom(cold_store.clone()))
-        .vlog_threshold(None); // Disable vLog for simplicity
+        .vlog_threshold(None) // Disable vLog for simplicity
+        .background_flush(false) // Synchronous for deterministic testing
+        .background_compaction(false); // Synchronous compaction for test control
 
     let db = options.open(dir.path()).unwrap();
 
