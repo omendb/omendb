@@ -36,23 +36,69 @@ pub enum WALError {
 
 pub type Result<T> = std::result::Result<T, WALError>;
 
+/// WAL durability policy controlling when data is persisted to disk.
+///
+/// Choose based on your durability requirements:
+///
+/// | Policy | Survives | macOS | Linux | Use Case |
+/// |--------|----------|-------|-------|----------|
+/// | [`SyncAll`](Self::SyncAll) | Power loss | 4 ms | 5 ms | Financial, medical |
+/// | [`SyncData`](Self::SyncData) | Power loss | 4 ms | 5 µs | Default, general use |
+/// | [`Barrier`](Self::Barrier) | App crash | 0.3 ms | 5 µs | High-throughput on macOS |
+/// | [`None`](Self::None) | Nothing | 4 µs | 4 µs | Caching, ephemeral data |
+///
+/// # Platform Differences
+///
+/// **macOS APFS** treats `fdatasync()` like `fsync()`, making `SyncData` ~1000x slower
+/// than Linux. Use [`Barrier`](Self::Barrier) for fast writes that still survive app crashes.
+///
+/// **Linux ext4/xfs** has fast `fdatasync()`, so `SyncData` and `Barrier` perform similarly.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use seerdb::{DBOptions, SyncPolicy};
+///
+/// // Default: safe, survives power loss (slow on macOS)
+/// let db = DBOptions::default().open("./db")?;
+///
+/// // Fast on macOS: survives app crashes, not power loss
+/// let db = DBOptions::default()
+///     .sync_policy(SyncPolicy::Barrier)
+///     .open("./db")?;
+/// # Ok::<(), seerdb::DBError>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SyncPolicy {
-    /// Sync data and metadata on every write (safest, slowest)
+    /// Sync data and metadata on every write.
+    ///
+    /// **Durability**: Survives power loss, kernel panic, app crash.
+    /// **Performance**: ~4 ms/op on both macOS and Linux.
+    /// **Use when**: Data integrity is critical (financial, medical).
     SyncAll,
-    /// Sync data only on every write (safe, faster)
+
+    /// Sync data only on every write (default).
+    ///
+    /// **Durability**: Survives power loss and app crash.
+    /// **Performance**: ~5 µs on Linux, ~4 ms on macOS (APFS limitation).
+    /// **Use when**: General purpose, data must survive power loss.
     SyncData,
-    /// Write barrier only - ensures ordering without waiting for disk
+
+    /// Write barrier only - ensures ordering without waiting for disk.
     ///
-    /// On macOS: Uses `F_BARRIERFSYNC` which is ~10x faster than `SyncData`.
-    /// Guarantees write ordering (earlier writes complete before later ones)
-    /// but data may be lost on power failure (survives app/system crashes).
+    /// **Durability**: Survives app crash and system sleep. Data may be lost on power failure.
+    /// **Performance**: ~0.3 ms on macOS (13x faster than `SyncData`), ~5 µs on Linux.
+    /// **Use when**: High-throughput on macOS where power loss is acceptable risk.
     ///
-    /// On other platforms: Falls back to `SyncData` behavior.
-    ///
-    /// This is what Apple's `SQLite` uses internally for performance.
+    /// On macOS, uses `F_BARRIERFSYNC` (same as Apple's `SQLite`).
+    /// On other platforms, falls back to `SyncData`.
     Barrier,
-    /// No sync, rely on OS (fastest, least safe)
+
+    /// No sync - rely on OS to flush when it wants.
+    ///
+    /// **Durability**: None. Data loss possible on any crash.
+    /// **Performance**: ~4 µs/op (memory speed).
+    /// **Use when**: Caching, scratch data, ephemeral workloads.
     None,
 }
 

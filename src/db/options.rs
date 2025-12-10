@@ -58,21 +58,83 @@ impl ReadOptions {
 /// Use the builder pattern to configure options, then call [`open()`](Self::open)
 /// to create the database. For simple cases, use [`DB::open()`](super::DB::open).
 ///
-/// # Examples
+/// # Quick Start
 ///
 /// ```rust,no_run
 /// use seerdb::DBOptions;
 ///
-/// // Simple: use DB::open directly
+/// // Simple: just open with defaults (recommended for most cases)
 /// let db = seerdb::DB::open("./my_db")?;
 ///
-/// // Configured: use builder pattern
+/// // Custom: tune specific options
 /// let db = DBOptions::default()
-///     .memtable_capacity(64 * 1024 * 1024)
-///     .background_compaction(true)
+///     .memtable_capacity(512 * 1024 * 1024)  // 512MB write buffer
 ///     .open("./my_db")?;
 /// # Ok::<(), seerdb::DBError>(())
 /// ```
+///
+/// # Configuration Profiles
+///
+/// For common workloads, use a preset profile:
+///
+/// | Profile | Use Case | Memory |
+/// |---------|----------|--------|
+/// | [`default()`](Self::default) | General purpose | 256 MB |
+/// | [`embedded()`](Self::embedded) | CLI tools, mobile, `IoT` | 64 MB |
+/// | [`high_throughput()`](Self::high_throughput) | Write-heavy servers | 512 MB |
+/// | [`large_scale()`](Self::large_scale) | 1B+ keys, analytics | 1 GB |
+///
+/// # Option Reference
+///
+/// ## Essential Options
+///
+/// Most users only need these:
+///
+/// | Option | Default | Description |
+/// |--------|---------|-------------|
+/// | [`memtable_capacity`](Self::memtable_capacity) | 256 MB | Write buffer size |
+/// | [`sync_policy`](Self::sync_policy) | `SyncData` | Durability level ([see platform notes](#platform-notes)) |
+/// | [`compression`](Self::compression) | LZ4 | `SSTable` compression |
+///
+/// ## Tuning Options
+///
+/// For performance optimization:
+///
+/// | Option | Default | Description |
+/// |--------|---------|-------------|
+/// | [`vlog_threshold`](Self::vlog_threshold) | 4 KB | Value size for key-value separation |
+/// | [`block_cache_capacity`](Self::block_cache_capacity) | 16K blocks | Read cache size |
+/// | [`adaptive_compaction`](Self::adaptive_compaction) | false | Auto-tune compaction |
+/// | [`background_compaction`](Self::background_compaction) | true | Async compaction |
+///
+/// ## Expert Options
+///
+/// Rarely needed, for specific tuning:
+///
+/// | Option | Default | Description |
+/// |--------|---------|-------------|
+/// | [`l0_slowdown_writes_trigger`](Self::l0_slowdown_writes_trigger) | 20 | L0 count before throttling |
+/// | [`l0_stop_writes_trigger`](Self::l0_stop_writes_trigger) | 36 | L0 count before blocking |
+/// | [`group_commit_delay_us`](Self::group_commit_delay_us) | 0 | Batching delay |
+/// | [`skip_wal`](Self::skip_wal) | false | Disable durability |
+///
+/// # Platform Notes
+///
+/// **macOS Performance**: The default `SyncPolicy::SyncData` is ~13x slower on macOS
+/// than Linux due to APFS treating `fdatasync()` like `fsync()`. If your application
+/// can tolerate data loss on power failure (but not app crashes), use `Barrier`:
+///
+/// ```rust,no_run
+/// use seerdb::{DBOptions, SyncPolicy};
+///
+/// // 13x faster writes on macOS, still survives app crashes
+/// let db = DBOptions::default()
+///     .sync_policy(SyncPolicy::Barrier)
+///     .open("./my_db")?;
+/// # Ok::<(), seerdb::DBError>(())
+/// ```
+///
+/// See [`SyncPolicy`] for durability trade-offs.
 #[derive(Debug, Clone)]
 pub struct DBOptions {
     /// Internal: set by `open()` or `open_with()`, not by users directly.
@@ -122,8 +184,8 @@ impl Default for DBOptions {
             size_ratio: 10,
             num_levels: 7,
             vlog_threshold: Some(4096),
-            background_compaction: false,
-            background_flush: false,
+            background_compaction: true,
+            background_flush: true,
             adaptive_compaction: false,
             max_memory_bytes: None,
             min_disk_space_bytes: None,
@@ -180,14 +242,19 @@ impl DBOptions {
         super::DB::open_with(path, self.clone())
     }
 
-    /// Configuration profile for embedded/single-process applications.
+    /// Configuration for memory-constrained embedded applications.
     ///
-    /// Optimized for lower memory usage and simpler operation:
-    /// - 64MB memtable
-    /// - Smaller block cache
-    /// - Direct WAL writes
-    /// - Metrics disabled
-    /// - Synchronous compaction
+    /// Use when: CLI tools, mobile apps, `IoT` devices, or single-process apps
+    /// with limited RAM.
+    ///
+    /// | Option | Default | Embedded | Reason |
+    /// |--------|---------|----------|--------|
+    /// | `memtable_capacity` | 256 MB | 64 MB | Reduce memory footprint |
+    /// | `block_cache_capacity` | 16K | 4K | Fewer cached blocks |
+    /// | `background_compaction` | true | false | Simpler threading model |
+    /// | `background_flush` | true | false | Predictable latency |
+    /// | `metrics` | enabled | disabled | Reduce overhead |
+    /// | `direct_wal` | false | true | Skip pipelined WAL |
     #[must_use]
     pub fn embedded() -> Self {
         Self {
@@ -201,46 +268,46 @@ impl DBOptions {
         }
     }
 
-    /// Configuration profile for high-throughput server workloads.
+    /// Configuration for write-heavy server workloads.
     ///
-    /// Optimized for write-heavy workloads:
-    /// - 512MB memtable
-    /// - Large block cache
-    /// - Background compaction and flush
-    /// - Adaptive compaction enabled
+    /// Use when: High-throughput services, streaming data ingestion,
+    /// or write-heavy OLTP workloads.
+    ///
+    /// | Option | Default | High-Throughput | Reason |
+    /// |--------|---------|-----------------|--------|
+    /// | `memtable_capacity` | 256 MB | 512 MB | Larger write buffer, fewer flushes |
+    /// | `block_cache_capacity` | 16K | 64K | More cached blocks for reads |
+    /// | `adaptive_compaction` | false | true | Auto-tune compaction strategy |
     #[must_use]
     pub fn high_throughput() -> Self {
         Self {
             memtable_capacity: 512 * 1024 * 1024,
             block_cache_capacity: 65_536,
-            background_compaction: true,
-            background_flush: true,
             adaptive_compaction: true,
-            use_direct_wal: false,
-            disable_metrics: false,
             ..Default::default()
         }
     }
 
-    /// Configuration profile for large-scale deployments (1B+ keys).
+    /// Configuration for large datasets (1B+ keys, 100GB+ data).
     ///
-    /// Optimized for very large datasets:
-    /// - 1GB memtable
-    /// - Maximum block cache
-    /// - Aggressive vLog threshold for large values
-    /// - All background operations enabled
+    /// Use when: Data warehousing, analytics backends, or any workload
+    /// where dataset size exceeds available RAM.
+    ///
+    /// | Option | Default | Large-Scale | Reason |
+    /// |--------|---------|-------------|--------|
+    /// | `memtable_capacity` | 256 MB | 1 GB | Batch more writes before flush |
+    /// | `block_cache_capacity` | 16K | 128K | Cache more blocks for large scans |
+    /// | `base_level_size` | 10 MB | 64 MB | Reduce level count for large data |
+    /// | `vlog_threshold` | 4 KB | 1 KB | Separate values earlier (less write amp) |
+    /// | `adaptive_compaction` | false | true | Auto-tune for varying load |
     #[must_use]
     pub fn large_scale() -> Self {
         Self {
             memtable_capacity: 1024 * 1024 * 1024,
             block_cache_capacity: 131_072,
             base_level_size: 64 * 1024 * 1024,
-            background_compaction: true,
-            background_flush: true,
             adaptive_compaction: true,
             vlog_threshold: Some(1024),
-            use_direct_wal: false,
-            disable_metrics: false,
             ..Default::default()
         }
     }

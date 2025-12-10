@@ -306,7 +306,10 @@ fn test_db_overwrite() {
 #[test]
 fn test_db_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default().memtable_capacity(100); // Small capacity to trigger flush
+    // Use synchronous flush to test flush behavior deterministically
+    let options = DBOptions::default()
+        .memtable_capacity(100) // Small capacity to trigger flush
+        .background_flush(false);
 
     let db = options.open(dir.path()).unwrap();
 
@@ -408,7 +411,10 @@ fn test_db_recovery_with_overwrites() {
 #[test]
 fn test_db_recovery_with_flush() {
     let dir = tempdir().unwrap();
-    let options = DBOptions::default().memtable_capacity(100); // Small to trigger flush during recovery
+    // Use synchronous flush to test recovery behavior deterministically
+    let options = DBOptions::default()
+        .memtable_capacity(100) // Small to trigger flush during recovery
+        .background_flush(false);
 
     // Write enough data to trigger flush on recovery
     {
@@ -453,7 +459,8 @@ fn test_db_with_kv_separation() {
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
         .memtable_capacity(200) // Small enough to trigger flush
-        .vlog_threshold(Some(50)); // 50 byte threshold
+        .vlog_threshold(Some(50)) // 50 byte threshold
+        .background_flush(false); // Synchronous for deterministic testing
 
     let db = options.open(dir.path()).unwrap();
 
@@ -518,6 +525,7 @@ fn test_db_background_compaction() {
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
         .memtable_capacity(100) // Small to trigger flushes
+        .background_flush(false) // Synchronous flush for deterministic testing
         .background_compaction(true); // Enable background compaction
 
     let db = options.open(dir.path()).unwrap();
@@ -553,11 +561,13 @@ fn test_db_sync_vs_async_compaction() {
 
     let options_sync = DBOptions::default()
         .memtable_capacity(100)
-        .background_compaction(false); // Synchronous
+        .background_flush(false) // Synchronous flush for deterministic testing
+        .background_compaction(false); // Synchronous compaction
 
     let options_async = DBOptions::default()
         .memtable_capacity(100)
-        .background_compaction(true); // Asynchronous
+        .background_flush(false) // Synchronous flush for deterministic testing
+        .background_compaction(true); // Asynchronous compaction
 
     let db_sync = options_sync.open(dir_sync.path()).unwrap();
     let db_async = options_async.open(dir_async.path()).unwrap();

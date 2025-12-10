@@ -68,26 +68,27 @@
 //! # }
 //! ```
 //!
-//! # Advanced Configuration
+//! # Configuration
+//!
+//! The defaults work well for most cases. Customize only what you need:
 //!
 //! ```rust,no_run
 //! use seerdb::{DBOptions, SyncPolicy};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Using builder pattern (recommended)
+//! // Customize specific options
 //! let db = DBOptions::default()
-//!     .memtable_capacity(64 * 1024 * 1024)  // 64MB memtable
-//!     .sync_policy(SyncPolicy::SyncData)     // fsync data on each write
-//!     .background_compaction(true)           // Enable async compaction
-//!     .vlog_threshold(Some(4096))            // Use vLog for values >4KB
+//!     .memtable_capacity(512 * 1024 * 1024)  // 512MB write buffer
 //!     .open("./my_database")?;
 //!
-//! // Or using configuration profiles
+//! // Or use a preset profile
 //! let db = DBOptions::high_throughput()
 //!     .open("./my_database")?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! See [`DBOptions`] for all configuration options and profiles.
 //!
 //! # Architecture
 //!
@@ -112,9 +113,16 @@
 //!
 //! seerdb provides configurable durability via [`SyncPolicy`]:
 //!
-//! - `SyncAll`: fsync both data and metadata (slowest, strongest)
-//! - `SyncData`: fsync data only (fast, strong)
-//! - `None`: No fsync (fastest, data loss possible on crash)
+//! | Policy | Survives | Performance |
+//! |--------|----------|-------------|
+//! | `SyncAll` | Power loss | ~4 ms |
+//! | `SyncData` | Power loss | ~5 µs Linux, ~4 ms macOS |
+//! | `Barrier` | App crash | ~5 µs Linux, ~0.3 ms macOS |
+//! | `None` | Nothing | ~4 µs |
+//!
+//! **macOS note**: `SyncData` is slow on macOS due to APFS. Use `Barrier` for
+//! high-throughput writes when power-loss durability isn't required.
+//! See [`SyncPolicy`] for details.
 //!
 //! # Observability
 //!
