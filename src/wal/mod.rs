@@ -127,7 +127,7 @@ fn barrier_sync(file: &File) -> io::Result<()> {
     }
 }
 
-/// Non-macOS: Fall back to sync_data (fdatasync is already fast on Linux)
+/// Non-macOS: Fall back to `sync_data` (`fdatasync` is already fast on Linux)
 #[cfg(not(target_os = "macos"))]
 fn barrier_sync(file: &File) -> io::Result<()> {
     file.sync_data()
