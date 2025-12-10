@@ -76,6 +76,10 @@ fail = { version = "0.5", optional = true }
 # Runtime CPU feature detection and dispatch (AVX-512, AVX2, SSE4.1, NEON, SVE)
 multiversion = "0.8"
 
+# Platform-specific: macOS F_BARRIERFSYNC for fast WAL sync
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"

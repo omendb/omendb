@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
+
 pub use pipelined::{PipelineConfig, PipelinedWAL};
 pub use reader::WALReader;
 pub use record::{BatchOp, Record};
@@ -39,8 +42,49 @@ pub enum SyncPolicy {
     SyncAll,
     /// Sync data only on every write (safe, faster)
     SyncData,
+    /// Write barrier only - ensures ordering without waiting for disk
+    ///
+    /// On macOS: Uses `F_BARRIERFSYNC` which is ~10x faster than `SyncData`.
+    /// Guarantees write ordering (earlier writes complete before later ones)
+    /// but data may be lost on power failure (survives app/system crashes).
+    ///
+    /// On other platforms: Falls back to `SyncData` behavior.
+    ///
+    /// This is what Apple's `SQLite` uses internally for performance.
+    Barrier,
     /// No sync, rely on OS (fastest, least safe)
     None,
+}
+
+/// Sync a file according to the given policy
+fn sync_file(file: &File, policy: SyncPolicy) -> io::Result<()> {
+    match policy {
+        SyncPolicy::SyncAll => file.sync_all(),
+        SyncPolicy::SyncData => file.sync_data(),
+        SyncPolicy::Barrier => barrier_sync(file),
+        SyncPolicy::None => Ok(()),
+    }
+}
+
+/// macOS: Use `F_BARRIERFSYNC` for ~10x faster sync with write ordering guarantee
+#[cfg(target_os = "macos")]
+fn barrier_sync(file: &File) -> io::Result<()> {
+    // F_BARRIERFSYNC (0x55 = 85) issues an I/O barrier ensuring write ordering.
+    // Returns immediately after issuing barrier, doesn't wait for disk flush.
+    // Data survives app crashes; may be lost on power failure.
+    const F_BARRIERFSYNC: libc::c_int = 85;
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), F_BARRIERFSYNC) };
+    if ret == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Non-macOS: Fall back to sync_data (fdatasync is already fast on Linux)
+#[cfg(not(target_os = "macos"))]
+fn barrier_sync(file: &File) -> io::Result<()> {
+    file.sync_data()
 }
 
 /// Recovery mode for WAL replay during `DB::open()`
@@ -246,12 +290,8 @@ impl WAL {
                 file.write_all(&batch_buffer)?;
             }
 
-            // Sync once at the end for batch
-            match self.sync_policy {
-                SyncPolicy::SyncAll => file.sync_all()?,
-                SyncPolicy::SyncData => file.sync_data()?,
-                SyncPolicy::None => {}
-            }
+            // Sync according to policy
+            sync_file(&file, self.sync_policy)?;
 
             // Failpoint: crash after WAL sync, before returning to caller
             // Test: WAL data durable, but caller doesn't know - recovery replays
