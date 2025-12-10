@@ -1309,7 +1309,8 @@ fn test_block_cache_shared_across_sstables() {
     let dir = tempdir().unwrap();
     let options = DBOptions::default()
         .memtable_capacity(2048) // Small to force multiple flushes
-        .block_cache_capacity(1000); // Enough to cache blocks from multiple SSTables
+        .block_cache_capacity(1000) // Enough to cache blocks from multiple SSTables
+        .background_flush(false); // Synchronous for deterministic testing
 
     let db = options.open(dir.path()).unwrap();
 
