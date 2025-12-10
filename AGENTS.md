@@ -75,6 +75,8 @@ Commands to verify correctness (must pass):
 - Clippy: `cargo clippy --lib` (zero warnings with pedantic)
 - Docs: `cargo doc --no-deps` (zero warnings)
 
+**Version bumps:** Always `git add Cargo.toml Cargo.lock` — lock file updates automatically.
+
 ## Performance Verification
 
 **CRITICAL: Always profile before and after dependency changes or hot-path modifications.**
@@ -93,11 +95,13 @@ cargo bench --bench quick_regression
 ```
 
 **Red flags requiring investigation:**
+
 - PUT > 1,000 ns/op (expect ~200 ns/op)
 - GET > 500 ns/op (expect ~180 ns/op)
 - Any operation 10x+ slower than baseline
 
 **Dependency evaluation checklist:**
+
 1. Check GitHub issues for performance regressions
 2. Run profiling test before and after
 3. Compare against documented baselines
