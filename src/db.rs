@@ -157,6 +157,12 @@ impl DB {
     }
 
     /// Get a value by key.
+    ///
+    /// Read path:
+    /// 1. Lookup key in B-tree
+    /// 2. If value is inline, return it
+    /// 3. If value is blob pointer, read from blob file
+    /// 4. If deleted (tombstone), return None
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
 
