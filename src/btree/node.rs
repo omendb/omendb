@@ -65,6 +65,30 @@ pub struct BlobPointer {
     pub length: u32,
 }
 
+impl BlobPointer {
+    /// Size of serialized blob pointer (file_id:4 + offset:8 + length:4 = 16 bytes).
+    pub const SERIALIZED_SIZE: usize = 16;
+
+    /// Serialize to bytes.
+    pub fn to_bytes(&self) -> [u8; Self::SERIALIZED_SIZE] {
+        let mut buf = [0u8; Self::SERIALIZED_SIZE];
+        buf[0..4].copy_from_slice(&self.file_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.offset.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.length.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(buf: &[u8; Self::SERIALIZED_SIZE]) -> Self {
+        let file_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let offset = u64::from_le_bytes([
+            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+        ]);
+        let length = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        Self { file_id, offset, length }
+    }
+}
+
 /// Fixed-size page header (32 bytes).
 ///
 /// Layout: magic(4) | version(4) | page_type(4) | count(4) | free_space(4) | checksum(8) | parent_id(4)

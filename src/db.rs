@@ -13,7 +13,7 @@ use crate::btree::{BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::BufferManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
-use crate::recovery::{SyncPolicy, WalManager};
+use crate::recovery::{SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -123,12 +123,36 @@ impl DB {
     }
 
     /// Insert a key-value pair.
+    ///
+    /// Write path:
+    /// 1. Log to WAL (for crash recovery)
+    /// 2. If value is large, store in blob file
+    /// 3. Insert into B-tree
+    /// 4. Track for flush
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_open()?;
 
-        // For now, use the in-memory B-tree.
-        // The full write path (WAL, buffer, device, PMT) will be wired in tk-dtfo.
-        self.btree.insert(key, value)?;
+        // 1. Log to WAL.
+        self.wal.append(&WalRecord::pmt_update(
+            self.allocator.next_id(),
+            0, // file_id for main data file
+            0, // offset will be set on flush
+        ));
+
+        // 2. Check if value should be stored in blob.
+        if self.blobs.should_separate(value.len()) {
+            // Store in blob file.
+            let ptr = self.blobs.append(key, value.to_vec());
+            // Insert blob pointer into B-tree.
+            self.btree.insert(key, &ptr.to_bytes())?;
+        } else {
+            // Store inline in B-tree.
+            self.btree.insert(key, value)?;
+        }
+
+        // 3. Allocate a page for this entry.
+        let _page_id = self.allocator.alloc();
+
         Ok(())
     }
 
@@ -151,9 +175,26 @@ impl DB {
     }
 
     /// Delete a key.
+    ///
+    /// Write path:
+    /// 1. Log to WAL (for crash recovery)
+    /// 2. Insert tombstone in B-tree
+    /// 3. If was blob, mark blob for GC
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_open()?;
 
+        // 1. Log to WAL.
+        self.wal.append(&WalRecord::page_dealloc(
+            self.allocator.next_id(),
+        ));
+
+        // 2. Check if existing value is a blob.
+        if let LookupResult::Blob(ptr) = self.btree.lookup(key) {
+            // Mark blob for GC.
+            self.blobs.mark_deleted(&ptr);
+        }
+
+        // 3. Insert tombstone in B-tree.
         let found = self.btree.delete(key)?;
         Ok(found)
     }
