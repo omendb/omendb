@@ -13,7 +13,7 @@ use crate::btree::{BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::BufferManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
-use crate::recovery::{SyncPolicy, WalManager, WalRecord};
+use crate::recovery::{RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ impl DB {
         let blobs = BlobManager::with_threshold(options.blob_threshold);
 
         // Try to load existing state or create new.
-        let (pmt, allocator) = if meta_path.exists() {
+        let (mut pmt, mut allocator) = if meta_path.exists() {
             Self::load_meta(&meta_path)?
         } else {
             (PMT::new(), PageAllocator::new())
@@ -101,9 +101,10 @@ impl DB {
 
         // Check if WAL exists (crash recovery needed).
         if wal_path.exists() {
-            // Will implement recovery in tk-ggtk.
-            // For now, just log that recovery is needed.
-            eprintln!("WAL exists at {:?}, recovery not yet implemented", wal_path);
+            // Replay WAL to recover from crash.
+            Self::recover_from_wal(&wal_path, &mut pmt, &mut allocator)?;
+            // Delete WAL after successful recovery.
+            fs::remove_file(&wal_path)?;
         }
 
         let btree = BTree::new();
@@ -290,6 +291,57 @@ impl DB {
             .ok_or_else(|| Error::Corruption("invalid allocator data".into()))?;
 
         Ok((pmt, allocator))
+    }
+
+    /// Recover database state from WAL.
+    ///
+    /// Replays all WAL records to rebuild PMT and allocator state.
+    fn recover_from_wal(
+        wal_path: &Path,
+        pmt: &mut PMT,
+        allocator: &mut PageAllocator,
+    ) -> Result<()> {
+        let wal_data = fs::read(wal_path)?;
+        let records = WalManager::parse_records(&wal_data);
+
+        for record in &records {
+            match record.record_type {
+                RecordType::PmtUpdate if record.payload.len() >= 20 => {
+                    // PMT update: page_id(8) + file_id(4) + offset(8)
+                    let page_id = u64::from_le_bytes([
+                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
+                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
+                    ]);
+                    let file_id = u32::from_le_bytes([
+                        record.payload[8], record.payload[9], record.payload[10], record.payload[11],
+                    ]);
+                    let offset = u64::from_le_bytes([
+                        record.payload[12], record.payload[13], record.payload[14], record.payload[15],
+                        record.payload[16], record.payload[17], record.payload[18], record.payload[19],
+                    ]);
+                    pmt.insert(page_id, file_id, offset);
+                }
+                RecordType::PageAlloc if record.payload.len() >= 12 => {
+                    // Page allocation: page_id(8) + file_id(4)
+                    let _page_id = u64::from_le_bytes([
+                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
+                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
+                    ]);
+                    let _page_id = allocator.alloc();
+                }
+                RecordType::PageDealloc if record.payload.len() >= 8 => {
+                    // Page deallocation: page_id(8)
+                    let page_id = u64::from_le_bytes([
+                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
+                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
+                    ]);
+                    allocator.free(page_id);
+                }
+                _ => {} // Other record types not relevant for recovery
+            }
+        }
+
+        Ok(())
     }
 
     /// Save PMT and allocator to meta file.

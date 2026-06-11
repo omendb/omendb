@@ -6,4 +6,4 @@
 
 mod wal;
 
-pub use wal::{WalRecord, WalManager, SyncPolicy};
+pub use wal::{RecordType, SyncPolicy, WalManager, WalRecord};
