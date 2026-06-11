@@ -13,9 +13,3 @@ flamegraph*.svg
 
 # Benchmark results
 /criterion
-
-# AI session context (local only)
-/ai/
-ai/
-.beads/.local_version
-.hhg/
