@@ -13,6 +13,18 @@
 //! and garbage collection reclaims invalidated pages. Large values are stored
 //! separately in an append-only blob log.
 //!
+//! # Example
+//!
+//! ```no_run
+//! use seerdb::{DB, Options};
+//!
+//! let mut db = DB::open("./my_db", Options::default()).unwrap();
+//! db.put(b"key", b"value").unwrap();
+//! let val = db.get(b"key").unwrap();
+//! db.delete(b"key").unwrap();
+//! db.close().unwrap();
+//! ```
+//!
 //! # References
 //!
 //! - LeanStore (VLDB 2024, 2026): out-of-place B-tree, SSD-aware buffer management
@@ -20,10 +32,17 @@
 //! - WiscKey (FAST 2016): key-value separation for reduced write amplification
 //! - Tidehunter (2026): WAL-as-store architecture (reference for I/O patterns)
 
+pub mod allocator;
+pub mod blob;
 pub mod btree;
 pub mod buffer;
-pub mod blob;
 pub mod concurrency;
+pub mod db;
+pub mod error;
+pub mod mvcc;
 pub mod recovery;
 pub mod space;
-pub mod mvcc;
+
+// Re-export main types at crate root.
+pub use db::{DB, Options};
+pub use error::{Error, Result};

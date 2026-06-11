@@ -1,51 +1,48 @@
 # Handoff — seerdb
 
-## What Happened This Session
+## Current State (2026-06-11)
 
-Complete architecture pivot. seerdb was a 23K-line LSM storage engine (Rust, nightly). After extensive SOTA research, we decided LSM's compaction problem (10-30x write amplification) is architectural, not tunable. Replaced everything with an out-of-place B-tree design inspired by LeanStore (VLDB 2024, 2026).
+**Not a working storage engine yet.** Components are implemented and tested in isolation but not integrated.
 
-**Deleted:** 51K lines. All LSM code, tests, benches, fuzz targets, old dependencies.
-**Created:** Clean skeleton on `dev` branch. Module stubs. Complete spec and testing plan.
+## What Exists
 
-## Key Files (all local, not in git — in ai/)
+| Module | Tests | Purpose |
+|--------|-------|---------|
+| btree/node | 17 | 4KB slotted page with prefix compression |
+| btree/tree | 8 | B-tree ops (in-memory Vec<Node>) |
+| buffer | 5 | Buffer pool with clock eviction |
+| blob | 6 | Append-only blob files |
+| pmt | 7 | Page mapping table |
+| wal | 6 | CRC32C checksummed WAL records |
+| concurrency | 12 | Hybrid latches, transactions |
+| device | 5 | File I/O with O_DIRECT |
+| **Total** | **72** | |
 
-| File | Read This |
-|------|-----------|
+## Integration Roadmap
+
+Four tasks to reach a working `DB::open/put/get/delete` API:
+
+| Order | Task | Description |
+|-------|------|-------------|
+| 1 | tk-veoi | DB struct + file management + page allocator |
+| 2 | tk-dtfo | Write path: put → WAL → buffer → device → PMT |
+| 3 | tk-utsr | Read path: get → PMT → buffer → device |
+| 4 | tk-ggtk | Crash recovery: WAL replay + PMT rebuild |
+
+After: Benchmarks (tk-u62d), Fuzz targets (tk-ircl)
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `ai/design/engine_spec.md` | Complete engine specification |
+| `ai/PLAN.md` | Integration roadmap |
 | `ai/STATUS.md` | Current state |
-| `ai/design/engine_spec.md` | **Complete engine spec** — node format, PMT, buffer manager, blob, WAL, concurrency, phases |
-| `ai/DECISIONS.md` | 9 ADRs with rationale |
-| `ai/TODO.md` | Phase 1-6 tasks |
-| `ai/design/testing_plan.md` | Testing layers, benchmarks |
-
-## Decisions Made
-
-1. **Out-of-place B-tree** over LSM (6-10x less flash writes, better reads, simpler)
-2. **Rust stable** (no nightly)
-3. **Minimal deps** (<15 crates: thiserror, bytes, crc32c, lz4_flex, zstd, tracing, parking_lot)
-4. **KV separation** for large values (>1KB → blob files, like WiredTiger/InnoDB overflow pages)
-5. **Testing-first** (property-based tests for every invariant, crash recovery tests)
-6. **FDP/ZNS deferred to V2** (standard I/O for V1)
-7. **io_uring deferred to V2** (standard fs for V1)
-8. **Mojo revisit in 2027+** (Rust for now)
-
-## References
-
-- LeanStore: https://github.com/leanstore/leanstore (~5K lines C++ core)
-- ZLeanStore: https://github.com/LeeBohyun/ZLeanStore (~7.4K lines C++, has blobs)
-- Tidehunter: https://github.com/MystenLabs/tidehunter (~30K lines Rust, WAL-as-store)
-- "How to Write to SSDs" (VLDB 2026): out-of-place B-tree, NoWA pattern, FDP/ZNS
-- redb: https://github.com/cberner/redb (Rust CoW B-tree, competitive benchmark baseline)
-
-## Next Steps
-
-1. Read `ai/design/engine_spec.md` for the full spec
-2. `tk ls` to see tasks
-3. Start `tk-gmc9`: B-tree node format (prefix compression, variable-length keys, 4KB pages)
-4. Then `tk-3ro3`: B-tree operations (insert with split, lookup, delete with merge, range scan)
+| `ai/DECISIONS.md` | 9 ADRs |
 
 ## Environment
 
-- Branch: `dev`
-- Rust: stable (edition 2024)
-- Compiles: `cargo check` passes, `cargo clippy --all-features -- -D warnings` clean
-- No tests yet (skeleton only)
+- Branch: `dev` (Rust), `dev-mojo` (Mojo port at `../seerdb-mojo`)
+- Rust: stable, edition 2024
+- Tests: `cargo test --lib` (72 pass)
+- Lint: `cargo clippy --all-features -- -D warnings` (clean)

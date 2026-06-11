@@ -8,4 +8,4 @@ pub(crate) mod node;
 mod tree;
 
 pub use node::{Node, NodeHeader, PageType, ValueType, Tombstone, BlobPointer, ValueRef, InsertError, SplitError, PAGE_SIZE, BLOB_POINTER_SIZE};
-pub use tree::{BTree, LookupResult, RangeScan};
+pub use tree::{BTree, BTreeError, LookupResult, RangeScan};

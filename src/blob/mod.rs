@@ -7,5 +7,5 @@
 mod manager;
 mod file;
 
-pub use manager::BlobManager;
+pub use manager::{BlobManager, DEFAULT_BLOB_THRESHOLD};
 pub use file::BlobFile;
