@@ -46,6 +46,10 @@ pub enum RecordType {
     TxnAbort = 6,
     /// Checkpoint marker.
     Checkpoint = 7,
+    /// Put: key_len(u16) + key + value_len(u16) + value.
+    Put = 8,
+    /// Delete: key_len(u16) + key.
+    Delete = 9,
 }
 
 /// A WAL record.
@@ -101,6 +105,24 @@ impl WalRecord {
         Self::new(RecordType::TxnAbort, payload)
     }
 
+    /// Create a Put record (for crash recovery of B-tree data).
+    pub fn put(key: &[u8], value: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(4 + key.len() + value.len());
+        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(value);
+        Self::new(RecordType::Put, payload)
+    }
+
+    /// Create a Delete record (for crash recovery of B-tree data).
+    pub fn delete(key: &[u8]) -> Self {
+        let mut payload = Vec::with_capacity(2 + key.len());
+        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        payload.extend_from_slice(key);
+        Self::new(RecordType::Delete, payload)
+    }
+
     /// Serialize the record to bytes (for writing to the WAL file).
     ///
     /// Format: length(u32) + type(u8) + payload + crc32c(u32)
@@ -149,6 +171,8 @@ impl WalRecord {
             5 => RecordType::TxnCommit,
             6 => RecordType::TxnAbort,
             7 => RecordType::Checkpoint,
+            8 => RecordType::Put,
+            9 => RecordType::Delete,
             _ => return None, // unknown type
         };
 

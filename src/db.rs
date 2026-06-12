@@ -93,22 +93,26 @@ impl DB {
         };
 
         // Check if WAL exists (crash recovery needed).
-        if wal_path.exists() {
+        let mut btree = BTree::new();
+        let recovered_from_wal = if wal_path.exists() {
             // Replay WAL to recover from crash.
-            Self::recover_from_wal(&wal_path, &mut pmt, &mut allocator)?;
+            Self::recover_from_wal(&wal_path, &mut btree, &mut pmt, &mut allocator)?;
             // Delete WAL after successful recovery.
             fs::remove_file(&wal_path)?;
-        }
-
-        let btree = BTree::new();
+            true
+        } else {
+            false
+        };
 
         // Create storage engine.
         let mut engine = StorageEngine::new(btree, buffer, pmt, allocator, device);
 
-        // Load existing data from disk.
-        if let Err(e) = engine.load_from_disk() {
-            // Log error but continue — we can still operate with empty tree.
-            eprintln!("warning: failed to load data from disk: {e}");
+        // Load existing data from disk (only if not recovered from WAL).
+        if !recovered_from_wal {
+            if let Err(e) = engine.load_from_disk() {
+                // Log error but continue — we can still operate with empty tree.
+                eprintln!("warning: failed to load data from disk: {e}");
+            }
         }
 
         Ok(Self {
@@ -125,20 +129,21 @@ impl DB {
     ///
     /// Write path:
     /// 1. Log to WAL (for crash recovery)
-    /// 2. If value is large, store in blob file
-    /// 3. Insert into B-tree
-    /// 4. Track for flush
+    /// 2. Write WAL to disk (ensure crash recovery)
+    /// 3. If value is large, store in blob file
+    /// 4. Insert into B-tree
+    /// 5. Track for flush
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_open()?;
 
-        // 1. Log to WAL.
-        self.wal.append(&WalRecord::pmt_update(
-            self.engine.allocator().next_id(),
-            0, // file_id for main data file
-            0, // offset will be set on flush
-        ));
+        // 1. Log to WAL with key-value data for crash recovery.
+        self.wal.append(&WalRecord::put(key, value));
 
-        // 2. Check if value should be stored in blob.
+        // 2. Write WAL to disk before modifying B-tree.
+        // This ensures crash recovery can replay the WAL.
+        self.write_wal_to_disk()?;
+
+        // 3. Check if value should be stored in blob.
         if self.blobs.should_separate(value.len()) {
             // Store in blob file.
             let ptr = self.blobs.append(key, value.to_vec());
@@ -149,7 +154,7 @@ impl DB {
             self.engine.btree_mut().upsert(key, value)?;
         }
 
-        // 3. Allocate a page for this entry.
+        // 4. Allocate a page for this entry.
         let _page_id = self.engine.allocator_mut().alloc();
 
         Ok(())
@@ -183,17 +188,19 @@ impl DB {
     ///
     /// Write path:
     /// 1. Log to WAL (for crash recovery)
-    /// 2. Insert tombstone in B-tree
-    /// 3. If was blob, mark blob for GC
+    /// 2. Write WAL to disk (ensure crash recovery)
+    /// 3. Insert tombstone in B-tree
+    /// 4. If was blob, mark blob for GC
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_open()?;
 
-        // 1. Log to WAL.
-        self.wal.append(&WalRecord::page_dealloc(
-            self.engine.allocator().next_id(),
-        ));
+        // 1. Log to WAL with key for crash recovery.
+        self.wal.append(&WalRecord::delete(key));
 
-        // 2. Check if existing value is a blob.
+        // 2. Write WAL to disk before modifying B-tree.
+        self.write_wal_to_disk()?;
+
+        // 3. Check if existing value is a blob.
         if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key) {
             // Mark blob for GC.
             self.blobs.mark_deleted(&ptr);
@@ -209,24 +216,52 @@ impl DB {
         self.engine.btree().range_scan(start, end).collect()
     }
 
-    /// Flush all pending writes to disk.
-    pub fn flush(&mut self) -> Result<()> {
-        self.check_open()?;
-
-        // Flush through storage engine.
-        self.engine.flush()?;
-
-        // Flush WAL.
+    /// Write WAL records to disk and sync.
+    ///
+    /// This must be called BEFORE modifying the B-tree to ensure
+    /// crash recovery can replay the WAL.
+    fn write_wal_to_disk(&mut self) -> Result<()> {
         let mut wal_buf = Vec::new();
         self.wal.flush(&mut wal_buf)?;
         if !wal_buf.is_empty() {
             let wal_path = self.path.join(WAL_FILE);
-            fs::write(&wal_path, &wal_buf)?;
+            // Append to WAL file (not overwrite).
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)?;
+            file.write_all(&wal_buf)?;
+            // Sync to ensure WAL is persisted before modifying data.
+            file.sync_data()?;
         }
+        Ok(())
+    }
 
-        // Save meta.
+    /// Flush all pending writes to disk.
+    ///
+    /// Order is critical for crash recovery:
+    /// 1. Write and sync WAL (so we can replay on crash)
+    /// 2. Flush storage engine (write data pages)
+    /// 3. Save meta (PMT + allocator state)
+    pub fn flush(&mut self) -> Result<()> {
+        self.check_open()?;
+
+        // 1. Write and sync WAL first (critical for crash recovery).
+        self.write_wal_to_disk()?;
+
+        // 2. Flush storage engine (write data pages).
+        self.engine.flush()?;
+
+        // 3. Save meta (PMT + allocator state).
         let meta_path = self.path.join(META_FILE);
         Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
+
+        // 4. Delete WAL after successful flush (recovery complete).
+        let wal_path = self.path.join(WAL_FILE);
+        if wal_path.exists() {
+            fs::remove_file(&wal_path)?;
+        }
 
         Ok(())
     }
@@ -282,9 +317,10 @@ impl DB {
 
     /// Recover database state from WAL.
     ///
-    /// Replays all WAL records to rebuild PMT and allocator state.
+    /// Replays all WAL records to rebuild B-tree, PMT, and allocator state.
     fn recover_from_wal(
         wal_path: &Path,
+        btree: &mut BTree,
         pmt: &mut PMT,
         allocator: &mut PageAllocator,
     ) -> Result<()> {
@@ -324,6 +360,35 @@ impl DB {
                     ]);
                     allocator.free(page_id);
                 }
+                RecordType::Put if record.payload.len() >= 4 => {
+                    // Put: key_len(u16) + key + value_len(u16) + value
+                    let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
+                    if record.payload.len() < 2 + key_len + 2 {
+                        continue; // invalid record
+                    }
+                    let key = &record.payload[2..2 + key_len];
+                    let val_len_offset = 2 + key_len;
+                    let val_len = u16::from_le_bytes([
+                        record.payload[val_len_offset],
+                        record.payload[val_len_offset + 1],
+                    ]) as usize;
+                    if record.payload.len() < val_len_offset + 2 + val_len {
+                        continue; // invalid record
+                    }
+                    let value = &record.payload[val_len_offset + 2..val_len_offset + 2 + val_len];
+                    // Replay the put into the B-tree.
+                    let _ = btree.upsert(key, value);
+                }
+                RecordType::Delete if record.payload.len() >= 2 => {
+                    // Delete: key_len(u16) + key
+                    let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
+                    if record.payload.len() < 2 + key_len {
+                        continue; // invalid record
+                    }
+                    let key = &record.payload[2..2 + key_len];
+                    // Replay the delete into the B-tree.
+                    let _ = btree.delete(key);
+                }
                 _ => {} // Other record types not relevant for recovery
             }
         }
@@ -349,7 +414,10 @@ impl DB {
 
 impl Drop for DB {
     fn drop(&mut self) {
-        let _ = self.close();
+        // Don't call close() — let the WAL persist for crash recovery.
+        // The user should explicitly call close() or flush() to ensure
+        // data is persisted and WAL is cleaned up.
+        // If the process crashes, the WAL file will be preserved for recovery.
     }
 }
 
@@ -456,5 +524,35 @@ mod tests {
             assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
             assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
         }
+    }
+
+    #[test]
+    fn test_db_crash_recovery() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Write data (WAL is written to disk on each put).
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key1", b"value1").unwrap();
+            db.put(b"key2", b"value2").unwrap();
+            db.put(b"key3", b"value3").unwrap();
+            // Don't flush — simulate crash.
+            // WAL should be on disk.
+        }
+
+        // Verify WAL exists.
+        assert!(path.join(WAL_FILE).exists(), "WAL should exist after put");
+
+        // Reopen and verify data recovered from WAL.
+        {
+            let db = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+            assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+            assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+        }
+
+        // WAL should be deleted after recovery.
+        assert!(!path.join(WAL_FILE).exists(), "WAL should be deleted after recovery");
     }
 }
