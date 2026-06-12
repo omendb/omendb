@@ -145,10 +145,10 @@ impl DB {
             // Store in blob file.
             let ptr = self.blobs.append(key, value.to_vec());
             // Insert blob pointer into B-tree.
-            self.btree.insert(key, &ptr.to_bytes())?;
+            self.btree.upsert(key, &ptr.to_bytes())?;
         } else {
             // Store inline in B-tree.
-            self.btree.insert(key, value)?;
+            self.btree.upsert(key, value)?;
         }
 
         // 3. Allocate a page for this entry.

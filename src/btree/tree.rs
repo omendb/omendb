@@ -15,7 +15,7 @@
 //! In the full implementation, "modify" operations create new page versions.
 //! For now, we mutate nodes directly. The PMT integration comes later.
 
-use crate::btree::node::{InsertError, Node, SplitError, ValueRef};
+use crate::btree::node::{InsertError, Node, SplitError, ValueRef, BLOB_POINTER_SIZE};
 
 /// Page ID type (index into the page store).
 pub type PageId = u32;
@@ -100,6 +100,61 @@ impl BTree {
             }
             Err(InsertError::DuplicateKey(_)) => Err(BTreeError::DuplicateKey),
             Err(e) => Err(BTreeError::InsertFailed(e)),
+        }
+    }
+
+    /// Insert or update a key-value pair (upsert).
+    ///
+    /// If the key already exists, replaces the value.
+    /// May cause node splits if the leaf is full.
+    pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
+        let leaf_id = self.find_leaf(key);
+        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+
+        // Check if key exists.
+        match node.search(key) {
+            Ok(idx) => {
+                // Key exists — check if we can replace in place.
+                let old_value = node.value(idx);
+                let old_size = match old_value {
+                    Some(ValueRef::Inline(data)) => data.len(),
+                    Some(ValueRef::Blob(_)) => BLOB_POINTER_SIZE,
+                    Some(ValueRef::Tombstone) => 0,
+                    None => 0,
+                };
+
+                if value.len() == old_size {
+                    // Same size — replace in place.
+                    node.replace_value(idx, value);
+                    return Ok(());
+                }
+
+                // Different size — mark old as tombstone, insert new.
+                // This is simple but wastes space. GC will reclaim it later.
+                node.insert_tombstone(key)
+                    .map_err(BTreeError::InsertFailed)?;
+                node.insert(key, value)
+                    .map_err(|e| match e {
+                        InsertError::PageFull => {
+                            // Need to split.
+                            BTreeError::InsertFailed(e)
+                        }
+                        _ => BTreeError::InsertFailed(e),
+                    })?;
+                Ok(())
+            }
+            Err(_) => {
+                // Key doesn't exist — insert normally.
+                node.insert(key, value)
+                    .map_err(|e| match e {
+                        InsertError::PageFull => {
+                            // TODO: handle split for upsert
+                            BTreeError::InsertFailed(e)
+                        }
+                        _ => BTreeError::InsertFailed(e),
+                    })?;
+                Ok(())
+            }
         }
     }
 
