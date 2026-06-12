@@ -2,7 +2,7 @@
 
 ## Current State (2026-06-11)
 
-**86 tests passing.** KV separation integrated with persistence.
+**88 tests passing.** Transaction support added.
 
 ## What Changed
 
@@ -19,6 +19,9 @@
 11. Load blob files from disk on open
 12. Save blob files to disk during flush
 13. Added insert_blob method to BTree for proper blob pointer storage
+14. Added TransactionManager to DB
+15. Added begin_transaction, commit_transaction, abort_transaction methods
+16. Added concurrent transaction test
 
 ## Architecture
 
@@ -31,14 +34,14 @@ DB
 │   ├── PageAllocator (page IDs)
 │   └── Device (file I/O)
 ├── WalManager (crash recovery)
-└── BlobManager (KV separation, persistence)
+├── BlobManager (KV separation, persistence)
+└── TransactionManager (MVCC, snapshot isolation)
 ```
 
 ## Next Steps
 
-1. **Concurrency**: Page guards with optimistic lock coupling
-2. **Benchmarks**: YCSB, micro-ops, write amplification
-3. **Fuzz targets**: B-tree, WAL, blob, page parsing
+1. **Benchmarks**: YCSB, micro-ops, write amplification
+2. **Fuzz targets**: B-tree, WAL, blob, page parsing
 
 ## Key Documents
 
