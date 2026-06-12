@@ -60,6 +60,25 @@ impl BTree {
         }
     }
 
+    /// Create a B-tree from existing nodes (for loading from disk).
+    pub fn from_nodes(nodes: Vec<Node>, root: PageId) -> Self {
+        Self { nodes, root }
+    }
+
+    /// Add a node at a specific page ID (for loading from disk).
+    pub fn add_node(&mut self, node: Node, page_id: PageId) {
+        let idx = page_id as usize;
+        if idx >= self.nodes.len() {
+            self.nodes.resize_with(idx + 1, || Node::new_leaf());
+        }
+        self.nodes[idx] = node;
+    }
+
+    /// Get the root page ID.
+    pub fn root_id(&self) -> PageId {
+        self.root
+    }
+
     /// Number of nodes in the tree.
     pub fn node_count(&self) -> usize {
         self.nodes.len()

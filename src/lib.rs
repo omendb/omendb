@@ -42,6 +42,7 @@ pub mod error;
 pub mod mvcc;
 pub mod recovery;
 pub mod space;
+pub mod storage;
 
 // Re-export main types at crate root.
 pub use db::{DB, Options};

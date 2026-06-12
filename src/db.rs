@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
+use crate::storage::StorageEngine;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -38,20 +39,12 @@ pub struct DB {
     /// Configuration options.
     #[expect(dead_code)]
     options: Options,
-    /// B-tree (in-memory for now, will be backed by buffer manager).
-    btree: BTree,
-    /// Buffer pool manager.
-    buffer: BufferManager,
-    /// Page mapping table.
-    pmt: PMT,
-    /// Page allocator.
-    allocator: PageAllocator,
+    /// Storage engine (coordinates B-tree, buffer, PMT, device).
+    engine: StorageEngine,
     /// WAL manager.
     wal: WalManager,
     /// Blob manager.
     blobs: BlobManager,
-    /// Data file device.
-    device: Device,
     /// Whether the database is open.
     is_open: bool,
 }
@@ -109,16 +102,21 @@ impl DB {
 
         let btree = BTree::new();
 
+        // Create storage engine.
+        let mut engine = StorageEngine::new(btree, buffer, pmt, allocator, device);
+
+        // Load existing data from disk.
+        if let Err(e) = engine.load_from_disk() {
+            // Log error but continue — we can still operate with empty tree.
+            eprintln!("warning: failed to load data from disk: {e}");
+        }
+
         Ok(Self {
             path,
             options,
-            btree,
-            buffer,
-            pmt,
-            allocator,
+            engine,
             wal,
             blobs,
-            device,
             is_open: true,
         })
     }
@@ -135,7 +133,7 @@ impl DB {
 
         // 1. Log to WAL.
         self.wal.append(&WalRecord::pmt_update(
-            self.allocator.next_id(),
+            self.engine.allocator().next_id(),
             0, // file_id for main data file
             0, // offset will be set on flush
         ));
@@ -145,14 +143,14 @@ impl DB {
             // Store in blob file.
             let ptr = self.blobs.append(key, value.to_vec());
             // Insert blob pointer into B-tree.
-            self.btree.upsert(key, &ptr.to_bytes())?;
+            self.engine.btree_mut().upsert(key, &ptr.to_bytes())?;
         } else {
             // Store inline in B-tree.
-            self.btree.upsert(key, value)?;
+            self.engine.btree_mut().upsert(key, value)?;
         }
 
         // 3. Allocate a page for this entry.
-        let _page_id = self.allocator.alloc();
+        let _page_id = self.engine.allocator_mut().alloc();
 
         Ok(())
     }
@@ -167,7 +165,7 @@ impl DB {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
 
-        match self.btree.lookup(key) {
+        match self.engine.btree().lookup(key) {
             LookupResult::Found(value) => Ok(Some(value.to_vec())),
             LookupResult::Blob(ptr) => {
                 // Read from blob file.
@@ -192,39 +190,31 @@ impl DB {
 
         // 1. Log to WAL.
         self.wal.append(&WalRecord::page_dealloc(
-            self.allocator.next_id(),
+            self.engine.allocator().next_id(),
         ));
 
         // 2. Check if existing value is a blob.
-        if let LookupResult::Blob(ptr) = self.btree.lookup(key) {
+        if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key) {
             // Mark blob for GC.
             self.blobs.mark_deleted(&ptr);
         }
 
         // 3. Insert tombstone in B-tree.
-        let found = self.btree.delete(key)?;
+        let found = self.engine.btree_mut().delete(key)?;
         Ok(found)
     }
 
     /// Range scan over [start, end).
     pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.btree.range_scan(start, end).collect()
+        self.engine.btree().range_scan(start, end).collect()
     }
 
     /// Flush all pending writes to disk.
     pub fn flush(&mut self) -> Result<()> {
         self.check_open()?;
 
-        // Flush buffer pool.
-        let dirty_pages = self.buffer.flush_all();
-        for (page_id, data) in dirty_pages {
-            // Write to device.
-            let offset = page_id * PAGE_SIZE as u64;
-            self.device.write_page(offset, &data)?;
-
-            // Update PMT.
-            self.pmt.insert(page_id, 0, offset);
-        }
+        // Flush through storage engine.
+        self.engine.flush()?;
 
         // Flush WAL.
         let mut wal_buf = Vec::new();
@@ -236,10 +226,7 @@ impl DB {
 
         // Save meta.
         let meta_path = self.path.join(META_FILE);
-        Self::save_meta(&meta_path, &self.pmt, &self.allocator)?;
-
-        // Sync device.
-        self.device.sync()?;
+        Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
 
         Ok(())
     }
@@ -445,5 +432,29 @@ mod tests {
 
         // Meta file should exist.
         assert!(path.join(META_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Write data and close.
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key1", b"value1").unwrap();
+            db.put(b"key2", b"value2").unwrap();
+            db.put(b"key3", b"value3").unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        // Reopen and verify data persisted.
+        {
+            let db = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+            assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+            assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+        }
     }
 }
