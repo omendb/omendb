@@ -2,7 +2,7 @@
 
 ## Current State (2026-06-11)
 
-**88 tests passing.** Transaction support added.
+**89 tests passing.** Blob garbage collection added.
 
 ## What Changed
 
@@ -22,6 +22,8 @@
 14. Added TransactionManager to DB
 15. Added begin_transaction, commit_transaction, abort_transaction methods
 16. Added concurrent transaction test
+17. Added blob garbage collection (gc method, BlobStats struct)
+18. Added valid_count/deleted_count methods to BlobFile
 
 ## Architecture
 
@@ -34,7 +36,7 @@ DB
 │   ├── PageAllocator (page IDs)
 │   └── Device (file I/O)
 ├── WalManager (crash recovery)
-├── BlobManager (KV separation, persistence)
+├── BlobManager (KV separation, persistence, GC)
 └── TransactionManager (MVCC, snapshot isolation)
 ```
 
