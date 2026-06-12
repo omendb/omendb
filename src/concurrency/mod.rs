@@ -7,4 +7,4 @@ mod latch;
 mod txn;
 
 pub use latch::HybridLatch;
-pub use txn::{Transaction, TransactionId, TransactionState};
+pub use txn::{Transaction, TransactionId, TransactionManager, TransactionState};

@@ -11,6 +11,7 @@ use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
 use crate::btree::{BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::BufferManager;
+use crate::concurrency::TransactionManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{RecordType, SyncPolicy, WalManager, WalRecord};
@@ -45,6 +46,8 @@ pub struct DB {
     wal: WalManager,
     /// Blob manager.
     blobs: BlobManager,
+    /// Transaction manager for MVCC.
+    txn_manager: TransactionManager,
     /// Whether the database is open.
     is_open: bool,
 }
@@ -130,6 +133,7 @@ impl DB {
             engine,
             wal,
             blobs,
+            txn_manager: TransactionManager::new(),
             is_open: true,
         })
     }
@@ -288,6 +292,28 @@ impl DB {
             self.is_open = false;
         }
         Ok(())
+    }
+
+    /// Begin a new transaction.
+    ///
+    /// Returns a transaction handle that can be used to commit or abort.
+    pub fn begin_transaction(&self) -> crate::concurrency::Transaction {
+        self.txn_manager.begin()
+    }
+
+    /// Commit a transaction.
+    pub fn commit_transaction(&self, txn: &mut crate::concurrency::Transaction) {
+        self.txn_manager.commit(txn);
+    }
+
+    /// Abort a transaction.
+    pub fn abort_transaction(&self, txn: &mut crate::concurrency::Transaction) {
+        self.txn_manager.abort(txn);
+    }
+
+    /// Get the latest committed transaction ID.
+    pub fn latest_committed_txn(&self) -> u64 {
+        self.txn_manager.latest_committed()
     }
 
     /// Check if the database is open.
@@ -597,5 +623,33 @@ mod tests {
             assert_eq!(db.get(b"key1").unwrap(), Some(large_value.clone()));
             assert_eq!(db.get(b"key2").unwrap(), Some(b"small".to_vec()));
         }
+    }
+
+    #[test]
+    fn test_db_transaction() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = DB::open(&path, Options::default()).unwrap();
+
+        // Begin a transaction.
+        let mut txn = db.begin_transaction();
+        assert!(txn.is_active());
+        assert_eq!(txn.id(), 1);
+
+        // Commit the transaction.
+        db.commit_transaction(&mut txn);
+        assert!(!txn.is_active());
+        assert_eq!(db.latest_committed_txn(), 1);
+
+        // Begin another transaction.
+        let mut txn2 = db.begin_transaction();
+        assert_eq!(txn2.id(), 2);
+        assert_eq!(txn2.snapshot_id(), 1); // Can see txn 1
+
+        // Abort the transaction.
+        db.abort_transaction(&mut txn2);
+        assert!(!txn2.is_active());
+        assert_eq!(db.latest_committed_txn(), 1); // Still 1
     }
 }
