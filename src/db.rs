@@ -83,7 +83,16 @@ impl DB {
         let wal = WalManager::new(sync_policy);
 
         // Create blob manager.
-        let blobs = BlobManager::with_threshold(options.blob_threshold);
+        let blob_path = path.join(BLOB_FILE);
+        let blobs = if blob_path.exists() {
+            // Load blob files from disk.
+            let blob_data = fs::read(&blob_path)?;
+            BlobManager::from_bytes(&blob_data).unwrap_or_else(|| {
+                BlobManager::with_threshold(options.blob_threshold)
+            })
+        } else {
+            BlobManager::with_threshold(options.blob_threshold)
+        };
 
         // Try to load existing state or create new.
         let (mut pmt, mut allocator) = if meta_path.exists() {
@@ -148,7 +157,7 @@ impl DB {
             // Store in blob file.
             let ptr = self.blobs.append(key, value.to_vec());
             // Insert blob pointer into B-tree.
-            self.engine.btree_mut().upsert(key, &ptr.to_bytes())?;
+            self.engine.btree_mut().insert_blob(key, ptr)?;
         } else {
             // Store inline in B-tree.
             self.engine.btree_mut().upsert(key, value)?;
@@ -244,6 +253,7 @@ impl DB {
     /// 1. Write and sync WAL (so we can replay on crash)
     /// 2. Flush storage engine (write data pages)
     /// 3. Save meta (PMT + allocator state)
+    /// 4. Save blob files
     pub fn flush(&mut self) -> Result<()> {
         self.check_open()?;
 
@@ -257,7 +267,12 @@ impl DB {
         let meta_path = self.path.join(META_FILE);
         Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
 
-        // 4. Delete WAL after successful flush (recovery complete).
+        // 4. Save blob files.
+        let blob_path = self.path.join(BLOB_FILE);
+        let blob_data = self.blobs.to_bytes();
+        fs::write(&blob_path, &blob_data)?;
+
+        // 5. Delete WAL after successful flush (recovery complete).
         let wal_path = self.path.join(WAL_FILE);
         if wal_path.exists() {
             fs::remove_file(&wal_path)?;
@@ -554,5 +569,33 @@ mod tests {
 
         // WAL should be deleted after recovery.
         assert!(!path.join(WAL_FILE).exists(), "WAL should be deleted after recovery");
+    }
+
+    #[test]
+    fn test_db_blob_persistence() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Create a large value (>1KB threshold).
+        let large_value = vec![0xAB; 2000];
+
+        // Write large value and close.
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key1", &large_value).unwrap();
+            db.put(b"key2", b"small").unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+
+        // Verify blob file exists.
+        assert!(path.join(BLOB_FILE).exists(), "blob file should exist");
+
+        // Reopen and verify blob data persisted.
+        {
+            let db = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(db.get(b"key1").unwrap(), Some(large_value.clone()));
+            assert_eq!(db.get(b"key2").unwrap(), Some(b"small".to_vec()));
+        }
     }
 }

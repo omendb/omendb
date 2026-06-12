@@ -15,7 +15,7 @@
 //! In the full implementation, "modify" operations create new page versions.
 //! For now, we mutate nodes directly. The PMT integration comes later.
 
-use crate::btree::node::{InsertError, Node, SplitError, ValueRef, BLOB_POINTER_SIZE};
+use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef, BLOB_POINTER_SIZE};
 
 /// Page ID type (index into the page store).
 pub type PageId = u32;
@@ -207,6 +207,17 @@ impl BTree {
         node.insert_tombstone(key)
             .map_err(BTreeError::InsertFailed)?;
         Ok(true)
+    }
+
+    /// Insert a blob pointer for a key.
+    ///
+    /// This stores the blob pointer in the B-tree instead of the actual value.
+    pub fn insert_blob(&mut self, key: &[u8], ptr: BlobPointer) -> Result<(), BTreeError> {
+        let leaf_id = self.find_leaf(key);
+        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+        node.insert_blob(key, ptr)
+            .map_err(BTreeError::InsertFailed)?;
+        Ok(())
     }
 
     /// Create a forward range scan over [start, end).

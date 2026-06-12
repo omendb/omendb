@@ -108,6 +108,66 @@ impl BlobManager {
         prefix[..len].copy_from_slice(&key[..len]);
         prefix
     }
+
+    /// Serialize all blob files to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Write number of files.
+        buf.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
+
+        for file in &self.files {
+            // Write file ID.
+            buf.extend_from_slice(&file.file_id().to_le_bytes());
+            // Write file data.
+            let file_data = file.to_bytes();
+            buf.extend_from_slice(&(file_data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&file_data);
+        }
+
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 4 {
+            return None;
+        }
+
+        let num_files = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let mut files = Vec::with_capacity(num_files);
+        let mut next_file_id = 1u32;
+        let mut pos = 4;
+
+        for _ in 0..num_files {
+            if buf.len() < pos + 8 {
+                return None;
+            }
+
+            let file_id = u32::from_le_bytes([
+                buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
+            ]);
+            let data_len = u32::from_le_bytes([
+                buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7],
+            ]) as usize;
+            pos += 8;
+
+            if buf.len() < pos + data_len {
+                return None;
+            }
+
+            let file = BlobFile::from_bytes(file_id, &buf[pos..pos + data_len])?;
+            next_file_id = next_file_id.max(file_id + 1);
+            files.push(file);
+            pos += data_len;
+        }
+
+        Some(Self {
+            files,
+            next_file_id,
+            threshold: DEFAULT_BLOB_THRESHOLD,
+        })
+    }
 }
 
 impl Default for BlobManager {
