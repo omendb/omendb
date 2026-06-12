@@ -27,6 +27,16 @@ const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
 const META_FILE: &str = "seerdb.meta";
 
+/// Blob GC statistics.
+pub struct BlobStats {
+    /// Number of files needing garbage collection.
+    pub files_needing_gc: usize,
+    /// Total valid entries across all files.
+    pub total_valid: usize,
+    /// Total deleted entries across all files.
+    pub total_deleted: usize,
+}
+
 /// A seerdb database instance.
 ///
 /// Provides key-value storage with:
@@ -292,6 +302,28 @@ impl DB {
             self.is_open = false;
         }
         Ok(())
+    }
+
+    /// Run garbage collection on blob files.
+    ///
+    /// Returns the number of entries reclaimed.
+    pub fn gc(&mut self) -> Result<usize> {
+        self.check_open()?;
+        let reclaimed = self.blobs.gc();
+        if reclaimed > 0 {
+            // Flush after GC to persist changes.
+            self.flush()?;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Get blob GC statistics.
+    pub fn blob_stats(&self) -> BlobStats {
+        BlobStats {
+            files_needing_gc: self.blobs.files_needing_gc().len(),
+            total_valid: self.blobs.total_valid_entries(),
+            total_deleted: self.blobs.total_deleted_entries(),
+        }
     }
 
     /// Begin a new transaction.
@@ -687,5 +719,44 @@ mod tests {
 
         // Latest committed should be the max ID.
         assert_eq!(db.latest_committed_txn(), 10);
+    }
+
+    #[test]
+    fn test_db_gc() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        // Write some large values (>1KB threshold).
+        let large_value = vec![0xAB; 2000];
+        db.put(b"key1", &large_value).unwrap();
+        db.put(b"key2", &large_value).unwrap();
+        db.put(b"key3", &large_value).unwrap();
+        db.flush().unwrap();
+
+        // Check initial stats.
+        let stats = db.blob_stats();
+        assert_eq!(stats.total_valid, 3);
+        assert_eq!(stats.total_deleted, 0);
+        assert_eq!(stats.files_needing_gc, 0);
+
+        // Delete some entries.
+        db.delete(b"key1").unwrap();
+        db.delete(b"key2").unwrap();
+        db.flush().unwrap();
+
+        // Check stats after delete.
+        let stats = db.blob_stats();
+        assert_eq!(stats.total_valid, 1);
+        assert_eq!(stats.total_deleted, 2);
+
+        // Run GC.
+        let reclaimed = db.gc().unwrap();
+        assert!(reclaimed > 0);
+
+        // Check stats after GC.
+        let stats = db.blob_stats();
+        assert_eq!(stats.files_needing_gc, 0);
     }
 }

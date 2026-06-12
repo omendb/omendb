@@ -118,6 +118,16 @@ impl BlobFile {
         self.records.len()
     }
 
+    /// Number of valid (non-deleted) entries.
+    pub fn valid_count(&self) -> usize {
+        self.valid_count
+    }
+
+    /// Number of deleted entries.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted_count
+    }
+
     /// Whether the file needs garbage collection (>50% deleted).
     pub fn needs_gc(&self) -> bool {
         let total = self.valid_count + self.deleted_count;

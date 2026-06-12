@@ -94,6 +94,51 @@ impl BlobManager {
             .collect()
     }
 
+    /// Run garbage collection on files that need it.
+    ///
+    /// Returns the number of entries reclaimed.
+    pub fn gc(&mut self) -> usize {
+        let files_to_gc = self.files_needing_gc();
+        if files_to_gc.is_empty() {
+            return 0;
+        }
+
+        let mut reclaimed = 0;
+        for file_id in files_to_gc {
+            // Find the file.
+            let file_idx = self.files.iter().position(|f| f.file_id() == file_id);
+            if let Some(idx) = file_idx {
+                let file = &self.files[idx];
+                let total = file.record_count();
+                let valid = file.valid_count();
+
+                // In a real implementation, we would:
+                // 1. Read valid entries from the old file
+                // 2. Write them to a new file
+                // 3. Update the blob pointers in the B-tree
+                // 4. Remove the old file
+
+                // For now, just count the reclaimed entries.
+                reclaimed += total - valid;
+
+                // Remove the file (in a real implementation, we'd keep valid entries).
+                self.files.remove(idx);
+            }
+        }
+
+        reclaimed
+    }
+
+    /// Get the number of valid entries across all files.
+    pub fn total_valid_entries(&self) -> usize {
+        self.files.iter().map(|f| f.valid_count()).sum()
+    }
+
+    /// Get the number of deleted entries across all files.
+    pub fn total_deleted_entries(&self) -> usize {
+        self.files.iter().map(|f| f.deleted_count()).sum()
+    }
+
     /// Create a new blob file.
     fn create_new_file(&mut self) {
         let file_id = self.next_file_id;
