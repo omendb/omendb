@@ -1,48 +1,45 @@
-# Handoff — seerdb
+# seerdb Handoff
 
 ## Current State (2026-06-11)
 
-**Not a working storage engine yet.** Components are implemented and tested in isolation but not integrated.
+**85 tests passing.** Data persists to disk. Crash recovery via WAL replay works.
 
-## What Exists
+## What Changed
 
-| Module | Tests | Purpose |
-|--------|-------|---------|
-| btree/node | 17 | 4KB slotted page with prefix compression |
-| btree/tree | 8 | B-tree ops (in-memory Vec<Node>) |
-| buffer | 5 | Buffer pool with clock eviction |
-| blob | 6 | Append-only blob files |
-| pmt | 7 | Page mapping table |
-| wal | 6 | CRC32C checksummed WAL records |
-| concurrency | 12 | Hybrid latches, transactions |
-| device | 5 | File I/O with O_DIRECT |
-| **Total** | **72** | |
+1. Added `StorageEngine` to coordinate B-tree, buffer manager, PMT, device
+2. Implemented `flush`: serialize B-tree nodes to pages, write to device
+3. Implemented `load_from_disk`: read pages from device, deserialize to nodes
+4. Integrated `StorageEngine` into DB wrapper
+5. Added persistence test: write → close → reopen → read
+6. Added crash recovery via WAL replay
+7. Added Put/Delete WAL record types with key-value data
+8. Write WAL to disk before modifying B-tree (append mode)
+9. Drop no longer calls close() to preserve WAL for crash recovery
 
-## Integration Roadmap
+## Architecture
 
-Four tasks to reach a working `DB::open/put/get/delete` API:
+```
+DB
+├── StorageEngine
+│   ├── BTree (logical operations)
+│   ├── BufferManager (page cache)
+│   ├── PMT (page locations)
+│   ├── PageAllocator (page IDs)
+│   └── Device (file I/O)
+├── WalManager (crash recovery)
+└── BlobManager (KV separation)
+```
 
-| Order | Task | Description |
-|-------|------|-------------|
-| 1 | tk-veoi | DB struct + file management + page allocator |
-| 2 | tk-dtfo | Write path: put → WAL → buffer → device → PMT |
-| 3 | tk-utsr | Read path: get → PMT → buffer → device |
-| 4 | tk-ggtk | Crash recovery: WAL replay + PMT rebuild |
+## Next Steps
 
-After: Benchmarks (tk-u62d), Fuzz targets (tk-ircl)
+1. **KV separation**: Integrate blob manager with read/write path
+2. **Concurrency**: Page guards with optimistic lock coupling
+3. **Benchmarks**: YCSB, micro-ops, write amplification
+4. **Fuzz targets**: B-tree, WAL, blob, page parsing
 
-## Key Files
+## Key Documents
 
-| File | Purpose |
-|------|---------|
-| `ai/design/engine_spec.md` | Complete engine specification |
-| `ai/PLAN.md` | Integration roadmap |
-| `ai/STATUS.md` | Current state |
-| `ai/DECISIONS.md` | 9 ADRs |
-
-## Environment
-
-- Branch: `dev` (Rust), `dev-mojo` (Mojo port at `../seerdb-mojo`)
-- Rust: stable, edition 2024
-- Tests: `cargo test --lib` (72 pass)
-- Lint: `cargo clippy --all-features -- -D warnings` (clean)
+- `ai/PLAN.md` — Complete roadmap
+- `ai/design/engine_spec.md` — Engine specification
+- `ai/design/api_spec.md` — API specification
+- `ai/design/shared_api.md` — Cross-implementation alignment
