@@ -652,4 +652,40 @@ mod tests {
         assert!(!txn2.is_active());
         assert_eq!(db.latest_committed_txn(), 1); // Still 1
     }
+
+    #[test]
+    fn test_db_concurrent_transactions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db = DB::open(&path, Options::default()).unwrap();
+        let db = std::sync::Arc::new(db);
+        let mut handles = vec![];
+
+        // Spawn multiple threads that create transactions.
+        for _ in 0..10 {
+            let db = std::sync::Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let mut txn = db.begin_transaction();
+                // Simulate some work.
+                std::thread::yield_now();
+                db.commit_transaction(&mut txn);
+                txn.id()
+            }));
+        }
+
+        // Wait for all threads to complete.
+        let mut ids = vec![];
+        for handle in handles {
+            ids.push(handle.join().unwrap());
+        }
+
+        // All transactions should have unique IDs.
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 10);
+
+        // Latest committed should be the max ID.
+        assert_eq!(db.latest_committed_txn(), 10);
+    }
 }
