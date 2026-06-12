@@ -2,7 +2,7 @@
 
 ## Current State (2026-06-11)
 
-**85 tests passing.** Data persists to disk. Crash recovery via WAL replay works.
+**86 tests passing.** KV separation integrated with persistence.
 
 ## What Changed
 
@@ -15,6 +15,10 @@
 7. Added Put/Delete WAL record types with key-value data
 8. Write WAL to disk before modifying B-tree (append mode)
 9. Drop no longer calls close() to preserve WAL for crash recovery
+10. Added blob file persistence (to_bytes/from_bytes)
+11. Load blob files from disk on open
+12. Save blob files to disk during flush
+13. Added insert_blob method to BTree for proper blob pointer storage
 
 ## Architecture
 
@@ -27,15 +31,14 @@ DB
 │   ├── PageAllocator (page IDs)
 │   └── Device (file I/O)
 ├── WalManager (crash recovery)
-└── BlobManager (KV separation)
+└── BlobManager (KV separation, persistence)
 ```
 
 ## Next Steps
 
-1. **KV separation**: Integrate blob manager with read/write path
-2. **Concurrency**: Page guards with optimistic lock coupling
-3. **Benchmarks**: YCSB, micro-ops, write amplification
-4. **Fuzz targets**: B-tree, WAL, blob, page parsing
+1. **Concurrency**: Page guards with optimistic lock coupling
+2. **Benchmarks**: YCSB, micro-ops, write amplification
+3. **Fuzz targets**: B-tree, WAL, blob, page parsing
 
 ## Key Documents
 
