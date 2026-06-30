@@ -9,7 +9,7 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BTree, LookupResult, PAGE_SIZE};
+use crate::btree::{BTree, LookupResult};
 use crate::buffer::BufferManager;
 use crate::concurrency::TransactionManager;
 use crate::error::{Error, Result};
@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
-#[expect(dead_code)]
 const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
 const META_FILE: &str = "seerdb.meta";
@@ -130,11 +129,11 @@ impl DB {
         let mut engine = StorageEngine::new(btree, buffer, pmt, allocator, device);
 
         // Load existing data from disk (only if not recovered from WAL).
-        if !recovered_from_wal {
-            if let Err(e) = engine.load_from_disk() {
-                // Log error but continue — we can still operate with empty tree.
-                eprintln!("warning: failed to load data from disk: {e}");
-            }
+        if !recovered_from_wal
+            && let Err(e) = engine.load_from_disk()
+        {
+            // Log error but continue — we can still operate with empty tree.
+            eprintln!("warning: failed to load data from disk: {e}");
         }
 
         Ok(Self {

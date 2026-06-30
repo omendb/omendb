@@ -18,6 +18,7 @@ pub struct StorageEngine {
     /// The B-tree (logical operations).
     btree: BTree,
     /// Buffer manager (page cache).
+    #[expect(dead_code)]
     buffer: BufferManager,
     /// Page mapping table (page locations).
     pmt: PMT,

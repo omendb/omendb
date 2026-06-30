@@ -69,7 +69,7 @@ impl BTree {
     pub fn add_node(&mut self, node: Node, page_id: PageId) {
         let idx = page_id as usize;
         if idx >= self.nodes.len() {
-            self.nodes.resize_with(idx + 1, || Node::new_leaf());
+            self.nodes.resize_with(idx + 1, Node::new_leaf);
         }
         self.nodes[idx] = node;
     }

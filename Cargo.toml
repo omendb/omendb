@@ -26,6 +26,9 @@ proptest = "1.6"
 tempfile = "3.14"
 rand = "0.8"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # ZNS SSD support (Linux only)
