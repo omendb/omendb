@@ -132,9 +132,13 @@ impl TransactionManager {
     }
 
     /// Commit a transaction.
+    ///
+    /// Updates `latest_committed` to the maximum committed ID.
+    /// Uses `fetch_max` so that out-of-order commits don't cause
+    /// `latest_committed` to regress.
     pub fn commit(&self, txn: &mut Transaction) {
         txn.commit();
-        self.latest_committed.store(txn.id(), Ordering::Release);
+        self.latest_committed.fetch_max(txn.id(), Ordering::AcqRel);
     }
 
     /// Abort a transaction.
