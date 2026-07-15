@@ -1,21 +1,24 @@
 # seerdb
 
-High-performance out-of-place B-tree storage engine for NVMe SSDs. Written in Rust.
+High-performance, general-purpose embedded storage engine for modern SSDs. Written in Rust.
 
 ## What
 
 An embedded key-value storage engine designed from scratch for modern hardware:
 
-- **Out-of-place writes** (LeanStore-inspired): pages never updated in place, 6-10x less flash writes than LSM
+- **Out-of-place writes** (LeanStore-inspired): immutable page versions reduce rewrite amplification; SeerDB performance claims remain to be benchmarked
 - **KV separation** (WiscKey-inspired): large values stored separately for lower write amplification
 - **SSD-native**: designed for NVMe, with optional FDP/ZNS support
 - **MVCC**: copy-on-write concurrency control, snapshot isolation
 
-## Why
+## Direction
 
-LSM trees (RocksDB, LevelDB, fjall) rewrite data 10-30x during compaction. This is architectural, not tunable. Out-of-place B-trees achieve competitive write throughput with 6-10x less flash writes, better read performance, and simpler code.
-
-No Rust storage engine does this. seerdb fills that gap.
+The accepted architecture is a record-aware, out-of-place, versioned B+tree
+with WAL, immutable root generations, snapshots, blobs, and generation-safe
+reclamation. The first production slice is deliberately a single-writer
+durable kernel with concurrent readers. See
+[`ai/design/target_architecture.md`](ai/design/target_architecture.md) for the
+current design and staged optimization plan.
 
 ## Status
 

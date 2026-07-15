@@ -3,12 +3,14 @@
 //! This module coordinates the B-tree, buffer manager, PMT, allocator,
 //! and device to provide persistent storage.
 
+pub mod format;
+
+use crate::allocator::PageAllocator;
 use crate::btree::{BTree, Node, PAGE_SIZE};
 use crate::buffer::BufferManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
-use crate::allocator::PageAllocator;
 
 /// Storage engine that coordinates all components.
 ///

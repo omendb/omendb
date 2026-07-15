@@ -17,6 +17,8 @@
 
 use std::io::{self, Write};
 
+use crate::storage::format::CommitRecord;
+
 /// Sync policy for the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
@@ -50,6 +52,8 @@ pub enum RecordType {
     Put = 8,
     /// Delete: key_len(u16) + key.
     Delete = 9,
+    /// Durable commit envelope with commit/generation/root/count/digest.
+    Commit = 10,
 }
 
 /// A WAL record.
@@ -64,7 +68,10 @@ pub struct WalRecord {
 impl WalRecord {
     /// Create a new WAL record.
     pub fn new(record_type: RecordType, payload: Vec<u8>) -> Self {
-        Self { record_type, payload }
+        Self {
+            record_type,
+            payload,
+        }
     }
 
     /// Create a PMT update record.
@@ -103,6 +110,18 @@ impl WalRecord {
         let mut payload = Vec::with_capacity(8);
         payload.extend_from_slice(&txn_id.to_le_bytes());
         Self::new(RecordType::TxnAbort, payload)
+    }
+
+    /// Create a durable commit envelope record.
+    pub fn commit(commit: CommitRecord) -> Self {
+        Self::new(RecordType::Commit, commit.to_bytes().to_vec())
+    }
+
+    /// Decode this record as a durable commit envelope.
+    pub fn commit_record(&self) -> Option<CommitRecord> {
+        (self.record_type == RecordType::Commit)
+            .then(|| CommitRecord::from_bytes(&self.payload))
+            .flatten()
     }
 
     /// Create a Put record (for crash recovery of B-tree data).
@@ -173,6 +192,7 @@ impl WalRecord {
             7 => RecordType::Checkpoint,
             8 => RecordType::Put,
             9 => RecordType::Delete,
+            10 => RecordType::Commit,
             _ => return None, // unknown type
         };
 
@@ -190,7 +210,13 @@ impl WalRecord {
             return None; // CRC mismatch
         }
 
-        Some((Self { record_type, payload }, total_len))
+        Some((
+            Self {
+                record_type,
+                payload,
+            },
+            total_len,
+        ))
     }
 }
 
@@ -294,6 +320,13 @@ mod tests {
             WalRecord::page_dealloc(3),
             WalRecord::txn_commit(100),
             WalRecord::txn_abort(101),
+            WalRecord::commit(CommitRecord {
+                commit_id: crate::storage::format::CommitId::new(1),
+                generation_id: crate::storage::format::GenerationId::new(1),
+                root_page_id: 0,
+                mutation_count: 2,
+                digest: 3,
+            }),
         ];
 
         for record in records {
@@ -354,5 +387,18 @@ mod tests {
 
         let records = WalManager::parse_records(&buf);
         assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn test_commit_record_roundtrip() {
+        let expected = CommitRecord {
+            commit_id: crate::storage::format::CommitId::new(8),
+            generation_id: crate::storage::format::GenerationId::new(9),
+            root_page_id: 10,
+            mutation_count: 11,
+            digest: 12,
+        };
+        let record = WalRecord::commit(expected);
+        assert_eq!(record.commit_record(), Some(expected));
     }
 }
