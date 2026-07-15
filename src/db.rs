@@ -9,22 +9,29 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BTree, LookupResult};
+use crate::btree::{BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::BufferManager;
 use crate::concurrency::TransactionManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
-use crate::recovery::{RecordType, SyncPolicy, WalManager, WalRecord};
+use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
 use crate::storage::StorageEngine;
-use std::fs;
+use crate::storage::format::{
+    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
+    ManifestStore, PmtCheckpointId,
+};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
 const META_FILE: &str = "seerdb.meta";
+const MANIFEST_FILE: &str = "MANIFEST";
 
 /// Blob GC statistics.
 pub struct BlobStats {
@@ -57,8 +64,24 @@ pub struct DB {
     blobs: BlobManager,
     /// Transaction manager for MVCC.
     txn_manager: TransactionManager,
+    /// Authoritative root-generation publication store.
+    manifest: ManifestStore,
+    /// Stable database identity.
+    database_id: DatabaseId,
+    /// Stable logical history identity.
+    history_id: HistoryId,
+    /// Latest published generation.
+    generation_id: GenerationId,
+    /// Latest published commit.
+    commit_id: CommitId,
+    /// Number of mutation records since the last published generation.
+    pending_mutations: u64,
+    /// Digest over pending mutation records.
+    pending_digest: u32,
     /// Whether the database is open.
     is_open: bool,
+    /// Whether a failed publication fenced this writer until reopen.
+    write_fenced: bool,
 }
 
 impl DB {
@@ -74,6 +97,32 @@ impl DB {
         let data_path = path.join(DATA_FILE);
         let wal_path = path.join(WAL_FILE);
         let meta_path = path.join(META_FILE);
+        let manifest_path = path.join(MANIFEST_FILE);
+
+        let mut manifest = ManifestStore::open(&manifest_path)?;
+        let current_manifest = manifest.load_latest()?;
+        let (database_id, history_id, generation_id, commit_id) =
+            if let Some(current) = current_manifest {
+                if current.page_size as usize != PAGE_SIZE {
+                    return Err(Error::Corruption(format!(
+                        "manifest page size {} does not match build page size {PAGE_SIZE}",
+                        current.page_size
+                    )));
+                }
+                (
+                    current.database_id,
+                    current.history_id,
+                    current.generation_id,
+                    current.commit_id,
+                )
+            } else {
+                (
+                    Self::new_database_id(&path),
+                    HistoryId::new(1),
+                    GenerationId::new(0),
+                    CommitId::new(0),
+                )
+            };
 
         // Open the data file.
         let device_opts = DeviceOptions {
@@ -96,84 +145,118 @@ impl DB {
 
         // Create blob manager.
         let blob_path = path.join(BLOB_FILE);
-        let blobs = if blob_path.exists() {
+        let mut blobs = if blob_path.exists() {
             // Load blob files from disk.
             let blob_data = fs::read(&blob_path)?;
-            BlobManager::from_bytes(&blob_data).unwrap_or_else(|| {
-                BlobManager::with_threshold(options.blob_threshold)
-            })
+            BlobManager::from_bytes(&blob_data)
+                .unwrap_or_else(|| BlobManager::with_threshold(options.blob_threshold))
         } else {
             BlobManager::with_threshold(options.blob_threshold)
         };
 
-        // Try to load existing state or create new.
-        let (mut pmt, mut allocator) = if meta_path.exists() {
+        // A published manifest selects an immutable PMT checkpoint. Never
+        // pair an older manifest with a newer mutable metadata file.
+        let (pmt, allocator) = if let Some(current) = current_manifest {
+            if current.pmt_checkpoint_id.get() == 0 {
+                (PMT::new(), PageAllocator::new())
+            } else {
+                let checkpoint_path =
+                    path.join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
+                Self::load_meta(&checkpoint_path)?
+            }
+        } else if meta_path.exists() {
             Self::load_meta(&meta_path)?
         } else {
             (PMT::new(), PageAllocator::new())
         };
 
-        // Check if WAL exists (crash recovery needed).
-        let mut btree = BTree::new();
-        let recovered_from_wal = if wal_path.exists() {
-            // Replay WAL to recover from crash.
-            Self::recover_from_wal(&wal_path, &mut btree, &mut pmt, &mut allocator)?;
-            // Delete WAL after successful recovery.
-            fs::remove_file(&wal_path)?;
-            true
-        } else {
-            false
-        };
-
         // Create storage engine.
-        let mut engine = StorageEngine::new(btree, buffer, pmt, allocator, device);
+        let mut engine = StorageEngine::new(BTree::new(), buffer, pmt, allocator, device);
 
-        // Load existing data from disk (only if not recovered from WAL).
-        if !recovered_from_wal {
+        // A published manifest selects the PMT locations for the latest
+        // generation. Without one, retain the legacy scan as a migration path.
+        if let Some(current) = current_manifest {
+            engine.load_from_manifest(current.root_page_id)?;
+        } else if !wal_path.exists() {
             engine.load_from_disk()?;
         }
 
-        Ok(Self {
+        let recovery = if wal_path.exists() {
+            Some(Self::recover_from_wal(
+                &wal_path,
+                engine.btree_mut(),
+                &mut blobs,
+            )?)
+        } else {
+            None
+        };
+
+        let mut db = Self {
             path,
             options,
             engine,
             wal,
             blobs,
             txn_manager: TransactionManager::new(),
+            manifest,
+            database_id,
+            history_id,
+            generation_id,
+            commit_id,
+            pending_mutations: 0,
+            pending_digest: 0,
             is_open: true,
-        })
+            write_fenced: false,
+        };
+
+        if current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
+            db.manifest.publish(Manifest {
+                database_id: db.database_id,
+                history_id: db.history_id,
+                generation_id: GenerationId::new(0),
+                commit_id: CommitId::new(0),
+                page_size: PAGE_SIZE as u32,
+                root_page_id: db.engine.btree().root_id() as u64,
+                pmt_checkpoint_id: PmtCheckpointId::new(0),
+                wal_segment: 0,
+                wal_offset: 0,
+                mutation_count: 0,
+                digest: 0,
+                format_version: FORMAT_VERSION,
+            })?;
+        }
+
+        if let Some(recovery) = recovery {
+            if let Some(commit) = recovery.last_commit {
+                db.publish_recovered(commit, recovery.last_commit_offset)?;
+            } else {
+                // Complete mutations without a commit envelope are not
+                // visible in the durable protocol and may be discarded.
+                fs::remove_file(&wal_path)?;
+            }
+        }
+
+        Ok(db)
     }
 
     /// Insert a key-value pair.
     ///
-    /// Write path:
-    /// 1. Log to WAL (for crash recovery)
-    /// 2. Write WAL to disk (ensure crash recovery)
-    /// 3. If value is large, store in blob file
-    /// 4. Insert into B-tree
-    /// 5. Track for flush
+    /// The mutation is applied in memory, journaled durably, and included in
+    /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.check_open()?;
+        self.check_writable()?;
 
-        // 1. Log to WAL with key-value data for crash recovery.
-        self.wal.append(&WalRecord::put(key, value));
-
-        // 2. Write WAL to disk before modifying B-tree.
-        // This ensures crash recovery can replay the WAL.
-        self.write_wal_to_disk()?;
-
-        // 3. Check if value should be stored in blob.
+        // Mutate memory first, then make the successful mutation durable in
+        // the WAL. No page is written before the WAL reaches disk, and an
+        // operation that fails never enters a committed WAL batch.
         if self.blobs.should_separate(value.len()) {
-            // Store in blob file.
             let ptr = self.blobs.append(key, value.to_vec());
-            // Insert blob pointer into B-tree.
             self.engine.btree_mut().insert_blob(key, ptr)?;
         } else {
-            // Store inline in B-tree.
             self.engine.btree_mut().upsert(key, value)?;
         }
 
-        // 4. Allocate a page for this entry.
+        self.journal_mutation(WalRecord::put(key, value))?;
         let _page_id = self.engine.allocator_mut().alloc();
 
         Ok(())
@@ -205,28 +288,17 @@ impl DB {
 
     /// Delete a key.
     ///
-    /// Write path:
-    /// 1. Log to WAL (for crash recovery)
-    /// 2. Write WAL to disk (ensure crash recovery)
-    /// 3. Insert tombstone in B-tree
-    /// 4. If was blob, mark blob for GC
+    /// The tombstone is applied in memory, journaled durably, and included in
+    /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.check_open()?;
+        self.check_writable()?;
 
-        // 1. Log to WAL with key for crash recovery.
-        self.wal.append(&WalRecord::delete(key));
-
-        // 2. Write WAL to disk before modifying B-tree.
-        self.write_wal_to_disk()?;
-
-        // 3. Check if existing value is a blob.
         if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key) {
-            // Mark blob for GC.
             self.blobs.mark_deleted(&ptr);
         }
 
-        // 3. Insert tombstone in B-tree.
         let found = self.engine.btree_mut().delete(key)?;
+        self.journal_mutation(WalRecord::delete(key))?;
         Ok(found)
     }
 
@@ -235,10 +307,7 @@ impl DB {
         self.engine.btree().range_scan(start, end).collect()
     }
 
-    /// Write WAL records to disk and sync.
-    ///
-    /// This must be called BEFORE modifying the B-tree to ensure
-    /// crash recovery can replay the WAL.
+    /// Write buffered WAL records to disk and sync the mutation prefix.
     fn write_wal_to_disk(&mut self) -> Result<()> {
         let mut wal_buf = Vec::new();
         self.wal.flush(&mut wal_buf)?;
@@ -257,37 +326,120 @@ impl DB {
         Ok(())
     }
 
-    /// Flush all pending writes to disk.
-    ///
-    /// Order is critical for crash recovery:
-    /// 1. Write and sync WAL (so we can replay on crash)
-    /// 2. Flush storage engine (write data pages)
-    /// 3. Save meta (PMT + allocator state)
-    /// 4. Save blob files
-    pub fn flush(&mut self) -> Result<()> {
-        self.check_open()?;
+    /// Journal a mutation after it has successfully changed memory state.
+    fn journal_mutation(&mut self, record: WalRecord) -> Result<()> {
+        self.wal.append(&record);
+        if let Err(error) = self.write_wal_to_disk() {
+            self.write_fenced = true;
+            return Err(error);
+        }
+        self.pending_mutations = self
+            .pending_mutations
+            .checked_add(1)
+            .ok_or_else(|| Error::Wal("mutation count overflow".into()))?;
+        self.pending_digest = extend_digest(self.pending_digest, &record);
+        Ok(())
+    }
 
-        // 1. Write and sync WAL first (critical for crash recovery).
-        self.write_wal_to_disk()?;
-
-        // 2. Flush storage engine (write data pages).
+    /// Publish a generation after its pages and checkpoints are durable.
+    fn publish_generation(
+        &mut self,
+        commit: CommitRecord,
+        append_commit: bool,
+        recovered_wal_offset: u64,
+    ) -> Result<()> {
         self.engine.flush()?;
 
-        // 3. Save meta (PMT + allocator state).
+        let checkpoint_path = self
+            .path
+            .join(format!("seerdb.meta.{}", commit.generation_id.get()));
+        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
+        // Keep the legacy filename as a compatibility/debug snapshot. It is
+        // never authoritative once a manifest selects a checkpoint.
         let meta_path = self.path.join(META_FILE);
         Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
 
-        // 4. Save blob files.
         let blob_path = self.path.join(BLOB_FILE);
-        let blob_data = self.blobs.to_bytes();
-        fs::write(&blob_path, &blob_data)?;
+        atomic_write(&blob_path, &self.blobs.to_bytes())?;
 
-        // 5. Delete WAL after successful flush (recovery complete).
         let wal_path = self.path.join(WAL_FILE);
+        let wal_offset = if append_commit {
+            let offset = fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            self.wal.append(&WalRecord::commit(commit));
+            self.write_wal_to_disk()?;
+            offset
+        } else {
+            recovered_wal_offset
+        };
+
+        let manifest = Manifest {
+            database_id: self.database_id,
+            history_id: self.history_id,
+            generation_id: commit.generation_id,
+            commit_id: commit.commit_id,
+            page_size: PAGE_SIZE as u32,
+            root_page_id: commit.root_page_id,
+            pmt_checkpoint_id: PmtCheckpointId::new(commit.generation_id.get()),
+            wal_segment: 0,
+            wal_offset,
+            mutation_count: commit.mutation_count,
+            digest: commit.digest,
+            format_version: FORMAT_VERSION,
+        };
+        self.manifest.publish(manifest)?;
+
         if wal_path.exists() {
             fs::remove_file(&wal_path)?;
+            sync_directory(&self.path)?;
         }
 
+        self.generation_id = commit.generation_id;
+        self.commit_id = commit.commit_id;
+        self.pending_mutations = 0;
+        self.pending_digest = 0;
+        Ok(())
+    }
+
+    /// Checkpoint a committed WAL prefix discovered during reopen.
+    fn publish_recovered(&mut self, commit: CommitRecord, wal_offset: u64) -> Result<()> {
+        if let Err(error) = self.publish_generation(commit, false, wal_offset) {
+            self.write_fenced = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Flush all pending writes as one durable root generation.
+    pub fn flush(&mut self) -> Result<()> {
+        self.check_writable()?;
+        if self.pending_mutations == 0 {
+            return Ok(());
+        }
+
+        let commit = CommitRecord {
+            commit_id: CommitId::new(
+                self.commit_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+            ),
+            generation_id: GenerationId::new(
+                self.generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+            ),
+            root_page_id: self.engine.btree().root_id() as u64,
+            mutation_count: self.pending_mutations,
+            digest: self.pending_digest,
+        };
+
+        if let Err(error) = self.publish_generation(commit, true, 0) {
+            self.write_fenced = true;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -352,6 +504,31 @@ impl DB {
         Ok(())
     }
 
+    /// Reject writes after a failed publication until the database is reopened.
+    fn check_writable(&self) -> Result<()> {
+        self.check_open()?;
+        if self.write_fenced {
+            return Err(Error::NeedsRecovery(
+                "writer fenced after a failed durable publication; reopen required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Generate a stable-enough identity for a newly created database.
+    fn new_database_id(path: &Path) -> DatabaseId {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path_digest = crc32c::crc32c(path.to_string_lossy().as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&(now as u64).to_le_bytes());
+        bytes[8..12].copy_from_slice(&path_digest.to_le_bytes());
+        bytes[12..16].copy_from_slice(&std::process::id().to_le_bytes());
+        DatabaseId::new(bytes)
+    }
+
     /// Load PMT and allocator from meta file.
     fn load_meta(path: &Path) -> Result<(PMT, PageAllocator)> {
         let data = fs::read(path)?;
@@ -384,87 +561,6 @@ impl DB {
         Ok((pmt, allocator))
     }
 
-    /// Recover database state from WAL.
-    ///
-    /// Replays all WAL records to rebuild B-tree, PMT, and allocator state.
-    fn recover_from_wal(
-        wal_path: &Path,
-        btree: &mut BTree,
-        pmt: &mut PMT,
-        allocator: &mut PageAllocator,
-    ) -> Result<()> {
-        let wal_data = fs::read(wal_path)?;
-        let records = WalManager::parse_records(&wal_data);
-
-        for record in &records {
-            match record.record_type {
-                RecordType::PmtUpdate if record.payload.len() >= 20 => {
-                    // PMT update: page_id(8) + file_id(4) + offset(8)
-                    let page_id = u64::from_le_bytes([
-                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
-                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
-                    ]);
-                    let file_id = u32::from_le_bytes([
-                        record.payload[8], record.payload[9], record.payload[10], record.payload[11],
-                    ]);
-                    let offset = u64::from_le_bytes([
-                        record.payload[12], record.payload[13], record.payload[14], record.payload[15],
-                        record.payload[16], record.payload[17], record.payload[18], record.payload[19],
-                    ]);
-                    pmt.insert(page_id, file_id, offset);
-                }
-                RecordType::PageAlloc if record.payload.len() >= 12 => {
-                    // Page allocation: page_id(8) + file_id(4)
-                    let _page_id = u64::from_le_bytes([
-                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
-                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
-                    ]);
-                    let _page_id = allocator.alloc();
-                }
-                RecordType::PageDealloc if record.payload.len() >= 8 => {
-                    // Page deallocation: page_id(8)
-                    let page_id = u64::from_le_bytes([
-                        record.payload[0], record.payload[1], record.payload[2], record.payload[3],
-                        record.payload[4], record.payload[5], record.payload[6], record.payload[7],
-                    ]);
-                    allocator.free(page_id);
-                }
-                RecordType::Put if record.payload.len() >= 4 => {
-                    // Put: key_len(u16) + key + value_len(u16) + value
-                    let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
-                    if record.payload.len() < 2 + key_len + 2 {
-                        continue; // invalid record
-                    }
-                    let key = &record.payload[2..2 + key_len];
-                    let val_len_offset = 2 + key_len;
-                    let val_len = u16::from_le_bytes([
-                        record.payload[val_len_offset],
-                        record.payload[val_len_offset + 1],
-                    ]) as usize;
-                    if record.payload.len() < val_len_offset + 2 + val_len {
-                        continue; // invalid record
-                    }
-                    let value = &record.payload[val_len_offset + 2..val_len_offset + 2 + val_len];
-                    // Replay the put into the B-tree.
-                    let _ = btree.upsert(key, value);
-                }
-                RecordType::Delete if record.payload.len() >= 2 => {
-                    // Delete: key_len(u16) + key
-                    let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
-                    if record.payload.len() < 2 + key_len {
-                        continue; // invalid record
-                    }
-                    let key = &record.payload[2..2 + key_len];
-                    // Replay the delete into the B-tree.
-                    let _ = btree.delete(key);
-                }
-                _ => {} // Other record types not relevant for recovery
-            }
-        }
-
-        Ok(())
-    }
-
     /// Save PMT and allocator to meta file.
     fn save_meta(path: &Path, pmt: &PMT, allocator: &PageAllocator) -> Result<()> {
         let pmt_bytes = pmt.to_bytes();
@@ -476,9 +572,153 @@ impl DB {
         buf.extend_from_slice(&(alloc_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&alloc_bytes);
 
-        fs::write(path, &buf)?;
-        Ok(())
+        atomic_write(path, &buf)
     }
+
+    /// Recover a committed WAL prefix and reject corrupt complete records.
+    fn recover_from_wal(
+        wal_path: &Path,
+        btree: &mut BTree,
+        blobs: &mut BlobManager,
+    ) -> Result<RecoverySummary> {
+        let wal_data = fs::read(wal_path)?;
+        let (records, status) = WalManager::parse_records_with_status(&wal_data);
+        if status == ParseStatus::Corrupt {
+            return Err(Error::Corruption("invalid complete WAL record".into()));
+        }
+
+        let mut pending = Vec::new();
+        let mut last_commit = None;
+        let mut last_commit_offset = 0;
+        let mut offset = 0u64;
+        for record in &records {
+            let record_len = record.to_bytes().len() as u64;
+            match record.record_type {
+                RecordType::Put | RecordType::Delete => pending.push(record),
+                RecordType::Commit => {
+                    let commit = record
+                        .commit_record()
+                        .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+                    if commit.mutation_count != pending.len() as u64
+                        || commit.digest != digest_records(&pending)
+                    {
+                        return Err(Error::Corruption(
+                            "WAL commit does not match its mutation prefix".into(),
+                        ));
+                    }
+                    for mutation in pending.drain(..) {
+                        apply_mutation(mutation, btree, blobs)?;
+                    }
+                    last_commit = Some(commit);
+                    last_commit_offset = offset;
+                }
+                _ => {}
+            }
+            offset += record_len;
+        }
+
+        Ok(RecoverySummary {
+            last_commit,
+            last_commit_offset,
+        })
+    }
+}
+
+/// Recovery result for the committed WAL prefix.
+#[derive(Debug, Clone, Copy)]
+struct RecoverySummary {
+    last_commit: Option<CommitRecord>,
+    last_commit_offset: u64,
+}
+
+fn extend_digest(current: u32, record: &WalRecord) -> u32 {
+    let bytes = record.to_bytes();
+    let mut input = Vec::with_capacity(4 + bytes.len());
+    input.extend_from_slice(&current.to_le_bytes());
+    input.extend_from_slice(&bytes);
+    crc32c::crc32c(&input)
+}
+
+fn digest_records(records: &[&WalRecord]) -> u32 {
+    records
+        .iter()
+        .fold(0, |digest, record| extend_digest(digest, record))
+}
+
+fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<()> {
+    match record.record_type {
+        RecordType::Put => {
+            if record.payload.len() < 4 {
+                return Err(Error::Corruption("WAL put record too small".into()));
+            }
+            let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
+            let value_len_offset = 2usize
+                .checked_add(key_len)
+                .ok_or_else(|| Error::Corruption("WAL key length overflow".into()))?;
+            if record.payload.len() < value_len_offset + 2 {
+                return Err(Error::Corruption("WAL put key is truncated".into()));
+            }
+            let value_len = u16::from_le_bytes([
+                record.payload[value_len_offset],
+                record.payload[value_len_offset + 1],
+            ]) as usize;
+            let value_offset = value_len_offset + 2;
+            if record.payload.len() != value_offset + value_len {
+                return Err(Error::Corruption("WAL put value is truncated".into()));
+            }
+            let key = &record.payload[2..value_len_offset];
+            let value = &record.payload[value_offset..];
+            if blobs.should_separate(value.len()) {
+                let pointer = blobs.append(key, value.to_vec());
+                btree.insert_blob(key, pointer)?;
+            } else {
+                btree.upsert(key, value)?;
+            }
+        }
+        RecordType::Delete => {
+            if record.payload.len() < 2 {
+                return Err(Error::Corruption("WAL delete record too small".into()));
+            }
+            let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
+            if record.payload.len() != 2 + key_len {
+                return Err(Error::Corruption("WAL delete key is truncated".into()));
+            }
+            let key = &record.payload[2..];
+            if let LookupResult::Blob(pointer) = btree.lookup(key) {
+                blobs.mark_deleted(&pointer);
+            }
+            btree.delete(key)?;
+        }
+        _ => {
+            return Err(Error::Corruption(
+                "non-mutation passed to WAL applier".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(data)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)?;
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl Drop for DB {
@@ -493,7 +733,10 @@ impl Drop for DB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::tempdir;
+
+    use crate::storage::format::MANIFEST_SLOT_SIZE;
 
     #[test]
     fn test_db_open() {
@@ -580,6 +823,7 @@ mod tests {
         {
             let mut db = DB::open(&path, Options::default()).unwrap();
             db.put(b"key1", b"value1").unwrap();
+            db.flush().unwrap();
             db.put(b"key2", b"value2").unwrap();
             db.put(b"key3", b"value3").unwrap();
             db.flush().unwrap();
@@ -620,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_crash_recovery() {
+    fn test_db_discards_uncommitted_wal_suffix() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
 
@@ -637,16 +881,120 @@ mod tests {
         // Verify WAL exists.
         assert!(path.join(WAL_FILE).exists(), "WAL should exist after put");
 
-        // Reopen and verify data recovered from WAL.
+        // Reopen and verify uncommitted mutations are not visible.
         {
             let db = DB::open(&path, Options::default()).unwrap();
-            assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-            assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-            assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+            assert_eq!(db.get(b"key1").unwrap(), None);
+            assert_eq!(db.get(b"key2").unwrap(), None);
+            assert_eq!(db.get(b"key3").unwrap(), None);
         }
 
-        // WAL should be deleted after recovery.
-        assert!(!path.join(WAL_FILE).exists(), "WAL should be deleted after recovery");
+        // The uncommitted WAL suffix can be discarded after reopen.
+        assert!(
+            !path.join(WAL_FILE).exists(),
+            "WAL should be deleted after recovery"
+        );
+    }
+
+    #[test]
+    fn test_db_recovers_committed_wal_prefix_with_torn_suffix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let records = vec![
+            WalRecord::put(b"key1", b"value1"),
+            WalRecord::put(b"key2", b"value2"),
+            WalRecord::put(b"key3", b"value3"),
+        ];
+        let references: Vec<_> = records.iter().collect();
+        let commit = CommitRecord {
+            commit_id: CommitId::new(1),
+            generation_id: GenerationId::new(1),
+            root_page_id: 0,
+            mutation_count: records.len() as u64,
+            digest: digest_records(&references),
+        };
+        let mut wal_bytes = Vec::new();
+        for record in &records {
+            wal_bytes.extend_from_slice(&record.to_bytes());
+        }
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        wal_bytes.extend_from_slice(&[0xA5, 0x5A, 0x01]);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let db = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+        assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+        assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+        assert!(!path.join(WAL_FILE).exists());
+        assert!(path.join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_rejects_wal_commit_digest_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let record = WalRecord::put(b"key", b"value");
+        let references = vec![&record];
+        let commit = CommitRecord {
+            commit_id: CommitId::new(1),
+            generation_id: GenerationId::new(1),
+            root_page_id: 0,
+            mutation_count: 1,
+            digest: digest_records(&references) ^ 1,
+        };
+        let mut wal_bytes = record.to_bytes();
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let result = DB::open(&path, Options::default());
+        assert!(matches!(
+            result,
+            Err(Error::Corruption(message)) if message.contains("WAL commit")
+        ));
+    }
+
+    #[test]
+    fn test_db_rejects_when_both_manifest_slots_are_corrupt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.flush().unwrap();
+        }
+
+        let manifest_path = path.join(MANIFEST_FILE);
+        let mut file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
+        for slot in 0..2 {
+            file.seek(SeekFrom::Start((slot * MANIFEST_SLOT_SIZE) as u64))
+                .unwrap();
+            file.write_all(&[0xA5; MANIFEST_SLOT_SIZE]).unwrap();
+        }
+        file.sync_all().unwrap();
+
+        let result = DB::open(&path, Options::default());
+        assert!(matches!(result, Err(Error::Corruption(_))));
+    }
+
+    #[test]
+    fn test_db_fences_writer_after_sync_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.engine.inject_sync_failure();
+
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(matches!(
+            db.put(b"another", b"value"),
+            Err(Error::NeedsRecovery(_))
+        ));
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
     }
 
     #[test]

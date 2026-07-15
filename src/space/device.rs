@@ -7,6 +7,8 @@ use crate::btree::node::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(any(test, feature = "fault-injection"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Options for opening a device.
 #[derive(Debug, Clone)]
@@ -39,6 +41,9 @@ pub struct Device {
     use_odirect: bool,
     /// Whether to sync after writes.
     sync_writes: bool,
+    /// Test-only deterministic sync failure hook.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_sync: AtomicBool,
 }
 
 impl Device {
@@ -63,6 +68,8 @@ impl Device {
             file,
             use_odirect: options.use_odirect,
             sync_writes: options.sync_writes,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_sync: AtomicBool::new(false),
         })
     }
 
@@ -91,7 +98,17 @@ impl Device {
 
     /// Sync all data to disk.
     pub fn sync(&self) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected device sync failure"));
+        }
         self.file.sync_data()
+    }
+
+    /// Inject one deterministic sync failure for recovery tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_sync_failure(&self) {
+        self.fail_next_sync.store(true, Ordering::Release);
     }
 
     /// Get the file size.
@@ -111,7 +128,7 @@ impl Device {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
-    use std::alloc::{alloc_zeroed, Layout};
+    use std::alloc::{Layout, alloc_zeroed};
 
     let layout = Layout::from_size_align(size, PAGE_SIZE).expect("invalid layout");
     let ptr = unsafe { alloc_zeroed(layout) };
@@ -180,13 +197,17 @@ mod tests {
         // Write multiple pages.
         for i in 0..10 {
             let buf = [i as u8; PAGE_SIZE];
-            device.write_page(i as u64 * PAGE_SIZE as u64, &buf).unwrap();
+            device
+                .write_page(i as u64 * PAGE_SIZE as u64, &buf)
+                .unwrap();
         }
 
         // Read them back.
         for i in 0..10 {
             let mut buf = [0u8; PAGE_SIZE];
-            device.read_page(i as u64 * PAGE_SIZE as u64, &mut buf).unwrap();
+            device
+                .read_page(i as u64 * PAGE_SIZE as u64, &mut buf)
+                .unwrap();
             assert_eq!(buf, [i as u8; PAGE_SIZE]);
         }
     }

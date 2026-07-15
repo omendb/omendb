@@ -37,6 +37,8 @@ zns = []
 fdp = []
 # io_uring async I/O (Linux only)
 io-uring = []
+# Deterministic device failures for recovery and publication tests.
+fault-injection = []
 
 [profile.release]
 opt-level = 3

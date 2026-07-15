@@ -56,6 +56,17 @@ pub enum RecordType {
     Commit = 10,
 }
 
+/// Result of parsing a WAL prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseStatus {
+    /// The entire input contains complete valid records.
+    Complete,
+    /// The final record is incomplete and may be a torn write.
+    Incomplete,
+    /// A complete record has an invalid type or checksum.
+    Corrupt,
+}
+
 /// A WAL record.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
@@ -176,6 +187,9 @@ impl WalRecord {
         }
 
         let length = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if length < 5 {
+            return None;
+        }
         let total_len = 4 + length;
 
         if buf.len() < total_len {
@@ -280,20 +294,40 @@ impl WalManager {
 
     /// Parse all records from a buffer.
     pub fn parse_records(buf: &[u8]) -> Vec<WalRecord> {
+        Self::parse_records_with_status(buf).0
+    }
+
+    /// Parse a WAL prefix and classify an incomplete or corrupt suffix.
+    pub fn parse_records_with_status(buf: &[u8]) -> (Vec<WalRecord>, ParseStatus) {
         let mut records = Vec::new();
         let mut pos = 0;
 
         while pos < buf.len() {
+            if buf.len() - pos < 4 {
+                return (records, ParseStatus::Incomplete);
+            }
+            let length =
+                u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            if length < 5 {
+                return (records, ParseStatus::Corrupt);
+            }
+            let total_len = match 4usize.checked_add(length) {
+                Some(total_len) => total_len,
+                None => return (records, ParseStatus::Corrupt),
+            };
+            if buf.len() - pos < total_len {
+                return (records, ParseStatus::Incomplete);
+            }
             match WalRecord::from_bytes(&buf[pos..]) {
                 Some((record, consumed)) => {
                     records.push(record);
                     pos += consumed;
                 }
-                None => break, // corrupt or incomplete record
+                None => return (records, ParseStatus::Corrupt),
             }
         }
 
-        records
+        (records, ParseStatus::Complete)
     }
 }
 
@@ -387,6 +421,30 @@ mod tests {
 
         let records = WalManager::parse_records(&buf);
         assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_status_distinguishes_torn_and_corrupt_suffixes() {
+        let record = WalRecord::put(b"key", b"value");
+        let bytes = record.to_bytes();
+        assert_eq!(
+            WalManager::parse_records_with_status(&bytes).1,
+            ParseStatus::Complete
+        );
+
+        let torn = &bytes[..bytes.len() - 1];
+        assert_eq!(
+            WalManager::parse_records_with_status(torn).1,
+            ParseStatus::Incomplete
+        );
+
+        let mut corrupt = bytes;
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert_eq!(
+            WalManager::parse_records_with_status(&corrupt).1,
+            ParseStatus::Corrupt
+        );
     }
 
     #[test]

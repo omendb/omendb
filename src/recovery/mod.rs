@@ -1,9 +1,9 @@
 //! Crash recovery via Write-Ahead Logging (WAL).
 //!
-//! The WAL ensures that all mutations are logged before they are applied.
-//! On crash recovery, the WAL is replayed to restore the database to a
-//! consistent state.
+//! The WAL is durable before page generations are published. On crash
+//! recovery, only mutation prefixes closed by a valid commit envelope are
+//! replayed.
 
 mod wal;
 
-pub use wal::{RecordType, SyncPolicy, WalManager, WalRecord};
+pub use wal::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};

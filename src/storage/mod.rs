@@ -76,10 +76,22 @@ impl StorageEngine {
         &mut self.allocator
     }
 
+    /// Get mutable access to the page mapping table for recovery.
+    pub fn pmt_mut(&mut self) -> &mut PMT {
+        &mut self.pmt
+    }
+
+    /// Inject one device sync failure for publication-boundary tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_sync_failure(&self) {
+        self.device.inject_sync_failure();
+    }
+
     /// Flush all dirty pages to disk.
     pub fn flush(&mut self) -> Result<()> {
-        // For now, serialize all nodes to pages and write to disk.
-        // In the full implementation, this would only flush dirty pages.
+        // The bootstrap path rewrites the complete logical tree into a new
+        // physical generation. It is coarse, but preserves the out-of-place
+        // invariant needed by manifest publication.
         let node_count = self.btree.node_count();
 
         for page_id in 0..node_count {
@@ -94,24 +106,75 @@ impl StorageEngine {
                 })?;
                 persisted_node.update_checksum();
 
-                // Allocate a page offset if not already mapped.
-                let offset = if let Some(mapping) = self.pmt.get(page_id as u64) {
-                    mapping.offset
-                } else {
-                    let offset = self.next_offset;
-                    self.next_offset += PAGE_SIZE as u64;
-                    self.pmt.insert(page_id as u64, 0, offset);
-                    offset
-                };
+                // Every flush creates a new physical version. DB publishes
+                // the resulting PMT only after all data is durable.
+                let offset = self.next_offset;
 
                 // Write the page to the device.
                 self.device.write_page(offset, persisted_node.as_bytes())?;
+                self.next_offset += PAGE_SIZE as u64;
+                self.pmt.insert(page_id as u64, 0, offset);
             }
         }
 
         // Sync to ensure data is persisted.
         self.device.sync()?;
 
+        Ok(())
+    }
+
+    /// Load the page versions named by a durable manifest generation.
+    pub fn load_from_manifest(&mut self, root_page_id: u64) -> Result<()> {
+        if self.pmt.is_empty() {
+            self.next_offset = self.device.size()?;
+            return Ok(());
+        }
+
+        let max_page_id = self
+            .pmt
+            .iter()
+            .map(|(page_id, _)| page_id)
+            .max()
+            .ok_or_else(|| Error::Corruption("manifest PMT is unexpectedly empty".into()))?;
+        if root_page_id > u32::MAX as u64 || root_page_id > max_page_id {
+            return Err(Error::Corruption(format!(
+                "manifest root page {root_page_id} is outside PMT"
+            )));
+        }
+
+        let node_count = max_page_id
+            .checked_add(1)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| Error::Corruption("manifest PMT page count overflow".into()))?;
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            nodes.push(Node::new_leaf());
+        }
+
+        for page_id in 0..=max_page_id {
+            let mapping = self
+                .pmt
+                .get(page_id)
+                .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
+            let mut buf = [0u8; PAGE_SIZE];
+            self.device.read_page(mapping.offset, &mut buf)?;
+            let node = Node::from_bytes(Box::new(buf)).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "invalid page {page_id} at offset {}",
+                    mapping.offset
+                ))
+            })?;
+            if !node.verify_checksum() {
+                return Err(Error::Corruption(format!(
+                    "page checksum mismatch at offset {}",
+                    mapping.offset
+                )));
+            }
+            nodes[page_id as usize] = node;
+        }
+
+        self.btree = BTree::from_nodes(nodes, root_page_id as u32);
+        self.next_offset = self.device.size()?;
         Ok(())
     }
 
