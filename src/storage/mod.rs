@@ -5,10 +5,10 @@
 
 use crate::btree::{BTree, Node, PAGE_SIZE};
 use crate::buffer::BufferManager;
+use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
 use crate::allocator::PageAllocator;
-use std::io;
 
 /// Storage engine that coordinates all components.
 ///
@@ -75,7 +75,7 @@ impl StorageEngine {
     }
 
     /// Flush all dirty pages to disk.
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         // For now, serialize all nodes to pages and write to disk.
         // In the full implementation, this would only flush dirty pages.
         let node_count = self.btree.node_count();
@@ -83,7 +83,14 @@ impl StorageEngine {
         for page_id in 0..node_count {
             let node = self.btree.node(page_id as u32);
             if let Some(node) = node {
-                let data = node.as_bytes();
+                // B-tree mutations do not maintain the persisted checksum in
+                // place. Rebuild a temporary node so every page written has a
+                // checksum that covers its final bytes.
+                let page = Box::new(*node.as_bytes());
+                let mut persisted_node = Node::from_bytes(page).ok_or_else(|| {
+                    Error::Corruption(format!("invalid node page {page_id} before flush"))
+                })?;
+                persisted_node.update_checksum();
 
                 // Allocate a page offset if not already mapped.
                 let offset = if let Some(mapping) = self.pmt.get(page_id as u64) {
@@ -96,7 +103,7 @@ impl StorageEngine {
                 };
 
                 // Write the page to the device.
-                self.device.write_page(offset, data)?;
+                self.device.write_page(offset, persisted_node.as_bytes())?;
             }
         }
 
@@ -110,7 +117,7 @@ impl StorageEngine {
     ///
     /// This is a temporary implementation for bootstrapping.
     /// In the full implementation, pages would be loaded on demand.
-    pub fn load_from_disk(&mut self) -> io::Result<()> {
+    pub fn load_from_disk(&mut self) -> Result<()> {
         let device_size = self.device.size()?;
 
         if device_size == 0 {
@@ -127,6 +134,12 @@ impl StorageEngine {
 
             // Deserialize the node.
             if let Some(node) = Node::from_bytes(Box::new(buf)) {
+                if !node.verify_checksum() {
+                    return Err(Error::Corruption(format!(
+                        "page checksum mismatch at offset {offset}"
+                    )));
+                }
+
                 // Add to the B-tree.
                 self.btree.add_node(node, page_id as u32);
             }

@@ -129,11 +129,8 @@ impl DB {
         let mut engine = StorageEngine::new(btree, buffer, pmt, allocator, device);
 
         // Load existing data from disk (only if not recovered from WAL).
-        if !recovered_from_wal
-            && let Err(e) = engine.load_from_disk()
-        {
-            // Log error but continue — we can still operate with empty tree.
-            eprintln!("warning: failed to load data from disk: {e}");
+        if !recovered_from_wal {
+            engine.load_from_disk()?;
         }
 
         Ok(Self {
@@ -596,6 +593,30 @@ mod tests {
             assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
             assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
         }
+    }
+
+    #[test]
+    fn test_db_rejects_corrupt_page_checksum() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.flush().unwrap();
+        }
+
+        let data_path = path.join(DATA_FILE);
+        let mut data = fs::read(&data_path).unwrap();
+        assert!(data.len() >= crate::btree::PAGE_SIZE);
+        data[crate::btree::PAGE_SIZE - 1] ^= 0x01;
+        fs::write(&data_path, data).unwrap();
+
+        let result = DB::open(&path, Options::default());
+        assert!(matches!(
+            result,
+            Err(Error::Corruption(message)) if message.contains("checksum mismatch")
+        ));
     }
 
     #[test]
