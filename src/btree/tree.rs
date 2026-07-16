@@ -561,6 +561,13 @@ mod tests {
 
         tree.upsert(b"key", b"x").unwrap();
         assert!(matches!(tree.lookup(b"key"), LookupResult::Found(b"x")));
+
+        tree.delete(b"key").unwrap();
+        tree.upsert(b"key", b"restored").unwrap();
+        assert!(matches!(
+            tree.lookup(b"key"),
+            LookupResult::Found(b"restored")
+        ));
     }
 
     #[test]

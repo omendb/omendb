@@ -630,6 +630,9 @@ impl Node {
         let key = self.key(index).ok_or(InsertError::WrongNodeType)?;
         let original = self.clone();
         self.remove_entry(index)?;
+        while let Ok(duplicate_index) = self.search(&key) {
+            self.remove_entry(duplicate_index)?;
+        }
         match self.insert(&key, new_value) {
             Ok(()) => Ok(()),
             Err(error) => {
