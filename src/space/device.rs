@@ -44,6 +44,9 @@ pub struct Device {
     /// Test-only deterministic sync failure hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_sync: AtomicBool,
+    /// Test-only deterministic write failure hook.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_write: AtomicBool,
 }
 
 impl Device {
@@ -70,6 +73,8 @@ impl Device {
             sync_writes: options.sync_writes,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_sync: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_write: AtomicBool::new(false),
         })
     }
 
@@ -86,6 +91,10 @@ impl Device {
     ///
     /// The buffer must be page-aligned for O_DIRECT.
     pub fn write_page(&mut self, offset: u64, buf: &[u8; PAGE_SIZE]) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_next_write.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected device write failure"));
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
 
@@ -109,6 +118,12 @@ impl Device {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_sync_failure(&self) {
         self.fail_next_sync.store(true, Ordering::Release);
+    }
+
+    /// Inject one deterministic page-write failure for recovery tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_write_failure(&self) {
+        self.fail_next_write.store(true, Ordering::Release);
     }
 
     /// Get the file size.

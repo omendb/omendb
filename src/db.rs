@@ -26,6 +26,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(test, feature = "fault-injection"))]
+use std::cell::Cell;
+
+#[cfg(any(test, feature = "fault-injection"))]
+thread_local! {
+    static FAIL_NEXT_ATOMIC_RENAME: Cell<bool> = const { Cell::new(false) };
+}
+
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
@@ -709,8 +717,22 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     file.flush()?;
     file.sync_all()?;
     drop(file);
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    let injected = FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.replace(false));
+    #[cfg(any(test, feature = "fault-injection"))]
+    if injected {
+        return Err(std::io::Error::other("injected atomic rename failure").into());
+    }
+
     fs::rename(&temporary, path)?;
     sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+#[expect(dead_code)]
+fn inject_atomic_rename_failure() {
+    FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.set(true));
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -931,6 +953,57 @@ mod tests {
     }
 
     #[test]
+    fn test_db_reopen_accepts_every_wal_truncation_prefix() {
+        let records = vec![
+            WalRecord::put(b"key1", b"value1"),
+            WalRecord::put(b"key2", b"value2"),
+            WalRecord::put(b"key3", b"value3"),
+        ];
+        let references: Vec<_> = records.iter().collect();
+        let commit = CommitRecord {
+            commit_id: CommitId::new(1),
+            generation_id: GenerationId::new(1),
+            root_page_id: 0,
+            mutation_count: records.len() as u64,
+            digest: digest_records(&references),
+        };
+        let mut committed_wal = Vec::new();
+        for record in &records {
+            committed_wal.extend_from_slice(&record.to_bytes());
+        }
+        committed_wal.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        let committed_len = committed_wal.len();
+        committed_wal.extend_from_slice(&[0xA5, 0x5A, 0x01]);
+
+        for cut in 0..=committed_wal.len() {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(WAL_FILE), &committed_wal[..cut]).unwrap();
+
+            let db = DB::open(&path, Options::default()).unwrap_or_else(|error| {
+                panic!("WAL prefix at byte {cut} failed to reopen: {error:?}")
+            });
+            let committed = cut >= committed_len;
+            assert_eq!(
+                db.get(b"key1").unwrap(),
+                committed.then(|| b"value1".to_vec()),
+                "cut={cut}"
+            );
+            assert_eq!(
+                db.get(b"key2").unwrap(),
+                committed.then(|| b"value2".to_vec()),
+                "cut={cut}"
+            );
+            assert_eq!(
+                db.get(b"key3").unwrap(),
+                committed.then(|| b"value3".to_vec()),
+                "cut={cut}"
+            );
+        }
+    }
+
+    #[test]
     fn test_db_rejects_wal_commit_digest_mismatch() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -995,6 +1068,45 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_fences_writer_after_page_write_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.engine.inject_write_failure();
+
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(matches!(
+            db.put(b"another", b"value"),
+            Err(Error::NeedsRecovery(_))
+        ));
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_discards_wal_after_atomic_rename_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        inject_atomic_rename_failure();
+
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(matches!(
+            db.put(b"another", b"value"),
+            Err(Error::NeedsRecovery(_))
+        ));
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+        assert!(!path.join(WAL_FILE).exists());
     }
 
     #[test]

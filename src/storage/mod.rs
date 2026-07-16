@@ -87,6 +87,12 @@ impl StorageEngine {
         self.device.inject_sync_failure();
     }
 
+    /// Inject one device page-write failure for publication-boundary tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_write_failure(&self) {
+        self.device.inject_write_failure();
+    }
+
     /// Flush all dirty pages to disk.
     pub fn flush(&mut self) -> Result<()> {
         // The bootstrap path rewrites the complete logical tree into a new
