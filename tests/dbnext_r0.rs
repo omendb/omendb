@@ -343,6 +343,16 @@ fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
     let mut restored = DB::open(&snapshot_path, Options::default()).unwrap();
     let restored_report = restored.verify().unwrap();
     assert_eq!(restored_report.durability, source_report.durability);
+
+    source.put(b"inline", b"source-updated").unwrap();
+    source.delete(b"large").unwrap();
+    source.flush().unwrap();
+    source.compact().unwrap();
+    assert_eq!(source.get(b"inline").unwrap(), Some(b"source-updated".to_vec()));
+    assert_eq!(source.get(b"large").unwrap(), None);
+
+    // The verified snapshot is an independent retained root, so source
+    // mutation and compaction cannot alter its historical state.
     assert_eq!(restored.get(b"inline").unwrap(), Some(b"value".to_vec()));
     assert_eq!(restored.get(b"large").unwrap(), Some(large_value));
 }
