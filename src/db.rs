@@ -12,7 +12,7 @@ use crate::blob::BlobManager;
 use crate::btree::{BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
-use crate::error::{Error, Result};
+use crate::error::{CheckFailureKind, Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
@@ -45,6 +45,7 @@ const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
+const META_MAGIC: [u8; 8] = *b"SEERMET1";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 =
     (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
@@ -54,6 +55,28 @@ static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 enum OpenMode {
     Normal,
     Check,
+}
+
+#[derive(Debug)]
+struct VerificationFailure {
+    kind: CheckFailureKind,
+    message: String,
+}
+
+impl VerificationFailure {
+    fn from_error(kind: CheckFailureKind, error: Error) -> Self {
+        Self {
+            kind,
+            message: error_message(error),
+        }
+    }
+
+    fn into_error(self) -> Error {
+        Error::Check {
+            kind: self.kind,
+            message: self.message,
+        }
+    }
 }
 
 /// Blob GC statistics.
@@ -147,6 +170,36 @@ pub struct RestoreReport {
     pub copied_files: u32,
     /// Number of destination pages verified after history fork.
     pub verified_pages: u64,
+}
+
+/// Durable action performed while rebuilding a checked database copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairAction {
+    /// The source had no WAL requiring reconciliation.
+    NoRepair,
+    /// A complete mutation-only WAL was discarded as uncommitted.
+    DiscardedUncommittedWal,
+    /// A complete committed WAL image was reconciled in the destination.
+    ReconciledCommittedWal,
+    /// A torn WAL suffix was reconciled in the rebuilt copy.
+    ReconciledIncompleteWal,
+}
+
+/// Results from rebuilding a checked database into a new writable history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Source durable identity before rebuild.
+    pub source: DurabilityStatus,
+    /// WAL state found by the non-mutating source check.
+    pub source_wal_status: WalCheckStatus,
+    /// New writable identity after recovery and history fork.
+    pub destination: DurabilityStatus,
+    /// Number of durable artifacts copied into the rebuild workspace.
+    pub copied_files: u32,
+    /// Number of destination pages verified after rebuild.
+    pub verified_pages: u64,
+    /// Recovery/rebuild action performed in the destination.
+    pub action: RepairAction,
 }
 
 /// An owned, read-only snapshot view backed by an independently verified
@@ -314,13 +367,45 @@ impl DB {
     /// Check an existing database without taking writer ownership or
     /// replaying, truncating, or publishing its WAL.
     pub fn check<P: AsRef<Path>>(path: P, options: Options) -> Result<CheckReport> {
-        let mut db = Self::open_with_mode(path, options, OpenMode::Check)?;
-        let verification = db.verify()?;
-        let wal_status = db.wal_check_status()?;
+        let mut db = Self::open_with_mode(path, options, OpenMode::Check)
+            .map_err(Self::map_check_open_error)?;
+        let verification = db
+            .verify_inner()
+            .map_err(VerificationFailure::into_error)?;
+        let wal_status = db
+            .wal_check_status()
+            .map_err(|error| Self::map_check_error(CheckFailureKind::Wal, error))?;
         Ok(CheckReport {
             verification,
             wal_status,
         })
+    }
+
+    fn map_check_open_error(error: Error) -> Error {
+        Self::map_check_error(CheckFailureKind::Format, error)
+    }
+
+    fn map_check_error(default_kind: CheckFailureKind, error: Error) -> Error {
+        match error {
+            Error::Check { .. } => error,
+            Error::InvalidArgument(message) => Error::Check {
+                kind: CheckFailureKind::Target,
+                message,
+            },
+            Error::Io(error) => Error::Check {
+                kind: CheckFailureKind::Io,
+                message: error.to_string(),
+            },
+            Error::NeedsRecovery(message) => Error::Check {
+                kind: CheckFailureKind::Wal,
+                message,
+            },
+            Error::Corruption(message) => Error::Check {
+                kind: default_kind,
+                message,
+            },
+            other => other,
+        }
     }
 
     fn open_with_mode<P: AsRef<Path>>(
@@ -946,28 +1031,47 @@ impl DB {
     /// check/repair tooling and pre-snapshot validation.
     pub fn verify(&mut self) -> Result<VerificationReport> {
         self.check_readable()?;
+        self.verify_inner()
+            .map_err(|failure| Error::Corruption(failure.message))
+    }
+
+    fn verify_inner(&mut self) -> std::result::Result<VerificationReport, VerificationFailure> {
         let manifest = self
             .manifest
-            .load_latest()?
-            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+            .load_latest()
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Manifest, error))?
+            .ok_or_else(|| VerificationFailure {
+                kind: CheckFailureKind::Manifest,
+                message: "database has no valid manifest".into(),
+            })?;
         if manifest.database_id != self.database_id
             || manifest.history_id != self.history_id
             || manifest.generation_id != self.generation_id
             || manifest.commit_id != self.commit_id
         {
-            return Err(Error::Corruption(
-                "manifest identity does not match the open database".into(),
-            ));
+            return Err(VerificationFailure {
+                kind: CheckFailureKind::Manifest,
+                message: "manifest identity does not match the open database".into(),
+            });
         }
 
-        let (verified_pages, data_bytes) = self.engine.verify_pages(manifest.root_page_id)?;
-        let blob_pointers = self.engine.verify_tree(manifest.root_page_id)?;
+        let (verified_pages, data_bytes) = self
+            .engine
+            .verify_pages(manifest.root_page_id)
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::DataPage, error))?;
+        let blob_pointers = self
+            .engine
+            .verify_tree(manifest.root_page_id)
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Structure, error))?;
         for pointer in blob_pointers {
             if self.blobs.read(&pointer).is_none() {
-                return Err(Error::Corruption(format!(
-                    "blob pointer target is missing: file {}, offset {}, length {}",
-                    pointer.file_id, pointer.offset, pointer.length
-                )));
+                return Err(VerificationFailure {
+                    kind: CheckFailureKind::Blob,
+                    message: format!(
+                        "blob pointer target is missing: file {}, offset {}, length {}",
+                        pointer.file_id, pointer.offset, pointer.length
+                    ),
+                });
             }
         }
 
@@ -975,21 +1079,30 @@ impl DB {
             let checkpoint_path = self
                 .path
                 .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-            let (checkpoint_pmt, checkpoint_allocator) = Self::load_meta(&checkpoint_path)?;
+            let (checkpoint_pmt, checkpoint_allocator) = Self::load_meta(&checkpoint_path)
+                .map_err(|error| {
+                    VerificationFailure::from_error(CheckFailureKind::Checkpoint, error)
+                })?;
             if checkpoint_pmt.to_bytes() != self.engine.pmt().to_bytes()
                 || checkpoint_allocator.to_bytes() != self.engine.allocator().to_bytes()
             {
-                return Err(Error::Corruption(
-                    "manifest checkpoint does not match active PMT or allocator".into(),
-                ));
+                return Err(VerificationFailure {
+                    kind: CheckFailureKind::Checkpoint,
+                    message: "manifest checkpoint does not match active PMT or allocator".into(),
+                });
             }
         }
 
         let blob_path = self.path.join(BLOB_FILE);
         let blob_bytes = if blob_path.exists() {
-            let bytes = fs::read(&blob_path)?;
+            let bytes = fs::read(&blob_path).map_err(|error| {
+                VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
+            })?;
             BlobManager::from_bytes(&bytes).ok_or_else(|| {
-                Error::Corruption("blob file failed integrity verification".into())
+                VerificationFailure {
+                    kind: CheckFailureKind::Blob,
+                    message: "blob file failed integrity verification".into(),
+                }
             })?;
             bytes.len() as u64
         } else {
@@ -998,14 +1111,17 @@ impl DB {
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_bytes = if wal_path.exists() {
-            let bytes = fs::read(&wal_path)?;
+            let bytes = fs::read(&wal_path).map_err(|error| {
+                VerificationFailure::from_error(CheckFailureKind::Wal, error.into())
+            })?;
             let (_, status) = WalManager::parse_records_with_status(&bytes);
             if status == ParseStatus::Corrupt
                 || (!self.check_only && status != ParseStatus::Complete)
             {
-                return Err(Error::Corruption(format!(
-                    "WAL integrity status is {status:?}"
-                )));
+                return Err(VerificationFailure {
+                    kind: CheckFailureKind::Wal,
+                    message: format!("WAL integrity status is {status:?}"),
+                });
             }
             bytes.len() as u64
         } else {
@@ -1259,6 +1375,82 @@ impl DB {
         result
     }
 
+    /// Rebuild a checked database into a new writable history without
+    /// mutating the source directory.
+    ///
+    /// Unlike [`DB::restore`], this operation copies the source WAL as well as
+    /// the durable generation. The destination opens normally, so committed
+    /// WAL prefixes are reconciled (and replayed when they advance the
+    /// manifest), while uncommitted or torn suffixes are reconciled there. The
+    /// source is held under a shared advisory lock when
+    /// its writer lock exists; an active writer therefore receives
+    /// [`Error::DatabaseBusy`] instead of being copied concurrently.
+    pub fn repair<P: AsRef<Path>, Q: AsRef<Path>>(
+        source: P,
+        destination: Q,
+        options: Options,
+    ) -> Result<RepairReport> {
+        let source = source.as_ref().to_path_buf();
+        let destination = destination.as_ref().to_path_buf();
+        if destination.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "repair destination already exists: {}",
+                destination.display()
+            )));
+        }
+
+        let _source_lock = Self::acquire_source_shared_lock(&source)?;
+        let source_check = DB::check(&source, options.clone())?;
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = Self::next_derived_path(&destination, "repair")?;
+        let action = match source_check.wal_status {
+            WalCheckStatus::Clean => RepairAction::NoRepair,
+            WalCheckStatus::Pending => RepairAction::DiscardedUncommittedWal,
+            WalCheckStatus::NeedsRecovery => RepairAction::ReconciledCommittedWal,
+            WalCheckStatus::Incomplete => RepairAction::ReconciledIncompleteWal,
+        };
+
+        let result = (|| {
+            fs::create_dir_all(&temporary)?;
+            let copied_files = copy_repair_artifacts(&source, &temporary)?;
+            sync_directory(&temporary)?;
+
+            let mut repaired = DB::open(&temporary, options.clone())?;
+            repaired.fork_history()?;
+            let repaired_report = repaired.verify()?;
+            if repaired_report.durability.database_id
+                != source_check.verification.durability.database_id
+            {
+                return Err(Error::Corruption(
+                    "repaired history changed the database identity".into(),
+                ));
+            }
+            let destination_status = repaired_report.durability;
+            drop(repaired);
+
+            fs::rename(&temporary, &destination)?;
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent)?;
+            }
+
+            Ok(RepairReport {
+                source: source_check.verification.durability,
+                source_wal_status: source_check.wal_status,
+                destination: destination_status,
+                copied_files,
+                verified_pages: repaired_report.verified_pages,
+                action,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        result
+    }
+
     /// Create an owned read-only snapshot handle.
     ///
     /// The handle owns a verified temporary directory and removes it on
@@ -1481,6 +1673,22 @@ impl DB {
         }
     }
 
+    fn acquire_source_shared_lock(path: &Path) -> Result<Option<File>> {
+        let lock_path = path.join(LOCK_FILE);
+        if !lock_path.is_file() {
+            return Ok(None);
+        }
+
+        let file = OpenOptions::new().read(true).open(lock_path)?;
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(Error::DatabaseBusy)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Generate a stable-enough identity for a newly created database.
     fn new_database_id(path: &Path) -> DatabaseId {
         let now = SystemTime::now()
@@ -1498,6 +1706,43 @@ impl DB {
     /// Load PMT and allocator from meta file.
     fn load_meta(path: &Path) -> Result<(PMT, PageAllocator)> {
         let data = fs::read(path)?;
+        if data.len() >= META_MAGIC.len() && data[..META_MAGIC.len()] == META_MAGIC {
+            return Self::load_versioned_meta(&data);
+        }
+        Self::load_legacy_meta(&data)
+    }
+
+    fn load_versioned_meta(data: &[u8]) -> Result<(PMT, PageAllocator)> {
+        const HEADER_SIZE: usize = META_MAGIC.len() + 4;
+        const CHECKSUM_SIZE: usize = 4;
+        if data.len() < HEADER_SIZE + CHECKSUM_SIZE {
+            return Err(Error::Corruption("meta file is truncated".into()));
+        }
+
+        let version = u32::from_le_bytes(data[META_MAGIC.len()..HEADER_SIZE].try_into().map_err(
+            |_| Error::Corruption("meta version is truncated".into()),
+        )?);
+        if version != FORMAT_VERSION {
+            return Err(Error::Corruption(format!(
+                "unsupported meta format version {version}"
+            )));
+        }
+
+        let checksum_offset = data.len() - CHECKSUM_SIZE;
+        let expected = u32::from_le_bytes(
+            data[checksum_offset..]
+                .try_into()
+                .map_err(|_| Error::Corruption("meta checksum is truncated".into()))?,
+        );
+        let actual = crc32c::crc32c(&data[..checksum_offset]);
+        if expected != actual {
+            return Err(Error::Corruption("meta checksum mismatch".into()));
+        }
+
+        Self::load_legacy_meta(&data[HEADER_SIZE..checksum_offset])
+    }
+
+    fn load_legacy_meta(data: &[u8]) -> Result<(PMT, PageAllocator)> {
 
         if data.len() < 4 {
             return Err(Error::Corruption("meta file too small".into()));
@@ -1558,11 +1803,17 @@ impl DB {
         let alloc_len = u32::try_from(alloc_bytes.len())
             .map_err(|_| Error::InvalidArgument("allocator checkpoint is too large".into()))?;
 
-        let mut buf = Vec::with_capacity(4 + pmt_bytes.len() + 4 + alloc_bytes.len());
+        let mut buf = Vec::with_capacity(
+            META_MAGIC.len() + 4 + 4 + pmt_bytes.len() + 4 + alloc_bytes.len() + 4,
+        );
+        buf.extend_from_slice(&META_MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         buf.extend_from_slice(&pmt_len.to_le_bytes());
         buf.extend_from_slice(&pmt_bytes);
         buf.extend_from_slice(&alloc_len.to_le_bytes());
         buf.extend_from_slice(&alloc_bytes);
+        let checksum = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
 
         atomic_write(path, &buf)
     }
@@ -1665,6 +1916,14 @@ impl DB {
 struct RecoverySummary {
     last_commit: Option<CommitRecord>,
     last_commit_offset: u64,
+}
+
+fn error_message(error: Error) -> String {
+    match error {
+        Error::Corruption(message) => message,
+        Error::Check { message, .. } => message,
+        other => other.to_string(),
+    }
 }
 
 fn extend_digest(current: u32, record: &WalRecord) -> u32 {
@@ -1838,6 +2097,14 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 fn copy_snapshot_artifacts(source: &Path, destination: &Path) -> Result<u32> {
+    copy_artifacts(source, destination, false)
+}
+
+fn copy_repair_artifacts(source: &Path, destination: &Path) -> Result<u32> {
+    copy_artifacts(source, destination, true)
+}
+
+fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Result<u32> {
     let mut copied_files = 0u32;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -1854,7 +2121,8 @@ fn copy_snapshot_artifacts(source: &Path, destination: &Path) -> Result<u32> {
                 || name == DATA_FILE
                 || name == BLOB_FILE
                 || name == META_FILE
-                || name.starts_with("seerdb.meta."))
+                || name.starts_with("seerdb.meta.")
+                || (include_wal && (name == WAL_FILE || name == WAL_RESERVATION_FILE)))
         {
             continue;
         }
@@ -1944,7 +2212,8 @@ mod tests {
 
         assert!(matches!(
             DB::check(&path, Options::default()),
-            Err(Error::InvalidArgument(message)) if message.contains("does not exist")
+            Err(Error::Check { kind: CheckFailureKind::Target, message })
+                if message.contains("does not exist")
         ));
         assert!(!path.exists());
     }
@@ -2236,7 +2505,7 @@ mod tests {
 
         assert!(matches!(
             DB::open(&path, Options::default()),
-            Err(Error::Corruption(message)) if message.contains("trailing")
+            Err(Error::Corruption(message)) if message.contains("checksum")
         ));
     }
 
@@ -2299,6 +2568,10 @@ mod tests {
         assert!(matches!(
             result,
             Err(Error::Corruption(message)) if message.contains("checksum mismatch")
+        ));
+        assert!(matches!(
+            DB::check(&path, Options::default()),
+            Err(Error::Check { kind: CheckFailureKind::DataPage, .. })
         ));
     }
 

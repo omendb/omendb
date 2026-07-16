@@ -1,10 +1,15 @@
 #![cfg(feature = "fault-injection")]
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{DB, Error, Options, WalCheckStatus};
+use seerdb::recovery::WalRecord;
+use seerdb::storage::format::{
+    CommitId, CommitRecord, GenerationId, Manifest, FORMAT_VERSION,
+};
+use seerdb::{CheckFailureKind, DB, Error, Options, RepairAction, WalCheckStatus};
 use seerdb::blob::BlobManager;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +41,32 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     assert_eq!(db.range(b"key-00", b"key-99").unwrap(), expected_range);
+}
+
+fn active_manifest(path: &Path) -> Manifest {
+    let bytes = fs::read(path.join("MANIFEST")).unwrap();
+    bytes
+        .chunks_exact(seerdb::storage::format::MANIFEST_SLOT_SIZE)
+        .filter_map(|slot| {
+            let slot: &[u8; seerdb::storage::format::MANIFEST_SLOT_SIZE] = slot.try_into().unwrap();
+            Manifest::from_bytes(slot).unwrap()
+        })
+        .reduce(|current, candidate| {
+            if candidate.is_newer_than(current) {
+                candidate
+            } else {
+                current
+            }
+        })
+        .expect("database has an active manifest")
+}
+
+fn wal_digest(record: &WalRecord) -> u32 {
+    let bytes = record.to_bytes();
+    let mut input = Vec::with_capacity(4 + bytes.len());
+    input.extend_from_slice(&0u32.to_le_bytes());
+    input.extend_from_slice(&bytes);
+    crc32c::crc32c(&input)
 }
 
 #[test]
@@ -457,7 +488,8 @@ fn dbnext_r0_verify_rejects_dangling_blob_pointer() {
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("blob pointer target")
+        Err(Error::Check { kind: CheckFailureKind::Blob, message })
+            if message.contains("blob pointer target")
     ));
 }
 
@@ -479,6 +511,157 @@ fn dbnext_r0_offline_check_is_read_only_and_reports_wal_state() {
     let clean = DB::check(&path, Options::default()).unwrap();
     assert_eq!(clean.wal_status, WalCheckStatus::Clean);
     assert_eq!(clean.verification.wal_bytes, 0);
+}
+
+#[test]
+fn dbnext_r0_repair_discards_uncommitted_wal_without_mutating_source() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("repair-pending-source.db");
+    let destination_path = root.path().join("repair-pending-destination.db");
+    let mut db = DB::open(&source_path, Options::default()).unwrap();
+    db.put(b"stable", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"pending", b"uncommitted").unwrap();
+    assert!(matches!(
+        DB::repair(&source_path, &destination_path, Options::default()),
+        Err(Error::DatabaseBusy)
+    ));
+    drop(db);
+
+    let source_check = DB::check(&source_path, Options::default()).unwrap();
+    assert_eq!(source_check.wal_status, WalCheckStatus::Pending);
+    let report = DB::repair(&source_path, &destination_path, Options::default()).unwrap();
+    assert_eq!(report.action, RepairAction::DiscardedUncommittedWal);
+    assert_eq!(report.source_wal_status, WalCheckStatus::Pending);
+    assert!(source_path.join("seerdb.wal").is_file());
+    assert_eq!(
+        DB::check(&source_path, Options::default())
+            .unwrap()
+            .wal_status,
+        WalCheckStatus::Pending
+    );
+
+    let repaired = DB::open(&destination_path, Options::default()).unwrap();
+    assert_eq!(repaired.get(b"stable").unwrap(), Some(b"value-1".to_vec()));
+    assert_eq!(repaired.get(b"pending").unwrap(), None);
+    assert_ne!(
+        repaired.durability_status().history_id,
+        report.source.history_id
+    );
+}
+
+#[test]
+fn dbnext_r0_repair_replays_committed_wal_into_new_location() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("repair-committed-source.db");
+    let destination_path = root.path().join("repair-committed-destination.db");
+    {
+        let mut db = DB::open(&source_path, Options::default()).unwrap();
+        db.put(b"stable", b"value-1").unwrap();
+        db.flush().unwrap();
+    }
+
+    let current = active_manifest(&source_path);
+    let mutation = WalRecord::put(b"replayed", b"value-2");
+    let commit = CommitRecord {
+        commit_id: CommitId::new(current.commit_id.get() + 1),
+        generation_id: GenerationId::new(current.generation_id.get() + 1),
+        root_page_id: current.root_page_id,
+        mutation_count: 1,
+        digest: wal_digest(&mutation),
+    };
+    let mut wal = mutation.to_bytes();
+    wal.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+    fs::write(source_path.join("seerdb.wal"), wal).unwrap();
+
+    let source_check = DB::check(&source_path, Options::default()).unwrap();
+    assert_eq!(source_check.wal_status, WalCheckStatus::NeedsRecovery);
+    let report = DB::repair(&source_path, &destination_path, Options::default()).unwrap();
+    assert_eq!(report.action, RepairAction::ReconciledCommittedWal);
+    assert_eq!(report.source_wal_status, WalCheckStatus::NeedsRecovery);
+    assert!(source_path.join("seerdb.wal").is_file());
+
+    let repaired = DB::open(&destination_path, Options::default()).unwrap();
+    assert_eq!(repaired.get(b"stable").unwrap(), Some(b"value-1".to_vec()));
+    assert_eq!(repaired.get(b"replayed").unwrap(), Some(b"value-2".to_vec()));
+    assert_eq!(
+        repaired.durability_status().generation_id.get(),
+        current.generation_id.get() + 1
+    );
+    assert_ne!(
+        repaired.durability_status().history_id,
+        report.source.history_id
+    );
+}
+
+#[test]
+fn dbnext_r0_repair_reconciles_torn_wal_in_destination_only() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("repair-torn-source.db");
+    let destination_path = root.path().join("repair-torn-destination.db");
+    {
+        let mut db = DB::open(&source_path, Options::default()).unwrap();
+        db.put(b"stable", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"pending", b"uncommitted").unwrap();
+    }
+    let wal_path = source_path.join("seerdb.wal");
+    let before = fs::read(&wal_path).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap()
+        .write_all(&[0xA5, 0x5A])
+        .unwrap();
+
+    let source_check = DB::check(&source_path, Options::default()).unwrap();
+    assert_eq!(source_check.wal_status, WalCheckStatus::Incomplete);
+    let report = DB::repair(&source_path, &destination_path, Options::default()).unwrap();
+    assert_eq!(report.action, RepairAction::ReconciledIncompleteWal);
+    assert_eq!(report.source_wal_status, WalCheckStatus::Incomplete);
+    assert_ne!(before, fs::read(&wal_path).unwrap());
+
+    let repaired = DB::open(&destination_path, Options::default()).unwrap();
+    assert_eq!(repaired.get(b"stable").unwrap(), Some(b"value-1".to_vec()));
+    assert_eq!(repaired.get(b"pending").unwrap(), None);
+}
+
+#[test]
+fn dbnext_r0_unrecoverable_repair_refuses_truncated_data() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("repair-truncated-source.db");
+    let destination_path = root.path().join("repair-truncated-destination.db");
+    {
+        let mut db = DB::open(&source_path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let data_path = source_path.join("seerdb.data");
+    let original_length = fs::metadata(&data_path).unwrap().len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&data_path)
+        .unwrap()
+        .set_len(original_length - 1)
+        .unwrap();
+
+    assert!(matches!(
+        DB::check(&source_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::DataPage,
+            ..
+        })
+    ));
+    assert!(matches!(
+        DB::repair(&source_path, &destination_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::DataPage,
+            ..
+        })
+    ));
+    assert!(!destination_path.exists());
+    assert_eq!(fs::metadata(&data_path).unwrap().len(), original_length - 1);
 }
 
 #[test]
@@ -523,8 +706,56 @@ fn dbnext_r0_rejects_malformed_checkpoint_container() {
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("trailing")
+        Err(Error::Corruption(message)) if message.contains("checksum")
     ));
+}
+
+#[test]
+fn dbnext_r0_rejects_future_meta_version() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("future-meta.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let checkpoint_path = path.join("seerdb.meta.1");
+    let mut checkpoint = fs::read(&checkpoint_path).unwrap();
+    checkpoint[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+    let checksum_offset = checkpoint.len() - 4;
+    let checksum = crc32c::crc32c(&checkpoint[..checksum_offset]);
+    checkpoint[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(&checkpoint_path, checkpoint).unwrap();
+
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("unsupported meta format version")
+    ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check { kind: CheckFailureKind::Format, .. })
+    ));
+}
+
+#[test]
+fn dbnext_r0_accepts_legacy_meta_checkpoint() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("legacy-meta.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let checkpoint_path = path.join("seerdb.meta.1");
+    let checkpoint = fs::read(&checkpoint_path).unwrap();
+    let legacy = checkpoint[12..checkpoint.len() - 4].to_vec();
+    fs::write(&checkpoint_path, legacy).unwrap();
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+    assert!(reopened.verify().is_ok());
 }
 
 #[test]

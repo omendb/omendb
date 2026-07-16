@@ -3,6 +3,38 @@
 use crate::btree::{BTreeError, InsertError, SplitError};
 use crate::buffer::BufferError;
 
+/// Category of a failure reported by the non-mutating integrity checker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CheckFailureKind {
+    /// The requested check target is missing or not a database directory.
+    #[error("target")]
+    Target,
+    /// A persisted format or compatibility rule was rejected.
+    #[error("format")]
+    Format,
+    /// The manifest or its selected identity is invalid.
+    #[error("manifest")]
+    Manifest,
+    /// The selected PMT/allocator checkpoint is invalid or mismatched.
+    #[error("checkpoint")]
+    Checkpoint,
+    /// A physical data page is missing, malformed, or has a bad checksum.
+    #[error("data page")]
+    DataPage,
+    /// The logical B-tree graph violates reachability or routing invariants.
+    #[error("tree structure")]
+    Structure,
+    /// Blob metadata or a referenced blob target is invalid.
+    #[error("blob")]
+    Blob,
+    /// The WAL is malformed or has an invalid recovery frontier.
+    #[error("wal")]
+    Wal,
+    /// The checker could not read a required artifact.
+    #[error("io")]
+    Io,
+}
+
 /// Errors that can occur during database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -42,6 +74,15 @@ pub enum Error {
     /// Corruption detected (checksum mismatch, invalid data).
     #[error("corruption: {0}")]
     Corruption(String),
+
+    /// A non-mutating integrity check failed with an actionable category.
+    #[error("integrity check failed ({kind}): {message}")]
+    Check {
+        /// Failure category for machine-readable handling.
+        kind: CheckFailureKind,
+        /// Human-readable detail retained from the failing boundary.
+        message: String,
+    },
 
     /// Database is corrupted and needs recovery.
     #[error("database needs recovery: {0}")]
