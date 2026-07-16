@@ -291,6 +291,21 @@ fn dbnext_r0_atomic_batch_rejects_pending_generation_without_publishing() {
 }
 
 #[test]
+fn dbnext_r0_checkpoint_is_verified_and_idempotent_when_clean() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("checkpoint-barrier.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"checkpointed", b"value").unwrap();
+
+    let first = db.checkpoint().unwrap();
+    assert_eq!(first.durability.commit_id.get(), 1);
+    assert_eq!(first.wal_bytes, 0);
+    let second = db.checkpoint().unwrap();
+    assert_eq!(second, first);
+    assert_eq!(db.get(b"checkpointed").unwrap(), Some(b"value".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_rejects_corrupt_manifest() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt.db");

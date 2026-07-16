@@ -2,9 +2,9 @@
 //!
 //! This is deliberately a narrow adapter proof, not a replacement for the
 //! DBNext transaction/index layer. Each JSONL commit is applied as one SeerDB
-//! pending mutation batch and closed with one `flush`, which is the current
-//! SeerDB durable publication boundary. The result is suitable for the
-//! DBNext workload tooling to compare with its reference digest.
+//! atomic mutation batch and closed at the explicit SeerDB checkpoint barrier.
+//! The result is suitable for the DBNext workload tooling to compare with its
+//! reference digest.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -294,8 +294,7 @@ fn apply_checkpoint(db: &mut DB, state: &mut R0State, event: &Map<String, Value>
     if name.is_empty() {
         return Err(invalid("checkpoint event.name must not be empty"));
     }
-    db.flush()?;
-    let report = db.verify()?;
+    let report = db.checkpoint()?;
     let durability = db.durability_status();
     if durability.commit_id.get() != state.commit_id || report.wal_bytes != 0 {
         return Err(invalid(

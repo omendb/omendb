@@ -1310,6 +1310,17 @@ impl DB {
         Ok(())
     }
 
+    /// Establish and verify a named durable checkpoint barrier.
+    ///
+    /// A pending WAL generation is published first. When the database is
+    /// already clean, this is idempotent: it verifies the existing manifest
+    /// and does not invent an extra commit or generation.
+    pub fn checkpoint(&mut self) -> Result<VerificationReport> {
+        self.check_writable()?;
+        self.flush()?;
+        self.verify()
+    }
+
     /// Close the database (flush and sync).
     pub fn close(&mut self) -> Result<()> {
         if self.is_open {
