@@ -357,6 +357,18 @@ impl ManifestStore {
         Ok(Self { file })
     }
 
+    /// Open an existing manifest without write permissions.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let length = file.metadata()?.len();
+        if length != MANIFEST_FILE_SIZE {
+            return Err(Error::Corruption(format!(
+                "manifest has invalid length {length}"
+            )));
+        }
+        Ok(Self { file })
+    }
+
     /// Load the newest valid manifest generation.
     pub fn load_latest(&mut self) -> Result<Option<Manifest>> {
         let mut newest = None;

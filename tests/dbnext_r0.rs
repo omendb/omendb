@@ -1,7 +1,7 @@
 #![cfg(feature = "fault-injection")]
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{DB, Error, Options};
+use seerdb::{DB, Error, Options, WalCheckStatus};
 use seerdb::blob::BlobManager;
 use std::collections::BTreeMap;
 use std::fs;
@@ -455,6 +455,26 @@ fn dbnext_r0_verify_rejects_dangling_blob_pointer() {
         reopened.verify(),
         Err(Error::Corruption(message)) if message.contains("blob pointer target")
     ));
+}
+
+#[test]
+fn dbnext_r0_offline_check_is_read_only_and_reports_wal_state() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("offline-check.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"pending", b"value").unwrap();
+
+    // The writer remains open. A real offline check must not contend on the
+    // writer lock or reconcile the WAL in the source directory.
+    let pending = DB::check(&path, Options::default()).unwrap();
+    assert_eq!(pending.wal_status, WalCheckStatus::Pending);
+    assert!(path.join("seerdb.wal").is_file());
+    assert_eq!(db.get(b"pending").unwrap(), Some(b"value".to_vec()));
+
+    db.flush().unwrap();
+    let clean = DB::check(&path, Options::default()).unwrap();
+    assert_eq!(clean.wal_status, WalCheckStatus::Clean);
+    assert_eq!(clean.verification.wal_bytes, 0);
 }
 
 #[test]

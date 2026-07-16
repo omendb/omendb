@@ -64,10 +64,26 @@ pub struct Device {
 impl Device {
     /// Open a device file.
     pub fn open<P: AsRef<Path>>(path: P, options: &DeviceOptions) -> io::Result<Self> {
-        let mut open_options = OpenOptions::new();
-        open_options.read(true).write(true);
+        Self::open_with_mode(path, options, true)
+    }
 
-        if options.create {
+    /// Open an existing device without write permissions.
+    pub fn open_read_only<P: AsRef<Path>>(
+        path: P,
+        options: &DeviceOptions,
+    ) -> io::Result<Self> {
+        Self::open_with_mode(path, options, false)
+    }
+
+    fn open_with_mode<P: AsRef<Path>>(
+        path: P,
+        options: &DeviceOptions,
+        writable: bool,
+    ) -> io::Result<Self> {
+        let mut open_options = OpenOptions::new();
+        open_options.read(true).write(writable);
+
+        if options.create && writable {
             open_options.create(true);
         }
 

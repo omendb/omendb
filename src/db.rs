@@ -50,6 +50,12 @@ const WAL_COMMIT_RECORD_BYTES: u64 =
     (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Normal,
+    Check,
+}
+
 /// Blob GC statistics.
 pub struct BlobStats {
     /// Number of files needing garbage collection.
@@ -92,6 +98,29 @@ pub struct VerificationReport {
     pub wal_bytes: u64,
     /// Physical page slots currently safe for reuse.
     pub reclaimable_pages: u64,
+}
+
+/// WAL state observed by a non-mutating offline check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalCheckStatus {
+    /// No WAL records are present.
+    Clean,
+    /// Complete mutation records are present without a commit envelope.
+    Pending,
+    /// A commit envelope is present and recovery may need to advance the
+    /// authoritative manifest.
+    NeedsRecovery,
+    /// The final WAL record is torn or the reserved suffix is incomplete.
+    Incomplete,
+}
+
+/// Results from a non-mutating offline integrity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckReport {
+    /// Active-generation verification results.
+    pub verification: VerificationReport,
+    /// WAL state that the writable open path would reconcile.
+    pub wal_status: WalCheckStatus,
 }
 
 /// Results from creating and independently verifying a snapshot directory.
@@ -268,6 +297,8 @@ pub struct DB {
     write_fenced: bool,
     /// Whether this handle opened an immutable archive/snapshot.
     read_only: bool,
+    /// Whether this handle was opened only for non-mutating checks.
+    check_only: bool,
     /// Advisory writer ownership for the database directory.
     lock_file: Option<File>,
     /// Number of retryable WAL admission rejections for this handle.
@@ -277,10 +308,37 @@ pub struct DB {
 impl DB {
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
+        Self::open_with_mode(path, options, OpenMode::Normal)
+    }
+
+    /// Check an existing database without taking writer ownership or
+    /// replaying, truncating, or publishing its WAL.
+    pub fn check<P: AsRef<Path>>(path: P, options: Options) -> Result<CheckReport> {
+        let mut db = Self::open_with_mode(path, options, OpenMode::Check)?;
+        let verification = db.verify()?;
+        let wal_status = db.wal_check_status()?;
+        Ok(CheckReport {
+            verification,
+            wal_status,
+        })
+    }
+
+    fn open_with_mode<P: AsRef<Path>>(
+        path: P,
+        options: Options,
+        mode: OpenMode,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let check_only = mode == OpenMode::Check;
 
         // Create directory if it doesn't exist.
         if !path.exists() {
+            if check_only {
+                return Err(Error::InvalidArgument(format!(
+                    "check path does not exist: {}",
+                    path.display()
+                )));
+            }
             fs::create_dir_all(&path)?;
         }
 
@@ -288,8 +346,14 @@ impl DB {
         let wal_path = path.join(WAL_FILE);
         let meta_path = path.join(META_FILE);
         let manifest_path = path.join(MANIFEST_FILE);
-        let read_only = path.join(ARCHIVE_MARKER_FILE).is_file();
-        if read_only {
+        let archive = path.join(ARCHIVE_MARKER_FILE).is_file();
+        let read_only = check_only || archive;
+        if check_only && (!manifest_path.is_file() || !data_path.is_file()) {
+            return Err(Error::Corruption(
+                "check target is missing required manifest or data artifacts".into(),
+            ));
+        }
+        if archive && !check_only {
             if !manifest_path.is_file() || !data_path.is_file() {
                 return Err(Error::Corruption(
                     "read-only archive is missing required artifacts".into(),
@@ -307,8 +371,17 @@ impl DB {
             Some(Self::acquire_writer_lock(&path.join(LOCK_FILE))?)
         };
 
-        let mut manifest = ManifestStore::open(&manifest_path)?;
+        let mut manifest = if check_only {
+            ManifestStore::open_read_only(&manifest_path)?
+        } else {
+            ManifestStore::open(&manifest_path)?
+        };
         let current_manifest = manifest.load_latest()?;
+        if check_only && current_manifest.is_none() {
+            return Err(Error::Corruption(
+                "check target has no valid manifest generation".into(),
+            ));
+        }
         let (database_id, history_id, generation_id, commit_id) =
             if let Some(current) = current_manifest {
                 if current.page_size as usize != PAGE_SIZE {
@@ -338,7 +411,11 @@ impl DB {
             sync_writes: options.sync_writes,
             create: !read_only,
         };
-        let device = Device::open(&data_path, &device_opts)?;
+        let device = if check_only {
+            Device::open_read_only(&data_path, &device_opts)?
+        } else {
+            Device::open(&data_path, &device_opts)?
+        };
 
         // Create buffer manager.
         let buffer = BufferManager::new(options.buffer_pool_size);
@@ -402,11 +479,11 @@ impl DB {
         // WAL replay mutates the logical tree, so materialize a lazily opened
         // generation before applying a committed recovery prefix. A clean
         // reopen remains lazy and serves reads directly through the PMT.
-        if wal_path.exists() {
+        if wal_path.exists() && !check_only {
             engine.ensure_materialized()?;
         }
 
-        let recovery = if wal_path.exists() {
+        let recovery = if wal_path.exists() && !check_only {
             Some(Self::recover_from_wal(
                 &wal_path,
                 current_manifest,
@@ -435,11 +512,12 @@ impl DB {
             is_open: true,
             write_fenced: false,
             read_only,
+            check_only,
             lock_file,
             wal_admission_failures: 0,
         };
 
-        if current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
+        if !check_only && current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
             db.manifest.publish(Manifest {
                 database_id: db.database_id,
                 history_id: db.history_id,
@@ -922,7 +1000,9 @@ impl DB {
         let wal_bytes = if wal_path.exists() {
             let bytes = fs::read(&wal_path)?;
             let (_, status) = WalManager::parse_records_with_status(&bytes);
-            if status != ParseStatus::Complete {
+            if status == ParseStatus::Corrupt
+                || (!self.check_only && status != ParseStatus::Complete)
+            {
                 return Err(Error::Corruption(format!(
                     "WAL integrity status is {status:?}"
                 )));
@@ -940,6 +1020,108 @@ impl DB {
             wal_bytes,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
         })
+    }
+
+    fn wal_check_status(&mut self) -> Result<WalCheckStatus> {
+        let wal_path = self.path.join(WAL_FILE);
+        if !wal_path.exists() {
+            return Ok(WalCheckStatus::Clean);
+        }
+
+        let bytes = fs::read(wal_path)?;
+        if bytes.is_empty() {
+            return Ok(WalCheckStatus::Clean);
+        }
+
+        let (records, status) = WalManager::parse_records_with_status(&bytes);
+        if status == ParseStatus::Corrupt {
+            return Err(Error::Corruption(
+                "offline check found a corrupt WAL record".into(),
+            ));
+        }
+
+        let current_manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        let mut pending = Vec::new();
+        let mut saw_commit = false;
+        for record in &records {
+            match record.record_type {
+                RecordType::Put => {
+                    decode_put_payload(false, &record.payload)?;
+                    pending.push(record);
+                }
+                RecordType::PutV2 => {
+                    decode_put_payload(true, &record.payload)?;
+                    pending.push(record);
+                }
+                RecordType::Delete => {
+                    decode_delete_payload(false, &record.payload)?;
+                    pending.push(record);
+                }
+                RecordType::DeleteV2 => {
+                    decode_delete_payload(true, &record.payload)?;
+                    pending.push(record);
+                }
+                RecordType::Commit => {
+                    let commit = record
+                        .commit_record()
+                        .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+                    if commit.mutation_count != pending.len() as u64
+                        || commit.digest != digest_records(&pending)
+                    {
+                        return Err(Error::Corruption(
+                            "WAL commit does not match its mutation prefix".into(),
+                        ));
+                    }
+
+                    match commit
+                        .generation_id
+                        .get()
+                        .cmp(&current_manifest.generation_id.get())
+                    {
+                        std::cmp::Ordering::Less
+                            if commit.commit_id > current_manifest.commit_id =>
+                        {
+                            return Err(Error::Corruption(
+                                "WAL commit frontier is inconsistent with manifest".into(),
+                            ));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if commit.commit_id != current_manifest.commit_id
+                                || commit.root_page_id != current_manifest.root_page_id
+                                || commit.mutation_count != current_manifest.mutation_count
+                                || commit.digest != current_manifest.digest
+                            {
+                                return Err(Error::Corruption(
+                                    "WAL commit disagrees with authoritative manifest".into(),
+                                ));
+                            }
+                        }
+                        std::cmp::Ordering::Greater
+                            if commit.commit_id <= current_manifest.commit_id =>
+                        {
+                            return Err(Error::Corruption(
+                                "WAL commit frontier is inconsistent with manifest".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    saw_commit = true;
+                    pending.clear();
+                }
+                _ => {}
+            }
+        }
+
+        match status {
+            ParseStatus::Incomplete => Ok(WalCheckStatus::Incomplete),
+            ParseStatus::Complete if records.is_empty() => Ok(WalCheckStatus::Clean),
+            ParseStatus::Complete if saw_commit => Ok(WalCheckStatus::NeedsRecovery),
+            ParseStatus::Complete => Ok(WalCheckStatus::Pending),
+            ParseStatus::Corrupt => unreachable!("corrupt WAL status returned above"),
+        }
     }
 
     /// Flush and create an atomically published, independently verified
@@ -1731,6 +1913,40 @@ mod tests {
         ));
         drop(db);
         assert!(DB::open(&path, Options::default()).is_ok());
+    }
+
+    #[test]
+    fn test_db_check_is_non_mutating_and_does_not_take_writer_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("check.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"pending", b"value").unwrap();
+
+        let pending = DB::check(&path, Options::default()).unwrap();
+        assert_eq!(pending.wal_status, WalCheckStatus::Pending);
+        assert_eq!(
+            pending.verification.wal_bytes,
+            fs::metadata(path.join(WAL_FILE)).unwrap().len()
+        );
+        assert_eq!(db.get(b"pending").unwrap(), Some(b"value".to_vec()));
+
+        db.flush().unwrap();
+        let clean = DB::check(&path, Options::default()).unwrap();
+        assert_eq!(clean.wal_status, WalCheckStatus::Clean);
+        assert_eq!(clean.verification.wal_bytes, 0);
+        db.close().unwrap();
+    }
+
+    #[test]
+    fn test_db_check_does_not_create_missing_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+
+        assert!(matches!(
+            DB::check(&path, Options::default()),
+            Err(Error::InvalidArgument(message)) if message.contains("does not exist")
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
