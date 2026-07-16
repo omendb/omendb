@@ -45,5 +45,5 @@ pub mod space;
 pub mod storage;
 
 // Re-export main types at crate root.
-pub use db::{DB, Options};
+pub use db::{DB, DurabilityStatus, Options};
 pub use error::{Error, Result};

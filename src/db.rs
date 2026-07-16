@@ -51,6 +51,23 @@ pub struct BlobStats {
     pub total_deleted: usize,
 }
 
+/// Durable identity and publication state exposed for recovery diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurabilityStatus {
+    /// Stable database identity.
+    pub database_id: DatabaseId,
+    /// Stable logical history identity.
+    pub history_id: HistoryId,
+    /// Latest manifest generation known to this handle.
+    pub generation_id: GenerationId,
+    /// Latest durable commit known to this handle.
+    pub commit_id: CommitId,
+    /// Mutations currently journaled but not yet published in a generation.
+    pub pending_mutations: u64,
+    /// Whether this writer must be reopened before accepting more writes.
+    pub write_fenced: bool,
+}
+
 /// A seerdb database instance.
 ///
 /// Provides key-value storage with:
@@ -483,6 +500,18 @@ impl DB {
         }
     }
 
+    /// Return durable identity and publication state for diagnostics/recovery.
+    pub fn durability_status(&self) -> DurabilityStatus {
+        DurabilityStatus {
+            database_id: self.database_id,
+            history_id: self.history_id,
+            generation_id: self.generation_id,
+            commit_id: self.commit_id,
+            pending_mutations: self.pending_mutations,
+            write_fenced: self.write_fenced,
+        }
+    }
+
     /// Begin a new transaction.
     ///
     /// Returns a transaction handle that can be used to commit or abort.
@@ -847,8 +876,16 @@ mod tests {
         // Write data and close.
         {
             let mut db = DB::open(&path, Options::default()).unwrap();
+            let initial = db.durability_status();
+            assert_eq!(initial.generation_id.get(), 0);
+            assert_eq!(initial.commit_id.get(), 0);
             db.put(b"key1", b"value1").unwrap();
+            assert_eq!(db.durability_status().pending_mutations, 1);
             db.flush().unwrap();
+            let published = db.durability_status();
+            assert_eq!(published.generation_id.get(), 1);
+            assert_eq!(published.commit_id.get(), 1);
+            assert_eq!(published.pending_mutations, 0);
             db.put(b"key2", b"value2").unwrap();
             db.put(b"key3", b"value3").unwrap();
             db.flush().unwrap();
@@ -858,6 +895,10 @@ mod tests {
         // Reopen and verify data persisted.
         {
             let db = DB::open(&path, Options::default()).unwrap();
+            let status = db.durability_status();
+            assert_eq!(status.generation_id.get(), 2);
+            assert_eq!(status.commit_id.get(), 2);
+            assert_eq!(status.pending_mutations, 0);
             assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
             assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
             assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
