@@ -690,14 +690,21 @@ impl DB {
         // Mutate memory first, then make the successful mutation durable in
         // the WAL. No page is written before the WAL reaches disk, and an
         // operation that fails never enters a committed WAL batch.
+        let previous_blob = match self.engine.lookup(key)? {
+            LookupResult::Blob(pointer) => Some(pointer),
+            _ => None,
+        };
         if self.blobs.should_separate(value.len()) {
-            if let LookupResult::Blob(pointer) = self.engine.lookup(key)? {
-                self.blobs.mark_deleted(&pointer);
+            let pointer = self.blobs.append(key, value.to_vec());
+            if let Err(error) = self.engine.btree_mut().upsert_blob(key, pointer) {
+                let _ = self.blobs.rollback_append(&pointer);
+                return Err(error.into());
             }
-            let ptr = self.blobs.append(key, value.to_vec());
-            self.engine.btree_mut().upsert_blob(key, ptr)?;
         } else {
             self.engine.btree_mut().upsert(key, value)?;
+        }
+        if let Some(pointer) = previous_blob {
+            self.blobs.mark_deleted(&pointer);
         }
 
         self.journal_mutation(record)?;
@@ -739,11 +746,14 @@ impl DB {
         self.admit_wal_record(&record)?;
         self.engine.prepare_mutation(key)?;
 
-        if let LookupResult::Blob(ptr) = self.engine.lookup(key)? {
-            self.blobs.mark_deleted(&ptr);
-        }
-
+        let previous_blob = match self.engine.lookup(key)? {
+            LookupResult::Blob(pointer) => Some(pointer),
+            _ => None,
+        };
         let found = self.engine.btree_mut().delete(key)?;
+        if found && let Some(pointer) = previous_blob {
+            self.blobs.mark_deleted(&pointer);
+        }
         self.journal_mutation(record)?;
         Ok(found)
     }

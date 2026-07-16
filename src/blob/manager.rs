@@ -94,6 +94,23 @@ impl BlobManager {
         }
     }
 
+    /// Roll back a blob append whose B-tree pointer was not installed.
+    pub(crate) fn rollback_append(&mut self, pointer: &BlobPointer) -> bool {
+        let Some(file) = self.files.last_mut() else {
+            return false;
+        };
+        if file.file_id() != pointer.file_id
+            || !file.rollback_append(pointer.offset, pointer.length)
+        {
+            return false;
+        }
+
+        if file.record_count() == 0 {
+            self.files.pop();
+        }
+        true
+    }
+
     /// Read a value from a blob file.
     pub fn read(&self, ptr: &BlobPointer) -> Option<&[u8]> {
         self.files
@@ -455,6 +472,25 @@ mod tests {
         assert!(bm.mark_deleted(&ptr));
 
         assert_eq!(bm.gc(), 1);
+        assert_eq!(bm.file_count(), 0);
+    }
+
+    #[test]
+    fn test_blob_rollback_only_removes_unpublished_tail() {
+        let mut bm = BlobManager::new();
+        let first = bm.append(b"first", vec![1; 1500]);
+        let second = bm.append(b"second", vec![2; 1600]);
+
+        assert!(!bm.rollback_append(&first));
+        assert!(bm.rollback_append(&second));
+        assert_eq!(
+            bm.read(&first).map(|value| (value.len(), value[0])),
+            Some((1500, 1))
+        );
+        assert!(bm.read(&second).is_none());
+        assert!(!bm.rollback_append(&second));
+
+        assert!(bm.rollback_append(&first));
         assert_eq!(bm.file_count(), 0);
     }
 

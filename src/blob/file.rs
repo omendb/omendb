@@ -152,6 +152,31 @@ impl BlobFile {
         (current_offset, length)
     }
 
+    /// Roll back the most recent append before the record is published.
+    ///
+    /// Blob appends are staged in memory until the owning B-tree mutation
+    /// succeeds. Restricting rollback to the tail preserves append ordering
+    /// and avoids exposing a partially applied blob mutation to later writes.
+    pub(crate) fn rollback_append(&mut self, offset: u64, length: u32) -> bool {
+        let Some(record) = self.records.last() else {
+            return false;
+        };
+        let expected_offset = self
+            .offset
+            .saturating_sub(record.serialized_size() as u64);
+        if expected_offset != offset
+            || record.value.len() != length as usize
+            || self.deleted_offsets.contains(&offset)
+        {
+            return false;
+        }
+
+        self.records.pop();
+        self.offset = offset;
+        self.valid_count = self.valid_count.saturating_sub(1);
+        true
+    }
+
     /// Read a value at the given offset and length.
     pub fn read(&self, offset: u64, length: u32) -> Option<&[u8]> {
         // Find the record that contains this offset.

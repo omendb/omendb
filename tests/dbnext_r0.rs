@@ -456,6 +456,38 @@ fn dbnext_r0_blob_reclamation_survives_reopen() {
 }
 
 #[test]
+fn dbnext_r0_blob_to_inline_retires_old_value() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-inline-replacement.db");
+    let large = vec![0xC3; 2_048];
+
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", &large).unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"inline-value").unwrap();
+        db.flush().unwrap();
+
+        let stats = db.blob_stats();
+        assert_eq!(stats.total_valid, 0);
+        assert_eq!(stats.total_deleted, 1);
+        assert_eq!(db.get(b"key").unwrap(), Some(b"inline-value".to_vec()));
+        assert_eq!(db.gc().unwrap(), 1);
+        let stats = db.blob_stats();
+        assert_eq!(stats.files_needing_gc, 0);
+        assert_eq!(stats.total_valid, 0);
+        assert_eq!(stats.total_deleted, 0);
+    }
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"inline-value".to_vec()));
+    let stats = reopened.blob_stats();
+    assert_eq!(stats.files_needing_gc, 0);
+    assert_eq!(stats.total_valid, 0);
+    assert_eq!(stats.total_deleted, 0);
+}
+
+#[test]
 fn dbnext_r0_newer_blob_image_cannot_reclaim_manifest_value() {
     let root = tempdir().unwrap();
     let path = root.path().join("blob-publication-fence.db");
