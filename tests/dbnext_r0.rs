@@ -1,12 +1,12 @@
 #![cfg(feature = "fault-injection")]
 #![allow(clippy::disallowed_methods)]
 
+use seerdb::blob::BlobManager;
 use seerdb::recovery::WalRecord;
 use seerdb::storage::format::{
     CommitId, CommitRecord, GenerationId, Manifest, FORMAT_VERSION,
 };
-use seerdb::{CheckFailureKind, DB, Error, Options, RepairAction, WalCheckStatus};
-use seerdb::blob::BlobManager;
+use seerdb::{BatchMutation, CheckFailureKind, DB, Error, Options, RepairAction, WalCheckStatus};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -169,6 +169,125 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
         restored.durability_status().history_id,
         restore_report.destination.history_id
     );
+}
+
+#[test]
+fn dbnext_r0_atomic_batch_commit_reopens_inline_and_blob_values() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("atomic-batch.db");
+    let large = vec![0x4Bu8; 2_048];
+    let mutations = vec![
+        BatchMutation::Put {
+            key: b"tenant/1/inline".to_vec(),
+            value: b"alpha".to_vec(),
+        },
+        BatchMutation::Put {
+            key: b"tenant/1/blob".to_vec(),
+            value: large.clone(),
+        },
+        BatchMutation::Put {
+            key: b"tenant/2/inline".to_vec(),
+            value: b"beta".to_vec(),
+        },
+    ];
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let status = db.commit_batch(&mutations).unwrap();
+    assert_eq!(status.commit_id.get(), 1);
+    assert_eq!(status.pending_mutations, 0);
+    assert!(!status.write_fenced);
+    assert_eq!(db.get(b"tenant/1/inline").unwrap(), Some(b"alpha".to_vec()));
+    assert_eq!(db.get(b"tenant/1/blob").unwrap(), Some(large.clone()));
+    assert_eq!(db.get(b"tenant/2/inline").unwrap(), Some(b"beta".to_vec()));
+    assert_eq!(db.blob_stats().total_valid, 1);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.durability_status().commit_id.get(), 1);
+    assert_eq!(
+        reopened.get(b"tenant/1/inline").unwrap(),
+        Some(b"alpha".to_vec())
+    );
+    assert_eq!(reopened.get(b"tenant/1/blob").unwrap(), Some(large));
+    assert_eq!(
+        reopened.get(b"tenant/2/inline").unwrap(),
+        Some(b"beta".to_vec())
+    );
+    assert_eq!(reopened.verify().unwrap().wal_bytes, 0);
+}
+
+#[test]
+fn dbnext_r0_atomic_batch_wal_failure_drops_the_whole_candidate() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("atomic-batch-wal-fault.db");
+    let mutations = vec![
+        BatchMutation::Put {
+            key: b"batch/a".to_vec(),
+            value: b"a".to_vec(),
+        },
+        BatchMutation::Put {
+            key: b"batch/b".to_vec(),
+            value: b"b".to_vec(),
+        },
+    ];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.inject_wal_after_write_failure();
+    assert!(matches!(db.commit_batch(&mutations), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"batch/a").unwrap(), None);
+    assert_eq!(reopened.get(b"batch/b").unwrap(), None);
+    assert_eq!(reopened.durability_status().commit_id.get(), 0);
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn dbnext_r0_atomic_batch_backpressure_is_pre_mutation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("atomic-batch-backpressure.db");
+    let mut db = DB::open(
+        &path,
+        Options {
+            max_wal_bytes: 1,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mutations = [BatchMutation::Put {
+        key: b"batch/key".to_vec(),
+        value: b"value".to_vec(),
+    }];
+
+    assert!(matches!(
+        db.commit_batch(&mutations),
+        Err(Error::Backpressure { .. })
+    ));
+    assert_eq!(db.durability_status().pending_mutations, 0);
+    assert!(!db.durability_status().write_fenced);
+    assert_eq!(db.get(b"batch/key").unwrap(), None);
+}
+
+#[test]
+fn dbnext_r0_atomic_batch_rejects_pending_generation_without_publishing() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("atomic-batch-pending.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"pending", b"value").unwrap();
+    let before = db.durability_status();
+
+    let mutations = [BatchMutation::Put {
+        key: b"batch/key".to_vec(),
+        value: b"batch-value".to_vec(),
+    }];
+    assert!(matches!(
+        db.commit_batch(&mutations),
+        Err(Error::InvalidArgument(message)) if message.contains("clean pending generation")
+    ));
+    assert_eq!(db.durability_status(), before);
+    assert_eq!(db.get(b"pending").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(db.get(b"batch/key").unwrap(), None);
 }
 
 #[test]

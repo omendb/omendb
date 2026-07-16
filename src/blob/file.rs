@@ -80,6 +80,7 @@ impl BlobRecord {
 ///
 /// Blob files store large values that don't fit in B-tree nodes.
 /// Records are appended sequentially and never modified in place.
+#[derive(Clone)]
 pub struct BlobFile {
     /// File ID (unique identifier).
     file_id: u32,

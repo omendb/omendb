@@ -98,6 +98,29 @@ pub struct BlobStats {
     pub total_deleted: usize,
 }
 
+/// One mutation in an atomic multi-record commit.
+///
+/// The batch API is intentionally byte-oriented so general Rust consumers can
+/// define their own typed/indexed adapter above SeerDB. All mutations are
+/// validated against one candidate state before any WAL bytes or in-memory
+/// tree/blob state are changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchMutation {
+    /// Insert or replace an inline/blob-separated value.
+    Put {
+        /// User key.
+        key: Vec<u8>,
+        /// User value.
+        value: Vec<u8>,
+    },
+    /// Delete a key; deleting an absent key is a durable no-op, matching
+    /// [`DB::delete`] semantics.
+    Delete {
+        /// User key.
+        key: Vec<u8>,
+    },
+}
+
 /// Durable identity and publication state exposed for recovery diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurabilityStatus {
@@ -733,6 +756,158 @@ impl DB {
         Ok(())
     }
 
+    /// Commit multiple byte-key mutations atomically as one durable batch.
+    ///
+    /// The complete candidate B-tree/blob state is prepared off to the side
+    /// before the batch WAL is appended. A validation, capacity, or B-tree
+    /// error therefore leaves the current state untouched. Once the WAL batch
+    /// is durable, [`DB::flush`] publishes all mutations under one commit
+    /// envelope; a failure at that boundary fences the writer for recovery in
+    /// the same way as a single mutation.
+    pub fn commit_batch(&mut self, mutations: &[BatchMutation]) -> Result<DurabilityStatus> {
+        self.check_writable()?;
+        if mutations.is_empty() {
+            return Ok(self.durability_status());
+        }
+        if self.pending_mutations != 0 {
+            return Err(Error::InvalidArgument(
+                "commit_batch requires a clean pending generation; flush or discard pending mutations first".into(),
+            ));
+        }
+
+        let mut records = Vec::with_capacity(mutations.len());
+        let mut mutation_bytes = 0u64;
+        for mutation in mutations {
+            let record = match mutation {
+                BatchMutation::Put { key, value } => {
+                    validate_wal_put_lengths(key, value)?;
+                    WalRecord::put(key, value)
+                }
+                BatchMutation::Delete { key } => {
+                    validate_wal_key_length(key)?;
+                    WalRecord::delete(key)
+                }
+            };
+            mutation_bytes = mutation_bytes
+                .checked_add(record.to_bytes().len() as u64)
+                .ok_or(Error::DiskFull)?;
+            records.push(record);
+        }
+
+        let required_wal = mutation_bytes
+            .checked_add(WAL_COMMIT_RECORD_BYTES)
+            .ok_or(Error::DiskFull)?;
+        let available_wal = self
+            .options
+            .max_wal_bytes
+            .saturating_sub(self.pending_wal_bytes);
+        if required_wal > available_wal {
+            self.wal_admission_failures = self.wal_admission_failures.saturating_add(1);
+            return Err(Error::Backpressure {
+                required: required_wal,
+                available: available_wal,
+            });
+        }
+
+        for mutation in mutations {
+            let key = match mutation {
+                BatchMutation::Put { key, .. } | BatchMutation::Delete { key } => key,
+            };
+            self.engine.prepare_mutation(key)?;
+        }
+
+        let mut candidate_tree = self.engine.btree().clone();
+        let mut candidate_blobs = self.blobs.clone();
+        let mut blob_changed = false;
+        for mutation in mutations {
+            match mutation {
+                BatchMutation::Put { key, value } => {
+                    let previous_blob = match candidate_tree.lookup(key).map_err(Error::from)? {
+                        LookupResult::Blob(pointer) => Some(pointer),
+                        _ => None,
+                    };
+                    let separates = candidate_blobs.should_separate(value.len());
+                    if separates {
+                        let pointer = candidate_blobs.append(key, value.clone());
+                        if let Err(error) = candidate_tree.upsert_blob(key, pointer) {
+                            let _ = candidate_blobs.rollback_append(&pointer);
+                            return Err(error.into());
+                        }
+                    } else {
+                        candidate_tree.upsert(key, value).map_err(Error::from)?;
+                    }
+                    if let Some(pointer) = previous_blob {
+                        if !candidate_blobs.mark_deleted(&pointer) {
+                            return Err(Error::Corruption(
+                                "batch replacement references a missing blob".into(),
+                            ));
+                        }
+                        blob_changed = true;
+                    }
+                    blob_changed |= separates;
+                }
+                BatchMutation::Delete { key } => {
+                    let previous_blob = match candidate_tree.lookup(key).map_err(Error::from)? {
+                        LookupResult::Blob(pointer) => Some(pointer),
+                        _ => None,
+                    };
+                    let _ = candidate_tree.delete(key).map_err(Error::from)?;
+                    if let Some(pointer) = previous_blob {
+                        if !candidate_blobs.mark_deleted(&pointer) {
+                            return Err(Error::Corruption(
+                                "batch delete references a missing blob".into(),
+                            ));
+                        }
+                        blob_changed = true;
+                    }
+                }
+            }
+        }
+
+        if blob_changed {
+            let projected = candidate_blobs
+                .serialized_size()
+                .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+            self.engine.check_artifact_capacity(projected)?;
+        }
+
+        self.ensure_wal_reservation()?;
+        if blob_changed {
+            let projected = candidate_blobs
+                .serialized_size()
+                .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+            self.reserve_blob_image(projected)?;
+        }
+
+        let next_pending_mutations = u64::try_from(mutations.len())
+            .ok()
+            .and_then(|count| self.pending_mutations.checked_add(count))
+            .ok_or(Error::Wal("mutation count overflow".into()))?;
+        let next_pending_bytes = self
+            .pending_wal_bytes
+            .checked_add(mutation_bytes)
+            .ok_or(Error::Wal("WAL byte count overflow".into()))?;
+        let next_digest = records.iter().fold(self.pending_digest, |digest, record| {
+            extend_digest(digest, record)
+        });
+
+        for record in &records {
+            self.wal.append(record);
+        }
+        if let Err(error) = self.write_wal_to_disk(self.wal.sync_policy() != SyncPolicy::None) {
+            self.write_fenced = true;
+            return Err(error);
+        }
+
+        *self.engine.btree_mut() = candidate_tree;
+        self.blobs = candidate_blobs;
+        self.pending_mutations = next_pending_mutations;
+        self.pending_wal_bytes = next_pending_bytes;
+        self.pending_digest = next_digest;
+        self.flush()?;
+        Ok(self.durability_status())
+    }
+
     /// Get a value by key.
     ///
     /// Read path:
@@ -904,7 +1079,10 @@ impl DB {
             .projected_serialized_size(retired, appended_value_len)
             .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
         self.engine.check_artifact_capacity(required)?;
+        self.reserve_blob_image(required)
+    }
 
+    fn reserve_blob_image(&self, required: u64) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let reservation_path = self.path.join(BLOB_RESERVATION_FILE);

@@ -41,6 +41,7 @@ pub enum LookupResult {
 /// This is the core B-tree logic. In the full implementation, this will be
 /// backed by the buffer manager and PMT. Missing slots represent pages that
 /// have not been loaded into this logical view yet.
+#[derive(Clone)]
 pub struct BTree {
     /// Loaded nodes indexed by stable logical page ID. `None` is an unloaded
     /// page in a sparse PMT-backed view.

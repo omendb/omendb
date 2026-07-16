@@ -17,6 +17,7 @@ const BLOB_FORMAT_VERSION: u32 = 1;
 ///
 /// Large values (>blob_threshold) are stored in blob files.
 /// The B-tree stores blob pointers instead of the actual values.
+#[derive(Clone)]
 pub struct BlobManager {
     /// Active blob files.
     files: Vec<BlobFile>,

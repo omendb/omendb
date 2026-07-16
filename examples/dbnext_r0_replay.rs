@@ -8,7 +8,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{DB, Options};
+use seerdb::{BatchMutation, DB, Options};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -250,32 +250,25 @@ fn apply_commit(db: &mut DB, state: &mut R0State, event: &Map<String, Value>) ->
                     return Err(invalid(format!("cannot update absent record: {key:?}")));
                 }
                 candidate.insert(key, Some(payload));
-                operations.push((key, Some(bytes)));
+                operations.push(BatchMutation::Put {
+                    key: record_key(key),
+                    value: bytes,
+                });
             }
             "delete" => {
                 if candidate.get(&key).and_then(Option::as_ref).is_none() {
                     return Err(invalid(format!("cannot delete absent record: {key:?}")));
                 }
                 candidate.insert(key, None);
-                operations.push((key, None));
+                operations.push(BatchMutation::Delete {
+                    key: record_key(key),
+                });
             }
             other => return Err(invalid(format!("unknown mutation operation: {other}"))),
         }
     }
 
-    for (key, payload) in operations {
-        let key = record_key(key);
-        match payload {
-            Some(payload) => db.put(&key, &payload)?,
-            None => {
-                if !db.delete(&key)? {
-                    return Err(invalid("SeerDB delete disagreed with the R0 model"));
-                }
-            }
-        }
-    }
-    db.flush()?;
-    let durability = db.durability_status();
+    let durability = db.commit_batch(&operations)?;
     if durability.commit_id.get() != next_commit
         || durability.pending_mutations != 0
         || durability.write_fenced
