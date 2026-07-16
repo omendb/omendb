@@ -55,6 +55,10 @@ pub struct Device {
     /// Test-only deterministic write failure hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_write: AtomicBool,
+    /// Test-only failure after page bytes are written but before the caller
+    /// can publish the generation.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_after_write: AtomicBool,
     /// Test-only deterministic disk-full hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_disk_full: AtomicBool,
@@ -105,6 +109,8 @@ impl Device {
             fail_next_sync: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_write: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_after_write: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_disk_full: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -174,6 +180,11 @@ impl Device {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_next_after_write.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected post-write failure"));
+        }
+
         if self.sync_writes {
             self.file.sync_data()?;
         }
@@ -231,6 +242,12 @@ impl Device {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_write_failure(&self) {
         self.fail_next_write.store(true, Ordering::Release);
+    }
+
+    /// Inject one failure after a complete page write and before publication.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_after_write_failure(&self) {
+        self.fail_next_after_write.store(true, Ordering::Release);
     }
 
     /// Inject one deterministic disk-full result for recovery tests.

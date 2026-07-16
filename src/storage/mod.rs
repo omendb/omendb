@@ -334,6 +334,12 @@ impl StorageEngine {
         self.device.inject_write_failure();
     }
 
+    /// Inject one failure after a complete device page write.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_after_write_failure(&self) {
+        self.device.inject_after_write_failure();
+    }
+
     /// Inject one deterministic disk-full result for recovery tests.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_disk_full(&self) {

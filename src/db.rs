@@ -1764,6 +1764,12 @@ impl DB {
         self.engine.inject_write_failure();
     }
 
+    /// Inject one failure after a complete page write and before publication.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_after_write_failure(&self) {
+        self.engine.inject_after_write_failure();
+    }
+
     /// Inject one disk-full result for the feature-gated fault harness.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_disk_full(&self) {

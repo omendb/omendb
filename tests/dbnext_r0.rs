@@ -1170,6 +1170,26 @@ fn dbnext_r0_short_and_torn_checkpoint_images_preserve_prior_generation() {
 }
 
 #[test]
+fn dbnext_r0_post_page_write_failure_preserves_prior_manifest_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("post-page-write.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-2").unwrap();
+    db.inject_after_write_failure();
+
+    assert!(matches!(db.flush(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
 fn dbnext_r0_reopens_deep_tree_with_internal_routing() {
     let root = tempdir().unwrap();
     let path = root.path().join("deep-tree.db");
