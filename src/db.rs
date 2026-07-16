@@ -756,6 +756,7 @@ impl Drop for DB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::{Seek, SeekFrom, Write};
     use std::process::Command;
     use tempfile::tempdir;
@@ -953,6 +954,68 @@ mod tests {
         );
         assert_eq!(db.get(b"unpublished").unwrap(), None);
         assert!(!path.join(WAL_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_randomized_publication_fault_matrix() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
+            for key_id in 0..16 {
+                let key = format!("key-{key_id:02}");
+                assert_eq!(
+                    db.get(key.as_bytes()).unwrap(),
+                    model.get(key.as_bytes()).cloned()
+                );
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        let mut committed = BTreeMap::new();
+        let mut seed = 0x5EED_CAFE_u64;
+
+        for round in 0..32 {
+            let mut candidate = committed.clone();
+            let operation_count = (next(&mut seed) % 4 + 1) as usize;
+            for operation in 0..operation_count {
+                let key_id = next(&mut seed) % 16;
+                let key = format!("key-{key_id:02}");
+                let value = format!("value-{round:02}-{operation:02}-{key_id:02}");
+                db.put(key.as_bytes(), value.as_bytes()).unwrap();
+                candidate.insert(key.into_bytes(), value.into_bytes());
+            }
+
+            let fault = next(&mut seed) % 4;
+            match fault {
+                1 => db.engine.inject_sync_failure(),
+                2 => db.engine.inject_write_failure(),
+                3 => inject_atomic_rename_failure(),
+                _ => {}
+            }
+
+            let result = db.flush();
+            if fault == 0 {
+                result.unwrap();
+                committed = candidate;
+                assert_model(&db, &committed);
+            } else {
+                assert!(result.is_err(), "fault {fault} did not fail publication");
+                drop(db);
+                db = DB::open(&path, Options::default()).unwrap();
+                assert_model(&db, &committed);
+            }
+        }
+
+        db.close().unwrap();
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_model(&reopened, &committed);
     }
 
     #[test]
