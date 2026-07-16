@@ -214,6 +214,46 @@ fn dbnext_r0_atomic_batch_commit_reopens_inline_and_blob_values() {
 }
 
 #[test]
+fn dbnext_r0_stale_expected_base_is_rejected_without_side_effects() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("stale-base.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"first".to_vec(),
+            value: b"value-1".to_vec(),
+        }])
+        .unwrap();
+
+    let error = db
+        .commit_batch_at(
+            CommitId::new(0),
+            &[BatchMutation::Put {
+                key: b"stale".to_vec(),
+                value: b"must-not-appear".to_vec(),
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::SerializationConflict { expected, current }
+            if expected == CommitId::new(0) && current == first.commit_id
+    ));
+    assert_eq!(db.get(b"stale").unwrap(), None);
+    assert_eq!(db.durability_status().commit_id, first.commit_id);
+
+    db.commit_batch_at(
+        first.commit_id,
+        &[BatchMutation::Put {
+            key: b"next".to_vec(),
+            value: b"value-2".to_vec(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(db.get(b"next").unwrap(), Some(b"value-2".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_atomic_batch_wal_failure_drops_the_whole_candidate() {
     fn run_case<F>(root: &Path, name: &str, options: Options, inject: F)
     where

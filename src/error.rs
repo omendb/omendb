@@ -2,6 +2,7 @@
 
 use crate::btree::{BTreeError, InsertError, SplitError};
 use crate::buffer::BufferError;
+use crate::storage::format::CommitId;
 
 /// Category of a failure reported by the non-mutating integrity checker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -95,6 +96,17 @@ pub enum Error {
     /// A retained historical root is no longer available to this handle.
     #[error("snapshot unavailable: {0}")]
     SnapshotUnavailable(String),
+
+    /// The caller attempted to commit against a stale published state.
+    #[error(
+        "serialization conflict: expected commit {expected:?}, current commit {current:?}"
+    )]
+    SerializationConflict {
+        /// Commit the caller used as its expected base.
+        expected: CommitId,
+        /// Commit currently published by this writer.
+        current: CommitId,
+    },
 
     /// B-tree operation failed.
     #[error("btree error: {0}")]

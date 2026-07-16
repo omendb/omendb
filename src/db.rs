@@ -1018,7 +1018,30 @@ impl DB {
     /// envelope; a failure at that boundary fences the writer for recovery in
     /// the same way as a single mutation.
     pub fn commit_batch(&mut self, mutations: &[BatchMutation]) -> Result<DurabilityStatus> {
+        let expected_commit = self.commit_id;
+        self.commit_batch_at(expected_commit, mutations)
+    }
+
+    /// Commit multiple byte-key mutations only if the published commit still
+    /// matches the caller's expected base.
+    ///
+    /// This is the storage boundary for optimistic transaction adapters. The
+    /// expected-base check happens before validation, WAL admission, or any
+    /// candidate tree/blob work, so a stale caller has no side effects. An
+    /// empty batch is a validated no-op and returns the current durability
+    /// status when the expected base matches.
+    pub fn commit_batch_at(
+        &mut self,
+        expected_commit: CommitId,
+        mutations: &[BatchMutation],
+    ) -> Result<DurabilityStatus> {
         self.check_writable()?;
+        if self.commit_id != expected_commit {
+            return Err(Error::SerializationConflict {
+                expected: expected_commit,
+                current: self.commit_id,
+            });
+        }
         if mutations.is_empty() {
             return Ok(self.durability_status());
         }

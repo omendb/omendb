@@ -54,4 +54,4 @@ pub use db::{
 };
 pub use error::{CheckFailureKind, Error, Result};
 pub use storage::StorageMetrics;
-pub use storage::format::SnapshotId;
+pub use storage::format::{CommitId, GenerationId, HistoryId, SnapshotId};
