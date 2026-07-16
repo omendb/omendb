@@ -346,6 +346,11 @@ impl StorageEngine {
         self.device.inject_capacity_limit(capacity);
     }
 
+    /// Reject an artifact image that exceeds the deterministic device budget.
+    pub fn check_artifact_capacity(&self, length: u64) -> Result<()> {
+        self.device.check_capacity(length).map_err(Error::from)
+    }
+
     /// Flush all dirty pages to disk.
     pub fn flush(&mut self) -> Result<()> {
         // The bootstrap path rewrites the complete logical tree into a new

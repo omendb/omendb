@@ -188,16 +188,27 @@ impl Device {
     /// StorageEngine can preflight an entire generation before issuing its
     /// first page write.
     pub fn check_write_capacity(&self, _offset: u64) -> io::Result<()> {
-        #[cfg(any(test, feature = "fault-injection"))]
-        if _offset.saturating_add(PAGE_SIZE as u64)
-            > self.capacity_limit.load(Ordering::Acquire)
-        {
-            return Err(io::Error::from(io::ErrorKind::StorageFull));
-        }
+        let end = _offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::StorageFull))?;
+        self.check_capacity(end)?;
         #[cfg(any(test, feature = "fault-injection"))]
         if self.fail_next_disk_full.load(Ordering::Acquire) {
             return Err(io::Error::from(io::ErrorKind::StorageFull));
         }
+        Ok(())
+    }
+
+    /// Check a deterministic absolute artifact end offset without consuming
+    /// the one-shot disk-full fault used by actual page writes.
+    pub fn check_capacity(&self, end: u64) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if end > self.capacity_limit.load(Ordering::Acquire)
+        {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let _ = end;
         Ok(())
     }
 

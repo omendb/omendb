@@ -6,4 +6,4 @@
 mod device;
 
 pub use device::{Device, DeviceOptions};
-pub(crate) use device::preallocate_file;
+pub(crate) use device::{preallocate_file, reserve_file};

@@ -9,13 +9,13 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BTree, LookupResult, PAGE_SIZE};
+use crate::btree::{BlobPointer, BTree, LookupResult, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
-use crate::space::{preallocate_file, Device, DeviceOptions};
+use crate::space::{preallocate_file, reserve_file, Device, DeviceOptions};
 use crate::storage::{StorageEngine, StorageMetrics};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
@@ -23,7 +23,7 @@ use crate::storage::format::{
 };
 use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +39,7 @@ thread_local! {
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
+const BLOB_RESERVATION_FILE: &str = "seerdb.blob.reserve";
 const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
@@ -468,6 +469,9 @@ impl DB {
         } else {
             Some(Self::acquire_writer_lock(&path.join(LOCK_FILE))?)
         };
+        if !read_only {
+            clear_blob_reservation(&path)?;
+        }
 
         let mut manifest = if check_only {
             ManifestStore::open_read_only(&manifest_path).map_err(|error| {
@@ -683,6 +687,7 @@ impl DB {
     /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_writable()?;
+        validate_wal_put_lengths(key, value)?;
         let record = WalRecord::put(key, value);
         self.admit_wal_record(&record)?;
         self.engine.prepare_mutation(key)?;
@@ -694,7 +699,14 @@ impl DB {
             LookupResult::Blob(pointer) => Some(pointer),
             _ => None,
         };
-        if self.blobs.should_separate(value.len()) {
+        let appended_value_len = self
+            .blobs
+            .should_separate(value.len())
+            .then_some(value.len());
+        if previous_blob.is_some() || appended_value_len.is_some() {
+            self.admit_blob_image(previous_blob.as_ref(), appended_value_len)?;
+        }
+        if appended_value_len.is_some() {
             let pointer = self.blobs.append(key, value.to_vec());
             if let Err(error) = self.engine.btree_mut().upsert_blob(key, pointer) {
                 let _ = self.blobs.rollback_append(&pointer);
@@ -742,6 +754,7 @@ impl DB {
     /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
+        validate_wal_key_length(key)?;
         let record = WalRecord::delete(key);
         self.admit_wal_record(&record)?;
         self.engine.prepare_mutation(key)?;
@@ -750,6 +763,9 @@ impl DB {
             LookupResult::Blob(pointer) => Some(pointer),
             _ => None,
         };
+        if previous_blob.is_some() {
+            self.admit_blob_image(previous_blob.as_ref(), None)?;
+        }
         let found = self.engine.btree_mut().delete(key)?;
         if found && let Some(pointer) = previous_blob {
             self.blobs.mark_deleted(&pointer);
@@ -848,6 +864,57 @@ impl DB {
         Ok(())
     }
 
+    /// Reserve the next blob image before a mutation changes memory state.
+    ///
+    /// Linux and macOS retain the physical reservation in a sidecar that is
+    /// consumed by the next atomic blob publication. Other platforms use a
+    /// best-effort filesystem-space check and keep the final write fallback.
+    fn admit_blob_image(
+        &self,
+        retired: Option<&BlobPointer>,
+        appended_value_len: Option<usize>,
+    ) -> Result<()> {
+        let required = self
+            .blobs
+            .projected_serialized_size(retired, appended_value_len)
+            .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+        self.engine.check_artifact_capacity(required)?;
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let reservation_path = self.path.join(BLOB_RESERVATION_FILE);
+            let file = match OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&reservation_path)
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = fs::remove_file(&reservation_path);
+                    return Err(error.into());
+                }
+            };
+            if let Err(error) = reserve_file(&file, required) {
+                drop(file);
+                let _ = fs::remove_file(&reservation_path);
+                return Err(error.into());
+            }
+            file.sync_data()?;
+            sync_directory(&self.path)?;
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if required > fs2::available_space(&self.path)? {
+                return Err(Error::DiskFull);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Ensure the database owns a fixed-size WAL reservation extent before a
     /// mutation changes tree or blob state. The extent is rounded to fixed
     /// segments so future WAL growth has a bounded, stable admission domain;
@@ -879,6 +946,18 @@ impl DB {
         Ok(current.max(target))
     }
 
+    fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let reservation = self.path.join(BLOB_RESERVATION_FILE);
+            if reservation.is_file() {
+                return atomic_write_reserved(path, &reservation, data);
+            }
+        }
+
+        atomic_write(path, data)
+    }
+
     /// Publish a generation after its pages and checkpoints are durable.
     fn publish_generation(
         &mut self,
@@ -906,7 +985,7 @@ impl DB {
 
         let blob_path = self.path.join(BLOB_FILE);
         self.blobs.set_generation(commit.generation_id.get());
-        atomic_write(&blob_path, &self.blobs.to_bytes())?;
+        self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
@@ -2091,6 +2170,25 @@ fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((&payload[2..value_len_offset], &payload[value_offset..]))
 }
 
+fn validate_wal_key_length(key: &[u8]) -> Result<()> {
+    if u32::try_from(key.len()).is_err() {
+        return Err(Error::InvalidArgument(
+            "key exceeds the durable WAL length limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wal_put_lengths(key: &[u8], value: &[u8]) -> Result<()> {
+    validate_wal_key_length(key)?;
+    if u32::try_from(value.len()).is_err() {
+        return Err(Error::InvalidArgument(
+            "value exceeds the durable WAL length limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_delete_payload(v2: bool, payload: &[u8]) -> Result<&[u8]> {
     if v2 {
         if payload.len() < 4 {
@@ -2142,6 +2240,33 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_write_reserved(path: &Path, reservation: &Path, data: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(reservation)?;
+    if !reserve_file(&file, data.len() as u64)? {
+        return Err(Error::DiskFull);
+    }
+    file.set_len(data.len() as u64)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(data)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    let injected = FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.replace(false));
+    #[cfg(any(test, feature = "fault-injection"))]
+    if injected {
+        return Err(std::io::Error::other("injected atomic rename failure").into());
+    }
+
+    fs::rename(reservation, path)?;
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
 #[cfg(any(test, feature = "fault-injection"))]
 #[allow(dead_code)]
 fn inject_atomic_rename_failure() {
@@ -2152,6 +2277,15 @@ fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn clear_blob_reservation(path: &Path) -> Result<()> {
+    let reservation = path.join(BLOB_RESERVATION_FILE);
+    if reservation.exists() {
+        fs::remove_file(reservation)?;
+        sync_directory(path)?;
     }
     Ok(())
 }
@@ -2411,6 +2545,15 @@ mod tests {
                 .len(),
             WAL_RESERVATION_SEGMENT_BYTES
         );
+        assert!(path.join(BLOB_RESERVATION_FILE).is_file());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            fs::metadata(path.join(BLOB_RESERVATION_FILE))
+                .unwrap()
+                .blocks()
+                > 0,
+            "blob reservation should own physical blocks on this platform"
+        );
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
             fs::metadata(path.join(WAL_RESERVATION_FILE))
@@ -2424,10 +2567,30 @@ mod tests {
             WAL_RESERVATION_SEGMENT_BYTES
         );
         db.flush().unwrap();
+        assert!(!path.join(BLOB_RESERVATION_FILE).exists());
         drop(db);
 
         let reopened = DB::open(&path, Options::for_test()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn test_db_blob_admission_rejects_before_blob_or_tree_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blob-admission.db");
+        let value = vec![0x5A; 2_000];
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.inject_capacity_limit(0);
+
+        assert!(matches!(db.put(b"key", &value), Err(Error::DiskFull)));
+        assert_eq!(db.get(b"key").unwrap(), None);
+        assert_eq!(db.blob_stats().total_valid, 0);
+        assert_eq!(db.durability_status().pending_mutations, 0);
+        assert!(!db.durability_status().write_fenced);
+
+        drop(db);
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
     }
 
     #[test]

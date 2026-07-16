@@ -177,6 +177,16 @@ impl BlobFile {
         true
     }
 
+    pub(crate) fn serialized_size(&self) -> Option<u64> {
+        self.records.iter().try_fold(0u64, |size, record| {
+            size.checked_add(u64::try_from(record.serialized_size()).ok()?)
+        })
+    }
+
+    pub(crate) fn can_mark_deleted(&self, offset: u64) -> bool {
+        self.has_record_at(offset) && !self.deleted_offsets.contains(&offset)
+    }
+
     /// Read a value at the given offset and length.
     pub fn read(&self, offset: u64, length: u32) -> Option<&[u8]> {
         // Find the record that contains this offset.

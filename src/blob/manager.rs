@@ -3,7 +3,7 @@
 //! Manages multiple blob files for KV separation. Handles appending,
 //! reading, and garbage collection of blob files.
 
-use crate::blob::file::BlobFile;
+use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
 use std::collections::HashSet;
 
@@ -109,6 +109,58 @@ impl BlobManager {
             self.files.pop();
         }
         true
+    }
+
+    /// Return the serialized image size without allocating a second image.
+    pub(crate) fn serialized_size(&self) -> Option<u64> {
+        let header = BLOB_FORMAT_MAGIC
+            .len()
+            .checked_add(4)?
+            .checked_add(8)?
+            .checked_add(8)?
+            .checked_add(4)?;
+        let footer = 8usize.checked_add(4)?;
+        let mut size = u64::try_from(header.checked_add(footer)?).ok()?;
+
+        for file in &self.files {
+            size = size.checked_add(4 + 8 + 4)?;
+            size = size.checked_add(file.serialized_size()?)?;
+            size = size.checked_add(
+                u64::try_from(file.deleted_count())
+                    .ok()?
+                    .checked_mul(std::mem::size_of::<u64>() as u64)?,
+            )?;
+        }
+
+        Some(size)
+    }
+
+    /// Predict the next serialized image size for one mutation.
+    pub(crate) fn projected_serialized_size(
+        &self,
+        retired: Option<&BlobPointer>,
+        appended_value_len: Option<usize>,
+    ) -> Option<u64> {
+        let mut size = self.serialized_size()?;
+        if let Some(pointer) = retired && self.can_mark_deleted(pointer) {
+            size = size.checked_add(std::mem::size_of::<u64>() as u64)?;
+        }
+        if let Some(value_len) = appended_value_len {
+            u32::try_from(value_len).ok()?;
+            let record_size = BlobRecord::OVERHEAD_SIZE.checked_add(value_len)?;
+            if self.files.is_empty() {
+                size = size.checked_add(4 + 8 + 4)?;
+            }
+            size = size.checked_add(u64::try_from(record_size).ok()?)?;
+        }
+        Some(size)
+    }
+
+    fn can_mark_deleted(&self, pointer: &BlobPointer) -> bool {
+        self.files
+            .iter()
+            .find(|file| file.file_id() == pointer.file_id)
+            .is_some_and(|file| file.can_mark_deleted(pointer.offset))
     }
 
     /// Read a value from a blob file.
@@ -492,6 +544,24 @@ mod tests {
 
         assert!(bm.rollback_append(&first));
         assert_eq!(bm.file_count(), 0);
+    }
+
+    #[test]
+    fn test_blob_projected_size_matches_serialized_image() {
+        let mut bm = BlobManager::new();
+        assert_eq!(bm.serialized_size(), Some(bm.to_bytes().len() as u64));
+
+        let projected_append = bm.projected_serialized_size(None, Some(1_500)).unwrap();
+        let pointer = bm.append(b"key", vec![1; 1_500]);
+        assert_eq!(projected_append, bm.to_bytes().len() as u64);
+        assert_eq!(bm.serialized_size(), Some(projected_append));
+
+        let projected_delete = bm
+            .projected_serialized_size(Some(&pointer), None)
+            .unwrap();
+        assert!(bm.mark_deleted(&pointer));
+        assert_eq!(projected_delete, bm.to_bytes().len() as u64);
+        assert_eq!(bm.serialized_size(), Some(projected_delete));
     }
 
     #[test]
