@@ -392,3 +392,40 @@ fn dbnext_r0_rejects_malformed_checkpoint_container() {
         Err(Error::Corruption(message)) if message.contains("trailing")
     ));
 }
+
+#[test]
+fn dbnext_r0_compact_truncates_reclaimable_tail() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("compact.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    let first_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+
+    db.put(b"key", b"value-2").unwrap();
+    db.flush().unwrap();
+    let second_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert!(second_bytes > first_bytes);
+
+    db.put(b"key", b"value-3").unwrap();
+    db.flush().unwrap();
+    let before = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert_eq!(before, second_bytes);
+
+    let report = db.compact().unwrap();
+    assert!(report.manifest_replicated);
+    assert!(report.reclaimed_pages > 0);
+    assert_eq!(report.data_bytes_before, before);
+    assert!(report.data_bytes_after < report.data_bytes_before);
+    assert_eq!(db.get(b"key").unwrap(), Some(b"value-3".to_vec()));
+    assert_eq!(db.verify().unwrap().data_bytes, report.data_bytes_after);
+
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
+    assert_eq!(
+        reopened.verify().unwrap().data_bytes,
+        report.data_bytes_after
+    );
+}

@@ -98,6 +98,21 @@ pub struct SnapshotReport {
     pub verified_pages: u64,
 }
 
+/// Results from trimming reclaimable trailing data pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Durable identity after compaction.
+    pub durability: DurabilityStatus,
+    /// Data-file size before truncation.
+    pub data_bytes_before: u64,
+    /// Data-file size after truncation.
+    pub data_bytes_after: u64,
+    /// Number of physical page slots removed from the tail.
+    pub reclaimed_pages: u64,
+    /// Whether the active manifest was mirrored before truncation.
+    pub manifest_replicated: bool,
+}
+
 /// A seerdb database instance.
 ///
 /// Provides key-value storage with:
@@ -672,6 +687,46 @@ impl DB {
             let _ = fs::remove_dir_all(&temporary);
         }
         result
+    }
+
+    /// Reclaim trailing data pages that are no longer referenced by either
+    /// manifest slot.
+    ///
+    /// This is intentionally a bounded first compaction operation. It does
+    /// not move interior free pages and does not claim retained in-process
+    /// snapshot support. A pending generation is flushed first; then the
+    /// active manifest is mirrored into the other slot before truncation so a
+    /// torn maintenance operation cannot fall back to a root that needs the
+    /// removed tail pages.
+    pub fn compact(&mut self) -> Result<CompactionReport> {
+        self.check_writable()?;
+        self.flush()?;
+
+        let (before, after) = self.engine.reclaimable_tail_range()?;
+        let mut manifest_replicated = false;
+        if after < before {
+            let manifest = self
+                .manifest
+                .load_latest()?
+                .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+            self.manifest.publish(manifest)?;
+            manifest_replicated = true;
+        }
+
+        let (actual_before, actual_after) = self.engine.truncate_reclaimable_tail()?;
+        if actual_before != before || actual_after != after {
+            return Err(Error::NeedsRecovery(
+                "data file changed during compaction planning".into(),
+            ));
+        }
+
+        Ok(CompactionReport {
+            durability: self.durability_status(),
+            data_bytes_before: actual_before,
+            data_bytes_after: actual_after,
+            reclaimed_pages: (actual_before - actual_after) / PAGE_SIZE as u64,
+            manifest_replicated,
+        })
     }
 
     /// Inject one device sync failure for the feature-gated fault harness.

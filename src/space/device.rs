@@ -161,6 +161,25 @@ impl Device {
         self.file.metadata().map(|m| m.len())
     }
 
+    /// Truncate the page file to a durable, page-aligned length.
+    pub fn truncate(&mut self, length: u64) -> io::Result<()> {
+        if !length.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device length must be page aligned",
+            ));
+        }
+        let current = self.file.metadata()?.len();
+        if length > current {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "device truncation cannot grow the file",
+            ));
+        }
+        self.file.set_len(length)?;
+        self.file.sync_data()
+    }
+
     /// Whether O_DIRECT is being used.
     pub fn uses_odirect(&self) -> bool {
         self.use_odirect
@@ -273,6 +292,26 @@ mod tests {
         let buf = [0u8; PAGE_SIZE];
         device.write_page(0, &buf).unwrap();
         assert_eq!(device.size().unwrap(), PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn test_device_truncate_is_page_aligned_and_durable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let options = DeviceOptions {
+            use_odirect: false,
+            sync_writes: false,
+            create: true,
+        };
+        let mut device = Device::open(&path, &options).unwrap();
+        let page = [0xA5u8; PAGE_SIZE];
+        device.write_page(0, &page).unwrap();
+        device.write_page(PAGE_SIZE as u64, &page).unwrap();
+
+        device.truncate(PAGE_SIZE as u64).unwrap();
+        assert_eq!(device.size().unwrap(), PAGE_SIZE as u64);
+        assert!(device.truncate(1).is_err());
+        assert!(device.truncate((PAGE_SIZE * 2) as u64).is_err());
     }
 
     #[test]

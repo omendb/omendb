@@ -92,6 +92,53 @@ impl StorageEngine {
         self.free_offsets.len()
     }
 
+    /// Return the current data size and the size after trimming only trailing
+    /// free physical page slots.
+    pub fn reclaimable_tail_range(&self) -> Result<(u64, u64)> {
+        let before = self.device.size()?;
+        let page_size = PAGE_SIZE as u64;
+        let mut after = before;
+        let mut free_index = self.free_offsets.len();
+
+        while after >= page_size && free_index > 0 {
+            let offset = self.free_offsets[free_index - 1];
+            if offset != after - page_size {
+                break;
+            }
+            after -= page_size;
+            free_index -= 1;
+        }
+
+        Ok((before, after))
+    }
+
+    /// Trim trailing free page slots after the manifest barrier is complete.
+    ///
+    /// The caller must first ensure both manifest slots name the active
+    /// generation. This method never removes an active PMT mapping and does
+    /// not move interior free slots.
+    pub fn truncate_reclaimable_tail(&mut self) -> Result<(u64, u64)> {
+        if !self.pending_reclaimed_offsets.is_empty() {
+            return Err(Error::NeedsRecovery(
+                "cannot truncate pages before generation publication".into(),
+            ));
+        }
+
+        let (before, after) = self.reclaimable_tail_range()?;
+        if after == before {
+            return Ok((before, after));
+        }
+
+        self.device.truncate(after)?;
+        let retained = self
+            .free_offsets
+            .len()
+            .saturating_sub(((before - after) / PAGE_SIZE as u64) as usize);
+        self.free_offsets.truncate(retained);
+        self.next_offset = after;
+        Ok((before, after))
+    }
+
     /// Make the previous generation's retired pages reusable.
     ///
     /// DB calls this only after the new manifest has been durably published.
