@@ -730,7 +730,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
-#[expect(dead_code)]
+#[allow(dead_code)]
 fn inject_atomic_rename_failure() {
     FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.set(true));
 }

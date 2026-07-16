@@ -7,7 +7,7 @@ pub mod format;
 
 use crate::allocator::PageAllocator;
 use crate::btree::{BTree, Node, PAGE_SIZE};
-use crate::buffer::BufferManager;
+use crate::buffer::{BufferManager, BufferStats, GuardAccess};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
@@ -20,7 +20,6 @@ pub struct StorageEngine {
     /// The B-tree (logical operations).
     btree: BTree,
     /// Buffer manager (page cache).
-    #[expect(dead_code)]
     buffer: BufferManager,
     /// Page mapping table (page locations).
     pmt: PMT,
@@ -76,6 +75,11 @@ impl StorageEngine {
         &mut self.allocator
     }
 
+    /// Return current buffer-pool counters and derived occupancy metrics.
+    pub fn buffer_stats(&self) -> BufferStats {
+        self.buffer.stats()
+    }
+
     /// Get mutable access to the page mapping table for recovery.
     pub fn pmt_mut(&mut self) -> &mut PMT {
         &mut self.pmt
@@ -106,8 +110,8 @@ impl StorageEngine {
                 // B-tree mutations do not maintain the persisted checksum in
                 // place. Rebuild a temporary node so every page written has a
                 // checksum that covers its final bytes.
-                let page = Box::new(*node.as_bytes());
-                let mut persisted_node = Node::from_bytes(page).ok_or_else(|| {
+                let page = *node.as_bytes();
+                let mut persisted_node = Node::from_bytes(Box::new(page)).ok_or_else(|| {
                     Error::Corruption(format!("invalid node page {page_id} before flush"))
                 })?;
                 persisted_node.update_checksum();
@@ -116,8 +120,18 @@ impl StorageEngine {
                 // the resulting PMT only after all data is durable.
                 let offset = self.next_offset;
 
-                // Write the page to the device.
-                self.device.write_page(offset, persisted_node.as_bytes())?;
+                // Stage the page through the buffer manager, then write the
+                // clean flushed image to the out-of-place device version.
+                let page = *persisted_node.as_bytes();
+                let guard = self
+                    .buffer
+                    .fetch(page_id as u64, &page, GuardAccess::Write)?;
+                self.buffer.frame_data_mut(&guard).copy_from_slice(&page);
+                drop(guard);
+                let flushed_page = self.buffer.flush(page_id as u64).ok_or_else(|| {
+                    Error::Buffer(format!("page {page_id} was not dirty after staging"))
+                })?;
+                self.device.write_page(offset, &flushed_page)?;
                 self.next_offset += PAGE_SIZE as u64;
                 self.pmt.insert(page_id as u64, 0, offset);
             }
@@ -164,7 +178,10 @@ impl StorageEngine {
                 .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
             let mut buf = [0u8; PAGE_SIZE];
             self.device.read_page(mapping.offset, &mut buf)?;
-            let node = Node::from_bytes(Box::new(buf)).ok_or_else(|| {
+            let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
+            let buffered_page = Box::new(*self.buffer.frame_data(&guard));
+            drop(guard);
+            let node = Node::from_bytes(buffered_page).ok_or_else(|| {
                 Error::Corruption(format!(
                     "invalid page {page_id} at offset {}",
                     mapping.offset
@@ -203,8 +220,12 @@ impl StorageEngine {
             let mut buf = [0u8; PAGE_SIZE];
             self.device.read_page(offset, &mut buf)?;
 
+            let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
+            let buffered_page = Box::new(*self.buffer.frame_data(&guard));
+            drop(guard);
+
             // Deserialize the node.
-            if let Some(node) = Node::from_bytes(Box::new(buf)) {
+            if let Some(node) = Node::from_bytes(buffered_page) {
                 if !node.verify_checksum() {
                     return Err(Error::Corruption(format!(
                         "page checksum mismatch at offset {offset}"
@@ -226,5 +247,84 @@ impl StorageEngine {
         self.next_offset = offset;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::space::DeviceOptions;
+    use tempfile::tempdir;
+
+    #[test]
+    fn buffer_stages_clean_writeback_and_reuses_clean_frame() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        engine
+            .btree_mut()
+            .insert(b"key", b"value")
+            .expect("initial insert should fit");
+        engine.flush().unwrap();
+        let first = engine.buffer_stats();
+        assert_eq!(first.reads, 1);
+        assert_eq!(first.hits, 0);
+        assert_eq!(first.writes, 1);
+        assert_eq!(first.dirty_frames, 0);
+
+        engine
+            .btree_mut()
+            .insert(b"key2", b"updated")
+            .expect("second insert should fit");
+        engine.flush().unwrap();
+        let second = engine.buffer_stats();
+        assert_eq!(second.reads, 1);
+        assert_eq!(second.hits, 1);
+        assert_eq!(second.writes, 2);
+        assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn empty_buffer_pool_returns_typed_error() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(0),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+        engine
+            .btree_mut()
+            .insert(b"key", b"value")
+            .expect("initial insert should fit");
+
+        assert!(
+            matches!(engine.flush(), Err(Error::Buffer(message)) if message.contains("no frames"))
+        );
     }
 }

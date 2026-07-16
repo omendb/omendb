@@ -1,6 +1,7 @@
 //! Crate-level error types.
 
 use crate::btree::{BTreeError, InsertError, SplitError};
+use crate::buffer::BufferError;
 
 /// Errors that can occur during database operations.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +41,10 @@ pub enum Error {
     /// WAL error.
     #[error("wal error: {0}")]
     Wal(String),
+
+    /// Buffer pool could not safely provide a page frame.
+    #[error("buffer error: {0}")]
+    Buffer(String),
 }
 
 /// Result type for database operations.
@@ -49,9 +54,7 @@ impl From<InsertError> for Error {
     fn from(e: InsertError) -> Self {
         match e {
             InsertError::PageFull => Error::PageFull,
-            InsertError::WrongNodeType => {
-                Error::BTree("wrong node type for operation".into())
-            }
+            InsertError::WrongNodeType => Error::BTree("wrong node type for operation".into()),
             InsertError::DuplicateKey(_) => Error::DuplicateKey,
         }
     }
@@ -70,5 +73,11 @@ impl From<BTreeError> for Error {
             BTreeError::InsertFailed(e) => Error::from(e),
             BTreeError::SplitFailed(e) => Error::from(e),
         }
+    }
+}
+
+impl From<BufferError> for Error {
+    fn from(error: BufferError) -> Self {
+        Self::Buffer(error.to_string())
     }
 }
