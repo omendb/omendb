@@ -1,6 +1,7 @@
 //! Buffer frame: a slot in the buffer pool that holds a page.
 
 use crate::btree::node::PAGE_SIZE;
+use crate::buffer::PageCacheKey;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,8 +23,8 @@ pub enum FrameState {
 pub struct Frame {
     /// The page data buffer.
     pub data: Box<[u8; PAGE_SIZE]>,
-    /// Page ID currently stored in this frame (None if free).
-    pub page_id: Option<u64>,
+    /// Logical page and physical version currently stored in this frame.
+    pub page_key: Option<PageCacheKey>,
     /// Current state of the frame.
     pub state: FrameState,
     /// Number of active pins (concurrent readers/writers).
@@ -43,7 +44,7 @@ impl Frame {
     pub fn new_empty() -> Self {
         Self {
             data: Box::new([0u8; PAGE_SIZE]),
-            page_id: None,
+            page_key: None,
             state: FrameState::Free,
             pin_count: 0,
             pinned: false,
@@ -104,8 +105,8 @@ impl Frame {
     }
 
     /// Load page data into this frame.
-    pub fn load(&mut self, page_id: u64, data: &[u8; PAGE_SIZE]) {
-        self.page_id = Some(page_id);
+    pub fn load(&mut self, page_key: PageCacheKey, data: &[u8; PAGE_SIZE]) {
+        self.page_key = Some(page_key);
         self.data.copy_from_slice(data);
         self.state = FrameState::Clean;
         self.last_access = Instant::now();
@@ -114,7 +115,7 @@ impl Frame {
 
     /// Clear the frame (make it free).
     pub fn clear(&mut self) {
-        self.page_id = None;
+        self.page_key = None;
         self.state = FrameState::Free;
         self.pin_count = 0;
         self.pinned = false;

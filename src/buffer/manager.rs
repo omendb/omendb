@@ -10,6 +10,44 @@ use crate::buffer::guard::{GuardAccess, PageGuard};
 use std::collections::HashMap;
 use std::fmt;
 
+/// Identity of one page image in the buffer pool.
+///
+/// Logical page IDs are stable across out-of-place rewrites, so they are not
+/// sufficient as a cache key. `physical_version` comes from the PMT and must
+/// change whenever a new physical image is published. Version zero is
+/// reserved for the transitional pending/unversioned staging API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageCacheKey {
+    logical_page_id: u64,
+    physical_version: u64,
+}
+
+impl PageCacheKey {
+    /// Construct an identity for a published PMT page image.
+    pub const fn new(logical_page_id: u64, physical_version: u64) -> Self {
+        Self {
+            logical_page_id,
+            physical_version,
+        }
+    }
+
+    /// Construct the transitional key used by unversioned callers and
+    /// pre-publication write staging.
+    pub const fn unversioned(logical_page_id: u64) -> Self {
+        Self::new(logical_page_id, 0)
+    }
+
+    /// Logical page ID component of this cache identity.
+    pub const fn logical_page_id(self) -> u64 {
+        self.logical_page_id
+    }
+
+    /// PMT physical version component of this cache identity.
+    pub const fn physical_version(self) -> u64 {
+        self.physical_version
+    }
+}
+
 /// Errors raised when the buffer pool cannot safely satisfy a fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferError {
@@ -65,8 +103,8 @@ pub struct BufferStats {
 pub struct BufferManager {
     /// Array of buffer frames.
     frames: Vec<Frame>,
-    /// Map from page ID to frame index (for cache lookup).
-    page_map: HashMap<u64, usize>,
+    /// Map from logical page plus physical version to frame index.
+    page_map: HashMap<PageCacheKey, usize>,
     /// Clock hand for eviction (index into frames).
     clock_hand: usize,
     /// Statistics.
@@ -100,9 +138,34 @@ impl BufferManager {
 
     /// Whether a page currently has a resident frame.
     pub fn is_resident(&self, page_id: u64) -> bool {
+        self.is_resident_key(PageCacheKey::unversioned(page_id))
+    }
+
+    /// Whether the exact physical page image is resident.
+    pub fn is_resident_key(&self, page_key: PageCacheKey) -> bool {
         self.page_map
-            .get(&page_id)
+            .get(&page_key)
             .is_some_and(|&frame_idx| !self.frames[frame_idx].is_free())
+    }
+
+    /// Promote a clean pending image to the PMT version that now names it.
+    ///
+    /// The operation only changes cache identity; it never makes a page
+    /// visible to recovery. Manifest publication remains the visibility
+    /// barrier owned by the storage engine.
+    pub fn rekey(&mut self, from: PageCacheKey, to: PageCacheKey) {
+        if from == to {
+            return;
+        }
+        let Some(frame_idx) = self.page_map.remove(&from) else {
+            return;
+        };
+        if self.page_map.contains_key(&to) {
+            self.page_map.insert(from, frame_idx);
+            return;
+        }
+        self.frames[frame_idx].page_key = Some(to);
+        self.page_map.insert(to, frame_idx);
     }
 
     /// Get buffer pool statistics.
@@ -126,8 +189,18 @@ impl BufferManager {
         data: &[u8; PAGE_SIZE],
         access: GuardAccess,
     ) -> Result<PageGuard, BufferError> {
+        self.fetch_key(PageCacheKey::unversioned(page_id), data, access)
+    }
+
+    /// Fetch an exact logical/physical page image into the buffer pool.
+    pub fn fetch_key(
+        &mut self,
+        page_key: PageCacheKey,
+        data: &[u8; PAGE_SIZE],
+        access: GuardAccess,
+    ) -> Result<PageGuard, BufferError> {
         // Check if the page is already in the pool.
-        if let Some(&frame_idx) = self.page_map.get(&page_id) {
+        if let Some(&frame_idx) = self.page_map.get(&page_key) {
             let frame = &mut self.frames[frame_idx];
             if !frame.is_free() {
                 let pin_token = frame.acquire_guard();
@@ -135,7 +208,7 @@ impl BufferManager {
                 if access == GuardAccess::Write {
                     frame.mark_dirty();
                 }
-                return Ok(PageGuard::new(frame_idx, page_id, access, pin_token));
+                return Ok(PageGuard::new(frame_idx, page_key, access, pin_token));
             }
         }
 
@@ -146,17 +219,17 @@ impl BufferManager {
 
         // Load the page into the frame.
         let frame = &mut self.frames[frame_idx];
-        frame.load(page_id, data);
+        frame.load(page_key, data);
         let pin_token = frame.acquire_guard();
         if access == GuardAccess::Write {
             frame.mark_dirty();
         }
 
         // Update the page map.
-        self.page_map.insert(page_id, frame_idx);
+        self.page_map.insert(page_key, frame_idx);
         self.stats.free_frames -= 1;
 
-        Ok(PageGuard::new(frame_idx, page_id, access, pin_token))
+        Ok(PageGuard::new(frame_idx, page_key, access, pin_token))
     }
 
     /// Get a reference to the data in a frame.
@@ -171,7 +244,12 @@ impl BufferManager {
 
     /// Mark a page as dirty (has been modified).
     pub fn mark_dirty(&mut self, page_id: u64) {
-        if let Some(&frame_idx) = self.page_map.get(&page_id) {
+        self.mark_dirty_key(PageCacheKey::unversioned(page_id));
+    }
+
+    /// Mark an exact physical page image dirty.
+    pub fn mark_dirty_key(&mut self, page_key: PageCacheKey) {
+        if let Some(&frame_idx) = self.page_map.get(&page_key) {
             self.frames[frame_idx].mark_dirty();
         }
     }
@@ -182,7 +260,12 @@ impl BufferManager {
     /// applies to callers that explicitly pinned a frame through the lower
     /// level `Frame` API.
     pub fn unpin(&mut self, page_id: u64) {
-        if let Some(&frame_idx) = self.page_map.get(&page_id) {
+        self.unpin_key(PageCacheKey::unversioned(page_id));
+    }
+
+    /// Release an explicit pin on an exact physical page image.
+    pub fn unpin_key(&mut self, page_key: PageCacheKey) {
+        if let Some(&frame_idx) = self.page_map.get(&page_key) {
             self.frames[frame_idx].unpin();
         }
     }
@@ -191,7 +274,12 @@ impl BufferManager {
     ///
     /// Returns the page data if the page was dirty, None otherwise.
     pub fn flush(&mut self, page_id: u64) -> Option<Box<[u8; PAGE_SIZE]>> {
-        if let Some(&frame_idx) = self.page_map.get(&page_id) {
+        self.flush_key(PageCacheKey::unversioned(page_id))
+    }
+
+    /// Flush a dirty exact physical page image to an owned buffer.
+    pub fn flush_key(&mut self, page_key: PageCacheKey) -> Option<Box<[u8; PAGE_SIZE]>> {
+        if let Some(&frame_idx) = self.page_map.get(&page_key) {
             let frame = &mut self.frames[frame_idx];
             if frame.is_dirty() {
                 let data = frame.data.clone();
@@ -209,13 +297,13 @@ impl BufferManager {
     pub fn flush_all(&mut self) -> Vec<(u64, Box<[u8; PAGE_SIZE]>)> {
         let mut flushed = Vec::new();
 
-        for (page_id, &frame_idx) in self.page_map.iter() {
+        for (page_key, &frame_idx) in self.page_map.iter() {
             let frame = &mut self.frames[frame_idx];
             if frame.is_dirty() {
                 let data = frame.data.clone();
                 frame.mark_clean();
                 self.stats.writes += 1;
-                flushed.push((*page_id, data));
+                flushed.push((page_key.logical_page_id(), data));
             }
         }
 
@@ -224,15 +312,20 @@ impl BufferManager {
 
     /// Remove a page from the buffer pool.
     pub fn evict(&mut self, page_id: u64) -> Result<(), BufferError> {
-        if let Some(frame_idx) = self.page_map.remove(&page_id) {
+        self.evict_key(PageCacheKey::unversioned(page_id))
+    }
+
+    /// Remove an exact physical page image from the buffer pool.
+    pub fn evict_key(&mut self, page_key: PageCacheKey) -> Result<(), BufferError> {
+        if let Some(frame_idx) = self.page_map.remove(&page_key) {
             let frame = &self.frames[frame_idx];
             if frame.is_pinned() {
-                self.page_map.insert(page_id, frame_idx);
+                self.page_map.insert(page_key, frame_idx);
                 return Err(BufferError::AllFramesPinned);
             }
             if frame.is_dirty() {
-                self.page_map.insert(page_id, frame_idx);
-                return Err(BufferError::DirtyPage(page_id));
+                self.page_map.insert(page_key, frame_idx);
+                return Err(BufferError::DirtyPage(page_key.logical_page_id()));
             }
             self.frames[frame_idx].clear();
             self.stats.free_frames += 1;
@@ -286,14 +379,14 @@ impl BufferManager {
 
             if frame.is_dirty() {
                 if dirty_page.is_none() {
-                    dirty_page = frame.page_id;
+                    dirty_page = frame.page_key;
                 }
                 continue;
             }
 
             // A clean victim can be detached from the page map safely.
-            if let Some(old_page_id) = frame.page_id {
-                self.page_map.remove(&old_page_id);
+            if let Some(old_page_key) = frame.page_key {
+                self.page_map.remove(&old_page_key);
             }
             frame.clear();
             self.stats.free_frames += 1;
@@ -302,7 +395,7 @@ impl BufferManager {
         }
 
         match dirty_page {
-            Some(page_id) => Err(BufferError::DirtyPage(page_id)),
+            Some(page_key) => Err(BufferError::DirtyPage(page_key.logical_page_id())),
             None => Err(BufferError::AllFramesPinned),
         }
     }
@@ -336,6 +429,27 @@ mod tests {
         assert_eq!(bm.stats().reads, 1);
         assert_eq!(bm.stats().hits, 1);
         drop(guard);
+    }
+
+    #[test]
+    fn test_physical_version_is_part_of_cache_identity() {
+        let mut bm = BufferManager::new(PAGE_SIZE * 2);
+        let old = [1u8; PAGE_SIZE];
+        let new = [2u8; PAGE_SIZE];
+
+        let old_key = PageCacheKey::new(7, 11);
+        let new_key = PageCacheKey::new(7, 12);
+        let old_guard = bm.fetch_key(old_key, &old, GuardAccess::Read).unwrap();
+        assert_eq!(bm.stats().reads, 1);
+        drop(old_guard);
+
+        let new_guard = bm.fetch_key(new_key, &new, GuardAccess::Read).unwrap();
+        assert_eq!(bm.stats().reads, 2);
+        assert_eq!(bm.stats().hits, 0);
+        assert_eq!(bm.frame_data(&new_guard), &new);
+        assert!(bm.is_resident_key(old_key));
+        assert!(bm.is_resident_key(new_key));
+        drop(new_guard);
     }
 
     #[test]

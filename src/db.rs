@@ -251,6 +251,13 @@ impl DB {
             engine.load_from_disk()?;
         }
 
+        // WAL replay mutates the logical tree, so materialize a lazily opened
+        // generation before applying a committed recovery prefix. A clean
+        // reopen remains lazy and serves reads directly through the PMT.
+        if wal_path.exists() {
+            engine.ensure_materialized()?;
+        }
+
         let recovery = if wal_path.exists() {
             Some(Self::recover_from_wal(
                 &wal_path,
@@ -315,6 +322,7 @@ impl DB {
     /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_writable()?;
+        self.engine.ensure_materialized()?;
 
         // Mutate memory first, then make the successful mutation durable in
         // the WAL. No page is written before the WAL reaches disk, and an
@@ -341,7 +349,7 @@ impl DB {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
 
-        match self.engine.btree().lookup(key)? {
+        match self.engine.lookup(key)? {
             LookupResult::Found(value) => Ok(Some(value)),
             LookupResult::Blob(ptr) => {
                 // Read from blob file.
@@ -361,8 +369,9 @@ impl DB {
     /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
+        self.engine.ensure_materialized()?;
 
-        if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key)? {
+        if let LookupResult::Blob(ptr) = self.engine.lookup(key)? {
             self.blobs.mark_deleted(&ptr);
         }
 
@@ -374,11 +383,7 @@ impl DB {
     /// Range scan over [start, end).
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
-        Ok(self
-            .engine
-            .btree()
-            .range_scan(start, end)?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+        self.engine.range(start, end)
     }
 
     /// Write buffered WAL records to disk and sync the mutation prefix.
@@ -1185,6 +1190,40 @@ mod tests {
     }
 
     #[test]
+    fn test_db_reopen_reads_pmt_pages_on_demand() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let mut db = DB::open(&path, Options::for_test()).unwrap();
+            for index in 0..500 {
+                let key = format!("key-{index:06}");
+                db.put(key.as_bytes(), b"value").unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let mut db = DB::open(&path, Options::for_test()).unwrap();
+        assert_eq!(db.engine.btree().node_count(), 0);
+        assert_eq!(db.engine.buffer_stats().reads, 0);
+
+        assert_eq!(db.get(b"key-000250").unwrap(), Some(b"value".to_vec()));
+        assert!(db.engine.buffer_stats().reads > 0);
+        assert_eq!(db.engine.btree().node_count(), 0);
+
+        let range = db.range(b"key-000050", b"key-000450").unwrap();
+        assert_eq!(range.len(), 400);
+        assert_eq!(range.first().unwrap().0, b"key-000050");
+        assert_eq!(range.last().unwrap().0, b"key-000449");
+        assert_eq!(db.engine.btree().node_count(), 0);
+
+        db.put(b"key-000250", b"updated").unwrap();
+        assert!(db.engine.btree().node_count() > 0);
+        db.flush().unwrap();
+        assert_eq!(db.get(b"key-000250").unwrap(), Some(b"updated".to_vec()));
+    }
+
+    #[test]
     fn test_db_rejects_malformed_meta_container() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1260,7 +1299,8 @@ mod tests {
         data[crate::btree::PAGE_SIZE - 1] ^= 0x01;
         fs::write(&data_path, data).unwrap();
 
-        let result = DB::open(&path, Options::default());
+        let db = DB::open(&path, Options::default()).unwrap();
+        let result = db.get(b"key");
         assert!(matches!(
             result,
             Err(Error::Corruption(message)) if message.contains("checksum mismatch")

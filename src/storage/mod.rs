@@ -6,12 +6,13 @@
 pub mod format;
 
 use crate::allocator::PageAllocator;
-use crate::btree::{BTree, Node, PAGE_SIZE};
-use crate::buffer::{BufferManager, BufferStats, GuardAccess};
+use crate::btree::{BTree, LookupResult, Node, ValueRef, PAGE_SIZE};
+use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
 use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard};
 
 /// Storage engine that coordinates all components.
 ///
@@ -21,7 +22,7 @@ pub struct StorageEngine {
     /// The B-tree (logical operations).
     btree: BTree,
     /// Buffer manager (page cache).
-    buffer: BufferManager,
+    buffer: Mutex<BufferManager>,
     /// Page mapping table (page locations).
     pmt: PMT,
     /// Device (file I/O).
@@ -32,6 +33,9 @@ pub struct StorageEngine {
     free_offsets: Vec<u64>,
     /// Offsets retired by the last flush, pending manifest publication.
     pending_reclaimed_offsets: Vec<u64>,
+    /// Root of the immutable generation when its B-tree pages are still
+    /// available through the PMT-backed lazy read path.
+    lazy_root: Option<u32>,
 }
 
 impl StorageEngine {
@@ -45,12 +49,13 @@ impl StorageEngine {
     ) -> Self {
         Self {
             btree: btree.with_page_allocator(allocator),
-            buffer,
+            buffer: Mutex::new(buffer),
             pmt,
             device,
             next_offset: 0,
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
+            lazy_root: None,
         }
     }
 
@@ -81,7 +86,16 @@ impl StorageEngine {
 
     /// Return current buffer-pool counters and derived occupancy metrics.
     pub fn buffer_stats(&self) -> BufferStats {
-        self.buffer.stats()
+        match self.buffer.lock() {
+            Ok(buffer) => buffer.stats(),
+            Err(poisoned) => poisoned.into_inner().stats(),
+        }
+    }
+
+    fn buffer_lock(&self) -> Result<MutexGuard<'_, BufferManager>> {
+        self.buffer
+            .lock()
+            .map_err(|_| Error::Buffer("buffer pool mutex is poisoned".into()))
     }
 
     /// Number of physical page slots available for safe reuse.
@@ -155,7 +169,7 @@ impl StorageEngine {
     /// the future on-demand B-tree path. It deliberately owns all physical
     /// location and checksum checks instead of allowing callers to bypass the
     /// PMT with raw device offsets.
-    pub fn read_node(&mut self, page_id: u64) -> Result<Node> {
+    pub fn read_node(&self, page_id: u64) -> Result<Node> {
         let mapping = *self
             .pmt
             .get(page_id)
@@ -185,13 +199,18 @@ impl StorageEngine {
             )));
         }
 
+        let page_key = PageCacheKey::new(page_id, mapping.version);
         let mut buf = [0u8; PAGE_SIZE];
-        if !self.buffer.is_resident(page_id) {
+        if !self.buffer_lock()?.is_resident_key(page_key) {
             self.device.read_page(mapping.offset, &mut buf)?;
         }
-        let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
-        let buffered_page = Box::new(*self.buffer.frame_data(&guard));
-        drop(guard);
+        let buffered_page = {
+            let mut buffer = self.buffer_lock()?;
+            let guard = buffer.fetch_key(page_key, &buf, GuardAccess::Read)?;
+            let page = *buffer.frame_data(&guard);
+            drop(guard);
+            Box::new(page)
+        };
 
         let node = Node::from_bytes(buffered_page)
             .ok_or_else(|| Error::Corruption(format!("invalid page {page_id}")))?;
@@ -265,14 +284,16 @@ impl StorageEngine {
                 // Stage the page through the buffer manager, then write the
                 // clean flushed image to the out-of-place device version.
                 let page = *persisted_node.as_bytes();
-                let guard = self
-                    .buffer
-                    .fetch(page_id as u64, &page, GuardAccess::Write)?;
-                self.buffer.frame_data_mut(&guard).copy_from_slice(&page);
-                drop(guard);
-                let flushed_page = self.buffer.flush(page_id as u64).ok_or_else(|| {
-                    Error::Buffer(format!("page {page_id} was not dirty after staging"))
-                })?;
+                let pending_key = PageCacheKey::unversioned(page_id as u64);
+                let flushed_page = {
+                    let mut buffer = self.buffer_lock()?;
+                    let guard = buffer.fetch_key(pending_key, &page, GuardAccess::Write)?;
+                    buffer.frame_data_mut(&guard).copy_from_slice(&page);
+                    drop(guard);
+                    buffer.flush_key(pending_key).ok_or_else(|| {
+                        Error::Buffer(format!("page {page_id} was not dirty after staging"))
+                    })?
+                };
                 self.device.write_page(offset, &flushed_page)?;
                 if reuses_retired_slot {
                     self.free_offsets.pop();
@@ -280,6 +301,15 @@ impl StorageEngine {
                     self.next_offset += PAGE_SIZE as u64;
                 }
                 self.pmt.insert(page_id as u64, 0, offset);
+                let version = self
+                    .pmt
+                    .get(page_id as u64)
+                    .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
+                    .version;
+                self.buffer_lock()?.rekey(
+                    pending_key,
+                    PageCacheKey::new(page_id as u64, version),
+                );
             }
         }
 
@@ -290,9 +320,262 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Ensure mutations operate on a complete logical tree.
+    ///
+    /// Reopened generations stay lazy for read-only point/range access. The
+    /// first mutation materializes the immutable PMT-selected generation into
+    /// the transitional BTree overlay; later work will replace this fallback
+    /// with page-granular copy-on-write mutation overlays.
+    pub fn ensure_materialized(&mut self) -> Result<()> {
+        let Some(root_page_id) = self.lazy_root else {
+            return Ok(());
+        };
+
+        let max_page_id = self
+            .pmt
+            .iter()
+            .map(|(page_id, _)| page_id)
+            .max()
+            .ok_or_else(|| Error::Corruption("lazy manifest PMT is unexpectedly empty".into()))?;
+        let node_count = max_page_id
+            .checked_add(1)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| Error::Corruption("manifest PMT page count overflow".into()))?;
+        let mut nodes = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            nodes.push(Node::new_leaf());
+        }
+
+        for page_id in 0..=max_page_id {
+            nodes[page_id as usize] = self.read_node(page_id)?;
+        }
+
+        let allocator = self.btree.take_page_allocator();
+        self.btree = BTree::from_nodes_with_allocator(nodes, root_page_id, allocator);
+        self.lazy_root = None;
+        Ok(())
+    }
+
+    /// Look up a key through either the resident mutation tree or the
+    /// PMT-backed lazy generation selected at reopen.
+    pub fn lookup(&self, key: &[u8]) -> Result<LookupResult> {
+        if let Some(root_page_id) = self.lazy_root {
+            self.lookup_lazy(root_page_id, key)
+        } else {
+            self.btree.lookup(key).map_err(Error::from)
+        }
+    }
+
+    /// Scan a key range through either the resident mutation tree or the
+    /// PMT-backed lazy generation selected at reopen.
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(root_page_id) = self.lazy_root {
+            self.range_lazy(root_page_id, start, end)
+        } else {
+            self.btree
+                .range_scan(start, end)
+                .map_err(Error::from)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        }
+    }
+
+    fn lookup_lazy(&self, root_page_id: u32, key: &[u8]) -> Result<LookupResult> {
+        let leaf_id = self.find_leaf_page(root_page_id, key)?;
+        let node = self.read_node(leaf_id as u64)?;
+        Ok(match node.search(key) {
+            Ok(index) => match node.value(index) {
+                Some(ValueRef::Inline(value)) => LookupResult::Found(value.to_vec()),
+                Some(ValueRef::Blob(pointer)) => LookupResult::Blob(pointer),
+                Some(ValueRef::Tombstone) => LookupResult::Deleted,
+                None => {
+                    return Err(Error::Corruption(
+                        "lazy leaf value payload is malformed".into(),
+                    ));
+                }
+            },
+            Err(_) => LookupResult::NotFound,
+        })
+    }
+
+    fn range_lazy(
+        &self,
+        root_page_id: u32,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut results = Vec::new();
+        let mut current = self.find_leaf_page(root_page_id, start)?;
+        let mut first_leaf = true;
+        let mut previous_key = None;
+
+        loop {
+            let node = self.read_node(current as u64)?;
+            let mut index = if first_leaf {
+                first_leaf = false;
+                match node.search(start) {
+                    Ok(index) | Err(index) => index,
+                }
+            } else {
+                0
+            };
+            while index < node.count() {
+                let key = node
+                    .key(index)
+                    .ok_or_else(|| Error::Corruption("lazy range key is malformed".into()))?;
+                if key.as_slice() >= end {
+                    return Ok(results);
+                }
+                index += 1;
+
+                if key.as_slice() < start {
+                    continue;
+                }
+                if previous_key.as_deref() == Some(key.as_slice()) {
+                    continue;
+                }
+                previous_key = Some(key.clone());
+
+                match node.value(index - 1) {
+                    Some(ValueRef::Inline(value)) => results.push((key, value.to_vec())),
+                    Some(ValueRef::Blob(_)) | Some(ValueRef::Tombstone) => {}
+                    None => {
+                        return Err(Error::Corruption(
+                            "lazy range value payload is malformed".into(),
+                        ));
+                    }
+                }
+            }
+
+            let Some(next) = self.next_leaf_page(root_page_id, current)? else {
+                return Ok(results);
+            };
+            current = next;
+        }
+    }
+
+    fn find_leaf_page(&self, root_page_id: u32, key: &[u8]) -> Result<u32> {
+        let mut current = root_page_id;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(Error::Corruption(
+                    "cycle detected during lazy B-tree descent".into(),
+                ));
+            }
+            let node = self.read_node(current as u64)?;
+            if node.is_leaf() {
+                return Ok(current);
+            }
+            let mut child_id = node.leftmost_child();
+            for index in 0..node.count() {
+                let separator = node
+                    .key(index)
+                    .ok_or_else(|| Error::Corruption("lazy internal key is malformed".into()))?;
+                if key < separator.as_slice() {
+                    break;
+                }
+                child_id = node.child_id(index).ok_or_else(|| {
+                    Error::Corruption("lazy internal child is malformed".into())
+                })?;
+            }
+            current = u32::try_from(child_id).map_err(|_| {
+                Error::Corruption("lazy internal child ID exceeds logical width".into())
+            })?;
+        }
+    }
+
+    fn find_path_to_leaf_page(
+        &self,
+        current: u32,
+        target: u32,
+        path: &mut Vec<(u32, usize)>,
+        active: &mut HashSet<u32>,
+    ) -> Result<bool> {
+        if !active.insert(current) {
+            return Err(Error::Corruption(
+                "cycle detected during lazy range traversal".into(),
+            ));
+        }
+
+        let result = (|| {
+            let node = self.read_node(current as u64)?;
+            if node.is_leaf() {
+                return Ok(current == target);
+            }
+            let mut children = Vec::with_capacity(node.count() + 1);
+            children.push(u32::try_from(node.leftmost_child()).map_err(|_| {
+                Error::Corruption("lazy internal child ID exceeds logical width".into())
+            })?);
+            for index in 0..node.count() {
+                let child = node.child_id(index).ok_or_else(|| {
+                    Error::Corruption("lazy internal child is malformed".into())
+                })?;
+                children.push(u32::try_from(child).map_err(|_| {
+                    Error::Corruption("lazy internal child ID exceeds logical width".into())
+                })?);
+            }
+            for (position, child) in children.into_iter().enumerate() {
+                path.push((current, position));
+                if self.find_path_to_leaf_page(child, target, path, active)? {
+                    return Ok(true);
+                }
+                path.pop();
+            }
+            Ok(false)
+        })();
+        active.remove(&current);
+        result
+    }
+
+    fn leftmost_leaf_page(&self, mut current: u32) -> Result<Option<u32>> {
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(Error::Corruption(
+                    "cycle detected during lazy next-leaf traversal".into(),
+                ));
+            }
+            let node = self.read_node(current as u64)?;
+            if node.is_leaf() {
+                return Ok(Some(current));
+            }
+            current = u32::try_from(node.leftmost_child()).map_err(|_| {
+                Error::Corruption("lazy internal child ID exceeds logical width".into())
+            })?;
+        }
+    }
+
+    fn next_leaf_page(&self, root_page_id: u32, target: u32) -> Result<Option<u32>> {
+        let mut path = Vec::new();
+        let mut active = HashSet::new();
+        if !self.find_path_to_leaf_page(root_page_id, target, &mut path, &mut active)? {
+            return Err(Error::Corruption(
+                "lazy range leaf is not reachable from root".into(),
+            ));
+        }
+        for (parent_id, child_position) in path.into_iter().rev() {
+            let parent = self.read_node(parent_id as u64)?;
+            if child_position < parent.count() {
+                let child = parent.child_id(child_position).ok_or_else(|| {
+                    Error::Corruption("lazy internal child is malformed".into())
+                })?;
+                return self.leftmost_leaf_page(u32::try_from(child).map_err(|_| {
+                    Error::Corruption("lazy internal child ID exceeds logical width".into())
+                })?);
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the page versions named by a durable manifest generation.
     pub fn load_from_manifest(&mut self, root_page_id: u64) -> Result<()> {
         if self.pmt.is_empty() {
+            if root_page_id != 0 {
+                return Err(Error::Corruption(
+                    "empty manifest PMT names a non-zero root page".into(),
+                ));
+            }
             self.next_offset = self.device.size()?;
             self.free_offsets.clear();
             self.pending_reclaimed_offsets.clear();
@@ -314,28 +597,18 @@ impl StorageEngine {
             .map(|(page_id, _)| page_id)
             .max()
             .ok_or_else(|| Error::Corruption("manifest PMT is unexpectedly empty".into()))?;
-        if root_page_id > u32::MAX as u64 || root_page_id > max_page_id {
+        if root_page_id > u32::MAX as u64
+            || root_page_id > max_page_id
+            || !self.pmt.contains(root_page_id)
+        {
             return Err(Error::Corruption(format!(
                 "manifest root page {root_page_id} is outside PMT"
             )));
         }
 
-        let node_count = max_page_id
-            .checked_add(1)
-            .and_then(|count| usize::try_from(count).ok())
-            .ok_or_else(|| Error::Corruption("manifest PMT page count overflow".into()))?;
-        let mut nodes = Vec::with_capacity(node_count);
-        for _ in 0..node_count {
-            nodes.push(Node::new_leaf());
-        }
-
-        for page_id in 0..=max_page_id {
-            let node = self.read_node(page_id)?;
-            nodes[page_id as usize] = node;
-        }
-
         let allocator = self.btree.take_page_allocator();
-        self.btree = BTree::from_nodes_with_allocator(nodes, root_page_id as u32, allocator);
+        self.btree = BTree::from_nodes_with_allocator(Vec::new(), root_page_id as u32, allocator);
+        self.lazy_root = Some(root_page_id as u32);
         self.next_offset = device_size;
         Ok(())
     }
@@ -427,9 +700,13 @@ impl StorageEngine {
             let mut buf = [0u8; PAGE_SIZE];
             self.device.read_page(offset, &mut buf)?;
 
-            let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
-            let buffered_page = Box::new(*self.buffer.frame_data(&guard));
-            drop(guard);
+            let buffered_page = {
+                let mut buffer = self.buffer_lock()?;
+                let guard = buffer.fetch(page_id, &buf, GuardAccess::Read)?;
+                let page = *buffer.frame_data(&guard);
+                drop(guard);
+                Box::new(page)
+            };
 
             // Deserialize the node.
             if let Some(node) = Node::from_bytes(buffered_page) {
@@ -445,6 +722,15 @@ impl StorageEngine {
 
             // Update PMT.
             self.pmt.insert(page_id, 0, offset);
+            let version = self
+                .pmt
+                .get(page_id)
+                .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
+                .version;
+            self.buffer_lock()?.rekey(
+                PageCacheKey::unversioned(page_id),
+                PageCacheKey::new(page_id, version),
+            );
 
             offset += PAGE_SIZE as u64;
             page_id += 1;
@@ -468,7 +754,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn buffer_stages_clean_writeback_and_reuses_clean_frame() {
+    fn buffer_stages_versioned_writeback_without_aliasing_generations() {
         let dir = tempdir().unwrap();
         let device = Device::open(
             dir.path().join("data"),
@@ -504,8 +790,11 @@ mod tests {
             .expect("second insert should fit");
         engine.flush().unwrap();
         let second = engine.buffer_stats();
-        assert_eq!(second.reads, 1);
-        assert_eq!(second.hits, 1);
+        // The new pending image must not alias the old published-version
+        // frame. It is a second cache miss until publication can retire the
+        // old generation safely.
+        assert_eq!(second.reads, 2);
+        assert_eq!(second.hits, 0);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
     }

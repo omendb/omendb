@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use super::PageCacheKey;
+
 /// Access level for a page guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardAccess {
@@ -35,13 +37,13 @@ impl PageGuard {
     /// Create a new page guard.
     pub(crate) fn new(
         frame_index: usize,
-        page_id: u64,
+        page_key: PageCacheKey,
         access: GuardAccess,
         pin_token: Arc<()>,
     ) -> Self {
         Self {
             frame_index,
-            page_id,
+            page_id: page_key.logical_page_id(),
             access,
             pin_token: Some(pin_token),
         }
