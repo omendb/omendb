@@ -284,6 +284,7 @@ impl DB {
         let recovery = if wal_path.exists() {
             Some(Self::recover_from_wal(
                 &wal_path,
+                current_manifest,
                 engine.btree_mut(),
                 &mut blobs,
             )?)
@@ -1002,6 +1003,7 @@ impl DB {
     /// Recover a committed WAL prefix and reject corrupt complete records.
     fn recover_from_wal(
         wal_path: &Path,
+        current_manifest: Option<Manifest>,
         btree: &mut BTree,
         blobs: &mut BlobManager,
     ) -> Result<RecoverySummary> {
@@ -1032,6 +1034,47 @@ impl DB {
                             "WAL commit does not match its mutation prefix".into(),
                         ));
                     }
+
+                    if let Some(current) = current_manifest {
+                        match commit.generation_id.get().cmp(&current.generation_id.get()) {
+                            std::cmp::Ordering::Less => {
+                                if commit.commit_id.get() > current.commit_id.get() {
+                                    return Err(Error::Corruption(
+                                        "WAL commit frontier is inconsistent with manifest".into(),
+                                    ));
+                                }
+                                pending.clear();
+                                offset += record_len;
+                                continue;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                if commit.commit_id != current.commit_id {
+                                    return Err(Error::Corruption(
+                                        "WAL commit frontier is inconsistent with manifest".into(),
+                                    ));
+                                }
+                                if commit.root_page_id != current.root_page_id
+                                    || commit.mutation_count != current.mutation_count
+                                    || commit.digest != current.digest
+                                {
+                                    return Err(Error::Corruption(
+                                        "WAL commit disagrees with authoritative manifest".into(),
+                                    ));
+                                }
+                                pending.clear();
+                                offset += record_len;
+                                continue;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                if commit.commit_id <= current.commit_id {
+                                    return Err(Error::Corruption(
+                                        "WAL commit frontier is inconsistent with manifest".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     for mutation in pending.drain(..) {
                         apply_mutation(mutation, btree, blobs)?;
                     }
@@ -2051,6 +2094,46 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn test_db_discards_wal_commit_already_published_by_manifest() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale-authoritative-wal.db");
+
+        let (commit_id, generation_id, root_page_id) = {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.flush().unwrap();
+
+            (
+                db.commit_id,
+                db.generation_id,
+                db.engine.btree().root_id() as u64,
+            )
+        };
+
+        // Model the crash window where manifest publication succeeded but WAL
+        // cleanup did not. Replaying this commit would publish the same
+        // logical state under a new generation.
+        let record = WalRecord::put(b"key", b"value");
+        let commit = CommitRecord {
+            commit_id,
+            generation_id,
+            root_page_id,
+            mutation_count: 1,
+            digest: digest_records(&[&record]),
+        };
+        let mut wal_bytes = record.to_bytes();
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reopened.commit_id, commit_id);
+        assert_eq!(reopened.generation_id, generation_id);
+        assert_eq!(reopened.metrics().unwrap().storage.generation_flushes, 0);
+        assert!(!path.join(WAL_FILE).exists());
     }
 
     #[test]
