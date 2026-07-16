@@ -358,72 +358,118 @@ impl BTree {
         }
     }
 
-    /// Find the path from the root to a target leaf. Each path entry records
-    /// the child position within its parent (0 is the leftmost child).
-    fn find_path_to_leaf(
+    /// Find a target leaf while validating every page and routing edge that
+    /// the search visits. A cursor must not turn corruption into an ordinary
+    /// end-of-stream condition.
+    fn find_path_to_leaf_checked(
         &self,
         current: PageId,
         target: PageId,
         path: &mut Vec<(PageId, usize)>,
-    ) -> bool {
-        let Some(node) = self.node(current) else {
-            return false;
-        };
-        if node.is_leaf() {
-            return current == target;
+        active: &mut HashSet<PageId>,
+    ) -> Result<bool, BTreeError> {
+        if !active.insert(current) {
+            return Err(BTreeError::Corruption(
+                "cycle detected while locating range leaf".into(),
+            ));
         }
 
-        let leftmost = node.leftmost_child() as PageId;
-        let children: Vec<_> = (0..node.count())
-            .filter_map(|index| node.child_id(index).map(|child| child as PageId))
-            .collect();
-
-        path.push((current, 0));
-        if self.find_path_to_leaf(leftmost, target, path) {
-            return true;
-        }
-        path.pop();
-
-        for (index, child) in children.into_iter().enumerate() {
-            path.push((current, index + 1));
-            if self.find_path_to_leaf(child, target, path) {
-                return true;
-            }
-            path.pop();
-        }
-        false
-    }
-
-    /// Descend through leftmost children until reaching a leaf.
-    fn leftmost_leaf(&self, mut current: PageId) -> Option<PageId> {
-        loop {
-            let node = self.node(current)?;
+        let result = (|| {
+            let node = self
+                .node(current)
+                .ok_or_else(|| BTreeError::Corruption("range page is missing".into()))?;
             if node.is_leaf() {
-                return Some(current);
+                return Ok(current == target);
             }
-            let next = node.leftmost_child() as PageId;
-            if next == current {
-                return None;
+
+            let leftmost = node.leftmost_child();
+            if leftmost > u32::MAX as u64 {
+                return Err(BTreeError::Corruption(
+                    "internal child page ID exceeds the logical ID width".into(),
+                ));
             }
-            current = next;
+            let mut children = Vec::with_capacity(node.count() + 1);
+            children.push(leftmost as PageId);
+            for index in 0..node.count() {
+                let child = node.child_id(index).ok_or_else(|| {
+                    BTreeError::Corruption("internal child is malformed".into())
+                })?;
+                if child > u32::MAX as u64 {
+                    return Err(BTreeError::Corruption(
+                        "internal child page ID exceeds the logical ID width".into(),
+                    ));
+                }
+                children.push(child as PageId);
+            }
+
+            for (position, child) in children.into_iter().enumerate() {
+                path.push((current, position));
+                if self.find_path_to_leaf_checked(child, target, path, active)? {
+                    return Ok(true);
+                }
+                path.pop();
+            }
+            Ok(false)
+        })();
+
+        active.remove(&current);
+        result
+    }
+
+    /// Descend through leftmost children, reporting malformed routing state.
+    fn leftmost_leaf_checked(&self, mut current: PageId) -> Result<Option<PageId>, BTreeError> {
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(BTreeError::Corruption(
+                    "cycle detected while locating next range leaf".into(),
+                ));
+            }
+            let node = self
+                .node(current)
+                .ok_or_else(|| BTreeError::Corruption("range page is missing".into()))?;
+            if node.is_leaf() {
+                return Ok(Some(current));
+            }
+
+            let next = node.leftmost_child();
+            if next > u32::MAX as u64 {
+                return Err(BTreeError::Corruption(
+                    "internal child page ID exceeds the logical ID width".into(),
+                ));
+            }
+            current = next as PageId;
         }
     }
 
-    /// Find the leaf immediately to the right of `target` in key order.
-    fn next_leaf(&self, target: PageId) -> Option<PageId> {
+    /// Find the leaf immediately to the right of `target`, validating the
+    /// route and returning corruption instead of silently stopping a scan.
+    fn next_leaf_checked(&self, target: PageId) -> Result<Option<PageId>, BTreeError> {
         let mut path = Vec::new();
-        if !self.find_path_to_leaf(self.root, target, &mut path) {
-            return None;
+        let mut active = HashSet::new();
+        if !self.find_path_to_leaf_checked(self.root, target, &mut path, &mut active)? {
+            return Err(BTreeError::Corruption(
+                "range leaf is not reachable from the root".into(),
+            ));
         }
 
         for (parent_id, child_position) in path.into_iter().rev() {
-            let parent = self.node(parent_id)?;
+            let parent = self
+                .node(parent_id)
+                .ok_or_else(|| BTreeError::Corruption("range parent page is missing".into()))?;
             if child_position < parent.count() {
-                let next_child = parent.child_id(child_position)? as PageId;
-                return self.leftmost_leaf(next_child);
+                let next_child = parent.child_id(child_position).ok_or_else(|| {
+                    BTreeError::Corruption("internal child is malformed".into())
+                })?;
+                if next_child > u32::MAX as u64 {
+                    return Err(BTreeError::Corruption(
+                        "internal child page ID exceeds the logical ID width".into(),
+                    ));
+                }
+                return self.leftmost_leaf_checked(next_child as PageId);
             }
         }
-        None
+        Ok(None)
     }
 
     /// Split a leaf node that's full and insert the key-value.
@@ -683,7 +729,7 @@ impl<'a> RangeScan<'a> {
 }
 
 impl<'a> Iterator for RangeScan<'a> {
-    type Item = (Vec<u8>, Vec<u8>);
+    type Item = Result<(Vec<u8>, Vec<u8>), BTreeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -691,10 +737,20 @@ impl<'a> Iterator for RangeScan<'a> {
         }
 
         loop {
-            let node = self.tree.node(self.current_node)?;
+            let Some(node) = self.tree.node(self.current_node) else {
+                self.done = true;
+                return Some(Err(BTreeError::Corruption(
+                    "range page is missing".into(),
+                )));
+            };
 
             if self.current_index < node.count() {
-                let key = node.key(self.current_index)?;
+                let Some(key) = node.key(self.current_index) else {
+                    self.done = true;
+                    return Some(Err(BTreeError::Corruption(
+                        "range key is malformed".into(),
+                    )));
+                };
 
                 if key >= self.end {
                     self.done = true;
@@ -709,20 +765,38 @@ impl<'a> Iterator for RangeScan<'a> {
                 // the first occurrence (the first occurrence is the newest
                 // version and may itself be a tombstone).
                 if self.current_index > 1
-                    && node.key(self.current_index - 2).as_deref() == Some(key.as_slice())
+                    && node
+                        .key(self.current_index - 2)
+                        .is_some_and(|previous| previous == key)
                 {
                     continue;
                 }
 
-                if let Some(ValueRef::Inline(value)) = node.value(self.current_index - 1)
-                    && key >= self.start
-                {
-                    return Some((key, value.to_vec()));
+                match node.value(self.current_index - 1) {
+                    Some(ValueRef::Inline(value)) if key >= self.start => {
+                        return Some(Ok((key, value.to_vec())));
+                    }
+                    Some(ValueRef::Inline(_))
+                    | Some(ValueRef::Blob(_))
+                    | Some(ValueRef::Tombstone) => {}
+                    None => {
+                        self.done = true;
+                        return Some(Err(BTreeError::Corruption(
+                            "range value payload is malformed".into(),
+                        )));
+                    }
                 }
                 continue;
             }
 
-            let Some(next_leaf) = self.tree.next_leaf(self.current_node) else {
+            let next_leaf = match self.tree.next_leaf_checked(self.current_node) {
+                Ok(next_leaf) => next_leaf,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
+            let Some(next_leaf) = next_leaf else {
                 self.done = true;
                 return None;
             };
@@ -865,7 +939,11 @@ mod tests {
         tree.insert(b"d", b"4").unwrap();
         tree.insert(b"e", b"5").unwrap();
 
-        let results: Vec<_> = tree.range_scan(b"b", b"e").unwrap().collect();
+        let results: Vec<_> = tree
+            .range_scan(b"b", b"e")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, b"b");
         assert_eq!(results[1].0, b"c");
@@ -945,10 +1023,37 @@ mod tests {
         let results: Vec<_> = tree
             .range_scan(b"key_000050", b"key_000450")
             .unwrap()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 400);
         assert_eq!(results.first().unwrap().0, b"key_000050");
         assert_eq!(results.last().unwrap().0, b"key_000449");
+    }
+
+    #[test]
+    fn test_range_scan_reports_routing_corruption() {
+        let mut tree = BTree::new();
+        let mut root = Node::new_internal();
+        root.set_leftmost_child(1);
+        root.insert_child(b"z", u64::MAX).unwrap();
+
+        let mut leaf = Node::new_leaf();
+        leaf.insert(b"a", b"value").unwrap();
+
+        tree.add_node(root, 0);
+        tree.add_node(leaf, 1);
+
+        let mut scan = tree.range_scan(b"a", b"zz").unwrap();
+        assert!(matches!(
+            scan.next(),
+            Some(Ok((key, value))) if key == b"a" && value == b"value"
+        ));
+        assert!(matches!(
+            scan.next(),
+            Some(Err(BTreeError::Corruption(message)))
+                if message.contains("logical ID width")
+        ));
+        assert!(scan.next().is_none());
     }
 
     proptest! {
@@ -983,7 +1088,8 @@ mod tests {
             let actual: Vec<_> = tree
                 .range_scan(b"key-000", b"key-999")
                 .unwrap()
-                .collect();
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
             let expected: Vec<_> = reference.into_iter().collect();
             prop_assert_eq!(actual, expected);
         }

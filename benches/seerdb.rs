@@ -85,6 +85,7 @@ fn bench_btree_range_scan(c: &mut Criterion) {
                     let count = tree
                         .range_scan(b"key-00000000", end.as_bytes())
                         .unwrap()
+                        .map(Result::unwrap)
                         .count();
                     black_box(count);
                 });

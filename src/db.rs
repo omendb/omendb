@@ -378,7 +378,7 @@ impl DB {
             .engine
             .btree()
             .range_scan(start, end)?
-            .collect())
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Write buffered WAL records to disk and sync the mutation prefix.
