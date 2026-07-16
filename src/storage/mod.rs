@@ -33,6 +33,9 @@ pub struct StorageEngine {
     free_offsets: Vec<u64>,
     /// Offsets retired by the last flush, pending manifest publication.
     pending_reclaimed_offsets: Vec<u64>,
+    /// Cache identities retired by the last flush, pending manifest
+    /// publication. They cannot be evicted before the old root is fenced off.
+    pending_reclaimed_cache_keys: Vec<PageCacheKey>,
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
@@ -55,6 +58,7 @@ impl StorageEngine {
             next_offset: 0,
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
+            pending_reclaimed_cache_keys: Vec::new(),
             lazy_root: None,
         }
     }
@@ -160,6 +164,13 @@ impl StorageEngine {
             .append(&mut self.pending_reclaimed_offsets);
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
+        if let Ok(mut buffer) = self.buffer.lock() {
+            for page_key in self.pending_reclaimed_cache_keys.drain(..) {
+                let _ = buffer.evict_key(page_key);
+            }
+        } else {
+            self.pending_reclaimed_cache_keys.clear();
+        }
         self.btree.clear_dirty();
     }
 
@@ -258,6 +269,7 @@ impl StorageEngine {
         // invariant needed by manifest publication.
         let dirty_page_ids = self.btree.dirty_page_ids();
         let mut retired_offsets = Vec::new();
+        let mut retired_cache_keys = Vec::new();
 
         for page_id in dirty_page_ids {
             let node = self.btree.node(page_id);
@@ -275,6 +287,10 @@ impl StorageEngine {
                 // the resulting PMT only after all data is durable.
                 if let Some(mapping) = self.pmt.get(page_id as u64) {
                     retired_offsets.push(mapping.offset);
+                    retired_cache_keys.push(PageCacheKey::new(
+                        page_id as u64,
+                        mapping.version,
+                    ));
                 }
                 let (offset, reuses_retired_slot) = match self.free_offsets.last() {
                     Some(&offset) => (offset, true),
@@ -316,6 +332,7 @@ impl StorageEngine {
         // Sync to ensure data is persisted.
         self.device.sync()?;
         self.pending_reclaimed_offsets = retired_offsets;
+        self.pending_reclaimed_cache_keys = retired_cache_keys;
 
         Ok(())
     }
@@ -579,6 +596,7 @@ impl StorageEngine {
             self.next_offset = self.device.size()?;
             self.free_offsets.clear();
             self.pending_reclaimed_offsets.clear();
+            self.pending_reclaimed_cache_keys.clear();
             return Ok(());
         }
 
@@ -590,6 +608,7 @@ impl StorageEngine {
             .filter(|offset| !active_offsets.contains(offset))
             .collect();
         self.pending_reclaimed_offsets.clear();
+        self.pending_reclaimed_cache_keys.clear();
 
         let max_page_id = self
             .pmt
@@ -742,6 +761,7 @@ impl StorageEngine {
         self.btree.page_allocator_mut().advance_next_id(node_count);
         self.free_offsets.clear();
         self.pending_reclaimed_offsets.clear();
+        self.pending_reclaimed_cache_keys.clear();
 
         Ok(())
     }
