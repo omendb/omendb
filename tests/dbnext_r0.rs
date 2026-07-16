@@ -768,6 +768,79 @@ fn dbnext_r0_retained_root_pins_page_reuse_until_release() {
 }
 
 #[test]
+fn dbnext_r1_retained_root_reads_inline_and_blob_values() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-reads.db");
+    let large_before = vec![0x41u8; 2_048];
+    let large_after = vec![0x42u8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"inline", b"before").unwrap();
+    db.put(b"large", &large_before).unwrap();
+    db.flush().unwrap();
+
+    let retained = db.retain_current().unwrap();
+    let snapshot_id = retained.snapshot_id();
+    db.put(b"inline", b"after").unwrap();
+    db.put(b"large", &large_after).unwrap();
+    db.flush().unwrap();
+
+    assert_eq!(
+        db.get_at(snapshot_id, b"inline").unwrap(),
+        Some(b"before".to_vec())
+    );
+    assert_eq!(
+        db.get_at(snapshot_id, b"large").unwrap(),
+        Some(large_before.clone())
+    );
+    assert_eq!(
+        db.range_at(snapshot_id, b"inline", b"large\0").unwrap(),
+        vec![
+            (b"inline".to_vec(), b"before".to_vec()),
+            (b"large".to_vec(), large_before.clone()),
+        ]
+    );
+
+    drop(db);
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"large").unwrap(),
+        Some(large_before)
+    );
+    assert_eq!(reopened.get(b"large").unwrap(), Some(large_after));
+    drop(reopened);
+    retained.release().unwrap();
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert!(matches!(
+        reopened.get_at(snapshot_id, b"inline"),
+        Err(Error::SnapshotUnavailable(_))
+    ));
+}
+
+#[test]
+fn dbnext_r1_release_refreshes_reuse_without_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-release-refresh.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"before").unwrap();
+    db.flush().unwrap();
+    let retained = db.retain_current().unwrap();
+
+    db.put(b"key", b"after-retained").unwrap();
+    db.flush().unwrap();
+    let retained_size = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert_eq!(db.metrics().unwrap().reclaimable_pages, 0);
+
+    retained.release().unwrap();
+    db.put(b"key", b"after-release").unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        fs::metadata(path.join("seerdb.data")).unwrap().len(),
+        retained_size
+    );
+    assert_eq!(db.get(b"key").unwrap(), Some(b"after-release".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_corrupt_retention_registry_refuses_open() {
     let root = tempdir().unwrap();
     let path = root.path().join("retained-corrupt.db");
@@ -786,6 +859,56 @@ fn dbnext_r0_corrupt_retention_registry_refuses_open() {
         Err(Error::Corruption(message)) if message.contains("retention registry")
     ));
     drop(retained);
+}
+
+#[test]
+fn dbnext_r1_missing_retained_blob_image_refuses_open() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-blob-missing.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.flush().unwrap();
+    let retained = db.retain_current().unwrap();
+    let snapshot_id = retained.snapshot_id();
+    drop(db);
+
+    fs::remove_file(path.join(format!("seerdb.blob.retained.{}", snapshot_id.get()))).unwrap();
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("blob image")
+    ));
+    drop(retained);
+}
+
+#[test]
+fn dbnext_r1_multiple_retained_roots_read_distinct_generations() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-multiple.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let mut retained = Vec::new();
+    let mut expected = Vec::new();
+    for generation in 0..4 {
+        let value = format!("value-{generation}");
+        db.put(b"key", value.as_bytes()).unwrap();
+        db.flush().unwrap();
+        let snapshot = db.retain_current().unwrap();
+        expected.push((snapshot.snapshot_id(), value.into_bytes()));
+        retained.push(snapshot);
+    }
+
+    db.put(b"key", b"current").unwrap();
+    db.flush().unwrap();
+    for (snapshot_id, value) in &expected {
+        assert_eq!(
+            db.get_at(*snapshot_id, b"key").unwrap(),
+            Some(value.clone())
+        );
+    }
+
+    for snapshot in retained {
+        snapshot.release().unwrap();
+    }
+    assert!(!path.join("seerdb.retained").exists());
 }
 
 #[test]

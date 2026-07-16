@@ -69,6 +69,7 @@ impl PageMapping {
 /// The PMT is the core of the out-of-place B-tree design. When a page is
 /// modified, a new version is written to a different location, and the PMT
 /// is updated atomically to point to the new location.
+#[derive(Clone)]
 pub struct PMT {
     /// The mapping table.
     mappings: HashMap<u64, PageMapping>,

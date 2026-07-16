@@ -378,6 +378,11 @@ impl RetentionRegistry {
         &self.roots
     }
 
+    /// Return the next identifier without mutating the registry.
+    pub fn next_snapshot_id(&self) -> SnapshotId {
+        self.next_snapshot_id
+    }
+
     /// Allocate and insert one retained root.
     pub fn insert(&mut self, manifest: Manifest) -> Option<SnapshotId> {
         let snapshot_id = self.next_snapshot_id;

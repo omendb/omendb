@@ -22,7 +22,7 @@ use crate::storage::format::{
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -61,6 +61,10 @@ const META_MAGIC: [u8; 8] = *b"SEERMET1";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn retained_blob_path(path: &Path, snapshot_id: SnapshotId) -> PathBuf {
+    path.join(format!("{BLOB_FILE}.retained.{}", snapshot_id.get()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
@@ -263,7 +267,10 @@ pub struct RetainedSnapshot {
 
 struct RetentionState {
     path: PathBuf,
+    root_path: PathBuf,
     registry: RetentionRegistry,
+    protected_offsets: Arc<Mutex<HashSet<u64>>>,
+    offsets_by_snapshot: BTreeMap<SnapshotId, HashSet<u64>>,
 }
 
 struct RetentionLease {
@@ -330,7 +337,7 @@ impl Drop for Snapshot {
 }
 
 impl RetentionState {
-    fn load(path: PathBuf) -> Result<Self> {
+    fn load(path: PathBuf, protected_offsets: Arc<Mutex<HashSet<u64>>>) -> Result<Self> {
         let registry = if path.exists() {
             let bytes = fs::read(&path)?;
             RetentionRegistry::from_bytes(&bytes)
@@ -338,7 +345,16 @@ impl RetentionState {
         } else {
             RetentionRegistry::new()
         };
-        Ok(Self { path, registry })
+        Ok(Self {
+            root_path: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            path,
+            registry,
+            protected_offsets,
+            offsets_by_snapshot: BTreeMap::new(),
+        })
     }
 
     fn persist(&self, registry: &RetentionRegistry) -> Result<()> {
@@ -355,13 +371,36 @@ impl RetentionState {
         atomic_write(&self.path, &bytes)
     }
 
-    fn insert(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+    fn replace_protected_offsets(&self) -> Result<()> {
+        let mut protected = HashSet::new();
+        for offsets in self.offsets_by_snapshot.values() {
+            protected.extend(offsets);
+        }
+        *self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))? =
+            protected;
+        Ok(())
+    }
+
+    fn install_offsets(
+        &mut self,
+        offsets_by_snapshot: BTreeMap<SnapshotId, HashSet<u64>>,
+    ) -> Result<()> {
+        self.offsets_by_snapshot = offsets_by_snapshot;
+        self.replace_protected_offsets()
+    }
+
+    fn insert(&mut self, manifest: Manifest, offsets: HashSet<u64>) -> Result<SnapshotId> {
         let mut candidate = self.registry.clone();
         let snapshot_id = candidate
             .insert(manifest)
             .ok_or_else(|| Error::Wal("snapshot ID overflow".into()))?;
         self.persist(&candidate)?;
         self.registry = candidate;
+        self.offsets_by_snapshot.insert(snapshot_id, offsets);
+        self.replace_protected_offsets()?;
         Ok(snapshot_id)
     }
 
@@ -375,6 +414,13 @@ impl RetentionState {
         }
         self.persist(&candidate)?;
         self.registry = candidate;
+        self.offsets_by_snapshot.remove(&snapshot_id);
+        self.replace_protected_offsets()?;
+        let blob_path = retained_blob_path(&self.root_path, snapshot_id);
+        if blob_path.exists() {
+            fs::remove_file(blob_path)?;
+            sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))?;
+        }
         Ok(())
     }
 
@@ -384,6 +430,10 @@ impl RetentionState {
 
     fn is_empty(&self) -> bool {
         self.registry.is_empty()
+    }
+
+    fn next_snapshot_id(&self) -> SnapshotId {
+        self.registry.next_snapshot_id()
     }
 }
 
@@ -704,30 +754,39 @@ impl DB {
                 )
             };
 
+        let protected_offsets = Arc::new(Mutex::new(HashSet::new()));
         let retention_path = path.join(RETENTION_FILE);
-        let retention = Arc::new(Mutex::new(RetentionState::load(retention_path).map_err(
-            |error| {
-                if check_only {
-                    Self::map_check_error(CheckFailureKind::Format, error)
-                } else {
-                    error
-                }
-            },
-        )?));
-        let retained_offsets = {
-            let state = retention
+        let retention = Arc::new(Mutex::new(
+            RetentionState::load(retention_path, Arc::clone(&protected_offsets)).map_err(
+                |error| {
+                    if check_only {
+                        Self::map_check_error(CheckFailureKind::Format, error)
+                    } else {
+                        error
+                    }
+                },
+            )?,
+        ));
+        {
+            let mut state = retention
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-            Self::load_retained_offsets(&path, &state, database_id, history_id).map_err(
-                |error| {
+            let offsets = Self::load_retained_offset_map(&path, &state, database_id, history_id)
+                .map_err(|error| {
                     if check_only {
                         Self::map_check_error(CheckFailureKind::Checkpoint, error)
                     } else {
                         error
                     }
-                },
-            )?
-        };
+                })?;
+            state.install_offsets(offsets).map_err(|error| {
+                if check_only {
+                    Self::map_check_error(CheckFailureKind::Checkpoint, error)
+                } else {
+                    error
+                }
+            })?;
+        }
 
         // Open the data file.
         let device_opts = DeviceOptions {
@@ -813,7 +872,18 @@ impl DB {
         };
 
         // Create storage engine.
-        let mut engine = StorageEngine::new(BTree::new(), buffer, pmt, allocator, device);
+        let mut engine = StorageEngine::new_with_protected_offsets(
+            BTree::new(),
+            buffer,
+            pmt,
+            allocator,
+            device,
+            Arc::clone(&protected_offsets),
+        );
+        let retained_offsets = protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+            .clone();
         engine.set_protected_offsets(retained_offsets)?;
 
         // A published manifest selects the PMT locations for the latest
@@ -1115,6 +1185,19 @@ impl DB {
         }
     }
 
+    /// Get a value from a durably retained historical root.
+    ///
+    /// The page lookup uses the retained PMT over this handle's device and
+    /// buffer pool. Blob values resolve through the immutable blob image
+    /// captured with the same retention lease.
+    pub fn get_at(&self, snapshot_id: SnapshotId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_readable()?;
+        let manifest = self.retained_manifest(snapshot_id)?;
+        let pmt = self.retained_pmt(manifest)?;
+        let result = self.engine.lookup_at(manifest.root_page_id, &pmt, key)?;
+        self.lookup_result_value(result, snapshot_id)
+    }
+
     /// Delete a key.
     ///
     /// The tombstone is applied in memory, journaled durably, and included in
@@ -1158,6 +1241,103 @@ impl DB {
                 crate::btree::LookupResult::Deleted | crate::btree::LookupResult::NotFound => None,
             })
             .collect()
+    }
+
+    /// Scan a range from a durably retained historical root.
+    pub fn range_at(
+        &self,
+        snapshot_id: SnapshotId,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_readable()?;
+        let manifest = self.retained_manifest(snapshot_id)?;
+        let pmt = self.retained_pmt(manifest)?;
+        let blob_path = retained_blob_path(&self.path, snapshot_id);
+        let blob_bytes = fs::read(&blob_path)?;
+        let blobs = BlobManager::from_bytes(&blob_bytes).ok_or_else(|| {
+            Error::Corruption(format!(
+                "retained snapshot {} has an invalid blob image",
+                snapshot_id.get()
+            ))
+        })?;
+        self.engine
+            .range_at(manifest.root_page_id, &pmt, start, end)?
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                LookupResult::Found(value) => Some(Ok((key, value))),
+                LookupResult::Blob(pointer) => Some(
+                    blobs
+                        .read(&pointer)
+                        .map(|value| (key, value.to_vec()))
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "retained snapshot {} has an invalid blob pointer",
+                                snapshot_id.get()
+                            ))
+                        }),
+                ),
+                LookupResult::Deleted | LookupResult::NotFound => None,
+            })
+            .collect()
+    }
+
+    fn retained_manifest(&self, snapshot_id: SnapshotId) -> Result<Manifest> {
+        let state = self
+            .retention
+            .lock()
+            .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+        state
+            .roots()
+            .iter()
+            .find(|root| root.snapshot_id == snapshot_id)
+            .map(|root| root.manifest)
+            .ok_or_else(|| {
+                Error::SnapshotUnavailable(format!(
+                    "retained root {} is not active",
+                    snapshot_id.get()
+                ))
+            })
+    }
+
+    fn retained_pmt(&self, manifest: Manifest) -> Result<PMT> {
+        if manifest.pmt_checkpoint_id.get() == 0 {
+            return Ok(PMT::new());
+        }
+        let checkpoint = self
+            .path
+            .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
+        Self::load_meta(&checkpoint).map(|(pmt, _)| pmt)
+    }
+
+    fn lookup_result_value(
+        &self,
+        result: LookupResult,
+        snapshot_id: SnapshotId,
+    ) -> Result<Option<Vec<u8>>> {
+        match result {
+            LookupResult::Found(value) => Ok(Some(value)),
+            LookupResult::Blob(pointer) => {
+                let blob_path = retained_blob_path(&self.path, snapshot_id);
+                let blob_bytes = fs::read(&blob_path)?;
+                let blobs = BlobManager::from_bytes(&blob_bytes).ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "retained snapshot {} has an invalid blob image",
+                        snapshot_id.get()
+                    ))
+                })?;
+                blobs
+                    .read(&pointer)
+                    .map(|value| Some(value.to_vec()))
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "retained snapshot {} has an invalid blob pointer",
+                            snapshot_id.get()
+                        ))
+                    })
+            }
+            LookupResult::Deleted | LookupResult::NotFound => Ok(None),
+        }
     }
 
     /// Write buffered WAL records to disk and optionally force the prefix.
@@ -2056,10 +2236,10 @@ impl DB {
 
     /// Retain the current root generation with a durable physical lease.
     ///
-    /// The current read implementation is an independently verified copy,
-    /// while the source registry pins every page named by the retained PMT.
-    /// This makes reclamation safe today and leaves the public contract ready
-    /// for a shared in-history reader in a later slice.
+    /// The retained root is registered durably before its pages can be
+    /// reclaimed. Historical reads use the source device and the retained
+    /// PMT; the independently verified copy remains available for callers
+    /// that need an isolated archive-style handle.
     pub fn retain_current(&mut self) -> Result<RetainedSnapshot> {
         self.check_writable()?;
         let snapshot = self.begin_snapshot()?;
@@ -2068,11 +2248,39 @@ impl DB {
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         let snapshot_id = {
+            let state = self
+                .retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            state.next_snapshot_id()
+        };
+        let retained_blob = retained_blob_path(&self.path, snapshot_id);
+        let blob_bytes = if self.path.join(BLOB_FILE).is_file() {
+            fs::read(self.path.join(BLOB_FILE))?
+        } else {
+            self.blobs.to_bytes()
+        };
+        if let Err(error) = atomic_write(&retained_blob, &blob_bytes) {
+            let _ = fs::remove_file(&retained_blob);
+            return Err(error);
+        }
+        let offsets = match Self::load_manifest_offsets(&self.path, manifest, snapshot_id) {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                let _ = fs::remove_file(&retained_blob);
+                return Err(error);
+            }
+        };
+        let snapshot_id = {
             let mut state = self
                 .retention
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-            state.insert(manifest)?
+            if let Err(error) = state.insert(manifest, offsets) {
+                let _ = fs::remove_file(&retained_blob);
+                return Err(error);
+            }
+            snapshot_id
         };
 
         let protected = {
@@ -2080,7 +2288,11 @@ impl DB {
                 .retention
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-            Self::load_retained_offsets(&self.path, &state, self.database_id, self.history_id)?
+            state
+                .protected_offsets
+                .lock()
+                .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+                .clone()
         };
         if let Err(error) = self.engine.set_protected_offsets(protected) {
             self.write_fenced = true;
@@ -2417,13 +2629,13 @@ impl DB {
         Self::load_legacy_meta(&data)
     }
 
-    fn load_retained_offsets(
+    fn load_retained_offset_map(
         path: &Path,
         state: &RetentionState,
         database_id: DatabaseId,
         history_id: HistoryId,
-    ) -> Result<HashSet<u64>> {
-        let mut protected = HashSet::new();
+    ) -> Result<BTreeMap<SnapshotId, HashSet<u64>>> {
+        let mut offsets_by_snapshot = BTreeMap::new();
         for root in state.roots() {
             if root.manifest.database_id != database_id {
                 return Err(Error::Corruption(format!(
@@ -2444,36 +2656,61 @@ impl DB {
                     root.manifest.page_size
                 )));
             }
-            if root.manifest.pmt_checkpoint_id.get() == 0 {
-                if root.manifest.root_page_id != 0 {
-                    return Err(Error::Corruption(format!(
-                        "retained snapshot {} has a root without a checkpoint",
+            let blob_path = retained_blob_path(path, root.snapshot_id);
+            let blob_bytes = fs::read(&blob_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Error::Corruption(format!(
+                        "retained snapshot {} is missing its blob image",
                         root.snapshot_id.get()
-                    )));
+                    ))
+                } else {
+                    error.into()
                 }
-                continue;
-            }
-
-            let checkpoint = path.join(format!(
-                "seerdb.meta.{}",
-                root.manifest.pmt_checkpoint_id.get()
-            ));
-            let (pmt, _) = Self::load_meta(&checkpoint)?;
-            if !pmt.contains(root.manifest.root_page_id) {
+            })?;
+            if BlobManager::from_bytes(&blob_bytes).is_none() {
                 return Err(Error::Corruption(format!(
-                    "retained snapshot {} names a root missing from its checkpoint",
+                    "retained snapshot {} has an invalid blob image",
                     root.snapshot_id.get()
                 )));
             }
-            for (_, mapping) in pmt.iter() {
-                if mapping.file_id != 0 || !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
-                    return Err(Error::Corruption(format!(
-                        "retained snapshot {} names an invalid page mapping",
-                        root.snapshot_id.get()
-                    )));
-                }
-                protected.insert(mapping.offset);
+            let protected = Self::load_manifest_offsets(path, root.manifest, root.snapshot_id)?;
+            offsets_by_snapshot.insert(root.snapshot_id, protected);
+        }
+        Ok(offsets_by_snapshot)
+    }
+
+    fn load_manifest_offsets(
+        path: &Path,
+        manifest: Manifest,
+        snapshot_id: SnapshotId,
+    ) -> Result<HashSet<u64>> {
+        if manifest.pmt_checkpoint_id.get() == 0 {
+            if manifest.root_page_id != 0 {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} has a root without a checkpoint",
+                    snapshot_id.get()
+                )));
             }
+            return Ok(HashSet::new());
+        }
+
+        let checkpoint = path.join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
+        let (pmt, _) = Self::load_meta(&checkpoint)?;
+        if !pmt.contains(manifest.root_page_id) {
+            return Err(Error::Corruption(format!(
+                "retained snapshot {} names a root missing from its checkpoint",
+                snapshot_id.get()
+            )));
+        }
+        let mut protected = HashSet::new();
+        for (_, mapping) in pmt.iter() {
+            if mapping.file_id != 0 || !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} names an invalid page mapping",
+                    snapshot_id.get()
+                )));
+            }
+            protected.insert(mapping.offset);
         }
         Ok(protected)
     }

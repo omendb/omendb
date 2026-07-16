@@ -13,7 +13,7 @@ use crate::mvcc::PMT;
 use crate::space::Device;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Cumulative physical work performed by one storage-engine handle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,9 +96,8 @@ pub struct StorageEngine {
     pending_reclaimed_cache_keys: Vec<PageCacheKey>,
     /// Physical page offsets referenced by retained root generations. These
     /// pages remain unavailable for reuse until the corresponding retention
-    /// lease is released and the database is reopened or refreshes its
-    /// reclamation view.
-    protected_offsets: HashSet<u64>,
+    /// lease is released and the allocator refreshes its reclamation view.
+    protected_offsets: Arc<Mutex<HashSet<u64>>>,
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
@@ -115,6 +114,26 @@ impl StorageEngine {
         allocator: PageAllocator,
         device: Device,
     ) -> Self {
+        Self::new_with_protected_offsets(
+            btree,
+            buffer,
+            pmt,
+            allocator,
+            device,
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+    }
+
+    /// Create a storage engine sharing a retention protection set with the
+    /// database's durable root registry.
+    pub fn new_with_protected_offsets(
+        btree: BTree,
+        buffer: BufferManager,
+        pmt: PMT,
+        allocator: PageAllocator,
+        device: Device,
+        protected_offsets: Arc<Mutex<HashSet<u64>>>,
+    ) -> Self {
         Self {
             btree: btree.with_page_allocator(allocator),
             buffer: Mutex::new(buffer),
@@ -124,7 +143,7 @@ impl StorageEngine {
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
-            protected_offsets: HashSet::new(),
+            protected_offsets,
             lazy_root: None,
             metrics: StorageCounters::default(),
         }
@@ -183,10 +202,14 @@ impl StorageEngine {
     ///
     /// Recomputing from the device extent is intentionally conservative: a
     /// newly retained root can protect pages that were previously considered
-    /// free, while a released root is allowed to remain under-reclaimed until
-    /// the next reopen/refresh boundary.
+    /// free, while a released root becomes reusable at the next flush or
+    /// explicit refresh boundary.
     pub fn set_protected_offsets(&mut self, protected_offsets: HashSet<u64>) -> Result<()> {
-        self.protected_offsets = protected_offsets;
+        *self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))? =
+            protected_offsets;
         self.refresh_reclaimable_offsets()
     }
 
@@ -194,10 +217,15 @@ impl StorageEngine {
         let device_size = self.device.size()?;
         let active_offsets: HashSet<_> =
             self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        let protected_offsets = self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+            .clone();
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
             .filter(|offset| {
-                !active_offsets.contains(offset) && !self.protected_offsets.contains(offset)
+                !active_offsets.contains(offset) && !protected_offsets.contains(offset)
             })
             .collect();
         self.next_offset = device_size;
@@ -257,10 +285,14 @@ impl StorageEngine {
     /// Before that point, the old generation may still be the authoritative
     /// root after a crash and its physical pages must remain untouched.
     pub fn complete_generation(&mut self) {
+        let protected_offsets = match self.protected_offsets.lock() {
+            Ok(protected) => protected.clone(),
+            Err(_) => self.pending_reclaimed_offsets.iter().copied().collect(),
+        };
         let reclaimed_pages = self
             .pending_reclaimed_offsets
             .iter()
-            .filter(|offset| !self.protected_offsets.contains(offset))
+            .filter(|offset| !protected_offsets.contains(offset))
             .count() as u64;
         self.metrics
             .reclaimed_pages
@@ -272,7 +304,7 @@ impl StorageEngine {
         self.free_offsets.extend(
             self.pending_reclaimed_offsets
                 .drain(..)
-                .filter(|offset| !self.protected_offsets.contains(offset)),
+                .filter(|offset| !protected_offsets.contains(offset)),
         );
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
@@ -294,11 +326,20 @@ impl StorageEngine {
     /// location and checksum checks instead of allowing callers to bypass the
     /// PMT with raw device offsets.
     pub fn read_node(&self, page_id: u64) -> Result<Node> {
+        self.read_node_from_pmt(&self.pmt, page_id)
+    }
+
+    /// Read and validate one logical page through an explicitly selected PMT.
+    ///
+    /// Retained generations use this same device and versioned buffer-cache
+    /// boundary rather than reopening a second database directory. The PMT
+    /// mapping version is part of the cache key, so historical and current
+    /// page versions cannot alias in the buffer pool.
+    fn read_node_from_pmt(&self, pmt: &PMT, page_id: u64) -> Result<Node> {
         self.metrics
             .logical_page_reads
             .fetch_add(1, Ordering::Relaxed);
-        let mapping = *self
-            .pmt
+        let mapping = *pmt
             .get(page_id)
             .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
         if mapping.file_id != 0 {
@@ -410,6 +451,9 @@ impl StorageEngine {
 
     /// Flush all dirty pages to disk.
     pub fn flush(&mut self) -> Result<()> {
+        // A lease may have been released since the last publication. Refresh
+        // the allocator view before choosing a reusable physical slot.
+        self.refresh_reclaimable_offsets()?;
         // The bootstrap path rewrites the complete logical tree into a new
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
@@ -650,6 +694,26 @@ impl StorageEngine {
         }
     }
 
+    /// Look up a key in a retained PMT-selected root generation.
+    pub fn lookup_at(&self, root_page_id: u64, pmt: &PMT, key: &[u8]) -> Result<LookupResult> {
+        if pmt.is_empty() {
+            if root_page_id == 0 {
+                return Ok(LookupResult::NotFound);
+            }
+            return Err(Error::Corruption(
+                "empty historical PMT names a non-zero root page".into(),
+            ));
+        }
+        let root_page_id = u32::try_from(root_page_id)
+            .map_err(|_| Error::Corruption("historical root exceeds logical ID width".into()))?;
+        if !pmt.contains(root_page_id as u64) {
+            return Err(Error::Corruption(
+                "historical root is missing from its PMT checkpoint".into(),
+            ));
+        }
+        self.lookup_lazy_with_pmt(pmt, root_page_id, key)
+    }
+
     /// Scan a key range through either the resident mutation tree or the
     /// PMT-backed lazy generation selected at reopen.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, LookupResult)>> {
@@ -679,9 +743,44 @@ impl StorageEngine {
         }
     }
 
+    /// Scan a range in a retained PMT-selected root generation.
+    pub fn range_at(
+        &self,
+        root_page_id: u64,
+        pmt: &PMT,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, LookupResult)>> {
+        if pmt.is_empty() {
+            if root_page_id == 0 {
+                return Ok(Vec::new());
+            }
+            return Err(Error::Corruption(
+                "empty historical PMT names a non-zero root page".into(),
+            ));
+        }
+        let root_page_id = u32::try_from(root_page_id)
+            .map_err(|_| Error::Corruption("historical root exceeds logical ID width".into()))?;
+        if !pmt.contains(root_page_id as u64) {
+            return Err(Error::Corruption(
+                "historical root is missing from its PMT checkpoint".into(),
+            ));
+        }
+        self.range_lazy_with_pmt(pmt, root_page_id, start, end)
+    }
+
     fn lookup_lazy(&self, root_page_id: u32, key: &[u8]) -> Result<LookupResult> {
-        let leaf_id = self.find_leaf_page(root_page_id, key)?;
-        let node = self.read_node(leaf_id as u64)?;
+        self.lookup_lazy_with_pmt(&self.pmt, root_page_id, key)
+    }
+
+    fn lookup_lazy_with_pmt(
+        &self,
+        pmt: &PMT,
+        root_page_id: u32,
+        key: &[u8],
+    ) -> Result<LookupResult> {
+        let leaf_id = self.find_leaf_page(pmt, root_page_id, key)?;
+        let node = self.read_node_from_pmt(pmt, leaf_id as u64)?;
         Ok(match node.search(key) {
             Ok(index) => match node.value(index) {
                 Some(ValueRef::Inline(value)) => LookupResult::Found(value.to_vec()),
@@ -703,13 +802,23 @@ impl StorageEngine {
         start: &[u8],
         end: &[u8],
     ) -> Result<Vec<(Vec<u8>, LookupResult)>> {
+        self.range_lazy_with_pmt(&self.pmt, root_page_id, start, end)
+    }
+
+    fn range_lazy_with_pmt(
+        &self,
+        pmt: &PMT,
+        root_page_id: u32,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, LookupResult)>> {
         let mut results = Vec::new();
-        let mut current = self.find_leaf_page(root_page_id, start)?;
+        let mut current = self.find_leaf_page(pmt, root_page_id, start)?;
         let mut first_leaf = true;
         let mut previous_key = None;
 
         loop {
-            let node = self.read_node(current as u64)?;
+            let node = self.read_node_from_pmt(pmt, current as u64)?;
             let mut index = if first_leaf {
                 first_leaf = false;
                 match node.search(start) {
@@ -751,14 +860,14 @@ impl StorageEngine {
                 }
             }
 
-            let Some(next) = self.next_leaf_page(root_page_id, current)? else {
+            let Some(next) = self.next_leaf_page(pmt, root_page_id, current)? else {
                 return Ok(results);
             };
             current = next;
         }
     }
 
-    fn find_leaf_page(&self, root_page_id: u32, key: &[u8]) -> Result<u32> {
+    fn find_leaf_page(&self, pmt: &PMT, root_page_id: u32, key: &[u8]) -> Result<u32> {
         let mut current = root_page_id;
         let mut visited = HashSet::new();
         loop {
@@ -767,7 +876,7 @@ impl StorageEngine {
                     "cycle detected during lazy B-tree descent".into(),
                 ));
             }
-            let node = self.read_node(current as u64)?;
+            let node = self.read_node_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(current);
             }
@@ -791,6 +900,7 @@ impl StorageEngine {
 
     fn find_path_to_leaf_page(
         &self,
+        pmt: &PMT,
         current: u32,
         target: u32,
         path: &mut Vec<(u32, usize)>,
@@ -803,7 +913,7 @@ impl StorageEngine {
         }
 
         let result = (|| {
-            let node = self.read_node(current as u64)?;
+            let node = self.read_node_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(current == target);
             }
@@ -821,7 +931,7 @@ impl StorageEngine {
             }
             for (position, child) in children.into_iter().enumerate() {
                 path.push((current, position));
-                if self.find_path_to_leaf_page(child, target, path, active)? {
+                if self.find_path_to_leaf_page(pmt, child, target, path, active)? {
                     return Ok(true);
                 }
                 path.pop();
@@ -832,7 +942,7 @@ impl StorageEngine {
         result
     }
 
-    fn leftmost_leaf_page(&self, mut current: u32) -> Result<Option<u32>> {
+    fn leftmost_leaf_page(&self, pmt: &PMT, mut current: u32) -> Result<Option<u32>> {
         let mut visited = HashSet::new();
         loop {
             if !visited.insert(current) {
@@ -840,7 +950,7 @@ impl StorageEngine {
                     "cycle detected during lazy next-leaf traversal".into(),
                 ));
             }
-            let node = self.read_node(current as u64)?;
+            let node = self.read_node_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(Some(current));
             }
@@ -850,23 +960,26 @@ impl StorageEngine {
         }
     }
 
-    fn next_leaf_page(&self, root_page_id: u32, target: u32) -> Result<Option<u32>> {
+    fn next_leaf_page(&self, pmt: &PMT, root_page_id: u32, target: u32) -> Result<Option<u32>> {
         let mut path = Vec::new();
         let mut active = HashSet::new();
-        if !self.find_path_to_leaf_page(root_page_id, target, &mut path, &mut active)? {
+        if !self.find_path_to_leaf_page(pmt, root_page_id, target, &mut path, &mut active)? {
             return Err(Error::Corruption(
                 "lazy range leaf is not reachable from root".into(),
             ));
         }
         for (parent_id, child_position) in path.into_iter().rev() {
-            let parent = self.read_node(parent_id as u64)?;
+            let parent = self.read_node_from_pmt(pmt, parent_id as u64)?;
             if child_position < parent.count() {
                 let child = parent
                     .child_id(child_position)
                     .ok_or_else(|| Error::Corruption("lazy internal child is malformed".into()))?;
-                return self.leftmost_leaf_page(u32::try_from(child).map_err(|_| {
-                    Error::Corruption("lazy internal child ID exceeds logical width".into())
-                })?);
+                return self.leftmost_leaf_page(
+                    pmt,
+                    u32::try_from(child).map_err(|_| {
+                        Error::Corruption("lazy internal child ID exceeds logical width".into())
+                    })?,
+                );
             }
         }
         Ok(None)
@@ -890,10 +1003,15 @@ impl StorageEngine {
         let device_size = self.device.size()?;
         let active_offsets: HashSet<_> =
             self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        let protected_offsets = self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+            .clone();
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
             .filter(|offset| {
-                !active_offsets.contains(offset) && !self.protected_offsets.contains(offset)
+                !active_offsets.contains(offset) && !protected_offsets.contains(offset)
             })
             .collect();
         self.pending_reclaimed_offsets.clear();

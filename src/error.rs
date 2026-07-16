@@ -92,6 +92,10 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// A retained historical root is no longer available to this handle.
+    #[error("snapshot unavailable: {0}")]
+    SnapshotUnavailable(String),
+
     /// B-tree operation failed.
     #[error("btree error: {0}")]
     BTree(String),
