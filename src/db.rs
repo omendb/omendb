@@ -479,6 +479,7 @@ impl DB {
         };
         if !read_only {
             clear_blob_reservation(&path)?;
+            clear_wal_reservation(&path)?;
         }
 
         let mut manifest = if check_only {
@@ -945,17 +946,15 @@ impl DB {
     /// segments so future WAL growth has a bounded, stable admission domain;
     /// the logical WAL remains separately length-delimited and checksummed.
     fn ensure_wal_reservation(&self) -> Result<u64> {
-        if self.options.max_wal_bytes == 0 {
+        let target = self.wal_reservation_target()?;
+        if target == 0 {
             return Ok(0);
         }
 
-        let remainder = self.options.max_wal_bytes % WAL_RESERVATION_SEGMENT_BYTES;
-        let target = self
-            .options
-            .max_wal_bytes
-            .checked_add((WAL_RESERVATION_SEGMENT_BYTES - remainder) % WAL_RESERVATION_SEGMENT_BYTES)
-            .ok_or(Error::DiskFull)?;
-        let path = self.path.join(WAL_RESERVATION_FILE);
+        // Reserve the physical extent on the file that will receive WAL
+        // bytes. A separate sidecar would consume capacity without protecting
+        // the actual append path.
+        let path = self.path.join(WAL_FILE);
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -964,11 +963,28 @@ impl DB {
             .open(&path)?;
         let current = file.metadata()?.len();
         if current < target {
-            preallocate_file(&file, target)?;
+            let physically_reserved = reserve_file(&file, target)?;
+            if !physically_reserved
+                && fs2::available_space(&self.path)? < target.saturating_sub(current)
+            {
+                return Err(Error::DiskFull);
+            }
             file.sync_data()?;
             sync_directory(&self.path)?;
         }
         Ok(current.max(target))
+    }
+
+    fn wal_reservation_target(&self) -> Result<u64> {
+        if self.options.max_wal_bytes == 0 {
+            return Ok(0);
+        }
+
+        let remainder = self.options.max_wal_bytes % WAL_RESERVATION_SEGMENT_BYTES;
+        self.options
+            .max_wal_bytes
+            .checked_add((WAL_RESERVATION_SEGMENT_BYTES - remainder) % WAL_RESERVATION_SEGMENT_BYTES)
+            .ok_or(Error::DiskFull)
     }
 
     fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<()> {
@@ -1197,7 +1213,11 @@ impl DB {
             data_bytes: artifact_size(DATA_FILE)?,
             blob_bytes: artifact_size(BLOB_FILE)?,
             wal_bytes: artifact_size(WAL_FILE)?,
-            wal_reserved_bytes: artifact_size(WAL_RESERVATION_FILE)?,
+            wal_reserved_bytes: if self.path.join(WAL_FILE).is_file() {
+                self.wal_reservation_target()?
+            } else {
+                0
+            },
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
         })
     }
@@ -2440,6 +2460,15 @@ fn clear_blob_reservation(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn clear_wal_reservation(path: &Path) -> Result<()> {
+    let reservation = path.join(WAL_RESERVATION_FILE);
+    if reservation.exists() {
+        fs::remove_file(reservation)?;
+        sync_directory(path)?;
+    }
+    Ok(())
+}
+
 fn copy_snapshot_artifacts(source: &Path, destination: &Path) -> Result<u32> {
     copy_artifacts(source, destination, false)
 }
@@ -2466,7 +2495,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
                 || name == BLOB_FILE
                 || name == META_FILE
                 || name.starts_with("seerdb.meta.")
-                || (include_wal && (name == WAL_FILE || name == WAL_RESERVATION_FILE)))
+                || (include_wal && name == WAL_FILE))
         {
             continue;
         }
@@ -2689,11 +2718,10 @@ mod tests {
 
         db.options.max_wal_bytes = exact_budget;
         db.put(b"key", &value).unwrap();
-        assert_eq!(
-            fs::metadata(path.join(WAL_RESERVATION_FILE))
-                .unwrap()
-                .len(),
-            WAL_RESERVATION_SEGMENT_BYTES
+        assert!(path.join(WAL_FILE).is_file());
+        assert!(!path.join(WAL_RESERVATION_FILE).exists());
+        assert!(
+            fs::metadata(path.join(WAL_FILE)).unwrap().len() < WAL_RESERVATION_SEGMENT_BYTES
         );
         assert!(path.join(BLOB_RESERVATION_FILE).is_file());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2706,11 +2734,8 @@ mod tests {
         );
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
-            fs::metadata(path.join(WAL_RESERVATION_FILE))
-                .unwrap()
-                .blocks()
-                > 0,
-            "WAL reservation should own physical blocks on this platform"
+            fs::metadata(path.join(WAL_FILE)).unwrap().blocks() > 0,
+            "WAL file should own physical blocks on this platform"
         );
         assert_eq!(
             db.metrics().unwrap().wal_reserved_bytes,
@@ -2718,10 +2743,24 @@ mod tests {
         );
         db.flush().unwrap();
         assert!(!path.join(BLOB_RESERVATION_FILE).exists());
+        assert!(!path.join(WAL_FILE).exists());
+        assert_eq!(db.metrics().unwrap().wal_reserved_bytes, 0);
         drop(db);
 
         let reopened = DB::open(&path, Options::for_test()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn test_db_removes_legacy_wal_reservation_sidecar_on_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-wal-reservation.db");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(WAL_RESERVATION_FILE), [0xA5; 4096]).unwrap();
+
+        let db = DB::open(&path, Options::default()).unwrap();
+        assert!(!path.join(WAL_RESERVATION_FILE).exists());
+        assert_eq!(db.metrics().unwrap().wal_reserved_bytes, 0);
     }
 
     #[test]

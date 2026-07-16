@@ -317,8 +317,10 @@ impl Device {
 /// Reserve a file extent before a durability-critical write.
 pub(crate) fn preallocate_file(file: &File, length: u64) -> io::Result<()> {
     let _ = reserve_file(file, length)?;
-    // Keep the logical length contract explicit for the WAL reservation and
-    // for callers that intentionally want a visible preallocated extent.
+    // Keep the logical length contract explicit for callers that intentionally
+    // want a visible preallocated extent. Keep-size WAL admission uses
+    // `reserve_file` directly so the logical WAL length remains its true
+    // append frontier.
     file.set_len(length)
 }
 
