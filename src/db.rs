@@ -763,14 +763,21 @@ impl DB {
 
         let pmt_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
-        if data.len() < 4 + pmt_len + 4 {
+        let pmt_end = 4usize
+            .checked_add(pmt_len)
+            .ok_or_else(|| Error::Corruption("meta PMT length overflows".into()))?;
+        let alloc_len_start = pmt_end;
+        let alloc_len_end = alloc_len_start
+            .checked_add(4)
+            .ok_or_else(|| Error::Corruption("meta allocator length overflows".into()))?;
+        if data.len() < alloc_len_end {
             return Err(Error::Corruption("meta file truncated".into()));
         }
 
-        let pmt = PMT::from_bytes(&data[4..4 + pmt_len])
+        let pmt = PMT::from_bytes(&data[4..pmt_end])
             .ok_or_else(|| Error::Corruption("invalid PMT data".into()))?;
 
-        let alloc_offset = 4 + pmt_len;
+        let alloc_offset = alloc_len_start;
         let alloc_len = u32::from_le_bytes([
             data[alloc_offset],
             data[alloc_offset + 1],
@@ -778,7 +785,21 @@ impl DB {
             data[alloc_offset + 3],
         ]) as usize;
 
-        let alloc_data = &data[alloc_offset + 4..alloc_offset + 4 + alloc_len];
+        let alloc_end = alloc_len_end
+            .checked_add(alloc_len)
+            .ok_or_else(|| Error::Corruption("meta allocator length overflows".into()))?;
+        if data.len() != alloc_end {
+            return Err(Error::Corruption(
+                if data.len() < alloc_end {
+                    "meta allocator data is truncated"
+                } else {
+                    "meta file has trailing bytes"
+                }
+                .into(),
+            ));
+        }
+
+        let alloc_data = &data[alloc_len_end..alloc_end];
         let allocator = PageAllocator::from_bytes(alloc_data)
             .ok_or_else(|| Error::Corruption("invalid allocator data".into()))?;
 
@@ -790,10 +811,15 @@ impl DB {
         let pmt_bytes = pmt.to_bytes();
         let alloc_bytes = allocator.to_bytes();
 
+        let pmt_len = u32::try_from(pmt_bytes.len())
+            .map_err(|_| Error::InvalidArgument("PMT checkpoint is too large".into()))?;
+        let alloc_len = u32::try_from(alloc_bytes.len())
+            .map_err(|_| Error::InvalidArgument("allocator checkpoint is too large".into()))?;
+
         let mut buf = Vec::with_capacity(4 + pmt_bytes.len() + 4 + alloc_bytes.len());
-        buf.extend_from_slice(&(pmt_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&pmt_len.to_le_bytes());
         buf.extend_from_slice(&pmt_bytes);
-        buf.extend_from_slice(&(alloc_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&alloc_len.to_le_bytes());
         buf.extend_from_slice(&alloc_bytes);
 
         atomic_write(path, &buf)
@@ -1086,6 +1112,28 @@ mod tests {
 
         // Meta file should exist.
         assert!(path.join(META_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_rejects_malformed_meta_container() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.flush().unwrap();
+        }
+
+        let checkpoint = path.join("seerdb.meta.1");
+        let mut meta = fs::read(&checkpoint).unwrap();
+        meta.push(0xA5);
+        fs::write(&checkpoint, meta).unwrap();
+
+        assert!(matches!(
+            DB::open(&path, Options::default()),
+            Err(Error::Corruption(message)) if message.contains("trailing")
+        ));
     }
 
     #[test]

@@ -371,3 +371,24 @@ fn dbnext_r0_rejects_corrupt_blob_artifact() {
         Err(Error::Corruption(message)) if message.contains("blob")
     ));
 }
+
+#[test]
+fn dbnext_r0_rejects_malformed_checkpoint_container() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("corrupt-checkpoint.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let checkpoint_path = path.join("seerdb.meta.1");
+    let mut checkpoint = fs::read(&checkpoint_path).unwrap();
+    checkpoint.push(0xA5);
+    fs::write(checkpoint_path, checkpoint).unwrap();
+
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("trailing")
+    ));
+}
