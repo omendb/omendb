@@ -301,6 +301,15 @@ fn dbnext_r0_wal_mutation_faults_fence_and_recover_prior_state() {
         },
         DB::inject_wal_sync_failure,
     );
+    run_case(
+        root.path(),
+        "wal-after-sync.db",
+        Options {
+            sync_writes: true,
+            ..Options::default()
+        },
+        DB::inject_wal_after_sync_failure,
+    );
 }
 
 #[test]
@@ -1080,6 +1089,48 @@ fn dbnext_r0_manifest_sync_fault_fences_compaction_and_recovers() {
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
     assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
+    fn run_case<F>(root: &Path, name: &str, inject: F, expect_wal_before_reopen: bool)
+    where
+        F: FnOnce(&DB),
+    {
+        let path = root.join(name);
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+
+        inject(&db);
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(db.durability_status().write_fenced);
+        assert_eq!(
+            path.join("seerdb.wal").exists(),
+            expect_wal_before_reopen
+        );
+
+        drop(db);
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+        assert!(!reopened.durability_status().write_fenced);
+        assert!(!path.join("seerdb.wal").exists());
+    }
+
+    let root = tempdir().unwrap();
+    run_case(
+        root.path(),
+        "post-manifest.db",
+        DB::inject_after_manifest_failure,
+        true,
+    );
+    run_case(
+        root.path(),
+        "wal-truncate.db",
+        DB::inject_wal_truncate_failure,
+        false,
+    );
 }
 
 #[test]

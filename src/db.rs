@@ -37,6 +37,9 @@ thread_local! {
     static FAIL_NEXT_WAL_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_WAL_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_WAL_SYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_WAL_AFTER_SYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_AFTER_MANIFEST: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_WAL_TRUNCATE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
@@ -833,6 +836,10 @@ impl DB {
                     SyncPolicy::SyncAll => file.sync_all()?,
                     SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data()?,
                 }
+                #[cfg(any(test, feature = "fault-injection"))]
+                if FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.replace(false)) {
+                    return Err(std::io::Error::other("injected post-WAL-sync failure").into());
+                }
             }
         }
         Ok(())
@@ -1030,10 +1037,22 @@ impl DB {
             format_version: FORMAT_VERSION,
         };
         self.manifest.publish(manifest)?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected post-manifest failure").into());
+        }
+
         self.engine.complete_generation();
 
         if wal_path.exists() {
             fs::remove_file(&wal_path)?;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            if FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.replace(false)) {
+                return Err(std::io::Error::other("injected WAL truncate failure").into());
+            }
+
             sync_directory(&self.path)?;
         }
 
@@ -1781,10 +1800,28 @@ impl DB {
         FAIL_NEXT_WAL_SYNC.with(|failure| failure.set(true));
     }
 
+    /// Inject one failure after the next WAL sync boundary.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_wal_after_sync_failure(&self) {
+        FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.set(true));
+    }
+
     /// Inject one failure at the next manifest sync boundary.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_manifest_sync_failure(&self) {
         self.manifest.inject_sync_failure();
+    }
+
+    /// Inject one failure after the next manifest becomes authoritative.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_after_manifest_failure(&self) {
+        FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after the next WAL file is removed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_wal_truncate_failure(&self) {
+        FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.set(true));
     }
 
     /// Begin a new transaction.
