@@ -756,6 +756,7 @@ impl Drop for DB {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+    use std::process::Command;
     use tempfile::tempdir;
 
     use crate::storage::format::MANIFEST_SLOT_SIZE;
@@ -916,6 +917,41 @@ mod tests {
             !path.join(WAL_FILE).exists(),
             "WAL should be deleted after recovery"
         );
+    }
+
+    #[test]
+    fn test_db_process_crash_recovery() {
+        if let Some(path) = std::env::var_os("SEERDB_CRASH_CHILD_PATH") {
+            let path = PathBuf::from(path);
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"published", b"value-before-crash").unwrap();
+            db.flush().unwrap();
+            db.put(b"unpublished", b"value-after-wal-only").unwrap();
+
+            // Exit without running Rust destructors. This leaves the WAL
+            // mutation on disk while the manifest still names the prior
+            // published generation, matching an abrupt process termination.
+            std::process::exit(137);
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("db::tests::test_db_process_crash_recovery")
+            .arg("--nocapture")
+            .env("SEERDB_CRASH_CHILD_PATH", &path)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "crash child unexpectedly exited cleanly");
+
+        let db = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(
+            db.get(b"published").unwrap(),
+            Some(b"value-before-crash".to_vec())
+        );
+        assert_eq!(db.get(b"unpublished").unwrap(), None);
+        assert!(!path.join(WAL_FILE).exists());
     }
 
     #[test]
