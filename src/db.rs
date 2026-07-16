@@ -384,7 +384,7 @@ impl DB {
     /// 3. If value is blob pointer, read from blob file
     /// 4. If deleted (tombstone), return None
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.check_open()?;
+        self.check_readable()?;
 
         match self.engine.lookup(key)? {
             LookupResult::Found(value) => Ok(Some(value)),
@@ -421,7 +421,7 @@ impl DB {
 
     /// Range scan over [start, end).
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.check_open()?;
+        self.check_readable()?;
         self.engine
             .range(start, end)?
             .into_iter()
@@ -535,6 +535,10 @@ impl DB {
         append_commit: bool,
         recovered_wal_offset: u64,
     ) -> Result<()> {
+        // Retire the older manifest slot before page writes can reuse any
+        // physical versions it names. If the new publication fails, both
+        // slots still identify the same current generation and its pages.
+        self.mirror_current_manifest()?;
         self.engine.flush()?;
 
         let checkpoint_path = self
@@ -588,6 +592,15 @@ impl DB {
         self.pending_mutations = 0;
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;
+        Ok(())
+    }
+
+    /// Make both manifest slots name the latest durable generation before a
+    /// new generation may reuse pages from older slots.
+    fn mirror_current_manifest(&mut self) -> Result<()> {
+        if let Some(current) = self.manifest.load_latest()? {
+            self.manifest.publish(current)?;
+        }
         Ok(())
     }
 
@@ -712,7 +725,7 @@ impl DB {
     /// This pass does not mutate logical state and is intended for DBNext
     /// check/repair tooling and pre-snapshot validation.
     pub fn verify(&mut self) -> Result<VerificationReport> {
-        self.check_open()?;
+        self.check_readable()?;
         let manifest = self
             .manifest
             .load_latest()?
@@ -940,6 +953,20 @@ impl DB {
     fn check_open(&self) -> Result<()> {
         if !self.is_open {
             return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        Ok(())
+    }
+
+    /// Reject ordinary reads after a failed publication until reopen restores
+    /// the last authoritative root. The in-memory mutation overlay may be
+    /// newer than the manifest after an ambiguous write, so exposing it would
+    /// make one handle disagree with the state a crash recovery would choose.
+    fn check_readable(&self) -> Result<()> {
+        self.check_open()?;
+        if self.write_fenced {
+            return Err(Error::NeedsRecovery(
+                "reads fenced after a failed durable publication; reopen required".into(),
+            ));
         }
         Ok(())
     }
@@ -2000,6 +2027,10 @@ mod tests {
             db.put(b"another", b"value"),
             Err(Error::NeedsRecovery(_))
         ));
+        assert!(matches!(
+            db.get(b"key"),
+            Err(Error::NeedsRecovery(message)) if message.contains("reads fenced")
+        ));
         drop(db);
 
         let reopened = DB::open(&path, Options::default()).unwrap();
@@ -2062,6 +2093,43 @@ mod tests {
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), None);
         assert!(!path.join(WAL_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_retains_manifest_fallback_before_reusing_pages() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest-retention.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+
+        // The next generation can reuse a page from before the current
+        // generation, but only after both manifest slots have been fenced to
+        // the current root. Fail before the new manifest is published.
+        db.put(b"key", b"value-3").unwrap();
+        inject_atomic_rename_failure();
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        drop(db);
+
+        // Simulate loss of the newest manifest slot. The mirrored fallback
+        // must still name value-2 even though the failed generation reused an
+        // older physical page.
+        let manifest_path = path.join(MANIFEST_FILE);
+        let mut manifest_file = OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap();
+        manifest_file
+            .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
+            .unwrap();
+        manifest_file.write_all(&[0xA5; MANIFEST_SLOT_SIZE]).unwrap();
+        manifest_file.sync_all().unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
     }
 
     #[test]
