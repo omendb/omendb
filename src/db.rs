@@ -1979,6 +1979,12 @@ impl DB {
         self.engine.inject_after_write_failure();
     }
 
+    /// Inject one final-write ENOSPC after a page write may have completed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_final_write_disk_full(&self) {
+        self.engine.inject_final_write_disk_full();
+    }
+
     /// Inject one disk-full result for the feature-gated fault harness.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_disk_full(&self) {

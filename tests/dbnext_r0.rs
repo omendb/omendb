@@ -1417,6 +1417,28 @@ fn dbnext_r0_post_page_write_failure_preserves_prior_manifest_generation() {
 }
 
 #[test]
+fn dbnext_r0_final_write_disk_full_fences_and_recovers_prior_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("final-write-disk-full.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-2").unwrap();
+    db.inject_final_write_disk_full();
+
+    assert!(matches!(db.flush(), Err(Error::DiskFull)));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    assert_eq!(reopened.durability_status().commit_id.get(), 1);
+    assert!(!reopened.durability_status().write_fenced);
+    assert_eq!(reopened.verify().unwrap().wal_bytes, 0);
+}
+
+#[test]
 fn dbnext_r0_reopens_deep_tree_with_internal_routing() {
     let root = tempdir().unwrap();
     let path = root.path().join("deep-tree.db");

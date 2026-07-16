@@ -59,6 +59,9 @@ pub struct Device {
     /// can publish the generation.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_after_write: AtomicBool,
+    /// Test-only final-write ENOSPC after page bytes may have reached media.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_final_write_disk_full: AtomicBool,
     /// Test-only deterministic disk-full hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_disk_full: AtomicBool,
@@ -111,6 +114,8 @@ impl Device {
             fail_next_write: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_after_write: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_final_write_disk_full: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_disk_full: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -181,6 +186,14 @@ impl Device {
         self.file.write_all(buf)?;
 
         #[cfg(any(test, feature = "fault-injection"))]
+        if self
+            .fail_next_final_write_disk_full
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
+
+        #[cfg(any(test, feature = "fault-injection"))]
         if self.fail_next_after_write.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected post-write failure"));
         }
@@ -248,6 +261,13 @@ impl Device {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_after_write_failure(&self) {
         self.fail_next_after_write.store(true, Ordering::Release);
+    }
+
+    /// Inject one final-write ENOSPC after a page write may have completed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_final_write_disk_full(&self) {
+        self.fail_next_final_write_disk_full
+            .store(true, Ordering::Release);
     }
 
     /// Inject one deterministic disk-full result for recovery tests.

@@ -340,6 +340,12 @@ impl StorageEngine {
         self.device.inject_after_write_failure();
     }
 
+    /// Inject one final-write ENOSPC after a page write may have completed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_final_write_disk_full(&self) {
+        self.device.inject_final_write_disk_full();
+    }
+
     /// Inject one deterministic disk-full result for recovery tests.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_disk_full(&self) {
