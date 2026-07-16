@@ -175,6 +175,7 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
 fn dbnext_r0_rejects_corrupt_manifest() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt.db");
+    let repair_path = root.path().join("corrupt-manifest-repair.db");
     {
         let mut db = DB::open(&path, Options::default()).unwrap();
         db.put(b"key", b"value").unwrap();
@@ -192,6 +193,21 @@ fn dbnext_r0_rejects_corrupt_manifest() {
         DB::open(&path, Options::default()),
         Err(Error::Corruption(_))
     ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Manifest,
+            ..
+        })
+    ));
+    assert!(matches!(
+        DB::repair(&path, &repair_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Manifest,
+            ..
+        })
+    ));
+    assert!(!repair_path.exists());
 }
 
 #[test]
@@ -668,6 +684,7 @@ fn dbnext_r0_unrecoverable_repair_refuses_truncated_data() {
 fn dbnext_r0_rejects_corrupt_blob_artifact() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-blob.db");
+    let repair_path = root.path().join("corrupt-blob-repair.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
     db.put(b"large", &vec![0xA5; 2_048]).unwrap();
     db.flush().unwrap();
@@ -687,12 +704,28 @@ fn dbnext_r0_rejects_corrupt_blob_artifact() {
         DB::open(&path, Options::default()),
         Err(Error::Corruption(message)) if message.contains("blob")
     ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Blob,
+            ..
+        })
+    ));
+    assert!(matches!(
+        DB::repair(&path, &repair_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Blob,
+            ..
+        })
+    ));
+    assert!(!repair_path.exists());
 }
 
 #[test]
 fn dbnext_r0_rejects_malformed_checkpoint_container() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-checkpoint.db");
+    let repair_path = root.path().join("corrupt-checkpoint-repair.db");
     {
         let mut db = DB::open(&path, Options::default()).unwrap();
         db.put(b"key", b"value").unwrap();
@@ -708,6 +741,21 @@ fn dbnext_r0_rejects_malformed_checkpoint_container() {
         DB::open(&path, Options::default()),
         Err(Error::Corruption(message)) if message.contains("checksum")
     ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Checkpoint,
+            ..
+        })
+    ));
+    assert!(matches!(
+        DB::repair(&path, &repair_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Checkpoint,
+            ..
+        })
+    ));
+    assert!(!repair_path.exists());
 }
 
 #[test]

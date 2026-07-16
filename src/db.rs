@@ -408,6 +408,18 @@ impl DB {
         }
     }
 
+    fn map_checkpoint_check_error(error: Error) -> Error {
+        match error {
+            Error::Corruption(message) if message.contains("unsupported meta format version") => {
+                Error::Check {
+                    kind: CheckFailureKind::Format,
+                    message,
+                }
+            }
+            other => Self::map_check_error(CheckFailureKind::Checkpoint, other),
+        }
+    }
+
     fn open_with_mode<P: AsRef<Path>>(
         path: P,
         options: Options,
@@ -434,9 +446,10 @@ impl DB {
         let archive = path.join(ARCHIVE_MARKER_FILE).is_file();
         let read_only = check_only || archive;
         if check_only && (!manifest_path.is_file() || !data_path.is_file()) {
-            return Err(Error::Corruption(
-                "check target is missing required manifest or data artifacts".into(),
-            ));
+            return Err(Error::Check {
+                kind: CheckFailureKind::Target,
+                message: "check target is missing required manifest or data artifacts".into(),
+            });
         }
         if archive && !check_only {
             if !manifest_path.is_file() || !data_path.is_file() {
@@ -457,15 +470,24 @@ impl DB {
         };
 
         let mut manifest = if check_only {
-            ManifestStore::open_read_only(&manifest_path)?
+            ManifestStore::open_read_only(&manifest_path).map_err(|error| {
+                Self::map_check_error(CheckFailureKind::Manifest, error)
+            })?
         } else {
             ManifestStore::open(&manifest_path)?
         };
-        let current_manifest = manifest.load_latest()?;
+        let current_manifest = manifest.load_latest().map_err(|error| {
+            if check_only {
+                Self::map_check_error(CheckFailureKind::Manifest, error)
+            } else {
+                error
+            }
+        })?;
         if check_only && current_manifest.is_none() {
-            return Err(Error::Corruption(
-                "check target has no valid manifest generation".into(),
-            ));
+            return Err(Error::Check {
+                kind: CheckFailureKind::Manifest,
+                message: "check target has no valid manifest generation".into(),
+            });
         }
         let (database_id, history_id, generation_id, commit_id) =
             if let Some(current) = current_manifest {
@@ -518,9 +540,20 @@ impl DB {
         let mut blobs = if blob_path.exists() {
             // Load blob files from disk.
             let blob_data = fs::read(&blob_path)?;
-            BlobManager::from_bytes(&blob_data).ok_or_else(|| {
-                Error::Corruption("blob file is truncated or has an invalid checksum".into())
-            })?
+            match BlobManager::from_bytes(&blob_data) {
+                Some(blobs) => blobs,
+                None if check_only => {
+                    return Err(Error::Check {
+                        kind: CheckFailureKind::Blob,
+                        message: "blob file is truncated or has an invalid checksum".into(),
+                    });
+                }
+                None => {
+                    return Err(Error::Corruption(
+                        "blob file is truncated or has an invalid checksum".into(),
+                    ));
+                }
+            }
         } else {
             BlobManager::with_threshold(options.blob_threshold)
         };
@@ -542,10 +575,22 @@ impl DB {
             } else {
                 let checkpoint_path =
                     path.join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
-                Self::load_meta(&checkpoint_path)?
+                Self::load_meta(&checkpoint_path).map_err(|error| {
+                    if check_only {
+                        Self::map_checkpoint_check_error(error)
+                    } else {
+                        error
+                    }
+                })?
             }
         } else if meta_path.exists() {
-            Self::load_meta(&meta_path)?
+            Self::load_meta(&meta_path).map_err(|error| {
+                if check_only {
+                    Self::map_checkpoint_check_error(error)
+                } else {
+                    error
+                }
+            })?
         } else {
             (PMT::new(), PageAllocator::new())
         };
