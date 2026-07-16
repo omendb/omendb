@@ -617,7 +617,10 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
         .spawn()
         .unwrap();
     let mut ready = false;
-    for _ in 0..500 {
+    // The child competes with the full integration suite for CPU and disk;
+    // readiness is still bounded, but five seconds is too sensitive to
+    // ordinary test-runner contention.
+    for _ in 0..3000 {
         if marker.exists() {
             ready = true;
             break;

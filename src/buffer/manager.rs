@@ -58,6 +58,11 @@ pub enum BufferError {
     /// An unpinned dirty frame cannot be discarded without a write-back
     /// callback from the storage engine.
     DirtyPage(u64),
+    /// A write-back was attempted while a live guard or explicit pin owns the
+    /// frame.
+    PinnedPage(u64),
+    /// The frame changed after a write-back image was captured.
+    StaleWriteback(u64),
 }
 
 impl fmt::Display for BufferError {
@@ -70,6 +75,12 @@ impl fmt::Display for BufferError {
                     f,
                     "dirty page {page_id} cannot be evicted before write-back"
                 )
+            }
+            Self::PinnedPage(page_id) => {
+                write!(f, "page {page_id} cannot be written back while pinned")
+            }
+            Self::StaleWriteback(page_id) => {
+                write!(f, "write-back image for page {page_id} is stale")
             }
         }
     }
@@ -90,10 +101,33 @@ pub struct BufferStats {
     pub dirty_frames: usize,
     /// Total page reads (cache misses).
     pub reads: u64,
-    /// Total page writes (evictions of dirty pages).
+    /// Completed dirty page write-backs.
     pub writes: u64,
     /// Cache hits.
     pub hits: u64,
+}
+
+/// A stable copy of a dirty frame awaiting durable write-back.
+///
+/// The frame remains dirty until [`BufferManager::complete_writeback`] is
+/// called after the storage engine confirms that the device write succeeded.
+/// Dropping this value therefore preserves the dirty state on I/O failure.
+#[derive(Debug)]
+pub struct Writeback {
+    page_key: PageCacheKey,
+    data: Box<[u8; PAGE_SIZE]>,
+}
+
+impl Writeback {
+    /// The exact logical/physical page image being written.
+    pub fn data(&self) -> &[u8; PAGE_SIZE] {
+        &self.data
+    }
+
+    /// The cache identity of the image being written.
+    pub const fn page_key(&self) -> PageCacheKey {
+        self.page_key
+    }
 }
 
 /// Buffer pool manager.
@@ -270,44 +304,76 @@ impl BufferManager {
         }
     }
 
-    /// Flush a dirty page to the provided buffer.
+    /// Begin a safe write-back of a dirty page.
     ///
-    /// Returns the page data if the page was dirty, None otherwise.
-    pub fn flush(&mut self, page_id: u64) -> Option<Box<[u8; PAGE_SIZE]>> {
-        self.flush_key(PageCacheKey::unversioned(page_id))
+    /// The returned image is detached from the frame, but the frame remains
+    /// dirty until [`Self::complete_writeback`] succeeds. This makes a device
+    /// error retryable and prevents a failed write from becoming an apparent
+    /// clean eviction. Live guards and explicit pins are rejected so a caller
+    /// cannot mutate the frame after the image is captured.
+    pub fn begin_writeback(&self, page_id: u64) -> Result<Option<Writeback>, BufferError> {
+        self.begin_writeback_key(PageCacheKey::unversioned(page_id))
     }
 
-    /// Flush a dirty exact physical page image to an owned buffer.
-    pub fn flush_key(&mut self, page_key: PageCacheKey) -> Option<Box<[u8; PAGE_SIZE]>> {
-        if let Some(&frame_idx) = self.page_map.get(&page_key) {
-            let frame = &mut self.frames[frame_idx];
-            if frame.is_dirty() {
-                let data = frame.data.clone();
-                frame.mark_clean();
-                self.stats.writes += 1;
-                return Some(data);
-            }
+    /// Begin a safe write-back of an exact physical page image.
+    pub fn begin_writeback_key(
+        &self,
+        page_key: PageCacheKey,
+    ) -> Result<Option<Writeback>, BufferError> {
+        let Some(&frame_idx) = self.page_map.get(&page_key) else {
+            return Ok(None);
+        };
+        let frame = &self.frames[frame_idx];
+        if !frame.is_dirty() {
+            return Ok(None);
         }
-        None
+        if frame.is_pinned() {
+            return Err(BufferError::PinnedPage(page_key.logical_page_id()));
+        }
+        Ok(Some(Writeback {
+            page_key,
+            data: frame.data.clone(),
+        }))
     }
 
-    /// Flush all dirty pages.
-    ///
-    /// Returns a vector of (page_id, data) for all flushed pages.
-    pub fn flush_all(&mut self) -> Vec<(u64, Box<[u8; PAGE_SIZE]>)> {
-        let mut flushed = Vec::new();
+    /// Complete a write-back after the device has durably accepted its image.
+    pub fn complete_writeback(&mut self, writeback: Writeback) -> Result<(), BufferError> {
+        let page_id = writeback.page_key.logical_page_id();
+        let Some(&frame_idx) = self.page_map.get(&writeback.page_key) else {
+            return Err(BufferError::StaleWriteback(page_id));
+        };
+        let frame = &mut self.frames[frame_idx];
+        if frame.is_pinned() {
+            return Err(BufferError::PinnedPage(page_id));
+        }
+        if !frame.is_dirty() || frame.data.as_ref() != writeback.data.as_ref() {
+            return Err(BufferError::StaleWriteback(page_id));
+        }
+        frame.mark_clean();
+        self.stats.writes += 1;
+        Ok(())
+    }
 
-        for (page_key, &frame_idx) in self.page_map.iter() {
-            let frame = &mut self.frames[frame_idx];
-            if frame.is_dirty() {
-                let data = frame.data.clone();
-                frame.mark_clean();
-                self.stats.writes += 1;
-                flushed.push((page_key.logical_page_id(), data));
+    /// Begin write-back for all dirty pages.
+    ///
+    /// No frame is marked clean until each returned token is completed.
+    pub fn begin_writeback_all(&self) -> Result<Vec<Writeback>, BufferError> {
+        let mut keys: Vec<_> = self
+            .page_map
+            .iter()
+            .filter_map(|(&page_key, &frame_idx)| {
+                self.frames[frame_idx].is_dirty().then_some(page_key)
+            })
+            .collect();
+        keys.sort_unstable_by_key(|key| (key.logical_page_id(), key.physical_version()));
+
+        let mut writebacks = Vec::with_capacity(keys.len());
+        for page_key in keys {
+            if let Some(writeback) = self.begin_writeback_key(page_key)? {
+                writebacks.push(writeback);
             }
         }
-
-        flushed
+        Ok(writebacks)
     }
 
     /// Remove a page from the buffer pool.
@@ -481,13 +547,15 @@ mod tests {
 
         let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
         bm.mark_dirty(guard.page_id());
-        let flushed = bm.flush(guard.page_id());
-        assert!(flushed.is_some());
         drop(guard);
+        let writeback = bm.begin_writeback(1).unwrap().unwrap();
+        assert_eq!(writeback.data(), &data);
+        bm.complete_writeback(writeback).unwrap();
+        assert_eq!(bm.stats().dirty_frames, 0);
     }
 
     #[test]
-    fn test_flush_all() {
+    fn test_writeback_all() {
         let mut bm = BufferManager::new(4096 * 3);
         let data = [0u8; PAGE_SIZE];
 
@@ -498,8 +566,12 @@ mod tests {
         drop(g1);
         drop(g2);
 
-        let flushed = bm.flush_all();
-        assert_eq!(flushed.len(), 2);
+        let writebacks = bm.begin_writeback_all().unwrap();
+        assert_eq!(writebacks.len(), 2);
+        for writeback in writebacks {
+            bm.complete_writeback(writeback).unwrap();
+        }
+        assert_eq!(bm.stats().dirty_frames, 0);
     }
 
     #[test]
@@ -541,8 +613,49 @@ mod tests {
             Err(BufferError::DirtyPage(1))
         ));
 
-        assert!(bm.flush(1).is_some());
+        let writeback = bm.begin_writeback(1).unwrap().unwrap();
+        bm.complete_writeback(writeback).unwrap();
         let guard = bm.fetch(2, &data, GuardAccess::Read).unwrap();
         drop(guard);
+    }
+
+    #[test]
+    fn test_writeback_refuses_live_guard_and_preserves_dirty_state() {
+        let mut bm = BufferManager::new(PAGE_SIZE);
+        let data = [0u8; PAGE_SIZE];
+        let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
+
+        assert!(matches!(
+            bm.begin_writeback(1),
+            Err(BufferError::PinnedPage(1))
+        ));
+        drop(guard);
+
+        let writeback = bm.begin_writeback(1).unwrap().unwrap();
+        drop(writeback);
+        assert_eq!(bm.stats().dirty_frames, 1);
+        assert!(matches!(
+            bm.fetch(2, &data, GuardAccess::Read),
+            Err(BufferError::DirtyPage(1))
+        ));
+    }
+
+    #[test]
+    fn test_stale_writeback_cannot_clean_newer_frame_image() {
+        let mut bm = BufferManager::new(PAGE_SIZE * 2);
+        let data = [0u8; PAGE_SIZE];
+        let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
+        drop(guard);
+        let writeback = bm.begin_writeback(1).unwrap().unwrap();
+
+        let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
+        bm.frame_data_mut(&guard)[0] = 1;
+        drop(guard);
+
+        assert!(matches!(
+            bm.complete_writeback(writeback),
+            Err(BufferError::StaleWriteback(1))
+        ));
+        assert_eq!(bm.stats().dirty_frames, 1);
     }
 }

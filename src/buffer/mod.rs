@@ -10,4 +10,4 @@ mod manager;
 
 pub use frame::Frame;
 pub use guard::{GuardAccess, PageGuard};
-pub use manager::{BufferError, BufferManager, BufferStats, PageCacheKey};
+pub use manager::{BufferError, BufferManager, BufferStats, PageCacheKey, Writeback};

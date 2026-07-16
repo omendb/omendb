@@ -372,6 +372,8 @@ impl StorageEngine {
         self.preflight_flush_capacity(&dirty_page_ids)?;
         let mut retired_offsets = Vec::new();
         let mut retired_cache_keys = Vec::new();
+        let mut pending_writebacks = Vec::with_capacity(dirty_page_ids.len());
+        let mut pending_rekeys = Vec::with_capacity(dirty_page_ids.len());
 
         for page_id in dirty_page_ids {
             let node = self.btree.node(page_id);
@@ -403,16 +405,17 @@ impl StorageEngine {
                 // clean flushed image to the out-of-place device version.
                 let page = *persisted_node.as_bytes();
                 let pending_key = PageCacheKey::unversioned(page_id as u64);
-                let flushed_page = {
+                let writeback = {
                     let mut buffer = self.buffer_lock()?;
                     let guard = buffer.fetch_key(pending_key, &page, GuardAccess::Write)?;
                     buffer.frame_data_mut(&guard).copy_from_slice(&page);
                     drop(guard);
-                    buffer.flush_key(pending_key).ok_or_else(|| {
+                    buffer.begin_writeback_key(pending_key)?.ok_or_else(|| {
                         Error::Buffer(format!("page {page_id} was not dirty after staging"))
                     })?
                 };
-                self.device.write_page(offset, &flushed_page)?;
+                self.device.write_page(offset, writeback.data())?;
+                pending_writebacks.push(writeback);
                 self.metrics
                     .physical_page_writes
                     .fetch_add(1, Ordering::Relaxed);
@@ -430,15 +433,24 @@ impl StorageEngine {
                     .get(page_id as u64)
                     .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
                     .version;
-                self.buffer_lock()?.rekey(
+                pending_rekeys.push((
                     pending_key,
                     PageCacheKey::new(page_id as u64, version),
-                );
+                ));
             }
         }
 
         // Sync to ensure data is persisted.
         self.device.sync()?;
+        {
+            let mut buffer = self.buffer_lock()?;
+            for writeback in pending_writebacks {
+                buffer.complete_writeback(writeback)?;
+            }
+            for (from, to) in pending_rekeys {
+                buffer.rekey(from, to);
+            }
+        }
         self.metrics.syncs.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .generation_flushes
@@ -1227,6 +1239,62 @@ mod tests {
         assert_eq!(second.hits, 0);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn failed_device_write_leaves_buffer_image_dirty_for_retry() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        engine.btree_mut().insert(b"key", b"value").unwrap();
+        engine.inject_write_failure();
+        assert!(matches!(engine.flush(), Err(Error::Io(_))));
+        assert_eq!(engine.buffer_stats().dirty_frames, 1);
+
+        engine.flush().unwrap();
+        assert_eq!(engine.buffer_stats().dirty_frames, 0);
+        assert_eq!(engine.device.size().unwrap(), PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn failed_device_sync_leaves_buffer_image_dirty_for_recovery() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        engine.btree_mut().insert(b"key", b"value").unwrap();
+        engine.inject_sync_failure();
+        assert!(matches!(engine.flush(), Err(Error::Io(_))));
+        assert_eq!(engine.buffer_stats().dirty_frames, 1);
     }
 
     #[test]
