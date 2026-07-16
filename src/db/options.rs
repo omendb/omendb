@@ -20,8 +20,9 @@ pub struct Options {
     /// Sync writes to disk. Default: false (caller must call flush).
     pub sync_writes: bool,
 
-    /// Maximum on-disk WAL bytes admitted for one pending generation,
-    /// including its commit envelope. Default: 64 MiB.
+    /// Maximum logical WAL bytes admitted for one pending generation,
+    /// including its commit envelope. A fixed reservation extent is rounded
+    /// from this limit in 1 MiB segments. Default: 64 MiB.
     pub max_wal_bytes: u64,
 }
 

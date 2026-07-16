@@ -38,8 +38,10 @@ thread_local! {
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
+const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
+const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 =
     (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 
@@ -128,8 +130,10 @@ pub struct DBMetrics {
     pub data_bytes: u64,
     /// Current blob-file size in bytes.
     pub blob_bytes: u64,
-    /// Current WAL size in bytes.
+    /// Current logical WAL size in bytes.
     pub wal_bytes: u64,
+    /// Fixed WAL capacity extent reserved for future pending mutations.
+    pub wal_reserved_bytes: u64,
     /// Physical pages currently safe for reuse.
     pub reclaimable_pages: u64,
 }
@@ -166,6 +170,8 @@ pub struct DB {
     commit_id: CommitId,
     /// Number of mutation records since the last published generation.
     pending_mutations: u64,
+    /// Logical WAL bytes admitted for the pending generation.
+    pending_wal_bytes: u64,
     /// Digest over pending mutation records.
     pending_digest: u32,
     /// Whether the database is open.
@@ -305,6 +311,7 @@ impl DB {
             generation_id,
             commit_id,
             pending_mutations: 0,
+            pending_wal_bytes: 0,
             pending_digest: 0,
             is_open: true,
             write_fenced: false,
@@ -461,6 +468,10 @@ impl DB {
             .pending_mutations
             .checked_add(1)
             .ok_or_else(|| Error::Wal("mutation count overflow".into()))?;
+        self.pending_wal_bytes = self
+            .pending_wal_bytes
+            .checked_add(record.to_bytes().len() as u64)
+            .ok_or_else(|| Error::Wal("WAL byte count overflow".into()))?;
         self.pending_digest = extend_digest(self.pending_digest, &record);
         Ok(())
     }
@@ -469,12 +480,7 @@ impl DB {
     /// closes its pending generation. This runs before any tree or blob state
     /// changes, so retryable backpressure cannot leave a partial mutation.
     fn admit_wal_record(&mut self, record: &WalRecord) -> Result<()> {
-        let wal_path = self.path.join(WAL_FILE);
-        let used = match fs::metadata(wal_path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
+        let used = self.pending_wal_bytes;
         let required = (record.to_bytes().len() as u64)
             .checked_add(WAL_COMMIT_RECORD_BYTES)
             .ok_or(Error::DiskFull)?;
@@ -486,7 +492,40 @@ impl DB {
                 available,
             });
         }
+
+        self.ensure_wal_reservation()?;
         Ok(())
+    }
+
+    /// Ensure the database owns a fixed-size WAL reservation extent before a
+    /// mutation changes tree or blob state. The extent is rounded to fixed
+    /// segments so future WAL growth has a bounded, stable admission domain;
+    /// the logical WAL remains separately length-delimited and checksummed.
+    fn ensure_wal_reservation(&self) -> Result<u64> {
+        if self.options.max_wal_bytes == 0 {
+            return Ok(0);
+        }
+
+        let remainder = self.options.max_wal_bytes % WAL_RESERVATION_SEGMENT_BYTES;
+        let target = self
+            .options
+            .max_wal_bytes
+            .checked_add((WAL_RESERVATION_SEGMENT_BYTES - remainder) % WAL_RESERVATION_SEGMENT_BYTES)
+            .ok_or(Error::DiskFull)?;
+        let path = self.path.join(WAL_RESERVATION_FILE);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let current = file.metadata()?.len();
+        if current < target {
+            file.set_len(target)?;
+            file.sync_data()?;
+            sync_directory(&self.path)?;
+        }
+        Ok(current.max(target))
     }
 
     /// Publish a generation after its pages and checkpoints are durable.
@@ -547,6 +586,7 @@ impl DB {
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
         self.pending_mutations = 0;
+        self.pending_wal_bytes = 0;
         self.pending_digest = 0;
         Ok(())
     }
@@ -662,6 +702,7 @@ impl DB {
             data_bytes: artifact_size(DATA_FILE)?,
             blob_bytes: artifact_size(BLOB_FILE)?,
             wal_bytes: artifact_size(WAL_FILE)?,
+            wal_reserved_bytes: artifact_size(WAL_RESERVATION_FILE)?,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
         })
     }
@@ -1455,6 +1496,16 @@ mod tests {
 
         db.options.max_wal_bytes = exact_budget;
         db.put(b"key", &value).unwrap();
+        assert_eq!(
+            fs::metadata(path.join(WAL_RESERVATION_FILE))
+                .unwrap()
+                .len(),
+            WAL_RESERVATION_SEGMENT_BYTES
+        );
+        assert_eq!(
+            db.metrics().unwrap().wal_reserved_bytes,
+            WAL_RESERVATION_SEGMENT_BYTES
+        );
         db.flush().unwrap();
         drop(db);
 

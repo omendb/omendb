@@ -314,6 +314,16 @@ impl WalManager {
             }
             let length =
                 u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+            // A fixed WAL reservation may leave an all-zero unused tail after
+            // the last valid record. Treat only that exact suffix as an
+            // unused/torn tail; non-zero malformed bytes remain corruption.
+            if length == 0 {
+                return if buf[pos..].iter().all(|byte| *byte == 0) {
+                    (records, ParseStatus::Incomplete)
+                } else {
+                    (records, ParseStatus::Corrupt)
+                };
+            }
             if length < 5 {
                 return (records, ParseStatus::Corrupt);
             }
@@ -451,6 +461,12 @@ mod tests {
             WalManager::parse_records_with_status(&corrupt).1,
             ParseStatus::Corrupt
         );
+
+        let mut reserved_tail = record.to_bytes();
+        reserved_tail.extend_from_slice(&[0; 4096]);
+        let (records, status) = WalManager::parse_records_with_status(&reserved_tail);
+        assert_eq!(records.len(), 1);
+        assert_eq!(status, ParseStatus::Incomplete);
     }
 
     #[test]
