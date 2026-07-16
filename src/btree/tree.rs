@@ -23,10 +23,10 @@ use std::collections::HashSet;
 pub type PageId = u32;
 
 /// Result of a lookup operation.
-#[derive(Debug)]
-pub enum LookupResult<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupResult {
     /// Key found with inline value.
-    Found(&'a [u8]),
+    Found(Vec<u8>),
     /// Key found with blob pointer.
     Blob(crate::btree::node::BlobPointer),
     /// Key is deleted (tombstone).
@@ -250,13 +250,13 @@ impl BTree {
     }
 
     /// Lookup a key in the B-tree.
-    pub fn lookup(&self, key: &[u8]) -> LookupResult<'_> {
+    pub fn lookup(&self, key: &[u8]) -> LookupResult {
         let leaf_id = self.find_leaf(key);
         let node = self.node(leaf_id).expect("leaf_id should be valid");
 
         match node.search(key) {
             Ok(idx) => match node.value(idx) {
-                Some(ValueRef::Inline(data)) => LookupResult::Found(data),
+                Some(ValueRef::Inline(data)) => LookupResult::Found(data.to_vec()),
                 Some(ValueRef::Blob(ptr)) => LookupResult::Blob(ptr),
                 Some(ValueRef::Tombstone) => LookupResult::Deleted,
                 None => LookupResult::NotFound,
@@ -724,10 +724,16 @@ mod tests {
 
         assert!(matches!(
             tree.lookup(b"hello"),
-            LookupResult::Found(b"world")
+            LookupResult::Found(value) if value == b"world"
         ));
-        assert!(matches!(tree.lookup(b"foo"), LookupResult::Found(b"bar")));
-        assert!(matches!(tree.lookup(b"aaa"), LookupResult::Found(b"bbb")));
+        assert!(matches!(
+            tree.lookup(b"foo"),
+            LookupResult::Found(value) if value == b"bar"
+        ));
+        assert!(matches!(
+            tree.lookup(b"aaa"),
+            LookupResult::Found(value) if value == b"bbb"
+        ));
         assert!(matches!(tree.lookup(b"missing"), LookupResult::NotFound));
     }
 
@@ -755,13 +761,34 @@ mod tests {
         ));
 
         tree.upsert(b"key", b"x").unwrap();
-        assert!(matches!(tree.lookup(b"key"), LookupResult::Found(b"x")));
+        assert!(matches!(
+            tree.lookup(b"key"),
+            LookupResult::Found(value) if value == b"x"
+        ));
 
         tree.delete(b"key").unwrap();
         tree.upsert(b"key", b"restored").unwrap();
         assert!(matches!(
             tree.lookup(b"key"),
-            LookupResult::Found(b"restored")
+            LookupResult::Found(value) if value == b"restored"
+        ));
+    }
+
+    #[test]
+    fn test_lookup_result_owns_inline_value() {
+        let mut tree = BTree::new();
+        tree.insert(b"key", b"before").unwrap();
+
+        let value = match tree.lookup(b"key") {
+            LookupResult::Found(value) => value,
+            other => panic!("unexpected lookup result: {other:?}"),
+        };
+        tree.upsert(b"key", b"after").unwrap();
+
+        assert_eq!(value, b"before");
+        assert!(matches!(
+            tree.lookup(b"key"),
+            LookupResult::Found(value) if value == b"after"
         ));
     }
 

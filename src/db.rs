@@ -342,7 +342,7 @@ impl DB {
         self.check_open()?;
 
         match self.engine.btree().lookup(key) {
-            LookupResult::Found(value) => Ok(Some(value.to_vec())),
+            LookupResult::Found(value) => Ok(Some(value)),
             LookupResult::Blob(ptr) => {
                 // Read from blob file.
                 match self.blobs.read(&ptr) {
