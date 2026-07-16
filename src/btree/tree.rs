@@ -15,7 +15,7 @@
 //! In the full implementation, "modify" operations create new page versions.
 //! For now, we mutate nodes directly. The PMT integration comes later.
 
-use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef, BLOB_POINTER_SIZE};
+use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef};
 
 /// Page ID type (index into the page store).
 pub type PageId = u32;
@@ -107,15 +107,22 @@ impl BTree {
     /// May cause node splits if the leaf is full.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
         let leaf_id = self.find_leaf(key);
-        let result = self.node_mut(leaf_id)
+        let result = self
+            .node_mut(leaf_id)
             .expect("leaf_id should be valid")
             .insert(key, value);
 
         match result {
             Ok(()) => Ok(()),
             Err(InsertError::PageFull) => {
-                self.split_and_insert_leaf(leaf_id, key, value)?;
-                Ok(())
+                let snapshot = self.nodes.clone();
+                let root = self.root;
+                let result = self.split_and_insert_leaf(leaf_id, key, value);
+                if result.is_err() {
+                    self.nodes = snapshot;
+                    self.root = root;
+                }
+                result
             }
             Err(InsertError::DuplicateKey(_)) => Err(BTreeError::DuplicateKey),
             Err(e) => Err(BTreeError::InsertFailed(e)),
@@ -128,53 +135,42 @@ impl BTree {
     /// May cause node splits if the leaf is full.
     pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
         let leaf_id = self.find_leaf(key);
-        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+        let existing_index = self.node(leaf_id).and_then(|node| node.search(key).ok());
 
-        // Check if key exists.
-        match node.search(key) {
-            Ok(idx) => {
-                // Key exists — check if we can replace in place.
-                let old_value = node.value(idx);
-                let old_size = match old_value {
-                    Some(ValueRef::Inline(data)) => data.len(),
-                    Some(ValueRef::Blob(_)) => BLOB_POINTER_SIZE,
-                    Some(ValueRef::Tombstone) => 0,
-                    None => 0,
-                };
+        let Some(index) = existing_index else {
+            // A missing key follows the fully split-aware insert path.
+            return self.insert(key, value);
+        };
 
-                if value.len() == old_size {
-                    // Same size — replace in place.
-                    node.replace_value(idx, value);
-                    return Ok(());
-                }
-
-                // Different size — mark old as tombstone, insert new.
-                // This is simple but wastes space. GC will reclaim it later.
-                node.insert_tombstone(key)
-                    .map_err(BTreeError::InsertFailed)?;
-                node.insert(key, value)
-                    .map_err(|e| match e {
-                        InsertError::PageFull => {
-                            // Need to split.
-                            BTreeError::InsertFailed(e)
-                        }
-                        _ => BTreeError::InsertFailed(e),
-                    })?;
-                Ok(())
-            }
-            Err(_) => {
-                // Key doesn't exist — insert normally.
-                node.insert(key, value)
-                    .map_err(|e| match e {
-                        InsertError::PageFull => {
-                            // TODO: handle split for upsert
-                            BTreeError::InsertFailed(e)
-                        }
-                        _ => BTreeError::InsertFailed(e),
-                    })?;
-                Ok(())
-            }
+        let same_size_inline = matches!(
+            self.node(leaf_id).and_then(|node| node.value(index)),
+            Some(ValueRef::Inline(old_value)) if old_value.len() == value.len()
+        );
+        if same_size_inline {
+            self.node_mut(leaf_id)
+                .expect("leaf_id should be valid")
+                .replace_value(index, value);
+            return Ok(());
         }
+
+        let snapshot = self.nodes.clone();
+        let root = self.root;
+        let result = match self
+            .node_mut(leaf_id)
+            .expect("leaf_id should be valid")
+            .replace_value_resized(index, value)
+        {
+            Ok(()) => Ok(()),
+            Err(InsertError::PageFull) => {
+                self.replace_full_entry_with_split(leaf_id, index, key, value)
+            }
+            Err(error) => Err(BTreeError::InsertFailed(error)),
+        };
+        if result.is_err() {
+            self.nodes = snapshot;
+            self.root = root;
+        }
+        result
     }
 
     /// Lookup a key in the B-tree.
@@ -288,8 +284,12 @@ impl BTree {
         if leaf_id == self.root {
             self.create_new_root(leaf_id, &median_key, right_id);
         } else {
-            let parent_id = self.find_parent(self.root, leaf_id)
+            let parent_id = self
+                .find_parent(self.root, leaf_id)
                 .expect("parent should exist for non-root node");
+            self.node_mut(right_id)
+                .expect("right node should be valid")
+                .set_parent_id(parent_id);
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
 
@@ -303,13 +303,18 @@ impl BTree {
         // For internal nodes, child_id(i) is the child AFTER key_i.
         // The leftmost child (before key 0) is stored in leftmost_child.
         new_root.set_leftmost_child(left_id as u64);
-        new_root.insert_child(key, right_id as u64)
+        new_root
+            .insert_child(key, right_id as u64)
             .expect("new root should have space");
 
         let new_root_id = self.alloc_node(new_root);
 
-        self.node_mut(left_id).expect("left_id should be valid").set_parent_id(new_root_id);
-        self.node_mut(right_id).expect("right_id should be valid").set_parent_id(new_root_id);
+        self.node_mut(left_id)
+            .expect("left_id should be valid")
+            .set_parent_id(new_root_id);
+        self.node_mut(right_id)
+            .expect("right_id should be valid")
+            .set_parent_id(new_root_id);
 
         self.root = new_root_id;
     }
@@ -323,6 +328,14 @@ impl BTree {
         let node = self.node(current)?;
         if node.is_leaf() {
             return None;
+        }
+
+        let leftmost_child = node.leftmost_child() as u32;
+        if leftmost_child == target {
+            return Some(current);
+        }
+        if let Some(parent) = self.find_parent(leftmost_child, target) {
+            return Some(parent);
         }
 
         for i in 0..node.count() {
@@ -346,15 +359,14 @@ impl BTree {
         key: &[u8],
         right_child_id: PageId,
     ) -> Result<(), BTreeError> {
-        let result = self.node_mut(parent_id)
+        let result = self
+            .node_mut(parent_id)
             .expect("parent_id should be valid")
             .insert_child(key, right_child_id as u64);
 
         match result {
             Ok(()) => Ok(()),
-            Err(InsertError::PageFull) => {
-                self.split_internal(parent_id, key, right_child_id)
-            }
+            Err(InsertError::PageFull) => self.split_internal(parent_id, key, right_child_id),
             Err(e) => Err(BTreeError::InsertFailed(e)),
         }
     }
@@ -387,12 +399,41 @@ impl BTree {
         if node_id == self.root {
             self.create_new_root(node_id, &median_key, right_id);
         } else {
-            let parent_id = self.find_parent(self.root, node_id)
+            let parent_id = self
+                .find_parent(self.root, node_id)
                 .expect("parent should exist for non-root node");
+            self.node_mut(right_id)
+                .expect("right node should be valid")
+                .set_parent_id(parent_id);
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
 
         Ok(())
+    }
+
+    /// Remove an existing entry and insert its replacement, splitting the
+    /// leaf when the resized value no longer fits.
+    fn replace_full_entry_with_split(
+        &mut self,
+        leaf_id: PageId,
+        index: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), BTreeError> {
+        self.node_mut(leaf_id)
+            .expect("leaf_id should be valid")
+            .remove_entry(index)
+            .map_err(BTreeError::InsertFailed)?;
+
+        match self
+            .node_mut(leaf_id)
+            .expect("leaf_id should be valid")
+            .insert(key, value)
+        {
+            Ok(()) => Ok(()),
+            Err(InsertError::PageFull) => self.split_and_insert_leaf(leaf_id, key, value),
+            Err(error) => Err(BTreeError::InsertFailed(error)),
+        }
     }
 }
 
@@ -486,7 +527,10 @@ mod tests {
         tree.insert(b"foo", b"bar").unwrap();
         tree.insert(b"aaa", b"bbb").unwrap();
 
-        assert!(matches!(tree.lookup(b"hello"), LookupResult::Found(b"world")));
+        assert!(matches!(
+            tree.lookup(b"hello"),
+            LookupResult::Found(b"world")
+        ));
         assert!(matches!(tree.lookup(b"foo"), LookupResult::Found(b"bar")));
         assert!(matches!(tree.lookup(b"aaa"), LookupResult::Found(b"bbb")));
         assert!(matches!(tree.lookup(b"missing"), LookupResult::NotFound));
@@ -497,7 +541,26 @@ mod tests {
         let mut tree = BTree::new();
 
         tree.insert(b"key", b"val1").unwrap();
-        assert!(matches!(tree.insert(b"key", b"val2"), Err(BTreeError::DuplicateKey)));
+        assert!(matches!(
+            tree.insert(b"key", b"val2"),
+            Err(BTreeError::DuplicateKey)
+        ));
+    }
+
+    #[test]
+    fn test_btree_upsert_resizes_existing_value() {
+        let mut tree = BTree::new();
+
+        tree.upsert(b"key", b"short").unwrap();
+        tree.upsert(b"key", b"a value with a different size")
+            .unwrap();
+        assert!(matches!(
+            tree.lookup(b"key"),
+            LookupResult::Found(value) if value == b"a value with a different size"
+        ));
+
+        tree.upsert(b"key", b"x").unwrap();
+        assert!(matches!(tree.lookup(b"key"), LookupResult::Found(b"x")));
     }
 
     #[test]
@@ -564,7 +627,10 @@ mod tests {
 
         for i in 0..500 {
             let key = format!("key_{:06}", i);
-            assert!(matches!(tree.lookup(key.as_bytes()), LookupResult::Found(_)));
+            assert!(matches!(
+                tree.lookup(key.as_bytes()),
+                LookupResult::Found(_)
+            ));
         }
     }
 
@@ -580,7 +646,33 @@ mod tests {
 
         for i in 0..50 {
             let key = format!("key_{:04}", i);
-            assert!(matches!(tree.lookup(key.as_bytes()), LookupResult::Found(_)));
+            assert!(matches!(
+                tree.lookup(key.as_bytes()),
+                LookupResult::Found(_)
+            ));
         }
+    }
+
+    #[test]
+    fn test_btree_upsert_split_and_leftmost_parent_routing() {
+        let mut tree = BTree::new();
+
+        for i in (0..500).rev() {
+            let key = format!("key_{i:06}");
+            tree.upsert(key.as_bytes(), b"initial")
+                .unwrap_or_else(|error| panic!("initial i={i}: {error:?}"));
+        }
+
+        for i in 0..500 {
+            let key = format!("key_{i:06}");
+            let value = format!("updated value with a different size {i}");
+            tree.upsert(key.as_bytes(), value.as_bytes()).unwrap();
+            assert!(matches!(
+                tree.lookup(key.as_bytes()),
+                LookupResult::Found(found) if found == value.as_bytes()
+            ));
+        }
+
+        assert!(tree.node_count() > 2);
     }
 }

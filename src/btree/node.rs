@@ -85,7 +85,11 @@ impl BlobPointer {
             buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
         ]);
         let length = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        Self { file_id, offset, length }
+        Self {
+            file_id,
+            offset,
+            length,
+        }
     }
 }
 
@@ -143,7 +147,15 @@ impl NodeHeader {
             buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
         ]);
         let parent_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
-        Self { magic, version, page_type, count, free_space, checksum, parent_id }
+        Self {
+            magic,
+            version,
+            page_type,
+            count,
+            free_space,
+            checksum,
+            parent_id,
+        }
     }
 
     /// Create a fresh header for the given page type.
@@ -171,6 +183,7 @@ impl NodeHeader {
 /// - Slots (fixed 4 bytes each) grow forward from the header
 /// - Entries (variable-length) grow backward from the end of the page
 /// - Free space sits in the middle
+#[derive(Clone)]
 pub struct Node {
     /// Raw page buffer (always PAGE_SIZE bytes).
     data: Box<[u8; PAGE_SIZE]>,
@@ -194,14 +207,20 @@ impl Node {
         let mut data = Box::new([0u8; PAGE_SIZE]);
         let header = NodeHeader::new(page_type);
         data[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
-        Self { data, leftmost_child: 0 }
+        Self {
+            data,
+            leftmost_child: 0,
+        }
     }
 
     /// Wrap an existing page buffer (e.g., read from disk).
     ///
     /// Returns `None` if the header magic is invalid.
     pub fn from_bytes(data: Box<[u8; PAGE_SIZE]>) -> Option<Self> {
-        let node = Self { data, leftmost_child: 0 };
+        let node = Self {
+            data,
+            leftmost_child: 0,
+        };
         if node.header().is_valid() {
             Some(node)
         } else {
@@ -274,8 +293,6 @@ impl Node {
     const fn slot_array_start() -> usize {
         HEADER_SIZE
     }
-
-
 
     /// Read the entry offset for slot `index`.
     fn slot_offset(&self, index: usize) -> usize {
@@ -388,7 +405,11 @@ impl Node {
                     ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], ptr[10], ptr[11],
                 ]);
                 let length = u32::from_le_bytes([ptr[12], ptr[13], ptr[14], ptr[15]]);
-                Some(ValueRef::Blob(BlobPointer { file_id, offset, length }))
+                Some(ValueRef::Blob(BlobPointer {
+                    file_id,
+                    offset,
+                    length,
+                }))
             }
             0x02 => Some(ValueRef::Tombstone),
             _ => None, // corrupt
@@ -515,7 +536,8 @@ impl Node {
 
         // Check if there's room: need space for new slot + entry
         let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self.new_entry_offset(entry_size)
+        let entry_offset = self
+            .new_entry_offset(entry_size)
             .ok_or(InsertError::PageFull)?;
 
         // Ensure slot array and entry don't overlap
@@ -592,6 +614,73 @@ impl Node {
         self.data[vt_off] = ValueType::Inline as u8;
     }
 
+    /// Replace an entry with a value of any size, rebuilding the leaf when
+    /// an in-place replacement is not possible.
+    ///
+    /// The original node remains unchanged when the rebuilt page cannot fit.
+    pub fn replace_value_resized(
+        &mut self,
+        index: usize,
+        new_value: &[u8],
+    ) -> Result<(), InsertError> {
+        if !self.is_leaf() || index >= self.count() {
+            return Err(InsertError::WrongNodeType);
+        }
+
+        let key = self.key(index).ok_or(InsertError::WrongNodeType)?;
+        let original = self.clone();
+        self.remove_entry(index)?;
+        match self.insert(&key, new_value) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                *self = original;
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove one leaf entry and compact the remaining entries.
+    pub fn remove_entry(&mut self, index: usize) -> Result<(), InsertError> {
+        if !self.is_leaf() || index >= self.count() {
+            return Err(InsertError::WrongNodeType);
+        }
+
+        enum OwnedValue {
+            Inline(Vec<u8>),
+            Blob(BlobPointer),
+            Tombstone,
+        }
+
+        let parent_id = self.parent_id();
+        let mut entries = Vec::with_capacity(self.count() - 1);
+        for entry_index in 0..self.count() {
+            if entry_index == index {
+                continue;
+            }
+            let key = self.key(entry_index).ok_or(InsertError::WrongNodeType)?;
+            let value = match self.value(entry_index).ok_or(InsertError::WrongNodeType)? {
+                ValueRef::Inline(value) => OwnedValue::Inline(value.to_vec()),
+                ValueRef::Blob(pointer) => OwnedValue::Blob(pointer),
+                ValueRef::Tombstone => OwnedValue::Tombstone,
+            };
+            entries.push((key, value));
+        }
+
+        let mut replacement = Self::new_leaf();
+        replacement.set_parent_id(parent_id);
+        for (key, value) in entries {
+            let result = match value {
+                OwnedValue::Inline(value) => replacement.insert(&key, &value),
+                OwnedValue::Blob(pointer) => replacement.insert_blob(&key, pointer),
+                OwnedValue::Tombstone => replacement.insert_tombstone(&key),
+            };
+            result?;
+        }
+
+        *self = replacement;
+        Ok(())
+    }
+
     /// Insert a key with a tombstone marker (delete).
     pub fn insert_tombstone(&mut self, key: &[u8]) -> Result<(), InsertError> {
         if !self.is_leaf() {
@@ -615,7 +704,8 @@ impl Node {
         let count = self.count();
 
         let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self.new_entry_offset(entry_size)
+        let entry_offset = self
+            .new_entry_offset(entry_size)
             .ok_or(InsertError::PageFull)?;
 
         if slot_array_end + SLOT_SIZE > entry_offset {
@@ -682,7 +772,8 @@ impl Node {
         let count = self.count();
 
         let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self.new_entry_offset(entry_size)
+        let entry_offset = self
+            .new_entry_offset(entry_size)
             .ok_or(InsertError::PageFull)?;
 
         if slot_array_end + SLOT_SIZE > entry_offset {
@@ -753,7 +844,8 @@ impl Node {
         let count = self.count();
 
         let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self.new_entry_offset(entry_size)
+        let entry_offset = self
+            .new_entry_offset(entry_size)
             .ok_or(InsertError::PageFull)?;
 
         if slot_array_end + SLOT_SIZE > entry_offset {
@@ -847,13 +939,19 @@ impl Node {
                 let v = self.value(i).ok_or(SplitError::Corruption)?;
                 match v {
                     ValueRef::Inline(data) => {
-                        right.insert(&k, data).map_err(|_| SplitError::InsertFailed)?;
+                        right
+                            .insert(&k, data)
+                            .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Blob(ptr) => {
-                        right.insert_blob(&k, ptr).map_err(|_| SplitError::InsertFailed)?;
+                        right
+                            .insert_blob(&k, ptr)
+                            .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Tombstone => {
-                        right.insert_tombstone(&k).map_err(|_| SplitError::InsertFailed)?;
+                        right
+                            .insert_tombstone(&k)
+                            .map_err(|_| SplitError::InsertFailed)?;
                     }
                 }
             }
@@ -866,12 +964,44 @@ impl Node {
             for i in (mid + 1)..count {
                 let k = self.key(i).ok_or(SplitError::Corruption)?;
                 let c = self.child_id(i).ok_or(SplitError::Corruption)?;
-                right.insert_child(&k, c).map_err(|_| SplitError::InsertFailed)?;
+                right
+                    .insert_child(&k, c)
+                    .map_err(|_| SplitError::InsertFailed)?;
             }
         }
 
-        // Truncate self to left half.
-        self.truncate(mid);
+        // Rebuild the left leaf so truncation also reclaims the old right-half
+        // entry bytes. Merely reducing the slot count would leave stale low
+        // offsets consuming the page and eventually report false PageFull
+        // errors after repeated left-side splits.
+        if self.is_leaf() {
+            let parent_id = self.parent_id();
+            let mut left = Node::new_leaf();
+            left.set_parent_id(parent_id);
+            for i in 0..mid {
+                let key = self.key(i).ok_or(SplitError::Corruption)?;
+                let value = self.value(i).ok_or(SplitError::Corruption)?;
+                match value {
+                    ValueRef::Inline(data) => {
+                        left.insert(&key, data)
+                            .map_err(|_| SplitError::InsertFailed)?;
+                    }
+                    ValueRef::Blob(pointer) => {
+                        left.insert_blob(&key, pointer)
+                            .map_err(|_| SplitError::InsertFailed)?;
+                    }
+                    ValueRef::Tombstone => {
+                        left.insert_tombstone(&key)
+                            .map_err(|_| SplitError::InsertFailed)?;
+                    }
+                }
+            }
+            *self = left;
+        } else {
+            // Internal nodes retain their child-routing metadata and use the
+            // cheaper slot truncation path.
+            self.truncate(mid);
+        }
 
         Ok((median_key, right))
     }
@@ -1052,11 +1182,26 @@ mod tests {
     fn test_blob_pointer() {
         let mut node = Node::new_leaf();
         node.insert(b"aaa", b"inline").unwrap();
-        node.insert_blob(b"zzz", BlobPointer { file_id: 1, offset: 4096, length: 1024 }).unwrap();
+        node.insert_blob(
+            b"zzz",
+            BlobPointer {
+                file_id: 1,
+                offset: 4096,
+                length: 1024,
+            },
+        )
+        .unwrap();
 
         assert_eq!(node.count(), 2);
         assert!(matches!(node.value(0), Some(ValueRef::Inline(_))));
-        assert!(matches!(node.value(1), Some(ValueRef::Blob(BlobPointer { file_id: 1, offset: 4096, length: 1024 }))));
+        assert!(matches!(
+            node.value(1),
+            Some(ValueRef::Blob(BlobPointer {
+                file_id: 1,
+                offset: 4096,
+                length: 1024
+            }))
+        ));
     }
 
     #[test]
@@ -1075,7 +1220,10 @@ mod tests {
     fn test_duplicate_key_rejected() {
         let mut node = Node::new_leaf();
         node.insert(b"key", b"val1").unwrap();
-        assert!(matches!(node.insert(b"key", b"val2"), Err(InsertError::DuplicateKey(_))));
+        assert!(matches!(
+            node.insert(b"key", b"val2"),
+            Err(InsertError::DuplicateKey(_))
+        ));
     }
 
     #[test]
@@ -1153,7 +1301,11 @@ mod tests {
         }
 
         // Should fit many entries in 4KB.
-        assert!(inserted.len() > 50, "expected >50 entries, got {}", inserted.len());
+        assert!(
+            inserted.len() > 50,
+            "expected >50 entries, got {}",
+            inserted.len()
+        );
 
         // Verify all inserted keys are searchable.
         for key in &inserted {
