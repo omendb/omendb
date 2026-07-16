@@ -883,6 +883,15 @@ impl DB {
         }
 
         let (verified_pages, data_bytes) = self.engine.verify_pages(manifest.root_page_id)?;
+        let blob_pointers = self.engine.verify_tree(manifest.root_page_id)?;
+        for pointer in blob_pointers {
+            if self.blobs.read(&pointer).is_none() {
+                return Err(Error::Corruption(format!(
+                    "blob pointer target is missing: file {}, offset {}, length {}",
+                    pointer.file_id, pointer.offset, pointer.length
+                )));
+            }
+        }
 
         if manifest.pmt_checkpoint_id.get() != 0 {
             let checkpoint_path = self

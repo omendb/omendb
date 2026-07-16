@@ -6,7 +6,7 @@
 pub mod format;
 
 use crate::allocator::PageAllocator;
-use crate::btree::{BTree, BTreeError, LookupResult, Node, ValueRef, PAGE_SIZE};
+use crate::btree::{BlobPointer, BTree, BTreeError, LookupResult, Node, ValueRef, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
@@ -916,6 +916,162 @@ impl StorageEngine {
         }
 
         Ok((verified_pages, device_size))
+    }
+
+    /// Verify the logical B-tree graph rooted at the active manifest.
+    ///
+    /// This traverses PMT-backed pages without materializing the resident
+    /// mutation tree. It validates parent links, child existence, routing
+    /// bounds, cycles, and that every mapped logical page is reachable. Blob
+    /// pointers are returned for validation by the owning database.
+    pub fn verify_tree(&self, root_page_id: u64) -> Result<Vec<BlobPointer>> {
+        let root = u32::try_from(root_page_id)
+            .map_err(|_| Error::Corruption("root page exceeds logical ID width".into()))?;
+        if self.pmt.is_empty() {
+            if root != 0 {
+                return Err(Error::Corruption(format!(
+                    "empty PMT names non-zero root page {root}"
+                )));
+            }
+            return Ok(Vec::new());
+        }
+
+        if !self.pmt.contains(root as u64) {
+            return Err(Error::Corruption(format!(
+                "root page {root} is absent from PMT"
+            )));
+        }
+        if self.pmt.iter().any(|(page_id, _)| page_id > u32::MAX as u64) {
+            return Err(Error::Corruption(
+                "PMT contains a page ID outside the logical width".into(),
+            ));
+        }
+
+        let mut visited = HashSet::new();
+        let mut blob_pointers = Vec::new();
+        self.verify_tree_node(
+            root,
+            0,
+            None,
+            None,
+            &mut visited,
+            &mut blob_pointers,
+        )?;
+
+        if visited.len() != self.pmt.len() {
+            let unreachable = self
+                .pmt
+                .iter()
+                .map(|(page_id, _)| page_id)
+                .find(|page_id| !visited.contains(&(*page_id as u32)));
+            return Err(Error::Corruption(format!(
+                "PMT contains unreachable page {}",
+                unreachable.unwrap_or_default()
+            )));
+        }
+
+        Ok(blob_pointers)
+    }
+
+    fn verify_tree_node(
+        &self,
+        page_id: u32,
+        expected_parent: u32,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        visited: &mut HashSet<u32>,
+        blob_pointers: &mut Vec<BlobPointer>,
+    ) -> Result<()> {
+        if !visited.insert(page_id) {
+            return Err(Error::Corruption(format!(
+                "B-tree cycle reaches page {page_id}"
+            )));
+        }
+
+        let node = self.read_node(page_id as u64)?;
+        if node.parent_id() != expected_parent {
+            return Err(Error::Corruption(format!(
+                "page {page_id} names parent {}, expected {expected_parent}",
+                node.parent_id()
+            )));
+        }
+
+        let mut keys = Vec::with_capacity(node.count());
+        for index in 0..node.count() {
+            let key = node
+                .key(index)
+                .ok_or_else(|| Error::Corruption(format!("page {page_id} has malformed key")))?;
+            if lower.as_deref().is_some_and(|bound| key.as_slice() < bound)
+                || upper.as_deref().is_some_and(|bound| key.as_slice() >= bound)
+            {
+                return Err(Error::Corruption(format!(
+                    "page {page_id} key violates routing bounds"
+                )));
+            }
+            if keys
+                .last()
+                .is_some_and(|previous: &Vec<u8>| previous > &key)
+            {
+                return Err(Error::Corruption(format!(
+                    "page {page_id} keys are not ordered"
+                )));
+            }
+            keys.push(key);
+        }
+
+        if node.is_leaf() {
+            for index in 0..node.count() {
+                match node.value(index) {
+                    Some(ValueRef::Blob(pointer)) => blob_pointers.push(pointer),
+                    Some(ValueRef::Inline(_) | ValueRef::Tombstone) => {}
+                    None => {
+                        return Err(Error::Corruption(format!(
+                            "leaf page {page_id} has malformed value"
+                        )));
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let mut children = Vec::with_capacity(node.count() + 1);
+        children.push(node.leftmost_child());
+        for index in 0..node.count() {
+            children.push(node.child_id(index).ok_or_else(|| {
+                Error::Corruption(format!("internal page {page_id} has malformed child"))
+            })?);
+        }
+
+        for (index, child) in children.into_iter().enumerate() {
+            let child = u32::try_from(child).map_err(|_| {
+                Error::Corruption(format!("internal page {page_id} child exceeds ID width"))
+            })?;
+            if !self.pmt.contains(child as u64) {
+                return Err(Error::Corruption(format!(
+                    "internal page {page_id} references missing child {child}"
+                )));
+            }
+            let child_lower = if index == 0 {
+                lower.clone()
+            } else {
+                Some(keys[index - 1].clone())
+            };
+            let child_upper = if index < keys.len() {
+                Some(keys[index].clone())
+            } else {
+                upper.clone()
+            };
+            self.verify_tree_node(
+                child,
+                page_id,
+                child_lower,
+                child_upper,
+                visited,
+                blob_pointers,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Load all pages from disk into the B-tree.

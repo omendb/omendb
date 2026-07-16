@@ -440,6 +440,24 @@ fn dbnext_r0_newer_blob_image_cannot_reclaim_manifest_value() {
 }
 
 #[test]
+fn dbnext_r0_verify_rejects_dangling_blob_pointer() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("dangling-blob.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"large", &vec![0x7Fu8; 2_048]).unwrap();
+        db.flush().unwrap();
+    }
+    fs::remove_file(path.join("seerdb.blob")).unwrap();
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert!(matches!(
+        reopened.verify(),
+        Err(Error::Corruption(message)) if message.contains("blob pointer target")
+    ));
+}
+
+#[test]
 fn dbnext_r0_rejects_corrupt_blob_artifact() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-blob.db");
