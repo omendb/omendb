@@ -436,11 +436,13 @@ impl StorageEngine {
     ///
     /// This closes the deterministic capacity/ENOSPC boundary for the active
     /// page set. Reuse of retired slots is always admitted; only newly growing
-    /// data-file slots can fail this preflight. Real filesystem ENOSPC can
-    /// still occur during the write itself and remains fenced/recoverable.
+    /// data-file slots can fail this preflight. Supported filesystems reserve
+    /// new data extents with keep-size semantics before page I/O; a final
+    /// filesystem ENOSPC during the write itself remains fenced/recoverable.
     fn preflight_flush_capacity(&self, dirty_page_ids: &[u32]) -> Result<()> {
         let mut free_index = self.free_offsets.len();
         let mut next_offset = self.next_offset;
+        let mut required_data_end = None;
         for &page_id in dirty_page_ids {
             if self.btree.node(page_id).is_none() {
                 continue;
@@ -453,6 +455,7 @@ impl StorageEngine {
                 next_offset = next_offset
                     .checked_add(PAGE_SIZE as u64)
                     .ok_or(Error::DiskFull)?;
+                required_data_end = Some(next_offset);
                 offset
             };
             if let Err(error) = self.device.check_write_capacity(offset) {
@@ -461,6 +464,14 @@ impl StorageEngine {
                     .fetch_add(1, Ordering::Relaxed);
                 return Err(Error::from(error));
             }
+        }
+        if let Some(end) = required_data_end
+            && let Err(error) = self.device.reserve(end)
+        {
+            self.metrics
+                .capacity_preflight_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(Error::from(error));
         }
         Ok(())
     }

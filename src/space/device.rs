@@ -251,6 +251,16 @@ impl Device {
         preallocate_file(&self.file, length)
     }
 
+    /// Reserve physical blocks through `length` without changing the logical
+    /// file length where the host supports a keep-size primitive.
+    ///
+    /// Returns `false` on platforms where only portable logical growth is
+    /// available. The caller can still perform its normal write and handle a
+    /// final filesystem `StorageFull` result there.
+    pub fn reserve(&self, length: u64) -> io::Result<bool> {
+        reserve_file(&self.file, length)
+    }
+
     /// Truncate the page file to a durable, page-aligned length.
     pub fn truncate(&mut self, length: u64) -> io::Result<()> {
         if !length.is_multiple_of(PAGE_SIZE as u64) {
@@ -278,9 +288,18 @@ impl Device {
 
 /// Reserve a file extent before a durability-critical write.
 pub(crate) fn preallocate_file(file: &File, length: u64) -> io::Result<()> {
+    let _ = reserve_file(file, length)?;
+    // Keep the logical length contract explicit for the WAL reservation and
+    // for callers that intentionally want a visible preallocated extent.
+    file.set_len(length)
+}
+
+/// Reserve physical blocks through `length` while preserving the current
+/// logical file length.
+pub(crate) fn reserve_file(file: &File, length: u64) -> io::Result<bool> {
     let current = file.metadata()?.len();
     if current >= length {
-        return Ok(());
+        return Ok(true);
     }
 
     #[cfg(target_os = "linux")]
@@ -293,10 +312,18 @@ pub(crate) fn preallocate_file(file: &File, length: u64) -> io::Result<()> {
         })?;
         // SAFETY: the descriptor is borrowed from a live `File`, and the
         // checked offsets/lengths are valid `off_t` values.
-        let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, size) };
+        let result = unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                offset,
+                size,
+            )
+        };
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(true)
     }
 
     #[cfg(target_os = "macos")]
@@ -328,12 +355,14 @@ pub(crate) fn preallocate_file(file: &File, length: u64) -> io::Result<()> {
         if result == -1 {
             return Err(io::Error::last_os_error());
         }
+        Ok(true)
     }
 
-    // The platform calls reserve blocks but do not replace the logical file
-    // length contract. Keep the final length explicit and identical across
-    // all supported platforms.
-    file.set_len(length)
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, length);
+        Ok(false)
+    }
 }
 
 /// Allocate a page-aligned buffer for O_DIRECT I/O.
@@ -363,6 +392,8 @@ pub fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::MetadataExt;
     use tempfile::tempdir;
 
     #[test]
@@ -459,6 +490,29 @@ mod tests {
         device.preallocate(length).unwrap();
         device.preallocate(length).unwrap();
         assert_eq!(device.size().unwrap(), length);
+    }
+
+    #[test]
+    fn test_device_reserve_keeps_logical_length() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let options = DeviceOptions {
+            use_odirect: false,
+            sync_writes: false,
+            create: true,
+        };
+
+        let device = Device::open(&path, &options).unwrap();
+        let length = (PAGE_SIZE * 2) as u64;
+        let physically_reserved = device.reserve(length).unwrap();
+        assert_eq!(device.size().unwrap(), 0);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(physically_reserved);
+            assert!(std::fs::metadata(&path).unwrap().blocks() > 0);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(!physically_reserved);
     }
 
     #[test]
