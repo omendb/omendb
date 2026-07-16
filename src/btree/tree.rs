@@ -256,6 +256,74 @@ impl BTree {
         }
     }
 
+    /// Find the path from the root to a target leaf. Each path entry records
+    /// the child position within its parent (0 is the leftmost child).
+    fn find_path_to_leaf(
+        &self,
+        current: PageId,
+        target: PageId,
+        path: &mut Vec<(PageId, usize)>,
+    ) -> bool {
+        let Some(node) = self.node(current) else {
+            return false;
+        };
+        if node.is_leaf() {
+            return current == target;
+        }
+
+        let leftmost = node.leftmost_child() as PageId;
+        let children: Vec<_> = (0..node.count())
+            .filter_map(|index| node.child_id(index).map(|child| child as PageId))
+            .collect();
+
+        path.push((current, 0));
+        if self.find_path_to_leaf(leftmost, target, path) {
+            return true;
+        }
+        path.pop();
+
+        for (index, child) in children.into_iter().enumerate() {
+            path.push((current, index + 1));
+            if self.find_path_to_leaf(child, target, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+
+    /// Descend through leftmost children until reaching a leaf.
+    fn leftmost_leaf(&self, mut current: PageId) -> Option<PageId> {
+        loop {
+            let node = self.node(current)?;
+            if node.is_leaf() {
+                return Some(current);
+            }
+            let next = node.leftmost_child() as PageId;
+            if next == current {
+                return None;
+            }
+            current = next;
+        }
+    }
+
+    /// Find the leaf immediately to the right of `target` in key order.
+    fn next_leaf(&self, target: PageId) -> Option<PageId> {
+        let mut path = Vec::new();
+        if !self.find_path_to_leaf(self.root, target, &mut path) {
+            return None;
+        }
+
+        for (parent_id, child_position) in path.into_iter().rev() {
+            let parent = self.node(parent_id)?;
+            if child_position < parent.count() {
+                let next_child = parent.child_id(child_position)? as PageId;
+                return self.leftmost_leaf(next_child);
+            }
+        }
+        None
+    }
+
     /// Split a leaf node that's full and insert the key-value.
     fn split_and_insert_leaf(
         &mut self,
@@ -508,9 +576,12 @@ impl<'a> Iterator for RangeScan<'a> {
                 continue;
             }
 
-            // No sibling pointers yet, so we can't traverse to the next leaf.
-            self.done = true;
-            return None;
+            let Some(next_leaf) = self.tree.next_leaf(self.current_node) else {
+                self.done = true;
+                return None;
+            };
+            self.current_node = next_leaf;
+            self.current_index = 0;
         }
     }
 }
@@ -681,5 +752,20 @@ mod tests {
         }
 
         assert!(tree.node_count() > 2);
+    }
+
+    #[test]
+    fn test_btree_range_scan_across_split_leaves() {
+        let mut tree = BTree::new();
+        for i in 0..500 {
+            let key = format!("key_{i:06}");
+            let value = format!("value_{i:06}");
+            tree.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+
+        let results: Vec<_> = tree.range_scan(b"key_000050", b"key_000450").collect();
+        assert_eq!(results.len(), 400);
+        assert_eq!(results.first().unwrap().0, b"key_000050");
+        assert_eq!(results.last().unwrap().0, b"key_000449");
     }
 }
