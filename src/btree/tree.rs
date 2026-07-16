@@ -19,6 +19,7 @@
 use crate::allocator::PageAllocator;
 use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Page ID type (index into the page store).
 pub type PageId = u32;
@@ -40,12 +41,14 @@ pub enum LookupResult {
 ///
 /// This is the core B-tree logic. In the full implementation, this will be
 /// backed by the buffer manager and PMT. Missing slots represent pages that
-/// have not been loaded into this logical view yet.
+/// have not been loaded into this logical view yet. Cloning a tree shares
+/// clean page buffers; the first mutation of a shared page creates a private
+/// copy, which gives batch staging atomicity without a full deep clone.
 #[derive(Clone)]
 pub struct BTree {
     /// Loaded nodes indexed by stable logical page ID. `None` is an unloaded
     /// page in a sparse PMT-backed view.
-    nodes: Vec<Option<Node>>,
+    nodes: Vec<Option<Arc<Node>>>,
     /// Page ID of the root node.
     root: PageId,
     /// Logical pages that may have changed since the last published generation.
@@ -65,7 +68,7 @@ impl BTree {
     pub fn new() -> Self {
         let root = Node::new_leaf();
         Self {
-            nodes: vec![Some(root)],
+            nodes: vec![Some(Arc::new(root))],
             root: 0,
             dirty_pages: HashSet::from([0]),
             page_allocator: PageAllocator::new(),
@@ -85,7 +88,7 @@ impl BTree {
     ) -> Self {
         page_allocator.advance_next_id(nodes.len() as u64);
         Self {
-            nodes: nodes.into_iter().map(Some).collect(),
+            nodes: nodes.into_iter().map(|node| Some(Arc::new(node))).collect(),
             root,
             dirty_pages: HashSet::new(),
             page_allocator,
@@ -140,7 +143,7 @@ impl BTree {
         if idx >= self.nodes.len() {
             self.nodes.resize_with(idx + 1, || None);
         }
-        self.nodes[idx] = Some(node);
+        self.nodes[idx] = Some(Arc::new(node));
         self.dirty_pages.remove(&page_id);
     }
 
@@ -210,13 +213,19 @@ impl BTree {
 
     /// Get a reference to a node by page ID.
     pub fn node(&self, id: PageId) -> Option<&Node> {
-        self.nodes.get(id as usize).and_then(Option::as_ref)
+        self.nodes
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map(Arc::as_ref)
     }
 
     /// Get a mutable reference to a node by page ID.
     fn node_mut(&mut self, id: PageId) -> Option<&mut Node> {
         self.dirty_pages.insert(id);
-        self.nodes.get_mut(id as usize).and_then(Option::as_mut)
+        self.nodes
+            .get_mut(id as usize)
+            .and_then(Option::as_mut)
+            .map(Arc::make_mut)
     }
 
     /// Allocate a new node and return its page ID.
@@ -229,7 +238,7 @@ impl BTree {
         if id as usize >= self.nodes.len() {
             self.nodes.resize_with(id as usize + 1, || None);
         }
-        self.nodes[id as usize] = Some(node);
+        self.nodes[id as usize] = Some(Arc::new(node));
         self.dirty_pages.insert(id);
         Ok(id)
     }
@@ -1055,6 +1064,29 @@ mod tests {
         assert!(matches!(
             tree.lookup(b"key").unwrap(),
             LookupResult::Found(value) if value == b"restored"
+        ));
+    }
+
+    #[test]
+    fn test_btree_clone_isolated_after_mutation() {
+        let mut original = BTree::new();
+        original.insert(b"key", b"before").unwrap();
+
+        let mut candidate = original.clone();
+        candidate.upsert(b"key", b"after").unwrap();
+        candidate.insert(b"another", b"value").unwrap();
+
+        assert!(matches!(
+            original.lookup(b"key").unwrap(),
+            LookupResult::Found(value) if value == b"before"
+        ));
+        assert!(matches!(
+            original.lookup(b"another").unwrap(),
+            LookupResult::NotFound
+        ));
+        assert!(matches!(
+            candidate.lookup(b"key").unwrap(),
+            LookupResult::Found(value) if value == b"after"
         ));
     }
 

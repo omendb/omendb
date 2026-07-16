@@ -4,7 +4,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use seerdb::btree::{BTree, LookupResult};
-use seerdb::{DB, Options};
+use seerdb::{BatchMutation, DB, Options};
 use std::time::Duration;
 use tempfile::{TempDir, tempdir};
 
@@ -155,6 +155,35 @@ fn bench_db_flush_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_db_commit_batch(c: &mut Criterion) {
+    let mut group = configure_group(c, "db_commit_batch");
+    for batch_size in [100usize, 500] {
+        group.throughput(Throughput::Elements(batch_size as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch_size,
+            |benchmark, &batch_size| {
+                let operations: Vec<_> = (0..batch_size)
+                    .map(|index| BatchMutation::Put {
+                        key: key(index).into_bytes(),
+                        value: value(index).into_bytes(),
+                    })
+                    .collect();
+                benchmark.iter_batched(
+                    empty_db,
+                    |(directory, mut db)| {
+                        db.commit_batch(&operations).unwrap();
+                        drop(db);
+                        drop(directory);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_db_flush_amplification(c: &mut Criterion) {
     let mut group = configure_group(c, "db_flush_amplification");
     for batch_size in [100usize, 500] {
@@ -288,6 +317,7 @@ criterion_group!(
     bench_db_point_lookup,
     bench_db_range_scan,
     bench_db_flush_batch,
+    bench_db_commit_batch,
     bench_db_flush_amplification,
     bench_db_mixed_workload,
     bench_db_blob_read,

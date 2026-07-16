@@ -6,6 +6,7 @@
 use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Default threshold for blob separation (1KB).
 pub const DEFAULT_BLOB_THRESHOLD: usize = 1024;
@@ -17,10 +18,13 @@ const BLOB_FORMAT_VERSION: u32 = 1;
 ///
 /// Large values (>blob_threshold) are stored in blob files.
 /// The B-tree stores blob pointers instead of the actual values.
+/// Cloning a manager shares immutable blob files; mutations clone only the
+/// affected file, keeping candidate batch state isolated without copying the
+/// entire blob catalog.
 #[derive(Clone)]
 pub struct BlobManager {
     /// Active blob files.
-    files: Vec<BlobFile>,
+    files: Vec<Arc<BlobFile>>,
     /// Next file ID.
     next_file_id: u32,
     /// Threshold for blob separation (in bytes).
@@ -63,7 +67,7 @@ impl BlobManager {
     /// Drop deletion marks when the blob image is newer than the manifest.
     pub(crate) fn clear_deletion_metadata(&mut self) {
         for file in &mut self.files {
-            file.clear_deletion_metadata();
+            Arc::make_mut(file).clear_deletion_metadata();
         }
     }
 
@@ -84,7 +88,7 @@ impl BlobManager {
             self.create_new_file();
         }
 
-        let file = self.files.last_mut().expect("blob file should exist");
+        let file = Arc::make_mut(self.files.last_mut().expect("blob file should exist"));
         let key_prefix = Self::make_key_prefix(key);
         let (offset, length) = file.append(key_prefix, value);
 
@@ -100,6 +104,7 @@ impl BlobManager {
         let Some(file) = self.files.last_mut() else {
             return false;
         };
+        let file = Arc::make_mut(file);
         if file.file_id() != pointer.file_id
             || !file.rollback_append(pointer.offset, pointer.length)
         {
@@ -174,8 +179,12 @@ impl BlobManager {
 
     /// Mark an entry as deleted (for GC).
     pub fn mark_deleted(&mut self, ptr: &BlobPointer) -> bool {
-        if let Some(file) = self.files.iter_mut().find(|f| f.file_id() == ptr.file_id) {
-            return file.mark_deleted(ptr.offset);
+        if let Some(file) = self
+            .files
+            .iter_mut()
+            .find(|file| file.file_id() == ptr.file_id)
+        {
+            return Arc::make_mut(file).mark_deleted(ptr.offset);
         }
         false
     }
@@ -243,7 +252,7 @@ impl BlobManager {
     fn create_new_file(&mut self) {
         let file_id = self.next_file_id;
         self.next_file_id += 1;
-        self.files.push(BlobFile::new(file_id));
+        self.files.push(Arc::new(BlobFile::new(file_id)));
     }
 
     /// Make a key prefix (first 8 bytes, padded with zeros if shorter).
@@ -355,7 +364,7 @@ impl BlobManager {
             }
             file.restore_deleted(&deleted_offsets)?;
             next_file_id = next_file_id.max(file_id.checked_add(1)?);
-            files.push(file);
+            files.push(Arc::new(file));
         }
 
         cursor.finish()?;
@@ -391,7 +400,7 @@ impl BlobManager {
             let data = cursor.take(data_len)?;
             let file = BlobFile::from_bytes(file_id, data)?;
             next_file_id = next_file_id.max(file_id.checked_add(1)?);
-            files.push(file);
+            files.push(Arc::new(file));
         }
 
         cursor.finish()?;
@@ -508,6 +517,23 @@ mod tests {
     }
 
     #[test]
+    fn test_blob_manager_clone_isolated_after_mutation() {
+        let mut original = BlobManager::new();
+        let pointer = original.append(b"key", vec![1; 1500]);
+
+        let mut candidate = original.clone();
+        assert!(candidate.mark_deleted(&pointer));
+        let candidate_pointer = candidate.append(b"another", vec![2; 1600]);
+
+        assert_eq!(original.total_valid_entries(), 1);
+        assert_eq!(original.total_deleted_entries(), 0);
+        assert_eq!(original.read(&pointer), Some(&vec![1; 1500][..]));
+        assert!(original.read(&candidate_pointer).is_none());
+        assert_eq!(candidate.total_valid_entries(), 1);
+        assert_eq!(candidate.total_deleted_entries(), 1);
+    }
+
+    #[test]
     fn test_blob_gc() {
         let mut bm = BlobManager::new();
 
@@ -612,7 +638,7 @@ mod tests {
         future[8..12].copy_from_slice(&2u32.to_le_bytes());
         assert!(BlobManager::from_bytes(&future).is_none());
 
-        manager.files.push(BlobFile::new(2));
+        manager.files.push(Arc::new(BlobFile::new(2)));
         let mut duplicate = manager.to_bytes();
         // Header is 32 bytes; skip the first file descriptor and its data.
         let second_file_id = 32 + 4 + 8 + manager.files[0].to_bytes().len() + 4;
