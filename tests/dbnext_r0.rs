@@ -429,3 +429,30 @@ fn dbnext_r0_compact_truncates_reclaimable_tail() {
         report.data_bytes_after
     );
 }
+
+#[test]
+fn dbnext_r0_compact_failure_fences_writer_until_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("compact-fault.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-2").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-3").unwrap();
+    db.flush().unwrap();
+
+    db.inject_sync_failure();
+    assert!(matches!(db.compact(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    assert!(matches!(
+        db.put(b"after-fault", b"value"),
+        Err(Error::NeedsRecovery(_))
+    ));
+
+    drop(db);
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
+    assert!(!reopened.durability_status().write_fenced);
+}

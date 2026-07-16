@@ -700,6 +700,17 @@ impl DB {
     /// removed tail pages.
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.check_writable()?;
+        let result = self.compact_inner();
+        if result.is_err() {
+            // A maintenance failure can occur after the manifest barrier or
+            // after the file length changed. Reopen is the only universally
+            // safe way to reconstruct the active generation and allocator.
+            self.write_fenced = true;
+        }
+        result
+    }
+
+    fn compact_inner(&mut self) -> Result<CompactionReport> {
         self.flush()?;
 
         let (before, after) = self.engine.reclaimable_tail_range()?;

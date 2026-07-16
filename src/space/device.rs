@@ -177,7 +177,7 @@ impl Device {
             ));
         }
         self.file.set_len(length)?;
-        self.file.sync_data()
+        self.sync()
     }
 
     /// Whether O_DIRECT is being used.
