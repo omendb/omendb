@@ -107,8 +107,8 @@ impl PageAllocator {
         ]);
         let free_count = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
 
-        let expected = 12 + free_count * 8;
-        if buf.len() < expected {
+        let expected = 12usize.checked_add(free_count.checked_mul(8)?)?;
+        if buf.len() != expected {
             return None;
         }
 
@@ -116,8 +116,14 @@ impl PageAllocator {
         let mut pos = 12;
         for _ in 0..free_count {
             let id = u64::from_le_bytes([
-                buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
-                buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7],
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+                buf[pos + 4],
+                buf[pos + 5],
+                buf[pos + 6],
+                buf[pos + 7],
             ]);
             free_list.push(id);
             pos += 8;
@@ -197,5 +203,14 @@ mod tests {
 
         assert_eq!(restored.next_id(), 4);
         assert_eq!(restored.free_count(), 1);
+    }
+
+    #[test]
+    fn test_deserialization_rejects_trailing_bytes() {
+        let alloc = PageAllocator::new();
+        let mut bytes = alloc.to_bytes();
+        bytes.push(0xA5);
+
+        assert!(PageAllocator::from_bytes(&bytes).is_none());
     }
 }

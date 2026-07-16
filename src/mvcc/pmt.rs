@@ -56,7 +56,11 @@ impl PageMapping {
         let version = u64::from_le_bytes([
             buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
         ]);
-        Self { file_id, offset, version }
+        Self {
+            file_id,
+            offset,
+            version,
+        }
     }
 }
 
@@ -130,7 +134,9 @@ impl PMT {
         let mut buf = Vec::with_capacity(4 + self.len() * (8 + PageMapping::SERIALIZED_SIZE));
         buf.extend_from_slice(&count.to_le_bytes());
 
-        for (&page_id, mapping) in &self.mappings {
+        let mut entries: Vec<_> = self.mappings.iter().collect();
+        entries.sort_unstable_by_key(|(page_id, _)| **page_id);
+        for (&page_id, mapping) in entries {
             buf.extend_from_slice(&page_id.to_le_bytes());
             buf.extend_from_slice(&mapping.to_bytes());
         }
@@ -145,8 +151,9 @@ impl PMT {
         }
 
         let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let expected_size = 4 + count * (8 + PageMapping::SERIALIZED_SIZE);
-        if buf.len() < expected_size {
+        let expected_size =
+            4usize.checked_add(count.checked_mul(8 + PageMapping::SERIALIZED_SIZE)?)?;
+        if buf.len() != expected_size {
             return None;
         }
 
@@ -155,8 +162,14 @@ impl PMT {
 
         for _ in 0..count {
             let page_id = u64::from_le_bytes([
-                buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
-                buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7],
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+                buf[pos + 4],
+                buf[pos + 5],
+                buf[pos + 6],
+                buf[pos + 7],
             ]);
             pos += 8;
 
@@ -242,6 +255,23 @@ mod tests {
         assert_eq!(restored.get(1).unwrap().offset, 4096);
         assert_eq!(restored.get(2).unwrap().file_id, 1);
         assert_eq!(restored.get(3).unwrap().version, 3);
+    }
+
+    #[test]
+    fn test_pmt_serialization_is_canonical() {
+        let mut pmt = PMT::new();
+        pmt.insert(3, 0, 12_288);
+        pmt.insert(1, 0, 4_096);
+        pmt.insert(2, 0, 8_192);
+
+        let bytes = pmt.to_bytes();
+        let page_ids: Vec<_> = (0..3)
+            .map(|index| {
+                let offset = 4 + index * (8 + PageMapping::SERIALIZED_SIZE);
+                u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(page_ids, vec![1, 2, 3]);
     }
 
     #[test]
