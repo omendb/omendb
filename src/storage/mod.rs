@@ -467,10 +467,9 @@ impl StorageEngine {
 
     /// Ensure mutations operate on a complete logical tree.
     ///
-    /// Reopened generations stay lazy for read-only point/range access. The
-    /// first mutation materializes the immutable PMT-selected generation into
-    /// the transitional BTree overlay; later work will replace this fallback
-    /// with page-granular copy-on-write mutation overlays.
+    /// Materialize the immutable PMT-selected generation for WAL replay or
+    /// other recovery work that may touch arbitrary keys. Normal foreground
+    /// mutations use `prepare_mutation` and remain sparse.
     pub fn ensure_materialized(&mut self) -> Result<()> {
         let Some(root_page_id) = self.lazy_root else {
             return Ok(());
@@ -947,17 +946,18 @@ impl StorageEngine {
                 Box::new(page)
             };
 
-            // Deserialize the node.
-            if let Some(node) = Node::from_bytes(buffered_page) {
-                if !node.verify_checksum() {
-                    return Err(Error::Corruption(format!(
-                        "page checksum mismatch at offset {offset}"
-                    )));
-                }
-
-                // Add to the B-tree.
-                self.btree.add_node(node, page_id as u32);
+            // Deserialize the node and fail closed on malformed legacy data.
+            let node = Node::from_bytes(buffered_page).ok_or_else(|| {
+                Error::Corruption(format!("invalid page at offset {offset}"))
+            })?;
+            if !node.verify_checksum() {
+                return Err(Error::Corruption(format!(
+                    "page checksum mismatch at offset {offset}"
+                )));
             }
+
+            // Add to the B-tree.
+            self.btree.add_node(node, page_id as u32);
 
             // Update PMT.
             self.pmt.insert(page_id, 0, offset);
@@ -991,6 +991,7 @@ impl StorageEngine {
 mod tests {
     use super::*;
     use crate::space::DeviceOptions;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -1037,6 +1038,34 @@ mod tests {
         assert_eq!(second.hits, 0);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn load_from_disk_rejects_malformed_page() {
+        let dir = tempdir().unwrap();
+        let data_path = dir.path().join("data");
+        fs::write(&data_path, [0u8; PAGE_SIZE]).unwrap();
+        let device = Device::open(
+            &data_path,
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        assert!(matches!(
+            engine.load_from_disk(),
+            Err(Error::Corruption(message)) if message.contains("invalid page")
+        ));
     }
 
     #[test]

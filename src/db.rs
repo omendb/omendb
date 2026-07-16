@@ -1036,8 +1036,11 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
             let key = &record.payload[2..value_len_offset];
             let value = &record.payload[value_offset..];
             if blobs.should_separate(value.len()) {
+                if let LookupResult::Blob(pointer) = btree.lookup(key)? {
+                    blobs.mark_deleted(&pointer);
+                }
                 let pointer = blobs.append(key, value.to_vec());
-                btree.insert_blob(key, pointer)?;
+                btree.upsert_blob(key, pointer)?;
             } else {
                 btree.upsert(key, value)?;
             }
@@ -1845,6 +1848,41 @@ mod tests {
             assert_eq!(db.get(b"key1").unwrap(), Some(vec![0xCD; 3_000]));
             assert_eq!(db.get(b"key2").unwrap(), Some(b"small".to_vec()));
         }
+    }
+
+    #[test]
+    fn test_db_recovers_committed_blob_upsert() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blob-recovery.db");
+        let initial = vec![0x11; 2_000];
+        let replacement = vec![0x22; 3_000];
+
+        let (commit_id, generation_id, root_page_id) = {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", &initial).unwrap();
+            db.flush().unwrap();
+
+            (
+                db.commit_id.get(),
+                db.generation_id.get(),
+                db.engine.btree().root_id() as u64,
+            )
+        };
+
+        let record = WalRecord::put(b"key", &replacement);
+        let commit = CommitRecord {
+            commit_id: CommitId::new(commit_id + 1),
+            generation_id: GenerationId::new(generation_id + 1),
+            root_page_id,
+            mutation_count: 1,
+            digest: digest_records(&[&record]),
+        };
+        let mut wal_bytes = record.to_bytes();
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(replacement));
     }
 
     #[test]
