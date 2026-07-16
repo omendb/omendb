@@ -26,6 +26,10 @@ proptest = "1.6"
 tempfile = "3.14"
 rand = "0.8"
 
+[[bench]]
+name = "seerdb"
+harness = false
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
