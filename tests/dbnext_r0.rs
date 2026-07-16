@@ -495,6 +495,32 @@ fn dbnext_r0_gc_capacity_refusal_preserves_blob_catalog() {
 }
 
 #[test]
+fn dbnext_r0_gc_publication_failure_preserves_previous_blob_image() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-gc-fault.db");
+    let value = vec![0x6Du8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"large", &value).unwrap();
+    db.flush().unwrap();
+    db.delete(b"large").unwrap();
+    db.flush().unwrap();
+
+    db.inject_atomic_rename_failure();
+    assert!(matches!(db.gc(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    assert!(path.join("seerdb.blob.reserve").is_file());
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert!(!path.join("seerdb.blob.reserve").exists());
+    assert_eq!(reopened.get(b"large").unwrap(), None);
+    assert_eq!(reopened.blob_stats().total_deleted, 1);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 1);
+    assert_eq!(reopened.gc().unwrap(), 1);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+}
+
+#[test]
 fn dbnext_r0_blob_to_inline_retires_old_value() {
     let root = tempdir().unwrap();
     let path = root.path().join("blob-inline-replacement.db");

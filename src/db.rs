@@ -1740,6 +1740,14 @@ impl DB {
         self.engine.inject_capacity_limit(capacity);
     }
 
+    /// Inject one atomic artifact rename failure for the feature-gated fault
+    /// harness. The next atomic publication on this thread fails before the
+    /// rename, leaving the previous artifact available for recovery.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_atomic_rename_failure(&self) {
+        inject_atomic_rename_failure();
+    }
+
     /// Begin a new transaction.
     ///
     /// Returns a transaction handle that can be used to commit or abort.
