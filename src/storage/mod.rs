@@ -571,19 +571,19 @@ impl StorageEngine {
 
     /// Scan a key range through either the resident mutation tree or the
     /// PMT-backed lazy generation selected at reopen.
-    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, LookupResult)>> {
         if let Some(root_page_id) = self.lazy_root {
             let base = self.range_lazy(root_page_id, start, end)?;
             if self.btree.dirty_page_ids().is_empty() {
                 return Ok(base);
             }
-            let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = base.into_iter().collect();
+            let mut merged: BTreeMap<Vec<u8>, LookupResult> = base.into_iter().collect();
             for (key, value) in self.btree.dirty_leaf_entries(start, end)? {
                 match value {
-                    LookupResult::Found(value) => {
+                    LookupResult::Found(_) | LookupResult::Blob(_) => {
                         merged.insert(key, value);
                     }
-                    LookupResult::Blob(_) | LookupResult::Deleted | LookupResult::NotFound => {
+                    LookupResult::Deleted | LookupResult::NotFound => {
                         merged.remove(&key);
                     }
                 }
@@ -621,7 +621,7 @@ impl StorageEngine {
         root_page_id: u32,
         start: &[u8],
         end: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Vec<u8>, LookupResult)>> {
         let mut results = Vec::new();
         let mut current = self.find_leaf_page(root_page_id, start)?;
         let mut first_leaf = true;
@@ -655,8 +655,13 @@ impl StorageEngine {
                 previous_key = Some(key.clone());
 
                 match node.value(index - 1) {
-                    Some(ValueRef::Inline(value)) => results.push((key, value.to_vec())),
-                    Some(ValueRef::Blob(_)) | Some(ValueRef::Tombstone) => {}
+                    Some(ValueRef::Inline(value)) => {
+                        results.push((key, LookupResult::Found(value.to_vec())))
+                    }
+                    Some(ValueRef::Blob(pointer)) => {
+                        results.push((key, LookupResult::Blob(pointer)))
+                    }
+                    Some(ValueRef::Tombstone) => {}
                     None => {
                         return Err(Error::Corruption(
                             "lazy range value payload is malformed".into(),

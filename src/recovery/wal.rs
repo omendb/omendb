@@ -48,12 +48,16 @@ pub enum RecordType {
     TxnAbort = 6,
     /// Checkpoint marker.
     Checkpoint = 7,
-    /// Put: key_len(u16) + key + value_len(u16) + value.
+    /// Legacy Put: key_len(u16) + key + value_len(u16) + value.
     Put = 8,
-    /// Delete: key_len(u16) + key.
+    /// Legacy Delete: key_len(u16) + key.
     Delete = 9,
     /// Durable commit envelope with commit/generation/root/count/digest.
     Commit = 10,
+    /// Current Put: key_len(u32) + key + value_len(u32) + value.
+    PutV2 = 11,
+    /// Current Delete: key_len(u32) + key.
+    DeleteV2 = 12,
 }
 
 /// Result of parsing a WAL prefix.
@@ -137,20 +141,20 @@ impl WalRecord {
 
     /// Create a Put record (for crash recovery of B-tree data).
     pub fn put(key: &[u8], value: &[u8]) -> Self {
-        let mut payload = Vec::with_capacity(4 + key.len() + value.len());
-        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        let mut payload = Vec::with_capacity(4 + key.len() + 4 + value.len());
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
         payload.extend_from_slice(key);
-        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
         payload.extend_from_slice(value);
-        Self::new(RecordType::Put, payload)
+        Self::new(RecordType::PutV2, payload)
     }
 
     /// Create a Delete record (for crash recovery of B-tree data).
     pub fn delete(key: &[u8]) -> Self {
-        let mut payload = Vec::with_capacity(2 + key.len());
-        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        let mut payload = Vec::with_capacity(4 + key.len());
+        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
         payload.extend_from_slice(key);
-        Self::new(RecordType::Delete, payload)
+        Self::new(RecordType::DeleteV2, payload)
     }
 
     /// Serialize the record to bytes (for writing to the WAL file).
@@ -207,6 +211,8 @@ impl WalRecord {
             8 => RecordType::Put,
             9 => RecordType::Delete,
             10 => RecordType::Commit,
+            11 => RecordType::PutV2,
+            12 => RecordType::DeleteV2,
             _ => return None, // unknown type
         };
 
@@ -458,5 +464,15 @@ mod tests {
         };
         let record = WalRecord::commit(expected);
         assert_eq!(record.commit_record(), Some(expected));
+    }
+
+    #[test]
+    fn test_large_mutation_payload_roundtrip() {
+        let value = vec![0xA5; 70_000];
+        let record = WalRecord::put(b"large-key", &value);
+        let (restored, consumed) = WalRecord::from_bytes(&record.to_bytes()).unwrap();
+
+        assert_eq!(consumed, record.to_bytes().len());
+        assert_eq!(restored.payload, record.payload);
     }
 }

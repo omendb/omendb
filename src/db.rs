@@ -40,6 +40,8 @@ const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
+const WAL_COMMIT_RECORD_BYTES: u64 =
+    (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 
 /// Blob GC statistics.
 pub struct BlobStats {
@@ -118,6 +120,8 @@ pub struct CompactionReport {
 pub struct DBMetrics {
     /// Physical page and publication counters for this open handle.
     pub storage: StorageMetrics,
+    /// Number of mutations rejected before application by the WAL budget.
+    pub wal_admission_failures: u64,
     /// Buffer-pool occupancy and cache counters for this open handle.
     pub buffer: BufferStats,
     /// Current data-file size in bytes.
@@ -168,6 +172,8 @@ pub struct DB {
     is_open: bool,
     /// Whether a failed publication fenced this writer until reopen.
     write_fenced: bool,
+    /// Number of retryable WAL admission rejections for this handle.
+    wal_admission_failures: u64,
 }
 
 impl DB {
@@ -301,6 +307,7 @@ impl DB {
             pending_digest: 0,
             is_open: true,
             write_fenced: false,
+            wal_admission_failures: 0,
         };
 
         if current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
@@ -339,6 +346,8 @@ impl DB {
     /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_writable()?;
+        let record = WalRecord::put(key, value);
+        self.admit_wal_record(&record)?;
         self.engine.prepare_mutation(key)?;
 
         // Mutate memory first, then make the successful mutation durable in
@@ -354,7 +363,7 @@ impl DB {
             self.engine.btree_mut().upsert(key, value)?;
         }
 
-        self.journal_mutation(WalRecord::put(key, value))?;
+        self.journal_mutation(record)?;
 
         Ok(())
     }
@@ -389,6 +398,8 @@ impl DB {
     /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
+        let record = WalRecord::delete(key);
+        self.admit_wal_record(&record)?;
         self.engine.prepare_mutation(key)?;
 
         if let LookupResult::Blob(ptr) = self.engine.lookup(key)? {
@@ -396,14 +407,27 @@ impl DB {
         }
 
         let found = self.engine.btree_mut().delete(key)?;
-        self.journal_mutation(WalRecord::delete(key))?;
+        self.journal_mutation(record)?;
         Ok(found)
     }
 
     /// Range scan over [start, end).
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
-        self.engine.range(start, end)
+        self.engine
+            .range(start, end)?
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                crate::btree::LookupResult::Found(value) => Some(Ok((key, value))),
+                crate::btree::LookupResult::Blob(pointer) => Some(
+                    self.blobs
+                        .read(&pointer)
+                        .map(|value| (key, value.to_vec()))
+                        .ok_or_else(|| Error::Corruption("blob pointer invalid".into())),
+                ),
+                crate::btree::LookupResult::Deleted | crate::btree::LookupResult::NotFound => None,
+            })
+            .collect()
     }
 
     /// Write buffered WAL records to disk and sync the mutation prefix.
@@ -437,6 +461,30 @@ impl DB {
             .checked_add(1)
             .ok_or_else(|| Error::Wal("mutation count overflow".into()))?;
         self.pending_digest = extend_digest(self.pending_digest, &record);
+        Ok(())
+    }
+
+    /// Reserve enough logical WAL budget for one mutation and the commit that
+    /// closes its pending generation. This runs before any tree or blob state
+    /// changes, so retryable backpressure cannot leave a partial mutation.
+    fn admit_wal_record(&mut self, record: &WalRecord) -> Result<()> {
+        let wal_path = self.path.join(WAL_FILE);
+        let used = match fs::metadata(wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        let required = (record.to_bytes().len() as u64)
+            .checked_add(WAL_COMMIT_RECORD_BYTES)
+            .ok_or(Error::DiskFull)?;
+        let available = self.options.max_wal_bytes.saturating_sub(used);
+        if required > available {
+            self.wal_admission_failures = self.wal_admission_failures.saturating_add(1);
+            return Err(Error::Backpressure {
+                required,
+                available,
+            });
+        }
         Ok(())
     }
 
@@ -608,6 +656,7 @@ impl DB {
 
         Ok(DBMetrics {
             storage: self.engine.metrics(),
+            wal_admission_failures: self.wal_admission_failures,
             buffer: self.engine.buffer_stats(),
             data_bytes: artifact_size(DATA_FILE)?,
             blob_bytes: artifact_size(BLOB_FILE)?,
@@ -969,7 +1018,9 @@ impl DB {
         for record in &records {
             let record_len = record.to_bytes().len() as u64;
             match record.record_type {
-                RecordType::Put | RecordType::Delete => pending.push(record),
+                RecordType::Put | RecordType::Delete | RecordType::PutV2 | RecordType::DeleteV2 => {
+                    pending.push(record)
+                }
                 RecordType::Commit => {
                     let commit = record
                         .commit_record()
@@ -1023,26 +1074,19 @@ fn digest_records(records: &[&WalRecord]) -> u32 {
 fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<()> {
     match record.record_type {
         RecordType::Put => {
-            if record.payload.len() < 4 {
-                return Err(Error::Corruption("WAL put record too small".into()));
+            let (key, value) = decode_put_payload(false, &record.payload)?;
+            if blobs.should_separate(value.len()) {
+                if let LookupResult::Blob(pointer) = btree.lookup(key)? {
+                    blobs.mark_deleted(&pointer);
+                }
+                let pointer = blobs.append(key, value.to_vec());
+                btree.upsert_blob(key, pointer)?;
+            } else {
+                btree.upsert(key, value)?;
             }
-            let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
-            let value_len_offset = 2usize
-                .checked_add(key_len)
-                .ok_or_else(|| Error::Corruption("WAL key length overflow".into()))?;
-            if record.payload.len() < value_len_offset + 2 {
-                return Err(Error::Corruption("WAL put key is truncated".into()));
-            }
-            let value_len = u16::from_le_bytes([
-                record.payload[value_len_offset],
-                record.payload[value_len_offset + 1],
-            ]) as usize;
-            let value_offset = value_len_offset + 2;
-            if record.payload.len() != value_offset + value_len {
-                return Err(Error::Corruption("WAL put value is truncated".into()));
-            }
-            let key = &record.payload[2..value_len_offset];
-            let value = &record.payload[value_offset..];
+        }
+        RecordType::PutV2 => {
+            let (key, value) = decode_put_payload(true, &record.payload)?;
             if blobs.should_separate(value.len()) {
                 if let LookupResult::Blob(pointer) = btree.lookup(key)? {
                     blobs.mark_deleted(&pointer);
@@ -1054,14 +1098,14 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
             }
         }
         RecordType::Delete => {
-            if record.payload.len() < 2 {
-                return Err(Error::Corruption("WAL delete record too small".into()));
+            let key = decode_delete_payload(false, &record.payload)?;
+            if let LookupResult::Blob(pointer) = btree.lookup(key)? {
+                blobs.mark_deleted(&pointer);
             }
-            let key_len = u16::from_le_bytes([record.payload[0], record.payload[1]]) as usize;
-            if record.payload.len() != 2 + key_len {
-                return Err(Error::Corruption("WAL delete key is truncated".into()));
-            }
-            let key = &record.payload[2..];
+            btree.delete(key)?;
+        }
+        RecordType::DeleteV2 => {
+            let key = decode_delete_payload(true, &record.payload)?;
             if let LookupResult::Blob(pointer) = btree.lookup(key)? {
                 blobs.mark_deleted(&pointer);
             }
@@ -1074,6 +1118,76 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
         }
     }
     Ok(())
+}
+
+fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
+    if v2 {
+        if payload.len() < 4 + 4 {
+            return Err(Error::Corruption("WAL v2 put record too small".into()));
+        }
+        let key_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let value_len_offset = 4usize
+            .checked_add(key_len)
+            .ok_or_else(|| Error::Corruption("WAL key length overflow".into()))?;
+        if payload.len() < value_len_offset + 4 {
+            return Err(Error::Corruption("WAL v2 put key is truncated".into()));
+        }
+        let value_len = u32::from_le_bytes([
+            payload[value_len_offset],
+            payload[value_len_offset + 1],
+            payload[value_len_offset + 2],
+            payload[value_len_offset + 3],
+        ]) as usize;
+        let value_offset = value_len_offset + 4;
+        if payload.len() != value_offset + value_len {
+            return Err(Error::Corruption("WAL v2 put value is truncated".into()));
+        }
+        return Ok((&payload[4..value_len_offset], &payload[value_offset..]));
+    }
+
+    // Read the pre-v2 u16 layout so an upgrade can recover an older WAL.
+    if payload.len() < 4 {
+        return Err(Error::Corruption("WAL put record too small".into()));
+    }
+    let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let value_len_offset = 2usize
+        .checked_add(key_len)
+        .ok_or_else(|| Error::Corruption("WAL key length overflow".into()))?;
+    if payload.len() < value_len_offset + 2 {
+        return Err(Error::Corruption("WAL put key is truncated".into()));
+    }
+    let value_len = u16::from_le_bytes([
+        payload[value_len_offset],
+        payload[value_len_offset + 1],
+    ]) as usize;
+    let value_offset = value_len_offset + 2;
+    if payload.len() != value_offset + value_len {
+        return Err(Error::Corruption("WAL put value is truncated".into()));
+    }
+    Ok((&payload[2..value_len_offset], &payload[value_offset..]))
+}
+
+fn decode_delete_payload(v2: bool, payload: &[u8]) -> Result<&[u8]> {
+    if v2 {
+        if payload.len() < 4 {
+            return Err(Error::Corruption("WAL v2 delete record too small".into()));
+        }
+        let key_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        if payload.len() != 4 + key_len {
+            return Err(Error::Corruption("WAL v2 delete key is truncated".into()));
+        }
+        return Ok(&payload[4..]);
+    }
+
+    // Read the pre-v2 u16 layout so an upgrade can recover an older WAL.
+    if payload.len() < 2 {
+        return Err(Error::Corruption("WAL delete record too small".into()));
+    }
+    let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if payload.len() != 2 + key_len {
+        return Err(Error::Corruption("WAL delete key is truncated".into()));
+    }
+    Ok(&payload[2..])
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
@@ -1271,6 +1385,38 @@ mod tests {
         assert_eq!(after.storage.physical_page_reads, 1);
         assert_eq!(after.storage.page_bytes_read, PAGE_SIZE as u64);
         assert_eq!(after.buffer.reads, 1);
+    }
+
+    #[test]
+    fn test_db_wal_admission_rejects_before_blob_or_tree_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal-admission.db");
+        let value = vec![0xA5; 2_000];
+        let record_bytes = WalRecord::put(b"key", &value).to_bytes().len() as u64;
+        let exact_budget = record_bytes + WAL_COMMIT_RECORD_BYTES;
+        let mut options = Options::for_test();
+        options.max_wal_bytes = exact_budget - 1;
+
+        let mut db = DB::open(&path, options).unwrap();
+        let error = db.put(b"key", &value).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Backpressure { required, available }
+                if required == exact_budget && available == exact_budget - 1
+        ));
+        assert_eq!(db.get(b"key").unwrap(), None);
+        assert_eq!(db.blob_stats().total_valid, 0);
+        assert!(!path.join(WAL_FILE).exists());
+        assert!(!db.durability_status().write_fenced);
+        assert_eq!(db.metrics().unwrap().wal_admission_failures, 1);
+
+        db.options.max_wal_bytes = exact_budget;
+        db.put(b"key", &value).unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let reopened = DB::open(&path, Options::for_test()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(value));
     }
 
     #[test]
@@ -1844,6 +1990,13 @@ mod tests {
             db.flush().unwrap();
             assert!(db.blob_stats().total_deleted > 0);
             assert_eq!(db.get(b"key1").unwrap(), Some(replacement));
+            assert_eq!(
+                db.range(b"key1", b"key3").unwrap(),
+                vec![
+                    (b"key1".to_vec(), vec![0xCD; 3_000]),
+                    (b"key2".to_vec(), b"small".to_vec()),
+                ]
+            );
             db.close().unwrap();
         }
 
@@ -1855,6 +2008,13 @@ mod tests {
             let db = DB::open(&path, Options::default()).unwrap();
             assert_eq!(db.get(b"key1").unwrap(), Some(vec![0xCD; 3_000]));
             assert_eq!(db.get(b"key2").unwrap(), Some(b"small".to_vec()));
+            assert_eq!(
+                db.range(b"key1", b"key3").unwrap(),
+                vec![
+                    (b"key1".to_vec(), vec![0xCD; 3_000]),
+                    (b"key2".to_vec(), b"small".to_vec()),
+                ]
+            );
         }
     }
 
@@ -1891,6 +2051,54 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn test_db_recovers_committed_large_blob_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large-blob-recovery.db");
+        let value = vec![0x7B; 70_000];
+        let record = WalRecord::put(b"large-key", &value);
+        let commit = CommitRecord {
+            commit_id: CommitId::new(1),
+            generation_id: GenerationId::new(1),
+            root_page_id: 0,
+            mutation_count: 1,
+            digest: digest_records(&[&record]),
+        };
+        let mut wal_bytes = record.to_bytes();
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"large-key").unwrap(), Some(value));
+    }
+
+    #[test]
+    fn test_db_replays_legacy_wal_put_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-wal.db");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(3u16).to_le_bytes());
+        payload.extend_from_slice(b"key");
+        payload.extend_from_slice(&(5u16).to_le_bytes());
+        payload.extend_from_slice(b"value");
+        let record = WalRecord::new(RecordType::Put, payload);
+        let commit = CommitRecord {
+            commit_id: CommitId::new(1),
+            generation_id: GenerationId::new(1),
+            root_page_id: 0,
+            mutation_count: 1,
+            digest: digest_records(&[&record]),
+        };
+        let mut wal_bytes = record.to_bytes();
+        wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]

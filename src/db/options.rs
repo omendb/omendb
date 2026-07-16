@@ -19,6 +19,10 @@ pub struct Options {
 
     /// Sync writes to disk. Default: false (caller must call flush).
     pub sync_writes: bool,
+
+    /// Maximum on-disk WAL bytes admitted for one pending generation,
+    /// including its commit envelope. Default: 64 MiB.
+    pub max_wal_bytes: u64,
 }
 
 impl Default for Options {
@@ -29,6 +33,7 @@ impl Default for Options {
             blob_threshold: DEFAULT_BLOB_THRESHOLD,
             use_odirect: false,
             sync_writes: false,
+            max_wal_bytes: 64 * 1024 * 1024,
         }
     }
 }

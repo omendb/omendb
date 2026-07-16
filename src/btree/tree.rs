@@ -819,7 +819,7 @@ impl<'a> RangeScan<'a> {
 }
 
 impl<'a> Iterator for RangeScan<'a> {
-    type Item = Result<(Vec<u8>, Vec<u8>), BTreeError>;
+    type Item = Result<(Vec<u8>, LookupResult), BTreeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -864,7 +864,10 @@ impl<'a> Iterator for RangeScan<'a> {
 
                 match node.value(self.current_index - 1) {
                     Some(ValueRef::Inline(value)) if key >= self.start => {
-                        return Some(Ok((key, value.to_vec())));
+                        return Some(Ok((key, LookupResult::Found(value.to_vec()))));
+                    }
+                    Some(ValueRef::Blob(pointer)) if key >= self.start => {
+                        return Some(Ok((key, LookupResult::Blob(pointer))));
                     }
                     Some(ValueRef::Inline(_))
                     | Some(ValueRef::Blob(_))
@@ -1136,7 +1139,7 @@ mod tests {
         let mut scan = tree.range_scan(b"a", b"zz").unwrap();
         assert!(matches!(
             scan.next(),
-            Some(Ok((key, value))) if key == b"a" && value == b"value"
+            Some(Ok((key, LookupResult::Found(value)))) if key == b"a" && value == b"value"
         ));
         assert!(matches!(
             scan.next(),
@@ -1179,7 +1182,16 @@ mod tests {
                 .range_scan(b"key-000", b"key-999")
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+                .unwrap()
+                .into_iter()
+                .filter_map(|(key, value)| match value {
+                    LookupResult::Found(value) => Some((key, value)),
+                    LookupResult::Deleted | LookupResult::NotFound => None,
+                    LookupResult::Blob(pointer) => {
+                        panic!("unexpected blob range value: {pointer:?}")
+                    }
+                })
+                .collect();
             let expected: Vec<_> = reference.into_iter().collect();
             prop_assert_eq!(actual, expected);
         }

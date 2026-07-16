@@ -14,6 +14,11 @@ pub enum Error {
     #[error("disk full")]
     DiskFull,
 
+    /// The configured WAL admission budget cannot cover this mutation and
+    /// its closing commit envelope. The caller may flush and retry.
+    #[error("write backpressure: requires {required} WAL bytes, {available} available")]
+    Backpressure { required: u64, available: u64 },
+
     /// Key not found.
     #[error("key not found")]
     NotFound,
