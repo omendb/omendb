@@ -327,7 +327,6 @@ impl DB {
         }
 
         self.journal_mutation(WalRecord::put(key, value))?;
-        let _page_id = self.engine.allocator_mut().alloc();
 
         Ok(())
     }
@@ -373,8 +372,9 @@ impl DB {
     }
 
     /// Range scan over [start, end).
-    pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.engine.btree().range_scan(start, end).collect()
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_open()?;
+        Ok(self.engine.btree().range_scan(start, end).collect())
     }
 
     /// Write buffered WAL records to disk and sync the mutation prefix.
@@ -1146,7 +1146,7 @@ mod tests {
         db.put(b"c", b"3").unwrap();
         db.put(b"d", b"4").unwrap();
 
-        let results = db.range(b"b", b"d");
+        let results = db.range(b"b", b"d").unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, b"b");
         assert_eq!(results[1].0, b"c");

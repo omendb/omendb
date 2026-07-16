@@ -17,13 +17,13 @@
 pub const PAGE_SIZE: usize = 4096;
 
 /// Header size in bytes.
-const HEADER_SIZE: usize = 32;
+const HEADER_SIZE: usize = 40;
 
 /// Magic number identifying seerdb pages.
 const MAGIC: u32 = 0x5345_4552; // "SEER"
 
 /// Current page format version.
-const PAGE_VERSION: u32 = 1;
+const PAGE_VERSION: u32 = 2;
 
 /// Size of each slot entry (offset: u16, key_len: u16).
 const SLOT_SIZE: usize = 4;
@@ -93,9 +93,9 @@ impl BlobPointer {
     }
 }
 
-/// Fixed-size page header (32 bytes).
+/// Fixed-size page header (40 bytes).
 ///
-/// Layout: magic(4) | version(4) | page_type(4) | count(4) | free_space(4) | checksum(8) | parent_id(4)
+/// Layout: magic(4) | version(4) | page_type(4) | count(4) | free_space(4) | checksum(8) | parent_id(4) | leftmost_child(8)
 #[derive(Debug, Clone)]
 pub struct NodeHeader {
     /// Magic number for page identification.
@@ -110,8 +110,10 @@ pub struct NodeHeader {
     pub free_space: u32,
     /// CRC32C checksum of the page contents (excluding this field).
     pub checksum: u64,
-    /// Parent page ID (0 if root). u32 fits in 32-byte header.
+    /// Parent page ID (0 if root).
     pub parent_id: u32,
+    /// Leftmost child page ID for internal nodes.
+    pub leftmost_child: u64,
 }
 
 impl NodeHeader {
@@ -128,6 +130,7 @@ impl NodeHeader {
         buf[16..20].copy_from_slice(&self.free_space.to_le_bytes());
         buf[20..28].copy_from_slice(&self.checksum.to_le_bytes());
         buf[28..32].copy_from_slice(&self.parent_id.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.leftmost_child.to_le_bytes());
         buf
     }
 
@@ -147,6 +150,9 @@ impl NodeHeader {
             buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
         ]);
         let parent_id = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
+        let leftmost_child = u64::from_le_bytes([
+            buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+        ]);
         Self {
             magic,
             version,
@@ -155,7 +161,19 @@ impl NodeHeader {
             free_space,
             checksum,
             parent_id,
+            leftmost_child,
         }
+    }
+
+    /// Deserialize a header while rejecting unknown page types.
+    fn try_from_bytes(buf: &[u8; HEADER_SIZE]) -> Option<Self> {
+        let page_type_raw = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if !matches!(page_type_raw, 1 | 2) {
+            return None;
+        }
+
+        let header = Self::from_bytes(buf);
+        header.is_valid().then_some(header)
     }
 
     /// Create a fresh header for the given page type.
@@ -168,6 +186,7 @@ impl NodeHeader {
             free_space: (PAGE_SIZE - HEADER_SIZE) as u32,
             checksum: 0,
             parent_id: 0,
+            leftmost_child: 0,
         }
     }
 
@@ -187,9 +206,6 @@ impl NodeHeader {
 pub struct Node {
     /// Raw page buffer (always PAGE_SIZE bytes).
     data: Box<[u8; PAGE_SIZE]>,
-    /// Leftmost child ID for internal nodes (before key 0).
-    /// Only used when page_type is Internal.
-    leftmost_child: u64,
 }
 
 impl Node {
@@ -207,25 +223,20 @@ impl Node {
         let mut data = Box::new([0u8; PAGE_SIZE]);
         let header = NodeHeader::new(page_type);
         data[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
-        Self {
-            data,
-            leftmost_child: 0,
-        }
+        Self { data }
     }
 
     /// Wrap an existing page buffer (e.g., read from disk).
     ///
-    /// Returns `None` if the header magic is invalid.
+    /// Returns `None` if the header or slotted-page layout is invalid.
     pub fn from_bytes(data: Box<[u8; PAGE_SIZE]>) -> Option<Self> {
         let node = Self {
             data,
-            leftmost_child: 0,
         };
-        if node.header().is_valid() {
-            Some(node)
-        } else {
-            None
-        }
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        header_bytes.copy_from_slice(&node.data[..HEADER_SIZE]);
+        NodeHeader::try_from_bytes(&header_bytes)?;
+        node.validate_layout().then_some(node)
     }
 
     /// Access the raw page bytes.
@@ -240,12 +251,14 @@ impl Node {
 
     /// Set the leftmost child ID (for internal nodes).
     pub fn set_leftmost_child(&mut self, child_id: u64) {
-        self.leftmost_child = child_id;
+        let mut header = self.header();
+        header.leftmost_child = child_id;
+        self.set_header(&header);
     }
 
     /// Get the leftmost child ID (for internal nodes).
     pub fn leftmost_child(&self) -> u64 {
-        self.leftmost_child
+        self.header().leftmost_child
     }
 
     /// Read the page header.
@@ -253,6 +266,96 @@ impl Node {
         let mut buf = [0u8; HEADER_SIZE];
         buf.copy_from_slice(&self.data[..HEADER_SIZE]);
         NodeHeader::from_bytes(&buf)
+    }
+
+    /// Validate all bounds and typed payloads in the slotted-page layout.
+    fn validate_layout(&self) -> bool {
+        let header = self.header();
+        let count = header.count as usize;
+        let slot_end = HEADER_SIZE.saturating_add(count.saturating_mul(SLOT_SIZE));
+        if count > (PAGE_SIZE - HEADER_SIZE) / SLOT_SIZE || slot_end > PAGE_SIZE {
+            return false;
+        }
+
+        let mut offsets = Vec::with_capacity(count);
+        for index in 0..count {
+            let offset = self.slot_offset(index);
+            if offset < slot_end || offset >= PAGE_SIZE {
+                return false;
+            }
+            offsets.push(offset);
+        }
+
+        let mut sorted_offsets = offsets.clone();
+        sorted_offsets.sort_unstable();
+        if sorted_offsets.windows(2).any(|window| window[0] == window[1]) {
+            return false;
+        }
+
+        let min_entry = offsets.iter().copied().min().unwrap_or(PAGE_SIZE);
+        if header.free_space as usize != min_entry.saturating_sub(slot_end) {
+            return false;
+        }
+
+        let mut previous_key = Vec::new();
+        for (index, &offset) in offsets.iter().enumerate() {
+            let sorted_index = match sorted_offsets.binary_search(&offset) {
+                Ok(index) => index,
+                Err(_) => return false,
+            };
+            let entry_end = sorted_offsets
+                .get(sorted_index + 1)
+                .copied()
+                .unwrap_or(PAGE_SIZE);
+            if entry_end <= offset || entry_end > PAGE_SIZE || offset + 4 > entry_end {
+                return false;
+            }
+
+            let prefix_len = self.entry_prefix_len(index) as usize;
+            let suffix_len = self.entry_suffix_len(index) as usize;
+            let suffix_end = match offset.checked_add(4 + suffix_len) {
+                Some(end) if end <= entry_end => end,
+                _ => return false,
+            };
+            let key_len = match prefix_len.checked_add(suffix_len) {
+                Some(length) => length,
+                None => return false,
+            };
+            if self.slot_key_len(index) as usize != key_len {
+                return false;
+            }
+
+            if prefix_len > previous_key.len() {
+                return false;
+            }
+            let key_start = offset + 4;
+            let key_suffix = &self.data[key_start..suffix_end];
+            let mut key = previous_key[..prefix_len].to_vec();
+            key.extend_from_slice(key_suffix);
+            if previous_key.as_slice() > key.as_slice() {
+                return false;
+            }
+            previous_key = key;
+
+            if self.is_internal() {
+                if suffix_end.checked_add(8).is_none_or(|end| end > entry_end) {
+                    return false;
+                }
+            } else {
+                if suffix_end >= entry_end {
+                    return false;
+                }
+                let value_type = self.data[suffix_end];
+                let value_start = suffix_end + 1;
+                match value_type {
+                    0x00 | 0x02 => {}
+                    0x01 if value_start.checked_add(BLOB_POINTER_SIZE).is_some_and(|end| end <= entry_end) => {}
+                    _ => return false,
+                }
+            }
+        }
+
+        true
     }
 
     /// Write the page header.
@@ -1147,6 +1250,7 @@ mod tests {
     #[test]
     fn test_internal_node_children() {
         let mut node = Node::new_internal();
+        node.set_leftmost_child(7);
         node.insert_child(b"b", 10).unwrap();
         node.insert_child(b"d", 20).unwrap();
         node.insert_child(b"f", 30).unwrap();
@@ -1154,6 +1258,10 @@ mod tests {
         assert_eq!(node.child_id(0), Some(10));
         assert_eq!(node.child_id(1), Some(20));
         assert_eq!(node.child_id(2), Some(30));
+
+        let restored = Node::from_bytes(node.into_bytes()).unwrap();
+        assert_eq!(restored.leftmost_child(), 7);
+        assert_eq!(restored.child_id(0), Some(10));
     }
 
     #[test]
@@ -1215,6 +1323,22 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_unknown_page_type() {
+        let mut node = Node::new_leaf().into_bytes();
+        node[8..12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(Node::from_bytes(node).is_none());
+    }
+
+    #[test]
+    fn test_rejects_invalid_slot_bounds() {
+        let mut node = Node::new_leaf();
+        node.insert(b"key", b"value").unwrap();
+        let mut bytes = node.into_bytes();
+        bytes[40..42].copy_from_slice(&1u16.to_le_bytes());
+        assert!(Node::from_bytes(bytes).is_none());
+    }
+
+    #[test]
     fn test_keys_iterator() {
         let mut node = Node::new_leaf();
         node.insert(b"c", b"3").unwrap();
@@ -1271,6 +1395,7 @@ mod tests {
             free_space: 3000,
             checksum: 0xDEAD_BEEF_CAFE_BABE,
             parent_id: 123,
+            leftmost_child: 456,
         };
         let bytes = header.to_bytes();
         let restored = NodeHeader::from_bytes(&bytes);
@@ -1281,5 +1406,26 @@ mod tests {
         assert_eq!(restored.free_space, header.free_space);
         assert_eq!(restored.checksum, header.checksum);
         assert_eq!(restored.parent_id, header.parent_id);
+        assert_eq!(restored.leftmost_child, header.leftmost_child);
+    }
+
+    #[test]
+    fn test_tombstone_blob_layout_roundtrip() {
+        let mut node = Node::new_leaf();
+        for key in [b"key1".as_slice(), b"key2".as_slice(), b"key3".as_slice()] {
+            node.insert_blob(
+                key,
+                BlobPointer {
+                    file_id: 1,
+                    offset: 4096,
+                    length: 2000,
+                },
+            )
+            .unwrap();
+        }
+        node.insert_tombstone(b"key1").unwrap();
+        node.insert_tombstone(b"key2").unwrap();
+
+        assert!(Node::from_bytes(node.into_bytes()).is_some());
     }
 }

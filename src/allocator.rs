@@ -9,6 +9,7 @@ use std::collections::HashSet;
 ///
 /// Tracks which pages are allocated and maintains a free list
 /// for reuse of deallocated pages.
+#[derive(Clone)]
 pub struct PageAllocator {
     /// Next page ID to allocate (sequential allocation).
     next_id: u64,
@@ -83,6 +84,11 @@ impl PageAllocator {
     /// Next page ID that would be allocated (for serialization).
     pub fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// Advance the next ID without moving it backwards.
+    pub fn advance_next_id(&mut self, minimum: u64) {
+        self.next_id = self.next_id.max(minimum);
     }
 
     /// Serialize the allocator state.

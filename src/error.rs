@@ -86,6 +86,7 @@ impl From<BTreeError> for Error {
             BTreeError::DuplicateKey => Error::DuplicateKey,
             BTreeError::InsertFailed(e) => Error::from(e),
             BTreeError::SplitFailed(e) => Error::from(e),
+            BTreeError::PageIdExhausted => Error::BTree("logical page ID exhausted".into()),
         }
     }
 }

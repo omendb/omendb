@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// Current durable format version.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Fixed size of the superblock record.
 pub const SUPERBLOCK_SIZE: usize = 4096;

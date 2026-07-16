@@ -5,8 +5,14 @@
 
 use crate::btree::node::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(not(any(unix, windows)))]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 #[cfg(any(test, feature = "fault-injection"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -91,10 +97,47 @@ impl Device {
     /// Read a page at the given offset.
     ///
     /// The buffer must be page-aligned for O_DIRECT.
-    pub fn read_page(&mut self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buf)?;
-        Ok(())
+    pub fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let mut filled = 0;
+            while filled < buf.len() {
+                let count = self.file.read_at(&mut buf[filled..], offset + filled as u64)?;
+                if count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "page read reached end of file",
+                    ));
+                }
+                filled += count;
+            }
+            Ok(())
+        }
+
+        #[cfg(windows)]
+        {
+            let mut filled = 0;
+            while filled < buf.len() {
+                let count = self
+                    .file
+                    .seek_read(&mut buf[filled..], offset + filled as u64)?;
+                if count == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "page read reached end of file",
+                    ));
+                }
+                filled += count;
+            }
+            Ok(())
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = &self.file;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buf)
+        }
     }
 
     /// Write a page at the given offset.

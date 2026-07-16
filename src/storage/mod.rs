@@ -24,8 +24,6 @@ pub struct StorageEngine {
     buffer: BufferManager,
     /// Page mapping table (page locations).
     pmt: PMT,
-    /// Page allocator.
-    allocator: PageAllocator,
     /// Device (file I/O).
     device: Device,
     /// Next offset for page allocation.
@@ -46,10 +44,9 @@ impl StorageEngine {
         device: Device,
     ) -> Self {
         Self {
-            btree,
+            btree: btree.with_page_allocator(allocator),
             buffer,
             pmt,
-            allocator,
             device,
             next_offset: 0,
             free_offsets: Vec::new(),
@@ -74,12 +71,12 @@ impl StorageEngine {
 
     /// Get a reference to the allocator.
     pub fn allocator(&self) -> &PageAllocator {
-        &self.allocator
+        self.btree.page_allocator()
     }
 
     /// Get a mutable reference to the allocator.
     pub fn allocator_mut(&mut self) -> &mut PageAllocator {
-        &mut self.allocator
+        self.btree.page_allocator_mut()
     }
 
     /// Return current buffer-pool counters and derived occupancy metrics.
@@ -189,7 +186,9 @@ impl StorageEngine {
         }
 
         let mut buf = [0u8; PAGE_SIZE];
-        self.device.read_page(mapping.offset, &mut buf)?;
+        if !self.buffer.is_resident(page_id) {
+            self.device.read_page(mapping.offset, &mut buf)?;
+        }
         let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
         let buffered_page = Box::new(*self.buffer.frame_data(&guard));
         drop(guard);
@@ -335,7 +334,8 @@ impl StorageEngine {
             nodes[page_id as usize] = node;
         }
 
-        self.btree = BTree::from_nodes(nodes, root_page_id as u32);
+        let allocator = self.btree.take_page_allocator();
+        self.btree = BTree::from_nodes_with_allocator(nodes, root_page_id as u32, allocator);
         self.next_offset = device_size;
         Ok(())
     }
@@ -452,6 +452,8 @@ impl StorageEngine {
 
         // Update the allocator.
         self.next_offset = offset;
+        let node_count = self.btree.node_count() as u64;
+        self.btree.page_allocator_mut().advance_next_id(node_count);
         self.free_offsets.clear();
         self.pending_reclaimed_offsets.clear();
 

@@ -98,6 +98,13 @@ impl BufferManager {
         self.frames.len()
     }
 
+    /// Whether a page currently has a resident frame.
+    pub fn is_resident(&self, page_id: u64) -> bool {
+        self.page_map
+            .get(&page_id)
+            .is_some_and(|&frame_idx| !self.frames[frame_idx].is_free())
+    }
+
     /// Get buffer pool statistics.
     pub fn stats(&self) -> BufferStats {
         let mut stats = self.stats.clone();

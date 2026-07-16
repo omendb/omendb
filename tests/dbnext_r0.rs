@@ -34,7 +34,7 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
         .filter(|(key, _)| key.as_slice() >= b"key-00" && key.as_slice() < b"key-99")
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    assert_eq!(db.range(b"key-00", b"key-99"), expected_range);
+    assert_eq!(db.range(b"key-00", b"key-99").unwrap(), expected_range);
 }
 
 fn copy_database(source: &Path, destination: &Path) {
@@ -304,7 +304,7 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
         recovered.get(b"published").unwrap(),
         Some(b"before-concurrent-crash".to_vec())
     );
-    let worker_records = recovered.range(b"worker-00", b"worker-~");
+    let worker_records = recovered.range(b"worker-00", b"worker-~").unwrap();
     assert!(
         !worker_records.is_empty(),
         "no concurrent batch was recovered"
@@ -455,4 +455,30 @@ fn dbnext_r0_compact_failure_fences_writer_until_reopen() {
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
     assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn dbnext_r0_reopens_deep_tree_with_internal_routing() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("deep-tree.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    for key_id in 0..600 {
+        let key = format!("key-{key_id:04}");
+        let value = format!("value-{key_id:04}");
+        db.put(key.as_bytes(), value.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    for key_id in 0..600 {
+        let key = format!("key-{key_id:04}");
+        let value = format!("value-{key_id:04}");
+        assert_eq!(
+            reopened.get(key.as_bytes()).unwrap(),
+            Some(value.into_bytes()),
+            "reopened lookup failed for {key}"
+        );
+    }
 }

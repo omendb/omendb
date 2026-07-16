@@ -112,7 +112,7 @@ fn bench_db_range_scan(c: &mut Criterion) {
             |benchmark, &scan_size| {
                 benchmark.iter(|| {
                     let end = key(scan_size);
-                    black_box(db.range(b"key-00000000", end.as_bytes()).len());
+                    black_box(db.range(b"key-00000000", end.as_bytes()).unwrap().len());
                 });
             },
         );

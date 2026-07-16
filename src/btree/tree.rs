@@ -15,6 +15,7 @@
 //! In the full implementation, "modify" operations create new page versions.
 //! For now, we mutate nodes directly. The PMT integration comes later.
 
+use crate::allocator::PageAllocator;
 use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef};
 use std::collections::HashSet;
 
@@ -45,6 +46,8 @@ pub struct BTree {
     root: PageId,
     /// Logical pages that may have changed since the last published generation.
     dirty_pages: HashSet<PageId>,
+    /// Single owner of stable logical page IDs used by this tree.
+    page_allocator: PageAllocator,
 }
 
 impl Default for BTree {
@@ -61,16 +64,51 @@ impl BTree {
             nodes: vec![root],
             root: 0,
             dirty_pages: HashSet::from([0]),
+            page_allocator: PageAllocator::new(),
         }
     }
 
     /// Create a B-tree from existing nodes (for loading from disk).
     pub fn from_nodes(nodes: Vec<Node>, root: PageId) -> Self {
+        Self::from_nodes_with_allocator(nodes, root, PageAllocator::new())
+    }
+
+    /// Create a B-tree from existing nodes and preserve its page allocator.
+    pub fn from_nodes_with_allocator(
+        nodes: Vec<Node>,
+        root: PageId,
+        mut page_allocator: PageAllocator,
+    ) -> Self {
+        page_allocator.advance_next_id(nodes.len() as u64);
         Self {
             nodes,
             root,
             dirty_pages: HashSet::new(),
+            page_allocator,
         }
+    }
+
+    /// Replace the tree's logical page allocator during storage bootstrap.
+    pub fn with_page_allocator(mut self, page_allocator: PageAllocator) -> Self {
+        self.page_allocator = page_allocator;
+        self.page_allocator
+            .advance_next_id(self.nodes.len() as u64);
+        self
+    }
+
+    /// Access the logical page allocator for durable checkpoints.
+    pub fn page_allocator(&self) -> &PageAllocator {
+        &self.page_allocator
+    }
+
+    /// Mutably access the logical page allocator.
+    pub fn page_allocator_mut(&mut self) -> &mut PageAllocator {
+        &mut self.page_allocator
+    }
+
+    /// Move the allocator out while replacing it with a fresh allocator.
+    pub fn take_page_allocator(&mut self) -> PageAllocator {
+        std::mem::take(&mut self.page_allocator)
     }
 
     /// Add a node at a specific page ID (for loading from disk).
@@ -117,11 +155,18 @@ impl BTree {
     }
 
     /// Allocate a new node and return its page ID.
-    fn alloc_node(&mut self, node: Node) -> PageId {
-        let id = self.nodes.len() as PageId;
-        self.nodes.push(node);
+    fn alloc_node(&mut self, node: Node) -> Result<PageId, BTreeError> {
+        let id = self.page_allocator.alloc();
+        if id > u32::MAX as u64 {
+            return Err(BTreeError::PageIdExhausted);
+        }
+        let id = id as PageId;
+        if id as usize >= self.nodes.len() {
+            self.nodes.resize_with(id as usize + 1, Node::new_leaf);
+        }
+        self.nodes[id as usize] = node;
         self.dirty_pages.insert(id);
-        id
+        Ok(id)
     }
 
     /// Insert a key-value pair into the B-tree.
@@ -141,11 +186,13 @@ impl BTree {
                 let snapshot = self.nodes.clone();
                 let root = self.root;
                 let dirty_pages = self.dirty_pages.clone();
+                let page_allocator = self.page_allocator.clone();
                 let result = self.split_and_insert_leaf(leaf_id, key, value);
                 if result.is_err() {
                     self.nodes = snapshot;
                     self.root = root;
                     self.dirty_pages = dirty_pages;
+                    self.page_allocator = page_allocator;
                 }
                 result
             }
@@ -181,6 +228,7 @@ impl BTree {
         let snapshot = self.nodes.clone();
         let root = self.root;
         let dirty_pages = self.dirty_pages.clone();
+        let page_allocator = self.page_allocator.clone();
         let result = match self
             .node_mut(leaf_id)
             .expect("leaf_id should be valid")
@@ -196,6 +244,7 @@ impl BTree {
             self.nodes = snapshot;
             self.root = root;
             self.dirty_pages = dirty_pages;
+            self.page_allocator = page_allocator;
         }
         result
     }
@@ -367,7 +416,7 @@ impl BTree {
             leaf.split().map_err(BTreeError::SplitFailed)?
         };
 
-        let right_id = self.alloc_node(right_node);
+        let right_id = self.alloc_node(right_node)?;
 
         let target_id = if key >= median_key.as_slice() {
             right_id
@@ -381,7 +430,7 @@ impl BTree {
             .map_err(BTreeError::InsertFailed)?;
 
         if leaf_id == self.root {
-            self.create_new_root(leaf_id, &median_key, right_id);
+            self.create_new_root(leaf_id, &median_key, right_id)?;
         } else {
             let parent_id = self
                 .parent_of(leaf_id)
@@ -396,7 +445,12 @@ impl BTree {
     }
 
     /// Create a new root with two children.
-    fn create_new_root(&mut self, left_id: PageId, key: &[u8], right_id: PageId) {
+    fn create_new_root(
+        &mut self,
+        left_id: PageId,
+        key: &[u8],
+        right_id: PageId,
+    ) -> Result<(), BTreeError> {
         let mut new_root = Node::new_internal();
 
         // For internal nodes, child_id(i) is the child AFTER key_i.
@@ -404,9 +458,9 @@ impl BTree {
         new_root.set_leftmost_child(left_id as u64);
         new_root
             .insert_child(key, right_id as u64)
-            .expect("new root should have space");
+            .map_err(BTreeError::InsertFailed)?;
 
-        let new_root_id = self.alloc_node(new_root);
+        let new_root_id = self.alloc_node(new_root)?;
 
         self.node_mut(left_id)
             .expect("left_id should be valid")
@@ -416,6 +470,7 @@ impl BTree {
             .set_parent_id(new_root_id);
 
         self.root = new_root_id;
+        Ok(())
     }
 
     /// Find the parent of a given node (by DFS).
@@ -501,7 +556,7 @@ impl BTree {
             node.split().map_err(BTreeError::SplitFailed)?
         };
 
-        let right_id = self.alloc_node(right_node);
+        let right_id = self.alloc_node(right_node)?;
 
         let target_id = if key >= median_key.as_slice() {
             right_id
@@ -515,7 +570,7 @@ impl BTree {
             .map_err(BTreeError::InsertFailed)?;
 
         if node_id == self.root {
-            self.create_new_root(node_id, &median_key, right_id);
+            self.create_new_root(node_id, &median_key, right_id)?;
         } else {
             let parent_id = self
                 .parent_of(node_id)
@@ -566,6 +621,8 @@ pub enum BTreeError {
     InsertFailed(InsertError),
     #[error("split failed: {0}")]
     SplitFailed(SplitError),
+    #[error("logical page ID exhausted")]
+    PageIdExhausted,
 }
 
 /// Cursor for range scanning the B-tree.
