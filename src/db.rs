@@ -901,6 +901,7 @@ impl DB {
                 let _ = fs::remove_file(&reservation_path);
                 return Err(error.into());
             }
+            file.set_len(required)?;
             file.sync_data()?;
             sync_directory(&self.path)?;
         }
