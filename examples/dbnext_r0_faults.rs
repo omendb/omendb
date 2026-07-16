@@ -87,8 +87,8 @@ mod runner {
                 Ok("device generation sync")
             }
             "PackedPageSync" => {
-                db.inject_after_write_failure();
-                Ok("page write after-write analogue (packed-page sync seam absent)")
+                db.inject_page_range_sync_failure();
+                Ok("page-generation sync after all page writes")
             }
             "ManifestSync" => {
                 db.inject_manifest_sync_failure();

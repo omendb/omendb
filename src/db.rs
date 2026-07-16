@@ -1979,6 +1979,13 @@ impl DB {
         self.engine.inject_after_write_failure();
     }
 
+    /// Inject one failure after the complete page generation is written but
+    /// before its device durability sync.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_page_range_sync_failure(&self) {
+        self.engine.inject_page_range_sync_failure();
+    }
+
     /// Inject one final-write ENOSPC after a page write may have completed.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_final_write_disk_full(&self) {

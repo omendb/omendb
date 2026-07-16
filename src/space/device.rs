@@ -59,6 +59,10 @@ pub struct Device {
     /// can publish the generation.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_after_write: AtomicBool,
+    /// Test-only failure after a page generation is written but before its
+    /// device durability sync begins.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_page_range_sync: AtomicBool,
     /// Test-only final-write ENOSPC after page bytes may have reached media.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_final_write_disk_full: AtomicBool,
@@ -114,6 +118,8 @@ impl Device {
             fail_next_write: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_after_write: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_page_range_sync: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_final_write_disk_full: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -261,6 +267,27 @@ impl Device {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_after_write_failure(&self) {
         self.fail_next_after_write.store(true, Ordering::Release);
+    }
+
+    /// Inject one failure after a complete page generation has been written
+    /// but before its device durability sync.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_page_range_sync_failure(&self) {
+        self.fail_next_page_range_sync
+            .store(true, Ordering::Release);
+    }
+
+    /// Check the page-generation sync fault boundary without consuming the
+    /// ordinary device-sync fault.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn check_page_range_sync(&self) -> io::Result<()> {
+        if self
+            .fail_next_page_range_sync
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(io::Error::other("injected page-generation sync failure"));
+        }
+        Ok(())
     }
 
     /// Inject one final-write ENOSPC after a page write may have completed.

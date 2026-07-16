@@ -340,6 +340,13 @@ impl StorageEngine {
         self.device.inject_after_write_failure();
     }
 
+    /// Inject one failure after the complete page generation is written but
+    /// before its device durability sync.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_page_range_sync_failure(&self) {
+        self.device.inject_page_range_sync_failure();
+    }
+
     /// Inject one final-write ENOSPC after a page write may have completed.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_final_write_disk_full(&self) {
@@ -441,6 +448,8 @@ impl StorageEngine {
         }
 
         // Sync to ensure data is persisted.
+        #[cfg(any(test, feature = "fault-injection"))]
+        self.device.check_page_range_sync()?;
         self.device.sync()?;
         {
             let mut buffer = self.buffer_lock()?;
