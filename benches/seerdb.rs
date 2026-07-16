@@ -155,6 +155,52 @@ fn bench_db_flush_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_db_flush_amplification(c: &mut Criterion) {
+    let mut group = configure_group(c, "db_flush_amplification");
+    for batch_size in [100usize, 500] {
+        let user_bytes = (0..batch_size).fold(0u64, |total, index| {
+            total + key(index).len() as u64 + value(index).len() as u64
+        });
+        group.throughput(Throughput::Bytes(user_bytes));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch_size,
+            |benchmark, &batch_size| {
+                benchmark.iter_batched(
+                    || {
+                        let (directory, mut db) = empty_db();
+                        let mut logical_bytes = 0u64;
+                        for index in 0..batch_size {
+                            let key = key(index);
+                            let value = value(index);
+                            logical_bytes += (key.len() + value.len()) as u64;
+                            db.put(key.as_bytes(), value.as_bytes()).unwrap();
+                        }
+                        let wal_bytes = db.metrics().unwrap().wal_bytes;
+                        (directory, db, logical_bytes, wal_bytes)
+                    },
+                    |(directory, mut db, logical_bytes, wal_bytes)| {
+                        let before = db.metrics().unwrap();
+                        db.flush().unwrap();
+                        let after = db.metrics().unwrap();
+                        let page_bytes = after
+                            .storage
+                            .page_bytes_written
+                            .saturating_sub(before.storage.page_bytes_written);
+                        let amplification = (page_bytes + wal_bytes) as f64
+                            / logical_bytes.max(1) as f64;
+                        black_box(amplification);
+                        drop(db);
+                        drop(directory);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_db_mixed_workload(c: &mut Criterion) {
     const OPERATIONS: usize = 500;
     let mut group = configure_group(c, "db_mixed_workload");
@@ -242,6 +288,7 @@ criterion_group!(
     bench_db_point_lookup,
     bench_db_range_scan,
     bench_db_flush_batch,
+    bench_db_flush_amplification,
     bench_db_mixed_workload,
     bench_db_blob_read,
     bench_db_reopen_lazy_point_read,
