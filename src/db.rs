@@ -397,6 +397,7 @@ impl DB {
             format_version: FORMAT_VERSION,
         };
         self.manifest.publish(manifest)?;
+        self.engine.complete_generation();
 
         if wal_path.exists() {
             fs::remove_file(&wal_path)?;
@@ -1115,6 +1116,25 @@ mod tests {
         db.engine.inject_write_failure();
 
         assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(matches!(
+            db.put(b"another", b"value"),
+            Err(Error::NeedsRecovery(_))
+        ));
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_fences_writer_after_disk_full() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.engine.inject_disk_full();
+
+        assert!(matches!(db.flush(), Err(Error::DiskFull)));
         assert!(matches!(
             db.put(b"another", b"value"),
             Err(Error::NeedsRecovery(_))

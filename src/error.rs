@@ -8,7 +8,11 @@ use crate::buffer::BufferError;
 pub enum Error {
     /// I/O error (file operations).
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+
+    /// The database or filesystem has no space for the requested write.
+    #[error("disk full")]
+    DiskFull,
 
     /// Key not found.
     #[error("key not found")]
@@ -49,6 +53,16 @@ pub enum Error {
 
 /// Result type for database operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::StorageFull {
+            Self::DiskFull
+        } else {
+            Self::Io(error)
+        }
+    }
+}
 
 impl From<InsertError> for Error {
     fn from(e: InsertError) -> Self {

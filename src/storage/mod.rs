@@ -11,6 +11,7 @@ use crate::buffer::{BufferManager, BufferStats, GuardAccess};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
+use std::collections::HashSet;
 
 /// Storage engine that coordinates all components.
 ///
@@ -29,6 +30,10 @@ pub struct StorageEngine {
     device: Device,
     /// Next offset for page allocation.
     next_offset: u64,
+    /// Physical page offsets that are not referenced by the active generation.
+    free_offsets: Vec<u64>,
+    /// Offsets retired by the last flush, pending manifest publication.
+    pending_reclaimed_offsets: Vec<u64>,
 }
 
 impl StorageEngine {
@@ -47,6 +52,8 @@ impl StorageEngine {
             allocator,
             device,
             next_offset: 0,
+            free_offsets: Vec::new(),
+            pending_reclaimed_offsets: Vec::new(),
         }
     }
 
@@ -80,6 +87,22 @@ impl StorageEngine {
         self.buffer.stats()
     }
 
+    /// Number of physical page slots available for safe reuse.
+    pub fn reclaimable_page_count(&self) -> usize {
+        self.free_offsets.len()
+    }
+
+    /// Make the previous generation's retired pages reusable.
+    ///
+    /// DB calls this only after the new manifest has been durably published.
+    /// Before that point, the old generation may still be the authoritative
+    /// root after a crash and its physical pages must remain untouched.
+    pub fn complete_generation(&mut self) {
+        self.free_offsets.append(&mut self.pending_reclaimed_offsets);
+        self.free_offsets.sort_unstable();
+        self.free_offsets.dedup();
+    }
+
     /// Get mutable access to the page mapping table for recovery.
     pub fn pmt_mut(&mut self) -> &mut PMT {
         &mut self.pmt
@@ -97,12 +120,19 @@ impl StorageEngine {
         self.device.inject_write_failure();
     }
 
+    /// Inject one deterministic disk-full result for recovery tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_disk_full(&self) {
+        self.device.inject_disk_full();
+    }
+
     /// Flush all dirty pages to disk.
     pub fn flush(&mut self) -> Result<()> {
         // The bootstrap path rewrites the complete logical tree into a new
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
         let node_count = self.btree.node_count();
+        let mut retired_offsets = Vec::new();
 
         for page_id in 0..node_count {
             let node = self.btree.node(page_id as u32);
@@ -118,7 +148,10 @@ impl StorageEngine {
 
                 // Every flush creates a new physical version. DB publishes
                 // the resulting PMT only after all data is durable.
-                let offset = self.next_offset;
+                if let Some(mapping) = self.pmt.get(page_id as u64) {
+                    retired_offsets.push(mapping.offset);
+                }
+                let offset = self.free_offsets.pop().unwrap_or(self.next_offset);
 
                 // Stage the page through the buffer manager, then write the
                 // clean flushed image to the out-of-place device version.
@@ -139,6 +172,7 @@ impl StorageEngine {
 
         // Sync to ensure data is persisted.
         self.device.sync()?;
+        self.pending_reclaimed_offsets = retired_offsets;
 
         Ok(())
     }
@@ -147,8 +181,19 @@ impl StorageEngine {
     pub fn load_from_manifest(&mut self, root_page_id: u64) -> Result<()> {
         if self.pmt.is_empty() {
             self.next_offset = self.device.size()?;
+            self.free_offsets.clear();
+            self.pending_reclaimed_offsets.clear();
             return Ok(());
         }
+
+        let device_size = self.device.size()?;
+        let active_offsets: HashSet<_> =
+            self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        self.free_offsets = (0..device_size)
+            .step_by(PAGE_SIZE)
+            .filter(|offset| !active_offsets.contains(offset))
+            .collect();
+        self.pending_reclaimed_offsets.clear();
 
         let max_page_id = self
             .pmt
@@ -197,7 +242,7 @@ impl StorageEngine {
         }
 
         self.btree = BTree::from_nodes(nodes, root_page_id as u32);
-        self.next_offset = self.device.size()?;
+        self.next_offset = device_size;
         Ok(())
     }
 
@@ -245,6 +290,8 @@ impl StorageEngine {
 
         // Update the allocator.
         self.next_offset = offset;
+        self.free_offsets.clear();
+        self.pending_reclaimed_offsets.clear();
 
         Ok(())
     }
@@ -297,6 +344,43 @@ mod tests {
         assert_eq!(second.hits, 1);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn reuses_retired_physical_pages_after_generation_completion() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        engine.btree_mut().insert(b"key", b"value-1").unwrap();
+        engine.flush().unwrap();
+        engine.complete_generation();
+        assert_eq!(engine.device.size().unwrap(), PAGE_SIZE as u64);
+
+        engine.btree_mut().upsert(b"key", b"value-2").unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.device.size().unwrap(), (PAGE_SIZE * 2) as u64);
+        engine.complete_generation();
+        assert_eq!(engine.reclaimable_page_count(), 1);
+
+        engine.btree_mut().upsert(b"key", b"value-3").unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.device.size().unwrap(), (PAGE_SIZE * 2) as u64);
+        assert_eq!(engine.reclaimable_page_count(), 0);
     }
 
     #[test]
