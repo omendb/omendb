@@ -105,6 +105,58 @@ impl StorageEngine {
         self.btree.clear_dirty();
     }
 
+    /// Read and validate one logical page through the active PMT and buffer.
+    ///
+    /// This is the page-oriented seam used by manifest loading today and by
+    /// the future on-demand B-tree path. It deliberately owns all physical
+    /// location and checksum checks instead of allowing callers to bypass the
+    /// PMT with raw device offsets.
+    pub fn read_node(&mut self, page_id: u64) -> Result<Node> {
+        let mapping = *self
+            .pmt
+            .get(page_id)
+            .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
+        if mapping.file_id != 0 {
+            return Err(Error::Corruption(format!(
+                "page {page_id} references unsupported file {}",
+                mapping.file_id
+            )));
+        }
+        if !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(Error::Corruption(format!(
+                "page {page_id} has unaligned offset {}",
+                mapping.offset
+            )));
+        }
+
+        let device_size = self.device.size()?;
+        let end = mapping
+            .offset
+            .checked_add(PAGE_SIZE as u64)
+            .ok_or_else(|| Error::Corruption(format!("page {page_id} offset overflows")))?;
+        if end > device_size {
+            return Err(Error::Corruption(format!(
+                "page {page_id} at offset {} exceeds data file size {device_size}",
+                mapping.offset
+            )));
+        }
+
+        let mut buf = [0u8; PAGE_SIZE];
+        self.device.read_page(mapping.offset, &mut buf)?;
+        let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
+        let buffered_page = Box::new(*self.buffer.frame_data(&guard));
+        drop(guard);
+
+        let node = Node::from_bytes(buffered_page)
+            .ok_or_else(|| Error::Corruption(format!("invalid page {page_id}")))?;
+        if !node.verify_checksum() {
+            return Err(Error::Corruption(format!(
+                "page checksum mismatch for page {page_id}"
+            )));
+        }
+        Ok(node)
+    }
+
     /// Get mutable access to the page mapping table for recovery.
     pub fn pmt_mut(&mut self) -> &mut PMT {
         &mut self.pmt
@@ -232,27 +284,7 @@ impl StorageEngine {
         }
 
         for page_id in 0..=max_page_id {
-            let mapping = self
-                .pmt
-                .get(page_id)
-                .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
-            let mut buf = [0u8; PAGE_SIZE];
-            self.device.read_page(mapping.offset, &mut buf)?;
-            let guard = self.buffer.fetch(page_id, &buf, GuardAccess::Read)?;
-            let buffered_page = Box::new(*self.buffer.frame_data(&guard));
-            drop(guard);
-            let node = Node::from_bytes(buffered_page).ok_or_else(|| {
-                Error::Corruption(format!(
-                    "invalid page {page_id} at offset {}",
-                    mapping.offset
-                ))
-            })?;
-            if !node.verify_checksum() {
-                return Err(Error::Corruption(format!(
-                    "page checksum mismatch at offset {}",
-                    mapping.offset
-                )));
-            }
+            let node = self.read_node(page_id)?;
             nodes[page_id as usize] = node;
         }
 
@@ -462,6 +494,39 @@ mod tests {
         engine.flush().unwrap();
         let second = engine.buffer_stats();
         assert_eq!(second.writes - first.writes, 1);
+    }
+
+    #[test]
+    fn read_node_uses_pmt_and_buffer_boundary() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        engine.btree_mut().insert(b"key", b"value").unwrap();
+        engine.flush().unwrap();
+        engine.complete_generation();
+
+        assert!(engine.read_node(0).unwrap().is_leaf());
+        assert!(engine.read_node(0).unwrap().is_leaf());
+        assert!(matches!(
+            engine.read_node(1),
+            Err(Error::Corruption(message)) if message.contains("missing page")
+        ));
+        assert!(engine.buffer_stats().hits >= 2);
     }
 
     #[test]
