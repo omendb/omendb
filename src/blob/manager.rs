@@ -188,6 +188,14 @@ impl BlobManager {
             .collect()
     }
 
+    /// Whether GC can remove at least one fully dead blob file without
+    /// rewriting any live pointers.
+    pub(crate) fn has_reclaimable_files(&self) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.needs_gc() && file.valid_count() == 0)
+    }
+
     /// Run garbage collection on files that need it.
     ///
     /// Only fully dead files are reclaimable without rewriting live pointers.

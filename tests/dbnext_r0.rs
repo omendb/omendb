@@ -456,6 +456,45 @@ fn dbnext_r0_blob_reclamation_survives_reopen() {
 }
 
 #[test]
+fn dbnext_r0_gc_capacity_refusal_preserves_blob_catalog() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-gc-capacity.db");
+    let value = vec![0x6Du8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"large", &value).unwrap();
+    db.flush().unwrap();
+    db.delete(b"large").unwrap();
+    db.flush().unwrap();
+
+    let before_bytes = fs::metadata(path.join("seerdb.blob")).unwrap().len();
+    let before = db.blob_stats();
+    assert_eq!(before.total_valid, 0);
+    assert_eq!(before.total_deleted, 1);
+    assert_eq!(before.files_needing_gc, 1);
+
+    db.inject_capacity_limit(0);
+    assert!(matches!(db.gc(), Err(Error::DiskFull)));
+    assert_eq!(
+        fs::metadata(path.join("seerdb.blob")).unwrap().len(),
+        before_bytes
+    );
+    let after_failure = db.blob_stats();
+    assert_eq!(after_failure.total_valid, before.total_valid);
+    assert_eq!(after_failure.total_deleted, before.total_deleted);
+    assert_eq!(after_failure.files_needing_gc, before.files_needing_gc);
+    assert!(!db.durability_status().write_fenced);
+
+    db.inject_capacity_limit(u64::MAX);
+    assert_eq!(db.gc().unwrap(), 1);
+    assert_eq!(db.blob_stats().files_needing_gc, 0);
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"large").unwrap(), None);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+}
+
+#[test]
 fn dbnext_r0_blob_to_inline_retires_old_value() {
     let root = tempdir().unwrap();
     let path = root.path().join("blob-inline-replacement.db");

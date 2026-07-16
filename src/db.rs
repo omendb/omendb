@@ -1104,10 +1104,16 @@ impl DB {
     pub fn gc(&mut self) -> Result<usize> {
         self.check_writable()?;
         self.flush()?;
+        if self.blobs.has_reclaimable_files() {
+            // Admission must precede removal from the in-memory catalog. The
+            // current image is an upper bound for the compacted image, so a
+            // successful reservation covers the subsequent atomic publish.
+            self.admit_blob_image(None, None)?;
+        }
         let reclaimed = self.blobs.gc();
         if reclaimed > 0 {
             let blob_path = self.path.join(BLOB_FILE);
-            if let Err(error) = atomic_write(&blob_path, &self.blobs.to_bytes()) {
+            if let Err(error) = self.write_blob_image(&blob_path, &self.blobs.to_bytes()) {
                 self.write_fenced = true;
                 return Err(error);
             }
@@ -3474,5 +3480,43 @@ mod tests {
         assert_eq!(reopened.get(b"key1").unwrap(), None);
         assert_eq!(reopened.get(b"key2").unwrap(), None);
         assert_eq!(reopened.get(b"key3").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_gc_admission_rejects_before_catalog_reclamation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gc-admission.db");
+        let value = vec![0xAB; 2_000];
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        db.put(b"key", &value).unwrap();
+        db.flush().unwrap();
+        db.delete(b"key").unwrap();
+        db.flush().unwrap();
+
+        let before_bytes = fs::metadata(path.join(BLOB_FILE)).unwrap().len();
+        let before_stats = db.blob_stats();
+        assert_eq!(before_stats.total_valid, 0);
+        assert_eq!(before_stats.total_deleted, 1);
+        assert_eq!(before_stats.files_needing_gc, 1);
+
+        db.inject_capacity_limit(0);
+        assert!(matches!(db.gc(), Err(Error::DiskFull)));
+        assert_eq!(
+            fs::metadata(path.join(BLOB_FILE)).unwrap().len(),
+            before_bytes
+        );
+        let after_failed_stats = db.blob_stats();
+        assert_eq!(after_failed_stats.total_valid, before_stats.total_valid);
+        assert_eq!(after_failed_stats.total_deleted, before_stats.total_deleted);
+        assert_eq!(
+            after_failed_stats.files_needing_gc,
+            before_stats.files_needing_gc
+        );
+        assert!(!db.durability_status().write_fenced);
+
+        db.inject_capacity_limit(u64::MAX);
+        assert_eq!(db.gc().unwrap(), 1);
+        assert_eq!(db.blob_stats().files_needing_gc, 0);
     }
 }
