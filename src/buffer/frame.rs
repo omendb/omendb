@@ -1,6 +1,7 @@
 //! Buffer frame: a slot in the buffer pool that holds a page.
 
 use crate::btree::node::PAGE_SIZE;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// State of a buffer frame.
@@ -33,6 +34,8 @@ pub struct Frame {
     pub last_access: Instant,
     /// Whether the frame has been accessed since the last eviction sweep.
     pub referenced: bool,
+    /// Ownership token used to derive the number of live page guards.
+    guard_token: Arc<()>,
 }
 
 impl Frame {
@@ -46,6 +49,7 @@ impl Frame {
             pinned: false,
             last_access: Instant::now(),
             referenced: false,
+            guard_token: Arc::new(()),
         }
     }
 
@@ -57,6 +61,11 @@ impl Frame {
     /// Whether this frame contains a dirty page.
     pub fn is_dirty(&self) -> bool {
         self.state == FrameState::Dirty
+    }
+
+    /// Whether an explicit pin or a live page guard prevents eviction.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned || Arc::strong_count(&self.guard_token) > 1
     }
 
     /// Mark the frame as containing a clean page.
@@ -75,6 +84,13 @@ impl Frame {
         self.pinned = true;
         self.last_access = Instant::now();
         self.referenced = true;
+    }
+
+    /// Acquire an RAII pin for a page guard.
+    pub(crate) fn acquire_guard(&mut self) -> Arc<()> {
+        self.last_access = Instant::now();
+        self.referenced = true;
+        Arc::clone(&self.guard_token)
     }
 
     /// Unpin the frame (allow eviction when pin_count reaches 0).

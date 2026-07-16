@@ -8,6 +8,36 @@ use crate::btree::node::PAGE_SIZE;
 use crate::buffer::frame::Frame;
 use crate::buffer::guard::{GuardAccess, PageGuard};
 use std::collections::HashMap;
+use std::fmt;
+
+/// Errors raised when the buffer pool cannot safely satisfy a fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferError {
+    /// The buffer pool has no frames.
+    EmptyPool,
+    /// Every frame is pinned by a live guard or an explicit pin.
+    AllFramesPinned,
+    /// An unpinned dirty frame cannot be discarded without a write-back
+    /// callback from the storage engine.
+    DirtyPage(u64),
+}
+
+impl fmt::Display for BufferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPool => write!(f, "buffer pool has no frames"),
+            Self::AllFramesPinned => write!(f, "all buffer frames are pinned"),
+            Self::DirtyPage(page_id) => {
+                write!(
+                    f,
+                    "dirty page {page_id} cannot be evicted before write-back"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BufferError {}
 
 /// Statistics about the buffer pool.
 #[derive(Debug, Clone, Default)]
@@ -69,8 +99,12 @@ impl BufferManager {
     }
 
     /// Get buffer pool statistics.
-    pub fn stats(&self) -> &BufferStats {
-        &self.stats
+    pub fn stats(&self) -> BufferStats {
+        let mut stats = self.stats.clone();
+        stats.free_frames = self.frames.iter().filter(|frame| frame.is_free()).count();
+        stats.pinned_frames = self.frames.iter().filter(|frame| frame.is_pinned()).count();
+        stats.dirty_frames = self.frames.iter().filter(|frame| frame.is_dirty()).count();
+        stats
     }
 
     /// Fetch a page into the buffer pool and return a guard.
@@ -84,30 +118,29 @@ impl BufferManager {
         page_id: u64,
         data: &[u8; PAGE_SIZE],
         access: GuardAccess,
-    ) -> PageGuard {
+    ) -> Result<PageGuard, BufferError> {
         // Check if the page is already in the pool.
         if let Some(&frame_idx) = self.page_map.get(&page_id) {
             let frame = &mut self.frames[frame_idx];
             if !frame.is_free() {
-                frame.pin();
+                let pin_token = frame.acquire_guard();
                 self.stats.hits += 1;
                 if access == GuardAccess::Write {
                     frame.mark_dirty();
                 }
-                return PageGuard::new(frame_idx, page_id, access);
+                return Ok(PageGuard::new(frame_idx, page_id, access, pin_token));
             }
         }
 
-        // Cache miss - need to load the page.
-        self.stats.reads += 1;
-
         // Find a free frame or evict one.
-        let frame_idx = self.find_free_frame();
+        let frame_idx = self.find_free_frame()?;
+        // Cache miss successfully found a frame and is now a page read.
+        self.stats.reads += 1;
 
         // Load the page into the frame.
         let frame = &mut self.frames[frame_idx];
         frame.load(page_id, data);
-        frame.pin();
+        let pin_token = frame.acquire_guard();
         if access == GuardAccess::Write {
             frame.mark_dirty();
         }
@@ -116,7 +149,7 @@ impl BufferManager {
         self.page_map.insert(page_id, frame_idx);
         self.stats.free_frames -= 1;
 
-        PageGuard::new(frame_idx, page_id, access)
+        Ok(PageGuard::new(frame_idx, page_id, access, pin_token))
     }
 
     /// Get a reference to the data in a frame.
@@ -136,7 +169,11 @@ impl BufferManager {
         }
     }
 
-    /// Unpin a page (allow it to be evicted).
+    /// Release an explicit pin on a page.
+    ///
+    /// Fetch guards are released by `PageGuard::drop`; this method only
+    /// applies to callers that explicitly pinned a frame through the lower
+    /// level `Frame` API.
     pub fn unpin(&mut self, page_id: u64) {
         if let Some(&frame_idx) = self.page_map.get(&page_id) {
             self.frames[frame_idx].unpin();
@@ -179,19 +216,33 @@ impl BufferManager {
     }
 
     /// Remove a page from the buffer pool.
-    pub fn evict(&mut self, page_id: u64) {
+    pub fn evict(&mut self, page_id: u64) -> Result<(), BufferError> {
         if let Some(frame_idx) = self.page_map.remove(&page_id) {
+            let frame = &self.frames[frame_idx];
+            if frame.is_pinned() {
+                self.page_map.insert(page_id, frame_idx);
+                return Err(BufferError::AllFramesPinned);
+            }
+            if frame.is_dirty() {
+                self.page_map.insert(page_id, frame_idx);
+                return Err(BufferError::DirtyPage(page_id));
+            }
             self.frames[frame_idx].clear();
             self.stats.free_frames += 1;
         }
+        Ok(())
     }
 
     /// Find a free frame or evict one using the clock algorithm.
-    fn find_free_frame(&mut self) -> usize {
+    fn find_free_frame(&mut self) -> Result<usize, BufferError> {
+        if self.frames.is_empty() {
+            return Err(BufferError::EmptyPool);
+        }
+
         // First, look for a free frame.
         for (i, frame) in self.frames.iter().enumerate() {
             if frame.is_free() {
-                return i;
+                return Ok(i);
             }
         }
 
@@ -203,17 +254,20 @@ impl BufferManager {
     ///
     /// Scans frames in a circular manner. If a frame is referenced,
     /// clear the reference bit and move on. Otherwise, evict it.
-    fn clock_evict(&mut self) -> usize {
+    fn clock_evict(&mut self) -> Result<usize, BufferError> {
         let len = self.frames.len();
+        let mut dirty_page = None;
 
-        loop {
+        // Two passes clear reference bits and then select an unreferenced
+        // clean victim. Dirty pages are never discarded here.
+        for _ in 0..len.saturating_mul(2) {
             let idx = self.clock_hand;
             self.clock_hand = (self.clock_hand + 1) % len;
 
             let frame = &mut self.frames[idx];
 
             // Skip pinned frames.
-            if frame.pinned {
+            if frame.is_pinned() {
                 continue;
             }
 
@@ -223,17 +277,26 @@ impl BufferManager {
                 continue;
             }
 
-            // Found a victim - evict it.
+            if frame.is_dirty() {
+                if dirty_page.is_none() {
+                    dirty_page = frame.page_id;
+                }
+                continue;
+            }
+
+            // A clean victim can be detached from the page map safely.
             if let Some(old_page_id) = frame.page_id {
                 self.page_map.remove(&old_page_id);
             }
-
-            // If dirty, we'd need to flush it. For now, just clear it.
-            // In the full implementation, this would trigger a write-back.
             frame.clear();
             self.stats.free_frames += 1;
 
-            return idx;
+            return Ok(idx);
+        }
+
+        match dirty_page {
+            Some(page_id) => Err(BufferError::DirtyPage(page_id)),
+            None => Err(BufferError::AllFramesPinned),
         }
     }
 }
@@ -256,16 +319,16 @@ mod tests {
         let data = [42u8; PAGE_SIZE];
 
         // First fetch - cache miss.
-        let guard = bm.fetch(1, &data, GuardAccess::Read);
+        let guard = bm.fetch(1, &data, GuardAccess::Read).unwrap();
         assert_eq!(bm.stats().reads, 1);
         assert_eq!(bm.stats().hits, 0);
-        bm.unpin(guard.page_id());
+        drop(guard);
 
         // Second fetch - cache hit.
-        let guard = bm.fetch(1, &data, GuardAccess::Read);
+        let guard = bm.fetch(1, &data, GuardAccess::Read).unwrap();
         assert_eq!(bm.stats().reads, 1);
         assert_eq!(bm.stats().hits, 1);
-        bm.unpin(guard.page_id());
+        drop(guard);
     }
 
     #[test]
@@ -276,18 +339,18 @@ mod tests {
         let data3 = [3u8; PAGE_SIZE];
 
         // Fill the buffer.
-        let g1 = bm.fetch(1, &data1, GuardAccess::Read);
-        let g2 = bm.fetch(2, &data2, GuardAccess::Read);
+        let g1 = bm.fetch(1, &data1, GuardAccess::Read).unwrap();
+        let g2 = bm.fetch(2, &data2, GuardAccess::Read).unwrap();
         assert_eq!(bm.stats().free_frames, 0);
 
-        // Unpin pages to allow eviction.
-        bm.unpin(g1.page_id());
-        bm.unpin(g2.page_id());
+        // Dropping guards allows eviction.
+        drop(g1);
+        drop(g2);
 
         // Fetch a new page - should evict one.
-        let g3 = bm.fetch(3, &data3, GuardAccess::Read);
+        let g3 = bm.fetch(3, &data3, GuardAccess::Read).unwrap();
         assert_eq!(bm.stats().reads, 3);
-        bm.unpin(g3.page_id());
+        drop(g3);
     }
 
     #[test]
@@ -295,11 +358,11 @@ mod tests {
         let mut bm = BufferManager::new(4096);
         let data = [0u8; PAGE_SIZE];
 
-        let guard = bm.fetch(1, &data, GuardAccess::Write);
+        let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
         bm.mark_dirty(guard.page_id());
         let flushed = bm.flush(guard.page_id());
         assert!(flushed.is_some());
-        bm.unpin(guard.page_id());
+        drop(guard);
     }
 
     #[test]
@@ -307,14 +370,58 @@ mod tests {
         let mut bm = BufferManager::new(4096 * 3);
         let data = [0u8; PAGE_SIZE];
 
-        let g1 = bm.fetch(1, &data, GuardAccess::Write);
-        let g2 = bm.fetch(2, &data, GuardAccess::Write);
+        let g1 = bm.fetch(1, &data, GuardAccess::Write).unwrap();
+        let g2 = bm.fetch(2, &data, GuardAccess::Write).unwrap();
         bm.mark_dirty(g1.page_id());
         bm.mark_dirty(g2.page_id());
-        bm.unpin(g1.page_id());
-        bm.unpin(g2.page_id());
+        drop(g1);
+        drop(g2);
 
         let flushed = bm.flush_all();
         assert_eq!(flushed.len(), 2);
+    }
+
+    #[test]
+    fn test_guard_drop_releases_pin() {
+        let mut bm = BufferManager::new(PAGE_SIZE);
+        let data = [1u8; PAGE_SIZE];
+
+        let guard = bm.fetch(1, &data, GuardAccess::Read).unwrap();
+        assert_eq!(bm.stats().pinned_frames, 1);
+        drop(guard);
+        assert_eq!(bm.stats().pinned_frames, 0);
+
+        let guard = bm.fetch(2, &data, GuardAccess::Read).unwrap();
+        drop(guard);
+    }
+
+    #[test]
+    fn test_fetch_refuses_pinned_pool() {
+        let mut bm = BufferManager::new(PAGE_SIZE);
+        let data = [0u8; PAGE_SIZE];
+        let guard = bm.fetch(1, &data, GuardAccess::Read).unwrap();
+
+        assert!(matches!(
+            bm.fetch(2, &data, GuardAccess::Read),
+            Err(BufferError::AllFramesPinned)
+        ));
+        drop(guard);
+    }
+
+    #[test]
+    fn test_fetch_refuses_dirty_eviction_until_flush() {
+        let mut bm = BufferManager::new(PAGE_SIZE);
+        let data = [0u8; PAGE_SIZE];
+        let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
+        drop(guard);
+
+        assert!(matches!(
+            bm.fetch(2, &data, GuardAccess::Read),
+            Err(BufferError::DirtyPage(1))
+        ));
+
+        assert!(bm.flush(1).is_some());
+        let guard = bm.fetch(2, &data, GuardAccess::Read).unwrap();
+        drop(guard);
     }
 }

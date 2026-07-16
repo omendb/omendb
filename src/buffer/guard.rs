@@ -3,6 +3,8 @@
 //! Guards ensure that pages are properly pinned/unpinned and provide
 //! controlled access to page data.
 
+use std::sync::Arc;
+
 /// Access level for a page guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardAccess {
@@ -14,9 +16,10 @@ pub enum GuardAccess {
 
 /// RAII guard for a page in the buffer pool.
 ///
-/// The guard holds a frame index and access level. It does not borrow
-/// the buffer manager, allowing multiple guards to coexist.
-/// Unpinning is handled manually via `BufferManager::unpin`.
+/// The guard holds a frame index, access level, and an ownership token. The
+/// token keeps the frame pinned while the guard is alive and is released by
+/// `Drop`, allowing multiple guards to coexist without borrowing the buffer
+/// manager.
 pub struct PageGuard {
     /// Index into the buffer pool's frame array.
     frame_index: usize,
@@ -24,15 +27,23 @@ pub struct PageGuard {
     page_id: u64,
     /// Access level.
     access: GuardAccess,
+    /// Shared ownership token for the frame pin.
+    pin_token: Option<Arc<()>>,
 }
 
 impl PageGuard {
     /// Create a new page guard.
-    pub(crate) fn new(frame_index: usize, page_id: u64, access: GuardAccess) -> Self {
+    pub(crate) fn new(
+        frame_index: usize,
+        page_id: u64,
+        access: GuardAccess,
+        pin_token: Arc<()>,
+    ) -> Self {
         Self {
             frame_index,
             page_id,
             access,
+            pin_token: Some(pin_token),
         }
     }
 
@@ -54,5 +65,13 @@ impl PageGuard {
     /// Whether this guard has write access.
     pub fn is_writable(&self) -> bool {
         self.access == GuardAccess::Write
+    }
+}
+
+impl Drop for PageGuard {
+    fn drop(&mut self) {
+        // Dropping the token is the corresponding unpin operation in the
+        // frame. Taking it makes that ownership transition explicit.
+        let _ = self.pin_token.take();
     }
 }
