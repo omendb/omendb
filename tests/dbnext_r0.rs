@@ -4,7 +4,12 @@
 use seerdb::{DB, Error, Options};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn next(seed: &mut u64) -> u64 {
@@ -222,4 +227,92 @@ fn dbnext_r0_rejects_future_manifest_version() {
         DB::open(&path, Options::default()),
         Err(Error::Corruption(_))
     ));
+}
+
+#[test]
+fn dbnext_r0_concurrent_process_crash_recovery() {
+    if let Some(path) = std::env::var_os("SEERDB_R0_CONCURRENT_CRASH_PATH") {
+        let path = Path::new(&path);
+        let marker = PathBuf::from(
+            std::env::var_os("SEERDB_R0_CONCURRENT_CRASH_MARKER")
+                .expect("concurrent crash child marker path"),
+        );
+        let mut db = DB::open(path, Options::default()).unwrap();
+        db.put(b"published", b"before-concurrent-crash").unwrap();
+        db.flush().unwrap();
+
+        let db = Arc::new(Mutex::new(db));
+        let started = Arc::new(AtomicBool::new(false));
+        for worker in 0..4 {
+            let db = Arc::clone(&db);
+            let started = Arc::clone(&started);
+            thread::spawn(move || {
+                for sequence in 0..256 {
+                    let key = format!("worker-{worker:02}-{sequence:04}");
+                    let mut db = db.lock().unwrap();
+                    if db.put(key.as_bytes(), key.as_bytes()).is_err() {
+                        return;
+                    }
+                    if sequence % 32 == 31 {
+                        if db.flush().is_ok() {
+                            started.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            });
+        }
+
+        while !started.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(marker, b"durable concurrent batch ready").unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    let root = tempdir().unwrap();
+    let path = root.path().join("concurrent-crash.db");
+    let marker = root.path().join("concurrent-crash.ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("dbnext_r0_concurrent_process_crash_recovery")
+        .arg("--nocapture")
+        .env("SEERDB_R0_CONCURRENT_CRASH_PATH", &path)
+        .env("SEERDB_R0_CONCURRENT_CRASH_MARKER", &marker)
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..500 {
+        if marker.exists() {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("concurrent crash child did not publish its ready marker");
+    }
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "crash child unexpectedly exited cleanly");
+
+    let recovered = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        recovered.get(b"published").unwrap(),
+        Some(b"before-concurrent-crash".to_vec())
+    );
+    let worker_records = recovered.range(b"worker-00", b"worker-~");
+    assert!(
+        !worker_records.is_empty(),
+        "no concurrent batch was recovered"
+    );
+    for (key, value) in worker_records {
+        assert_eq!(key, value, "recovered value is not self-identifying");
+    }
+    assert!(recovered.durability_status().generation_id.get() >= 1);
+    assert_eq!(recovered.durability_status().pending_mutations, 0);
+    assert!(!recovered.durability_status().write_fenced);
 }
