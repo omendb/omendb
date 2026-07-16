@@ -455,6 +455,10 @@ fn dbnext_r0_verify_rejects_dangling_blob_pointer() {
         reopened.verify(),
         Err(Error::Corruption(message)) if message.contains("blob pointer target")
     ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("blob pointer target")
+    ));
 }
 
 #[test]
