@@ -16,6 +16,7 @@
 //! For now, we mutate nodes directly. The PMT integration comes later.
 
 use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef};
+use std::collections::HashSet;
 
 /// Page ID type (index into the page store).
 pub type PageId = u32;
@@ -42,6 +43,8 @@ pub struct BTree {
     nodes: Vec<Node>,
     /// Page ID of the root node.
     root: PageId,
+    /// Logical pages that may have changed since the last published generation.
+    dirty_pages: HashSet<PageId>,
 }
 
 impl Default for BTree {
@@ -57,12 +60,17 @@ impl BTree {
         Self {
             nodes: vec![root],
             root: 0,
+            dirty_pages: HashSet::from([0]),
         }
     }
 
     /// Create a B-tree from existing nodes (for loading from disk).
     pub fn from_nodes(nodes: Vec<Node>, root: PageId) -> Self {
-        Self { nodes, root }
+        Self {
+            nodes,
+            root,
+            dirty_pages: HashSet::new(),
+        }
     }
 
     /// Add a node at a specific page ID (for loading from disk).
@@ -72,6 +80,7 @@ impl BTree {
             self.nodes.resize_with(idx + 1, Node::new_leaf);
         }
         self.nodes[idx] = node;
+        self.dirty_pages.remove(&page_id);
     }
 
     /// Get the root page ID.
@@ -84,6 +93,18 @@ impl BTree {
         self.nodes.len()
     }
 
+    /// Return the logical pages changed since the last published generation.
+    pub fn dirty_page_ids(&self) -> Vec<PageId> {
+        let mut pages: Vec<_> = self.dirty_pages.iter().copied().collect();
+        pages.sort_unstable();
+        pages
+    }
+
+    /// Mark the current in-memory tree as clean after manifest publication.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_pages.clear();
+    }
+
     /// Get a reference to a node by page ID.
     pub fn node(&self, id: PageId) -> Option<&Node> {
         self.nodes.get(id as usize)
@@ -91,6 +112,7 @@ impl BTree {
 
     /// Get a mutable reference to a node by page ID.
     fn node_mut(&mut self, id: PageId) -> Option<&mut Node> {
+        self.dirty_pages.insert(id);
         self.nodes.get_mut(id as usize)
     }
 
@@ -98,6 +120,7 @@ impl BTree {
     fn alloc_node(&mut self, node: Node) -> PageId {
         let id = self.nodes.len() as PageId;
         self.nodes.push(node);
+        self.dirty_pages.insert(id);
         id
     }
 
@@ -117,10 +140,12 @@ impl BTree {
             Err(InsertError::PageFull) => {
                 let snapshot = self.nodes.clone();
                 let root = self.root;
+                let dirty_pages = self.dirty_pages.clone();
                 let result = self.split_and_insert_leaf(leaf_id, key, value);
                 if result.is_err() {
                     self.nodes = snapshot;
                     self.root = root;
+                    self.dirty_pages = dirty_pages;
                 }
                 result
             }
@@ -155,6 +180,7 @@ impl BTree {
 
         let snapshot = self.nodes.clone();
         let root = self.root;
+        let dirty_pages = self.dirty_pages.clone();
         let result = match self
             .node_mut(leaf_id)
             .expect("leaf_id should be valid")
@@ -169,6 +195,7 @@ impl BTree {
         if result.is_err() {
             self.nodes = snapshot;
             self.root = root;
+            self.dirty_pages = dirty_pages;
         }
         result
     }
@@ -357,7 +384,7 @@ impl BTree {
             self.create_new_root(leaf_id, &median_key, right_id);
         } else {
             let parent_id = self
-                .find_parent(self.root, leaf_id)
+                .parent_of(leaf_id)
                 .expect("parent should exist for non-root node");
             self.node_mut(right_id)
                 .expect("right node should be valid")
@@ -424,6 +451,25 @@ impl BTree {
         None
     }
 
+    /// Return a node's recorded parent, validating it before falling back to
+    /// a structural search for legacy or externally loaded pages.
+    fn parent_of(&self, node_id: PageId) -> Option<PageId> {
+        if node_id == self.root {
+            return None;
+        }
+
+        let recorded = self.node(node_id).map(Node::parent_id);
+        if let Some(parent_id) = recorded.filter(|&parent_id| parent_id != 0)
+            && self
+                .node(parent_id)
+                .is_some_and(|parent| !parent.is_leaf())
+        {
+            return Some(parent_id);
+        }
+
+        self.find_parent(self.root, node_id)
+    }
+
     /// Insert a key and right child into an internal node.
     fn insert_into_internal(
         &mut self,
@@ -472,7 +518,7 @@ impl BTree {
             self.create_new_root(node_id, &median_key, right_id);
         } else {
             let parent_id = self
-                .find_parent(self.root, node_id)
+                .parent_of(node_id)
                 .expect("parent should exist for non-root node");
             self.node_mut(right_id)
                 .expect("right node should be valid")

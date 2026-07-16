@@ -102,6 +102,7 @@ impl StorageEngine {
             .append(&mut self.pending_reclaimed_offsets);
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
+        self.btree.clear_dirty();
     }
 
     /// Get mutable access to the page mapping table for recovery.
@@ -138,11 +139,11 @@ impl StorageEngine {
         // The bootstrap path rewrites the complete logical tree into a new
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
-        let node_count = self.btree.node_count();
+        let dirty_page_ids = self.btree.dirty_page_ids();
         let mut retired_offsets = Vec::new();
 
-        for page_id in 0..node_count {
-            let node = self.btree.node(page_id as u32);
+        for page_id in dirty_page_ids {
+            let node = self.btree.node(page_id);
             if let Some(node) = node {
                 // B-tree mutations do not maintain the persisted checksum in
                 // place. Rebuild a temporary node so every page written has a
@@ -426,6 +427,41 @@ mod tests {
         assert_eq!(second.hits, 1);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn flush_writes_only_logically_dirty_pages() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 600),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        for index in 0..500 {
+            let key = format!("key-{index:06}");
+            engine.btree_mut().insert(key.as_bytes(), b"v").unwrap();
+        }
+        engine.flush().unwrap();
+        let first = engine.buffer_stats();
+        assert!(first.writes > 1);
+        engine.complete_generation();
+
+        engine.btree_mut().upsert(b"key-000250", b"x").unwrap();
+        engine.flush().unwrap();
+        let second = engine.buffer_stats();
+        assert_eq!(second.writes - first.writes, 1);
     }
 
     #[test]
