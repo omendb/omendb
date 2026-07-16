@@ -553,6 +553,41 @@ fn dbnext_r0_blob_to_inline_retires_old_value() {
 }
 
 #[test]
+fn dbnext_r0_recovery_retires_blob_on_inline_wal_replacement() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-inline-recovery.db");
+    let large = vec![0xC3; 2_048];
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", &large).unwrap();
+        db.flush().unwrap();
+    }
+
+    let current = active_manifest(&path);
+    let record = WalRecord::put(b"key", b"inline-after-recovery");
+    let commit = CommitRecord {
+        commit_id: CommitId::new(current.commit_id.get() + 1),
+        generation_id: GenerationId::new(current.generation_id.get() + 1),
+        root_page_id: current.root_page_id,
+        mutation_count: 1,
+        digest: wal_digest(&record),
+    };
+    let mut wal_bytes = record.to_bytes();
+    wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
+    fs::write(path.join("seerdb.wal"), wal_bytes).unwrap();
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.get(b"key").unwrap(),
+        Some(b"inline-after-recovery".to_vec())
+    );
+    assert_eq!(reopened.blob_stats().total_valid, 0);
+    assert_eq!(reopened.blob_stats().total_deleted, 1);
+    assert_eq!(reopened.gc().unwrap(), 1);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+}
+
+#[test]
 fn dbnext_r0_newer_blob_image_cannot_reclaim_manifest_value() {
     let root = tempdir().unwrap();
     let path = root.path().join("blob-publication-fence.db");

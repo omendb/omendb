@@ -2089,45 +2089,56 @@ fn digest_records(records: &[&WalRecord]) -> u32 {
         .fold(0, |digest, record| extend_digest(digest, record))
 }
 
+fn apply_put_mutation(
+    key: &[u8],
+    value: &[u8],
+    btree: &mut BTree,
+    blobs: &mut BlobManager,
+) -> Result<()> {
+    let previous_blob = match btree.lookup(key)? {
+        LookupResult::Blob(pointer) => Some(pointer),
+        _ => None,
+    };
+
+    if blobs.should_separate(value.len()) {
+        let pointer = blobs.append(key, value.to_vec());
+        if let Err(error) = btree.upsert_blob(key, pointer) {
+            let _ = blobs.rollback_append(&pointer);
+            return Err(error.into());
+        }
+    } else {
+        btree.upsert(key, value)?;
+    }
+
+    if let Some(pointer) = previous_blob {
+        blobs.mark_deleted(&pointer);
+    }
+    Ok(())
+}
+
 fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<()> {
     match record.record_type {
         RecordType::Put => {
             let (key, value) = decode_put_payload(false, &record.payload)?;
-            if blobs.should_separate(value.len()) {
-                if let LookupResult::Blob(pointer) = btree.lookup(key)? {
-                    blobs.mark_deleted(&pointer);
-                }
-                let pointer = blobs.append(key, value.to_vec());
-                btree.upsert_blob(key, pointer)?;
-            } else {
-                btree.upsert(key, value)?;
-            }
+            apply_put_mutation(key, value, btree, blobs)?;
         }
         RecordType::PutV2 => {
             let (key, value) = decode_put_payload(true, &record.payload)?;
-            if blobs.should_separate(value.len()) {
-                if let LookupResult::Blob(pointer) = btree.lookup(key)? {
-                    blobs.mark_deleted(&pointer);
-                }
-                let pointer = blobs.append(key, value.to_vec());
-                btree.upsert_blob(key, pointer)?;
-            } else {
-                btree.upsert(key, value)?;
-            }
+            apply_put_mutation(key, value, btree, blobs)?;
         }
-        RecordType::Delete => {
-            let key = decode_delete_payload(false, &record.payload)?;
-            if let LookupResult::Blob(pointer) = btree.lookup(key)? {
+        RecordType::Delete | RecordType::DeleteV2 => {
+            let key = decode_delete_payload(
+                record.record_type == RecordType::DeleteV2,
+                &record.payload,
+            )?;
+            let previous_blob = match btree.lookup(key)? {
+                LookupResult::Blob(pointer) => Some(pointer),
+                _ => None,
+            };
+            let found = btree.delete(key)?;
+            if found && let Some(pointer) = previous_blob {
                 blobs.mark_deleted(&pointer);
             }
-            btree.delete(key)?;
-        }
-        RecordType::DeleteV2 => {
-            let key = decode_delete_payload(true, &record.payload)?;
-            if let LookupResult::Blob(pointer) = btree.lookup(key)? {
-                blobs.mark_deleted(&pointer);
-            }
-            btree.delete(key)?;
         }
         _ => {
             return Err(Error::Corruption(
