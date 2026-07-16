@@ -16,6 +16,8 @@ use std::error::Error as StdError;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
 use tempfile::TempDir;
 
 type AnyResult<T> = std::result::Result<T, Box<dyn StdError>>;
@@ -35,6 +37,7 @@ struct ReplayArgs {
     trace: PathBuf,
     db: Option<PathBuf>,
     output: Option<PathBuf>,
+    manifest: Option<PathBuf>,
 }
 
 fn invalid(message: impl Into<String>) -> Box<dyn StdError> {
@@ -306,12 +309,20 @@ fn apply_checkpoint(db: &mut DB, state: &mut R0State, event: &Map<String, Value>
 }
 
 fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
-    let mut db = DB::open(db_path, Options::default())?;
+    let options = Options::default();
+    let mut db = DB::open(db_path, options.clone())?;
+    let trace_bytes = fs::read(trace)?;
+    let trace_text = std::str::from_utf8(&trace_bytes)?;
+    let replay_started = Instant::now();
     let mut state = R0State::default();
     let mut previous_seq = 0u64;
     let mut event_count = 0u64;
+    let mut commit_count = 0u64;
+    let mut checkpoint_count = 0u64;
+    let mut commit_seconds = 0.0;
+    let mut checkpoint_seconds = 0.0;
 
-    for (line_number, line) in fs::read_to_string(trace)?.lines().enumerate() {
+    for (line_number, line) in trace_text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
@@ -325,9 +336,19 @@ fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
             )));
         }
         previous_seq = sequence;
-        match string_field(event, "kind", "trace event")?.as_str() {
-            "commit" => apply_commit(&mut db, &mut state, event)?,
-            "checkpoint" => apply_checkpoint(&mut db, &mut state, event)?,
+        let kind = string_field(event, "kind", "trace event")?;
+        let phase_started = Instant::now();
+        match kind.as_str() {
+            "commit" => {
+                apply_commit(&mut db, &mut state, event)?;
+                commit_count += 1;
+                commit_seconds += phase_started.elapsed().as_secs_f64();
+            }
+            "checkpoint" => {
+                apply_checkpoint(&mut db, &mut state, event)?;
+                checkpoint_count += 1;
+                checkpoint_seconds += phase_started.elapsed().as_secs_f64();
+            }
             kind => return Err(invalid(format!("unsupported R0 event kind: {kind}"))),
         }
         event_count += 1;
@@ -357,6 +378,8 @@ fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
         "adapter": "seerdb-r0-v0",
         "workload": "r0-integrity-recovery",
         "trace": trace,
+        "trace_bytes": trace_bytes.len(),
+        "trace_sha256": sha256_hex(&trace_bytes),
         "events": event_count,
         "commit_id": state.commit_id,
         "acknowledged_commit_id": state.last_acknowledged_commit_id,
@@ -368,6 +391,22 @@ fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
             "history_id": durability.history_id.get(),
             "generation_id": durability.generation_id.get(),
             "commit_id": durability.commit_id.get(),
+        },
+        "durability_settings": {
+            "mode": "local-durable-serialized-prototype",
+            "sync_writes": options.sync_writes,
+            "use_odirect": options.use_odirect,
+            "buffer_pool_size": options.buffer_pool_size,
+            "page_size": options.page_size,
+            "blob_threshold": options.blob_threshold,
+            "max_wal_bytes": options.max_wal_bytes,
+        },
+        "timing": {
+            "replay_seconds": replay_started.elapsed().as_secs_f64(),
+            "commit_seconds": commit_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
+            "commit_count": commit_count,
+            "checkpoint_count": checkpoint_count,
         },
         "verification": {
             "verified_pages": verification.verified_pages,
@@ -428,14 +467,100 @@ fn format_buffer_stats(stats: seerdb::buffer::BufferStats) -> Value {
     })
 }
 
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn absolute_path_string(path: &Path) -> String {
+    if path.is_absolute() {
+        return path_string(path);
+    }
+    std::env::current_dir()
+        .map(|current| path_string(&current.join(path)))
+        .unwrap_or_else(|_| path_string(path))
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .map(|path| path_string(&path))
+        .unwrap_or_else(|_| absolute_path_string(path))
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> Value {
+    match Command::new(program).args(arguments).output() {
+        Ok(output) if output.status.success() => {
+            Value::String(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        }
+        _ => Value::Null,
+    }
+}
+
+fn run_manifest(
+    trace: &Path,
+    db_path: &Path,
+    output: Option<&Path>,
+    manifest: Option<&Path>,
+    result: &Value,
+) -> Value {
+    let parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .ok();
+    json!({
+        "manifest_version": "dbnext-run-manifest-v1",
+        "target": "seerdb-rust",
+        "workload": result["workload"],
+        "trace": {
+            "path": canonical_path_string(trace),
+            "bytes": result["trace_bytes"],
+            "events": result["events"],
+            "sha256": result["trace_sha256"],
+        },
+        "schema": {
+            "bundle": "r0-integrity-recovery-v0",
+            "schema_version": 1,
+            "relation": "r0_records",
+        },
+        "paths": {
+            "trace": canonical_path_string(trace),
+            "result": output.map(canonical_path_string),
+            "manifest": manifest.map(canonical_path_string),
+            "database_directory": canonical_path_string(db_path),
+        },
+        "host": {
+            "os": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "cpu": {
+                "logical": parallelism,
+                "machine": std::env::consts::ARCH,
+            },
+        },
+        "software": {
+            "package": env!("CARGO_PKG_NAME"),
+            "version": env!("CARGO_PKG_VERSION"),
+            "git_head": command_output("git", &["rev-parse", "HEAD"]),
+            "rustc": command_output("rustc", &["--version"]),
+            "cargo": command_output("cargo", &["--version"]),
+        },
+        "durability": result["durability_settings"],
+        "timing": result["timing"],
+        "correctness": {
+            "state_digest": result["state_digest"],
+            "commit_id": result["commit_id"],
+            "acknowledged_commit_id": result["acknowledged_commit_id"],
+            "checkpoints": result["checkpoints"],
+        },
+        "metrics": result["metrics"],
+    })
+}
+
 fn parse_args() -> AnyResult<ReplayArgs> {
     let mut arguments = env::args_os().skip(1);
-    let trace = arguments
-        .next()
-        .map(PathBuf::from)
-        .ok_or_else(|| invalid("usage: dbnext_r0_replay TRACE [--db PATH] [--output PATH]"))?;
+    let trace = arguments.next().map(PathBuf::from).ok_or_else(|| {
+        invalid("usage: dbnext_r0_replay TRACE [--db PATH] [--output PATH] [--manifest PATH]")
+    })?;
     let mut db = None;
     let mut output = None;
+    let mut manifest = None;
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--db") => {
@@ -452,15 +577,32 @@ fn parse_args() -> AnyResult<ReplayArgs> {
                         .ok_or_else(|| invalid("--output requires a path"))?,
                 ));
             }
+            Some("--manifest") => {
+                manifest = Some(PathBuf::from(
+                    arguments
+                        .next()
+                        .ok_or_else(|| invalid("--manifest requires a path"))?,
+                ));
+            }
             Some(other) => return Err(invalid(format!("unknown argument: {other}"))),
             None => return Err(invalid("arguments must be valid UTF-8")),
         }
     }
-    Ok(ReplayArgs { trace, db, output })
+    Ok(ReplayArgs {
+        trace,
+        db,
+        output,
+        manifest,
+    })
 }
 
 fn main() -> AnyResult<()> {
-    let ReplayArgs { trace, db, output } = parse_args()?;
+    let ReplayArgs {
+        trace,
+        db,
+        output,
+        manifest,
+    } = parse_args()?;
     let (db_path, _temporary): (PathBuf, Option<TempDir>) = match db {
         Some(path) => {
             if path.exists() {
@@ -477,15 +619,33 @@ fn main() -> AnyResult<()> {
             (path, Some(temporary))
         }
     };
-    let result = replay_trace(&trace, &db_path)?;
+    if output.as_deref() == manifest.as_deref() && output.is_some() {
+        return Err(invalid("--output and --manifest must be different paths"));
+    }
+    let mut result = replay_trace(&trace, &db_path)?;
+    let manifest_value = run_manifest(
+        &trace,
+        &db_path,
+        output.as_deref(),
+        manifest.as_deref(),
+        &result,
+    );
+    result["run_manifest"] = manifest_value.clone();
     let encoded = serde_json::to_string_pretty(&result)? + "\n";
-    if let Some(output) = output {
+    if let Some(output) = output.as_deref() {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(output, encoded)?;
     } else {
         print!("{encoded}");
+    }
+    if let Some(manifest) = manifest.as_deref() {
+        if let Some(parent) = manifest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let encoded_manifest = serde_json::to_string_pretty(&manifest_value)? + "\n";
+        fs::write(manifest, encoded_manifest)?;
     }
     Ok(())
 }
@@ -512,5 +672,13 @@ mod tests {
         assert_eq!(result["acknowledged_commit_id"], 1);
         assert_eq!(result["ambiguous_commit_id"], Value::Null);
         assert_eq!(result["checkpoints"]["cp-1"], result["state_digest"]);
+        assert_eq!(
+            result["trace_sha256"],
+            sha256_hex(&fs::read(&trace).unwrap())
+        );
+        assert_eq!(result["trace_bytes"], fs::metadata(&trace).unwrap().len());
+        assert_eq!(result["timing"]["commit_count"], 1);
+        assert_eq!(result["timing"]["checkpoint_count"], 1);
+        assert_eq!(result["durability_settings"]["sync_writes"], false);
     }
 }
