@@ -459,7 +459,10 @@ impl DB {
             if should_sync {
                 // The commit boundary and any configured per-mutation policy
                 // force the WAL before dependent page publication.
-                file.sync_data()?;
+                match self.wal.sync_policy() {
+                    SyncPolicy::SyncAll => file.sync_all()?,
+                    SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data()?,
+                }
             }
         }
         Ok(())
