@@ -1,0 +1,159 @@
+#![cfg(feature = "fault-injection")]
+#![allow(clippy::disallowed_methods)]
+
+use seerdb::{DB, Error, Options};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use tempfile::tempdir;
+
+fn next(seed: &mut u64) -> u64 {
+    *seed = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *seed
+}
+
+fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
+    for key_id in 0..32 {
+        let key = format!("key-{key_id:02}");
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap(),
+            model.get(key.as_bytes()).cloned(),
+            "mismatch for {key}"
+        );
+    }
+
+    let expected_range: Vec<_> = model
+        .iter()
+        .filter(|(key, _)| key.as_slice() >= b"key-00" && key.as_slice() < b"key-99")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(db.range(b"key-00", b"key-99"), expected_range);
+}
+
+fn copy_database(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "tmp")
+        {
+            continue;
+        }
+        fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+    }
+}
+
+#[test]
+fn dbnext_r0_seeded_mutations_faults_and_restore() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("source.db");
+    let mut db = DB::open(&source_path, Options::default()).unwrap();
+    let initial_status = db.durability_status();
+    let mut committed = BTreeMap::new();
+    let mut seed = 0xDB00_0001_u64;
+
+    for round in 0..40 {
+        let mut candidate = committed.clone();
+        let operation_count = (next(&mut seed) % 4 + 1) as usize;
+        for operation in 0..operation_count {
+            let key_id = next(&mut seed) % 32;
+            let key = format!("key-{key_id:02}");
+            if next(&mut seed).is_multiple_of(5) {
+                let expected = candidate.remove(key.as_bytes()).is_some();
+                assert_eq!(db.delete(key.as_bytes()).unwrap(), expected);
+            } else {
+                let value = format!("value-{round:02}-{operation:02}-{key_id:02}");
+                db.put(key.as_bytes(), value.as_bytes()).unwrap();
+                candidate.insert(key.into_bytes(), value.into_bytes());
+            }
+        }
+
+        let fault = next(&mut seed) % 4;
+        match fault {
+            1 => db.inject_sync_failure(),
+            2 => db.inject_write_failure(),
+            3 => db.inject_disk_full(),
+            _ => {}
+        }
+
+        let result = db.flush();
+        if fault == 0 {
+            result.unwrap();
+            committed = candidate;
+            assert_model(&db, &committed);
+        } else {
+            assert!(result.is_err(), "fault {fault} did not fail publication");
+            assert!(db.durability_status().write_fenced);
+            drop(db);
+            db = DB::open(&source_path, Options::default()).unwrap();
+            assert_model(&db, &committed);
+        }
+
+        if round % 7 == 0 {
+            let status = db.durability_status();
+            drop(db);
+            db = DB::open(&source_path, Options::default()).unwrap();
+            assert_eq!(db.durability_status().database_id, status.database_id);
+            assert_eq!(db.durability_status().history_id, status.history_id);
+            assert_eq!(db.durability_status().commit_id, status.commit_id);
+            assert_eq!(db.durability_status().generation_id, status.generation_id);
+            assert_model(&db, &committed);
+        }
+    }
+
+    let final_status = db.durability_status();
+    db.close().unwrap();
+
+    let restored_path = root.path().join("restored.db");
+    copy_database(&source_path, &restored_path);
+    let restored = DB::open(&restored_path, Options::default()).unwrap();
+    assert_model(&restored, &committed);
+    assert_eq!(
+        restored.durability_status().database_id,
+        initial_status.database_id
+    );
+    assert_eq!(
+        restored.durability_status().history_id,
+        initial_status.history_id
+    );
+    assert_eq!(
+        restored.durability_status().commit_id,
+        final_status.commit_id
+    );
+    assert_eq!(
+        restored.durability_status().generation_id,
+        final_status.generation_id
+    );
+    assert_eq!(restored.durability_status().pending_mutations, 0);
+    assert!(!restored.durability_status().write_fenced);
+}
+
+#[test]
+fn dbnext_r0_rejects_corrupt_manifest() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("corrupt.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let manifest_path = path.join("MANIFEST");
+    let slot_size = seerdb::storage::format::MANIFEST_SLOT_SIZE;
+    let mut manifest = fs::read(&manifest_path).unwrap();
+    manifest[..slot_size].fill(0xA5);
+    manifest[slot_size..slot_size * 2].fill(0x5A);
+    fs::write(manifest_path, manifest).unwrap();
+
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(_))
+    ));
+}

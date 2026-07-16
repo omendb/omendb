@@ -512,6 +512,24 @@ impl DB {
         }
     }
 
+    /// Inject one device sync failure for the feature-gated fault harness.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_sync_failure(&self) {
+        self.engine.inject_sync_failure();
+    }
+
+    /// Inject one device page-write failure for the feature-gated fault harness.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_write_failure(&self) {
+        self.engine.inject_write_failure();
+    }
+
+    /// Inject one disk-full result for the feature-gated fault harness.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_disk_full(&self) {
+        self.engine.inject_disk_full();
+    }
+
     /// Begin a new transaction.
     ///
     /// Returns a transaction handle that can be used to commit or abort.
