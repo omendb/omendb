@@ -530,6 +530,12 @@ impl DB {
         self.engine.inject_disk_full();
     }
 
+    /// Set a persistent device capacity limit for the feature-gated fault harness.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_capacity_limit(&self, capacity: u64) {
+        self.engine.inject_capacity_limit(capacity);
+    }
+
     /// Begin a new transaction.
     ///
     /// Returns a transaction handle that can be used to commit or abort.

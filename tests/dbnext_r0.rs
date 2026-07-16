@@ -157,3 +157,43 @@ fn dbnext_r0_rejects_corrupt_manifest() {
         Err(Error::Corruption(_))
     ));
 }
+
+#[test]
+fn dbnext_r0_capacity_limit_preserves_last_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("capacity.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"committed", b"value-1").unwrap();
+    db.flush().unwrap();
+    let committed_status = db.durability_status();
+    let capacity = fs::metadata(path.join("seerdb.data")).unwrap().len();
+
+    db.inject_capacity_limit(capacity);
+    db.put(b"uncommitted", b"value-2").unwrap();
+    assert!(matches!(db.flush(), Err(Error::DiskFull)));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.get(b"committed").unwrap(),
+        Some(b"value-1".to_vec())
+    );
+    assert_eq!(reopened.get(b"uncommitted").unwrap(), None);
+    assert_eq!(
+        reopened.durability_status().database_id,
+        committed_status.database_id
+    );
+    assert_eq!(
+        reopened.durability_status().history_id,
+        committed_status.history_id
+    );
+    assert_eq!(
+        reopened.durability_status().generation_id,
+        committed_status.generation_id
+    );
+    assert_eq!(
+        reopened.durability_status().commit_id,
+        committed_status.commit_id
+    );
+}

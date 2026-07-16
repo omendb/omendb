@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(any(test, feature = "fault-injection"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Options for opening a device.
 #[derive(Debug, Clone)]
@@ -50,6 +50,9 @@ pub struct Device {
     /// Test-only deterministic disk-full hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_disk_full: AtomicBool,
+    /// Test-only persistent capacity limit in bytes.
+    #[cfg(any(test, feature = "fault-injection"))]
+    capacity_limit: AtomicU64,
 }
 
 impl Device {
@@ -80,6 +83,8 @@ impl Device {
             fail_next_write: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_disk_full: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            capacity_limit: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -96,6 +101,10 @@ impl Device {
     ///
     /// The buffer must be page-aligned for O_DIRECT.
     pub fn write_page(&mut self, offset: u64, buf: &[u8; PAGE_SIZE]) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if offset.saturating_add(PAGE_SIZE as u64) > self.capacity_limit.load(Ordering::Acquire) {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
         #[cfg(any(test, feature = "fault-injection"))]
         if self.fail_next_disk_full.swap(false, Ordering::AcqRel) {
             return Err(io::Error::from(io::ErrorKind::StorageFull));
@@ -139,6 +148,12 @@ impl Device {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_disk_full(&self) {
         self.fail_next_disk_full.store(true, Ordering::Release);
+    }
+
+    /// Set a persistent capacity limit for recovery tests.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_capacity_limit(&self, capacity: u64) {
+        self.capacity_limit.store(capacity, Ordering::Release);
     }
 
     /// Get the file size.
