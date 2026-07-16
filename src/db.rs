@@ -438,21 +438,29 @@ impl DB {
             .collect()
     }
 
-    /// Write buffered WAL records to disk and sync the mutation prefix.
-    fn write_wal_to_disk(&mut self) -> Result<()> {
+    /// Write buffered WAL records to disk and optionally force the prefix.
+    fn write_wal_to_disk(&mut self, force_sync: bool) -> Result<()> {
         let mut wal_buf = Vec::new();
         self.wal.flush(&mut wal_buf)?;
-        if !wal_buf.is_empty() {
+        let should_sync = force_sync || self.wal.sync_policy() != SyncPolicy::None;
+        if !wal_buf.is_empty() || should_sync {
             let wal_path = self.path.join(WAL_FILE);
-            // Append to WAL file (not overwrite).
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .create(true)
-                .append(true)
+                .append(!wal_buf.is_empty())
+                .read(should_sync)
+                .write(!wal_buf.is_empty() || should_sync)
                 .open(&wal_path)?;
-            file.write_all(&wal_buf)?;
-            // Sync to ensure WAL is persisted before modifying data.
-            file.sync_data()?;
+            if !wal_buf.is_empty() {
+                // Append to WAL file (not overwrite).
+                use std::io::Write;
+                file.write_all(&wal_buf)?;
+            }
+            if should_sync {
+                // The commit boundary and any configured per-mutation policy
+                // force the WAL before dependent page publication.
+                file.sync_data()?;
+            }
         }
         Ok(())
     }
@@ -460,7 +468,8 @@ impl DB {
     /// Journal a mutation after it has successfully changed memory state.
     fn journal_mutation(&mut self, record: WalRecord) -> Result<()> {
         self.wal.append(&record);
-        if let Err(error) = self.write_wal_to_disk() {
+        let sync_mutation = self.wal.sync_policy() != SyncPolicy::None;
+        if let Err(error) = self.write_wal_to_disk(sync_mutation) {
             self.write_fenced = true;
             return Err(error);
         }
@@ -539,6 +548,9 @@ impl DB {
         // physical versions it names. If the new publication fails, both
         // slots still identify the same current generation and its pages.
         self.mirror_current_manifest()?;
+        // A non-syncing mutation path is still ordered before page writes and
+        // the commit envelope is always forced at the publication boundary.
+        self.write_wal_to_disk(true)?;
         self.engine.flush()?;
 
         let checkpoint_path = self
@@ -559,7 +571,7 @@ impl DB {
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             self.wal.append(&WalRecord::commit(commit));
-            self.write_wal_to_disk()?;
+            self.write_wal_to_disk(true)?;
             offset
         } else {
             recovered_wal_offset
