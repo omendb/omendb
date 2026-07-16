@@ -511,15 +511,29 @@ impl Node {
             return Err(InsertError::WrongNodeType);
         }
 
-        // Check for duplicate.
         if let Ok(idx) = self.search(key) {
             return Err(InsertError::DuplicateKey(idx));
         }
 
-        let insertion_point = match self.search(key) {
-            Ok(_) => unreachable!(),
-            Err(idx) => idx,
-        };
+        let insertion_point = self.search(key).unwrap_err();
+        self.insert_leaf_value(key, ValueType::Inline, value, insertion_point)
+    }
+
+    /// Insert a leaf value at an already selected slot position.
+    ///
+    /// The caller controls duplicate ordering. Public mutation APIs reject
+    /// duplicate live keys, while internal rebuilds use the upper bound so
+    /// tombstone/version history is preserved in its original order.
+    fn insert_leaf_value(
+        &mut self,
+        key: &[u8],
+        value_type: ValueType,
+        value: &[u8],
+        insertion_point: usize,
+    ) -> Result<(), InsertError> {
+        if !self.is_leaf() {
+            return Err(InsertError::WrongNodeType);
+        }
 
         // Calculate prefix compression.
         let (prefix_len, suffix) = if insertion_point > 0 {
@@ -553,7 +567,7 @@ impl Node {
         pos += 2;
         self.data[pos..pos + suffix.len()].copy_from_slice(suffix);
         pos += suffix.len();
-        self.data[pos] = ValueType::Inline as u8;
+        self.data[pos] = value_type as u8;
         pos += 1;
         self.data[pos..pos + value.len()].copy_from_slice(value);
 
@@ -581,6 +595,17 @@ impl Node {
         self.set_header(&header);
 
         Ok(())
+    }
+
+    /// Return the insertion point after all existing versions of `key`.
+    fn upper_bound(&self, key: &[u8]) -> usize {
+        let mut index = match self.search(key) {
+            Ok(index) | Err(index) => index,
+        };
+        while index < self.count() && self.key(index).as_deref() == Some(key) {
+            index += 1;
+        }
+        index
     }
 
     /// Replace the value at a given index (in-place update).
@@ -672,10 +697,23 @@ impl Node {
         let mut replacement = Self::new_leaf();
         replacement.set_parent_id(parent_id);
         for (key, value) in entries {
+            let insertion_point = replacement.upper_bound(&key);
             let result = match value {
-                OwnedValue::Inline(value) => replacement.insert(&key, &value),
-                OwnedValue::Blob(pointer) => replacement.insert_blob(&key, pointer),
-                OwnedValue::Tombstone => replacement.insert_tombstone(&key),
+                OwnedValue::Inline(value) => {
+                    replacement.insert_leaf_value(&key, ValueType::Inline, &value, insertion_point)
+                }
+                OwnedValue::Blob(pointer) => {
+                    let bytes = pointer.to_bytes();
+                    replacement.insert_leaf_value(
+                        &key,
+                        ValueType::BlobPointer,
+                        &bytes,
+                        insertion_point,
+                    )
+                }
+                OwnedValue::Tombstone => {
+                    replacement.insert_leaf_value(&key, ValueType::Tombstone, &[], insertion_point)
+                }
             };
             result?;
         }
@@ -690,61 +728,8 @@ impl Node {
             return Err(InsertError::WrongNodeType);
         }
 
-        let insertion_point = match self.search(key) {
-            Ok(idx) => idx,
-            Err(idx) => idx,
-        };
-
-        let (prefix_len, suffix) = if insertion_point > 0 {
-            let prev_key = self.key(insertion_point - 1).unwrap_or_default();
-            let common = common_prefix(&prev_key, key);
-            (common as u16, &key[common..])
-        } else {
-            (0u16, key)
-        };
-
-        let entry_size = 4 + suffix.len() + 1; // prefix_len + suffix_len + suffix + value_type
-        let count = self.count();
-
-        let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self
-            .new_entry_offset(entry_size)
-            .ok_or(InsertError::PageFull)?;
-
-        if slot_array_end + SLOT_SIZE > entry_offset {
-            return Err(InsertError::PageFull);
-        }
-
-        let mut pos = entry_offset;
-        self.data[pos..pos + 2].copy_from_slice(&prefix_len.to_le_bytes());
-        pos += 2;
-        self.data[pos..pos + 2].copy_from_slice(&(suffix.len() as u16).to_le_bytes());
-        pos += 2;
-        self.data[pos..pos + suffix.len()].copy_from_slice(suffix);
-        pos += suffix.len();
-        self.data[pos] = ValueType::Tombstone as u8;
-
-        for i in (insertion_point..count).rev() {
-            let old_offset = self.slot_offset(i) as u16;
-            let old_key_len = self.slot_key_len(i);
-            self.set_slot_offset(i + 1, old_offset);
-            self.set_slot_key_len(i + 1, old_key_len);
-        }
-
-        self.set_slot_offset(insertion_point, entry_offset as u16);
-        self.set_slot_key_len(insertion_point, prefix_len + suffix.len() as u16);
-
-        let mut header = self.header();
-        header.count += 1;
-        let new_slot_array_end = Self::slot_array_start() + header.count as usize * SLOT_SIZE;
-        let min_entry = (0..header.count as usize)
-            .map(|i| self.slot_offset(i))
-            .min()
-            .unwrap_or(PAGE_SIZE);
-        header.free_space = (min_entry - new_slot_array_end) as u32;
-        self.set_header(&header);
-
-        Ok(())
+        let insertion_point = self.search(key).unwrap_or_else(|idx| idx);
+        self.insert_leaf_value(key, ValueType::Tombstone, &[], insertion_point)
     }
 
     /// Insert a key with a blob pointer value.
@@ -757,66 +742,9 @@ impl Node {
             return Err(InsertError::DuplicateKey(idx));
         }
 
-        let insertion_point = match self.search(key) {
-            Ok(_) => unreachable!(),
-            Err(idx) => idx,
-        };
-
-        let (prefix_len, suffix) = if insertion_point > 0 {
-            let prev_key = self.key(insertion_point - 1).unwrap_or_default();
-            let common = common_prefix(&prev_key, key);
-            (common as u16, &key[common..])
-        } else {
-            (0u16, key)
-        };
-
-        // entry = prefix_len(2) + suffix_len(2) + suffix + value_type(1) + blob_ptr(16)
-        let entry_size = 4 + suffix.len() + 1 + BLOB_POINTER_SIZE;
-        let count = self.count();
-
-        let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
-        let entry_offset = self
-            .new_entry_offset(entry_size)
-            .ok_or(InsertError::PageFull)?;
-
-        if slot_array_end + SLOT_SIZE > entry_offset {
-            return Err(InsertError::PageFull);
-        }
-
-        let mut pos = entry_offset;
-        self.data[pos..pos + 2].copy_from_slice(&prefix_len.to_le_bytes());
-        pos += 2;
-        self.data[pos..pos + 2].copy_from_slice(&(suffix.len() as u16).to_le_bytes());
-        pos += 2;
-        self.data[pos..pos + suffix.len()].copy_from_slice(suffix);
-        pos += suffix.len();
-        self.data[pos] = ValueType::BlobPointer as u8;
-        pos += 1;
-        self.data[pos..pos + 4].copy_from_slice(&ptr.file_id.to_le_bytes());
-        self.data[pos + 4..pos + 12].copy_from_slice(&ptr.offset.to_le_bytes());
-        self.data[pos + 12..pos + 16].copy_from_slice(&ptr.length.to_le_bytes());
-
-        for i in (insertion_point..count).rev() {
-            let old_offset = self.slot_offset(i) as u16;
-            let old_key_len = self.slot_key_len(i);
-            self.set_slot_offset(i + 1, old_offset);
-            self.set_slot_key_len(i + 1, old_key_len);
-        }
-
-        self.set_slot_offset(insertion_point, entry_offset as u16);
-        self.set_slot_key_len(insertion_point, prefix_len + suffix.len() as u16);
-
-        let mut header = self.header();
-        header.count += 1;
-        let new_slot_array_end = Self::slot_array_start() + header.count as usize * SLOT_SIZE;
-        let min_entry = (0..header.count as usize)
-            .map(|i| self.slot_offset(i))
-            .min()
-            .unwrap_or(PAGE_SIZE);
-        header.free_space = (min_entry - new_slot_array_end) as u32;
-        self.set_header(&header);
-
-        Ok(())
+        let insertion_point = self.search(key).unwrap_err();
+        let bytes = ptr.to_bytes();
+        self.insert_leaf_value(key, ValueType::BlobPointer, &bytes, insertion_point)
     }
 
     /// Insert a child pointer (for internal nodes).
@@ -940,20 +868,22 @@ impl Node {
             for i in mid..count {
                 let k = self.key(i).ok_or(SplitError::Corruption)?;
                 let v = self.value(i).ok_or(SplitError::Corruption)?;
+                let insertion_point = right.upper_bound(&k);
                 match v {
                     ValueRef::Inline(data) => {
                         right
-                            .insert(&k, data)
+                            .insert_leaf_value(&k, ValueType::Inline, data, insertion_point)
                             .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Blob(ptr) => {
+                        let bytes = ptr.to_bytes();
                         right
-                            .insert_blob(&k, ptr)
+                            .insert_leaf_value(&k, ValueType::BlobPointer, &bytes, insertion_point)
                             .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Tombstone => {
                         right
-                            .insert_tombstone(&k)
+                            .insert_leaf_value(&k, ValueType::Tombstone, &[], insertion_point)
                             .map_err(|_| SplitError::InsertFailed)?;
                     }
                 }
@@ -984,17 +914,24 @@ impl Node {
             for i in 0..mid {
                 let key = self.key(i).ok_or(SplitError::Corruption)?;
                 let value = self.value(i).ok_or(SplitError::Corruption)?;
+                let insertion_point = left.upper_bound(&key);
                 match value {
                     ValueRef::Inline(data) => {
-                        left.insert(&key, data)
+                        left.insert_leaf_value(&key, ValueType::Inline, data, insertion_point)
                             .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Blob(pointer) => {
-                        left.insert_blob(&key, pointer)
-                            .map_err(|_| SplitError::InsertFailed)?;
+                        let bytes = pointer.to_bytes();
+                        left.insert_leaf_value(
+                            &key,
+                            ValueType::BlobPointer,
+                            &bytes,
+                            insertion_point,
+                        )
+                        .map_err(|_| SplitError::InsertFailed)?;
                     }
                     ValueRef::Tombstone => {
-                        left.insert_tombstone(&key)
+                        left.insert_leaf_value(&key, ValueType::Tombstone, &[], insertion_point)
                             .map_err(|_| SplitError::InsertFailed)?;
                     }
                 }

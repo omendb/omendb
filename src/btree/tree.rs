@@ -196,7 +196,11 @@ impl BTree {
         let leaf_id = self.find_leaf(key);
         let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
 
-        if node.search(key).is_err() {
+        let index = match node.search(key) {
+            Ok(index) => index,
+            Err(_) => return Ok(false),
+        };
+        if matches!(node.value(index), Some(ValueRef::Tombstone)) {
             return Ok(false);
         }
 
@@ -488,10 +492,12 @@ impl BTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), BTreeError> {
-        self.node_mut(leaf_id)
-            .expect("leaf_id should be valid")
-            .remove_entry(index)
-            .map_err(BTreeError::InsertFailed)?;
+        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+        node.remove_entry(index).map_err(BTreeError::InsertFailed)?;
+        while let Ok(duplicate_index) = node.search(key) {
+            node.remove_entry(duplicate_index)
+                .map_err(BTreeError::InsertFailed)?;
+        }
 
         match self
             .node_mut(leaf_id)
@@ -568,6 +574,17 @@ impl<'a> Iterator for RangeScan<'a> {
 
                 self.current_index += 1;
 
+                // Deletes are represented by a tombstone inserted before the
+                // previous value for the same key.  A range scan must expose
+                // the logical view, so suppress every later duplicate after
+                // the first occurrence (the first occurrence is the newest
+                // version and may itself be a tombstone).
+                if self.current_index > 1
+                    && node.key(self.current_index - 2).as_deref() == Some(key.as_slice())
+                {
+                    continue;
+                }
+
                 if let Some(ValueRef::Inline(value)) = node.value(self.current_index - 1)
                     && key >= self.start
                 {
@@ -588,6 +605,10 @@ impl<'a> Iterator for RangeScan<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -650,6 +671,8 @@ mod tests {
 
         tree.delete(b"key").unwrap();
         assert!(matches!(tree.lookup(b"key"), LookupResult::Deleted));
+        assert!(tree.range_scan(b"key", b"key~").next().is_none());
+        assert!(!tree.delete(b"key").unwrap());
 
         assert_eq!(tree.delete(b"missing").unwrap(), false);
     }
@@ -767,5 +790,40 @@ mod tests {
         assert_eq!(results.len(), 400);
         assert_eq!(results.first().unwrap().0, b"key_000050");
         assert_eq!(results.last().unwrap().0, b"key_000449");
+    }
+
+    proptest! {
+        #[test]
+        fn prop_btree_mutations_match_reference_model(
+            operations in prop::collection::vec(
+                (0u8..64, prop::collection::vec(any::<u8>(), 0..48), any::<bool>()),
+                1..200
+            )
+        ) {
+            let mut tree = BTree::new();
+            let mut reference = BTreeMap::new();
+
+            for (key_id, value, is_write) in operations {
+                let key = format!("key-{key_id:03}");
+                if is_write {
+                    tree.upsert(key.as_bytes(), &value).unwrap();
+                    reference.insert(key.into_bytes(), value);
+                } else {
+                    let expected = reference.remove(key.as_bytes()).is_some();
+                    prop_assert_eq!(tree.delete(key.as_bytes()).unwrap(), expected);
+                }
+
+                for (reference_key, reference_value) in &reference {
+                    prop_assert!(matches!(
+                        tree.lookup(reference_key),
+                        LookupResult::Found(value) if value == reference_value.as_slice()
+                    ));
+                }
+            }
+
+            let actual: Vec<_> = tree.range_scan(b"key-000", b"key-999").collect();
+            let expected: Vec<_> = reference.into_iter().collect();
+            prop_assert_eq!(actual, expected);
+        }
     }
 }
