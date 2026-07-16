@@ -78,7 +78,7 @@ impl fmt::Display for BufferError {
 impl std::error::Error for BufferError {}
 
 /// Statistics about the buffer pool.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BufferStats {
     /// Total number of frames.
     pub total_frames: usize,

@@ -203,6 +203,23 @@ fn bench_db_blob_read(c: &mut Criterion) {
     drop(directory);
 }
 
+fn bench_db_reopen_lazy_point_read(c: &mut Criterion) {
+    let (directory, mut db) = populated_db(DEFAULT_KEYS);
+    let path = directory.path().join("db");
+    let probe_key = key(DEFAULT_KEYS / 2);
+    db.close().unwrap();
+
+    let mut group = configure_group(c, "db_reopen_lazy_point_read");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function(BenchmarkId::new("keys", DEFAULT_KEYS), |benchmark| {
+        benchmark.iter(|| {
+            let reopened = DB::open(&path, Options::default()).unwrap();
+            black_box(reopened.get(black_box(probe_key.as_bytes())).unwrap());
+        });
+    });
+    group.finish();
+}
+
 fn bench_db_reopen_verify(c: &mut Criterion) {
     let (directory, mut db) = populated_db(DEFAULT_KEYS);
     let path = directory.path().join("db");
@@ -227,6 +244,7 @@ criterion_group!(
     bench_db_flush_batch,
     bench_db_mixed_workload,
     bench_db_blob_read,
+    bench_db_reopen_lazy_point_read,
     bench_db_reopen_verify,
 );
 criterion_main!(benches);

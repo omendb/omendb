@@ -13,6 +13,64 @@ use crate::mvcc::PMT;
 use crate::space::Device;
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Cumulative physical work performed by one storage-engine handle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageMetrics {
+    /// Logical page reads requested through the PMT-backed page seam.
+    pub logical_page_reads: u64,
+    /// Physical page reads issued to the data device.
+    pub physical_page_reads: u64,
+    /// Physical page writes completed on the data device.
+    pub physical_page_writes: u64,
+    /// Bytes read from the data device for page operations.
+    pub page_bytes_read: u64,
+    /// Bytes written to the data device for page operations.
+    pub page_bytes_written: u64,
+    /// Published generation flushes completed by this handle.
+    pub generation_flushes: u64,
+    /// Successful data-device sync calls.
+    pub syncs: u64,
+    /// Physical pages made reusable after a publication barrier.
+    pub reclaimed_pages: u64,
+    /// Bytes made reusable after a publication barrier.
+    pub reclaimed_bytes: u64,
+    /// Deterministic capacity preflight failures.
+    pub capacity_preflight_failures: u64,
+}
+
+#[derive(Debug, Default)]
+struct StorageCounters {
+    logical_page_reads: AtomicU64,
+    physical_page_reads: AtomicU64,
+    physical_page_writes: AtomicU64,
+    page_bytes_read: AtomicU64,
+    page_bytes_written: AtomicU64,
+    generation_flushes: AtomicU64,
+    syncs: AtomicU64,
+    reclaimed_pages: AtomicU64,
+    reclaimed_bytes: AtomicU64,
+    capacity_preflight_failures: AtomicU64,
+}
+
+impl StorageCounters {
+    fn snapshot(&self) -> StorageMetrics {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        StorageMetrics {
+            logical_page_reads: load(&self.logical_page_reads),
+            physical_page_reads: load(&self.physical_page_reads),
+            physical_page_writes: load(&self.physical_page_writes),
+            page_bytes_read: load(&self.page_bytes_read),
+            page_bytes_written: load(&self.page_bytes_written),
+            generation_flushes: load(&self.generation_flushes),
+            syncs: load(&self.syncs),
+            reclaimed_pages: load(&self.reclaimed_pages),
+            reclaimed_bytes: load(&self.reclaimed_bytes),
+            capacity_preflight_failures: load(&self.capacity_preflight_failures),
+        }
+    }
+}
 
 /// Storage engine that coordinates all components.
 ///
@@ -39,6 +97,8 @@ pub struct StorageEngine {
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
+    /// Cumulative physical work counters for diagnostics and benchmarks.
+    metrics: StorageCounters,
 }
 
 impl StorageEngine {
@@ -60,6 +120,7 @@ impl StorageEngine {
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
             lazy_root: None,
+            metrics: StorageCounters::default(),
         }
     }
 
@@ -94,6 +155,11 @@ impl StorageEngine {
             Ok(buffer) => buffer.stats(),
             Err(poisoned) => poisoned.into_inner().stats(),
         }
+    }
+
+    /// Return cumulative physical work counters for this storage handle.
+    pub fn metrics(&self) -> StorageMetrics {
+        self.metrics.snapshot()
     }
 
     fn buffer_lock(&self) -> Result<MutexGuard<'_, BufferManager>> {
@@ -160,6 +226,14 @@ impl StorageEngine {
     /// Before that point, the old generation may still be the authoritative
     /// root after a crash and its physical pages must remain untouched.
     pub fn complete_generation(&mut self) {
+        let reclaimed_pages = self.pending_reclaimed_offsets.len() as u64;
+        self.metrics
+            .reclaimed_pages
+            .fetch_add(reclaimed_pages, Ordering::Relaxed);
+        self.metrics.reclaimed_bytes.fetch_add(
+            reclaimed_pages.saturating_mul(PAGE_SIZE as u64),
+            Ordering::Relaxed,
+        );
         self.free_offsets
             .append(&mut self.pending_reclaimed_offsets);
         self.free_offsets.sort_unstable();
@@ -181,6 +255,9 @@ impl StorageEngine {
     /// location and checksum checks instead of allowing callers to bypass the
     /// PMT with raw device offsets.
     pub fn read_node(&self, page_id: u64) -> Result<Node> {
+        self.metrics
+            .logical_page_reads
+            .fetch_add(1, Ordering::Relaxed);
         let mapping = *self
             .pmt
             .get(page_id)
@@ -213,6 +290,12 @@ impl StorageEngine {
         let page_key = PageCacheKey::new(page_id, mapping.version);
         let mut buf = [0u8; PAGE_SIZE];
         if !self.buffer_lock()?.is_resident_key(page_key) {
+            self.metrics
+                .physical_page_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .page_bytes_read
+                .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
             self.device.read_page(mapping.offset, &mut buf)?;
         }
         let buffered_page = {
@@ -312,6 +395,12 @@ impl StorageEngine {
                     })?
                 };
                 self.device.write_page(offset, &flushed_page)?;
+                self.metrics
+                    .physical_page_writes
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .page_bytes_written
+                    .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
                 if reuses_retired_slot {
                     self.free_offsets.pop();
                 } else {
@@ -332,6 +421,10 @@ impl StorageEngine {
 
         // Sync to ensure data is persisted.
         self.device.sync()?;
+        self.metrics.syncs.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .generation_flushes
+            .fetch_add(1, Ordering::Relaxed);
         self.pending_reclaimed_offsets = retired_offsets;
         self.pending_reclaimed_cache_keys = retired_cache_keys;
 
@@ -361,7 +454,12 @@ impl StorageEngine {
                     .ok_or(Error::DiskFull)?;
                 offset
             };
-            self.device.check_write_capacity(offset)?;
+            if let Err(error) = self.device.check_write_capacity(offset) {
+                self.metrics
+                    .capacity_preflight_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(Error::from(error));
+            }
         }
         Ok(())
     }
@@ -710,6 +808,12 @@ impl StorageEngine {
             }
 
             let mut page = [0u8; PAGE_SIZE];
+            self.metrics
+                .physical_page_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .page_bytes_read
+                .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
             self.device.read_page(mapping.offset, &mut page)?;
             let node = Node::from_bytes(Box::new(page)).ok_or_else(|| {
                 Error::Corruption(format!(
@@ -746,6 +850,12 @@ impl StorageEngine {
 
         while offset + PAGE_SIZE as u64 <= device_size {
             let mut buf = [0u8; PAGE_SIZE];
+            self.metrics
+                .physical_page_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .page_bytes_read
+                .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
             self.device.read_page(offset, &mut buf)?;
 
             let buffered_page = {

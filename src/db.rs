@@ -10,13 +10,13 @@ pub use options::Options;
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
 use crate::btree::{BTree, LookupResult, PAGE_SIZE};
-use crate::buffer::BufferManager;
+use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions};
-use crate::storage::StorageEngine;
+use crate::storage::{StorageEngine, StorageMetrics};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
     ManifestStore, PmtCheckpointId,
@@ -111,6 +111,23 @@ pub struct CompactionReport {
     pub reclaimed_pages: u64,
     /// Whether the active manifest was mirrored before truncation.
     pub manifest_replicated: bool,
+}
+
+/// Cumulative storage work and current artifact sizes for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DBMetrics {
+    /// Physical page and publication counters for this open handle.
+    pub storage: StorageMetrics,
+    /// Buffer-pool occupancy and cache counters for this open handle.
+    pub buffer: BufferStats,
+    /// Current data-file size in bytes.
+    pub data_bytes: u64,
+    /// Current blob-file size in bytes.
+    pub blob_bytes: u64,
+    /// Current WAL size in bytes.
+    pub wal_bytes: u64,
+    /// Physical pages currently safe for reuse.
+    pub reclaimable_pages: u64,
 }
 
 /// A seerdb database instance.
@@ -564,6 +581,28 @@ impl DB {
             pending_mutations: self.pending_mutations,
             write_fenced: self.write_fenced,
         }
+    }
+
+    /// Return storage counters and current artifact sizes for observability.
+    pub fn metrics(&self) -> Result<DBMetrics> {
+        self.check_open()?;
+        let artifact_size = |name: &str| -> Result<u64> {
+            let path = self.path.join(name);
+            match fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error.into()),
+            }
+        };
+
+        Ok(DBMetrics {
+            storage: self.engine.metrics(),
+            buffer: self.engine.buffer_stats(),
+            data_bytes: artifact_size(DATA_FILE)?,
+            blob_bytes: artifact_size(BLOB_FILE)?,
+            wal_bytes: artifact_size(WAL_FILE)?,
+            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
+        })
     }
 
     /// Verify the active manifest, checkpoint, pages, blob file, and WAL.
@@ -1187,6 +1226,37 @@ mod tests {
 
         // Meta file should exist.
         assert!(path.join(META_FILE).exists());
+    }
+
+    #[test]
+    fn test_db_metrics_attribute_page_work_and_lazy_reads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            db.flush().unwrap();
+
+            let metrics = db.metrics().unwrap();
+            assert_eq!(metrics.storage.physical_page_writes, 1);
+            assert_eq!(metrics.storage.page_bytes_written, PAGE_SIZE as u64);
+            assert_eq!(metrics.storage.generation_flushes, 1);
+            assert_eq!(metrics.storage.syncs, 1);
+            assert_eq!(metrics.data_bytes, PAGE_SIZE as u64);
+            assert_eq!(metrics.wal_bytes, 0);
+        }
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        let before = reopened.metrics().unwrap();
+        assert_eq!(before.storage.logical_page_reads, 0);
+        assert_eq!(before.storage.physical_page_reads, 0);
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+        let after = reopened.metrics().unwrap();
+        assert_eq!(after.storage.logical_page_reads, 2);
+        assert_eq!(after.storage.physical_page_reads, 1);
+        assert_eq!(after.storage.page_bytes_read, PAGE_SIZE as u64);
+        assert_eq!(after.buffer.reads, 1);
     }
 
     #[test]
