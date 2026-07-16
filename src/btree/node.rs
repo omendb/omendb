@@ -831,7 +831,13 @@ impl Node {
             return Err(InsertError::WrongNodeType);
         }
 
-        let insertion_point = self.search(key).unwrap_or_else(|idx| idx);
+        let insertion_point = match self.search(key) {
+            Ok(index) => {
+                self.remove_entry(index)?;
+                self.search(key).unwrap_or_else(|idx| idx)
+            }
+            Err(index) => index,
+        };
         self.insert_leaf_value(key, ValueType::Tombstone, &[], insertion_point)
     }
 
@@ -1201,23 +1207,9 @@ mod tests {
         let mut node = Node::new_leaf();
         node.insert(b"key", b"value").unwrap();
 
-        println!("After insert:");
-        println!("  count: {}", node.count());
-        println!("  key(0): {:?}", node.key(0));
-        println!("  value(0): {:?}", node.value(0));
-        println!("  search: {:?}", node.search(b"key"));
-
         node.insert_tombstone(b"key").unwrap();
-
-        println!("After tombstone:");
-        println!("  count: {}", node.count());
-        for i in 0..node.count() {
-            println!("  key({}): {:?}", i, node.key(i));
-            println!("  value({}): {:?}", i, node.value(i));
-        }
-        println!("  search: {:?}", node.search(b"key"));
-
-        // The tombstone should be found first (at lower index)
+        assert_eq!(node.count(), 1);
+        assert_eq!(node.search(b"key"), Ok(0));
         assert!(matches!(node.value(0), Some(ValueRef::Tombstone)));
     }
 

@@ -339,14 +339,17 @@ impl DB {
     /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_writable()?;
-        self.engine.ensure_materialized()?;
+        self.engine.prepare_mutation(key)?;
 
         // Mutate memory first, then make the successful mutation durable in
         // the WAL. No page is written before the WAL reaches disk, and an
         // operation that fails never enters a committed WAL batch.
         if self.blobs.should_separate(value.len()) {
+            if let LookupResult::Blob(pointer) = self.engine.lookup(key)? {
+                self.blobs.mark_deleted(&pointer);
+            }
             let ptr = self.blobs.append(key, value.to_vec());
-            self.engine.btree_mut().insert_blob(key, ptr)?;
+            self.engine.btree_mut().upsert_blob(key, ptr)?;
         } else {
             self.engine.btree_mut().upsert(key, value)?;
         }
@@ -386,7 +389,7 @@ impl DB {
     /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
-        self.engine.ensure_materialized()?;
+        self.engine.prepare_mutation(key)?;
 
         if let LookupResult::Blob(ptr) = self.engine.lookup(key)? {
             self.blobs.mark_deleted(&ptr);
@@ -1294,6 +1297,99 @@ mod tests {
     }
 
     #[test]
+    fn test_db_sparse_mutation_overlay_preserves_unloaded_ranges() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sparse-mutation.db");
+
+        {
+            let mut db = DB::open(&path, Options::for_test()).unwrap();
+            for index in 0..500 {
+                let key = format!("key-{index:06}");
+                let value = format!("value-{index:06}");
+                db.put(key.as_bytes(), value.as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let mut db = DB::open(&path, Options::for_test()).unwrap();
+        let durable_page_count = db.engine.pmt().iter().count();
+        db.put(b"key-000250", b"updated-250").unwrap();
+        db.put(b"key-000450", b"updated-450").unwrap();
+        assert!(db.engine.btree().node_count() < durable_page_count);
+        assert_eq!(
+            db.get(b"key-000250").unwrap(),
+            Some(b"updated-250".to_vec())
+        );
+        assert_eq!(
+            db.get(b"key-000450").unwrap(),
+            Some(b"updated-450".to_vec())
+        );
+
+        let before_delete = db.range(b"key-000240", b"key-000460").unwrap();
+        assert_eq!(before_delete.len(), 220);
+        assert_eq!(
+            before_delete
+                .iter()
+                .find(|(key, _)| key == b"key-000250")
+                .map(|(_, value)| value.as_slice()),
+            Some(b"updated-250".as_slice())
+        );
+
+        assert!(db.delete(b"key-000300").unwrap());
+        let after_delete = db.range(b"key-000240", b"key-000460").unwrap();
+        assert_eq!(after_delete.len(), 219);
+        assert!(!after_delete.iter().any(|(key, _)| key == b"key-000300"));
+        db.flush().unwrap();
+        drop(db);
+
+        let reopened = DB::open(&path, Options::for_test()).unwrap();
+        assert_eq!(
+            reopened.get(b"key-000250").unwrap(),
+            Some(b"updated-250".to_vec())
+        );
+        assert_eq!(reopened.get(b"key-000300").unwrap(), None);
+        assert_eq!(reopened.get(b"key-000450").unwrap(), Some(b"updated-450".to_vec()));
+    }
+
+    #[test]
+    fn test_db_sparse_mutation_overlay_split_reopens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sparse-split.db");
+
+        {
+            let mut db = DB::open(&path, Options::for_test()).unwrap();
+            for index in 0..500 {
+                let key = format!("key-{index:06}");
+                db.put(key.as_bytes(), b"value").unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let mut db = DB::open(&path, Options::for_test()).unwrap();
+        for index in 0..120 {
+            let key = format!("key-000250-new-{index:03}");
+            db.put(key.as_bytes(), b"new-value").unwrap();
+        }
+        assert!(db.engine.btree().dirty_page_ids().len() > 1);
+        assert_eq!(
+            db.range(b"key-000250-new-000", b"key-000250-new-120")
+                .unwrap()
+                .len(),
+            120
+        );
+        db.flush().unwrap();
+        drop(db);
+
+        let reopened = DB::open(&path, Options::for_test()).unwrap();
+        let values = reopened
+            .range(b"key-000250-new-000", b"key-000250-new-120")
+            .unwrap();
+        assert_eq!(values.len(), 120);
+        assert_eq!(values[0], (b"key-000250-new-000".to_vec(), b"new-value".to_vec()));
+        assert_eq!(values[119].0, b"key-000250-new-119");
+    }
+
+    #[test]
     fn test_db_rejects_malformed_meta_container() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -1731,6 +1827,12 @@ mod tests {
             db.put(b"key1", &large_value).unwrap();
             db.put(b"key2", b"small").unwrap();
             db.flush().unwrap();
+            let replacement = vec![0xCD; 3_000];
+            db.put(b"key1", &replacement).unwrap();
+            assert_eq!(db.get(b"key1").unwrap(), Some(replacement.clone()));
+            db.flush().unwrap();
+            assert!(db.blob_stats().total_deleted > 0);
+            assert_eq!(db.get(b"key1").unwrap(), Some(replacement));
             db.close().unwrap();
         }
 
@@ -1740,7 +1842,7 @@ mod tests {
         // Reopen and verify blob data persisted.
         {
             let db = DB::open(&path, Options::default()).unwrap();
-            assert_eq!(db.get(b"key1").unwrap(), Some(large_value.clone()));
+            assert_eq!(db.get(b"key1").unwrap(), Some(vec![0xCD; 3_000]));
             assert_eq!(db.get(b"key2").unwrap(), Some(b"small".to_vec()));
         }
     }

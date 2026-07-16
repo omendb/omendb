@@ -87,6 +87,9 @@ impl From<BTreeError> for Error {
             BTreeError::InsertFailed(e) => Error::from(e),
             BTreeError::SplitFailed(e) => Error::from(e),
             BTreeError::PageIdExhausted => Error::BTree("logical page ID exhausted".into()),
+            BTreeError::MissingPage(page_id) => {
+                Error::Corruption(format!("B-tree page {page_id} is not loaded"))
+            }
             BTreeError::Corruption(message) => Error::Corruption(message),
         }
     }

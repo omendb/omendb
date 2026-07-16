@@ -6,12 +6,12 @@
 pub mod format;
 
 use crate::allocator::PageAllocator;
-use crate::btree::{BTree, LookupResult, Node, ValueRef, PAGE_SIZE};
+use crate::btree::{BTree, BTreeError, LookupResult, Node, ValueRef, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -245,6 +245,7 @@ impl StorageEngine {
         } else {
             self.pending_reclaimed_cache_keys.clear();
         }
+        self.lazy_root = (!self.pmt.is_empty()).then_some(self.btree.root_id());
         self.btree.clear_dirty();
     }
 
@@ -500,11 +501,70 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Load only the root-to-leaf path required for a mutation.
+    ///
+    /// A clean reopen keeps all other logical pages in the PMT-backed
+    /// immutable generation. The loaded path becomes the sparse B-tree
+    /// mutation overlay; unchanged pages remain readable through the PMT.
+    pub fn prepare_mutation(&mut self, key: &[u8]) -> Result<()> {
+        if self.lazy_root.is_none() {
+            return Ok(());
+        }
+
+        let mut current = self.btree.root_id();
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                return Err(Error::Corruption(
+                    "cycle detected while preparing mutation path".into(),
+                ));
+            }
+            if self.btree.node(current).is_none() {
+                let node = self.read_node(current as u64)?;
+                self.btree.add_node(node, current);
+            }
+
+            let next = {
+                let node = self
+                    .btree
+                    .node(current)
+                    .ok_or(BTreeError::MissingPage(current))?;
+                if node.is_leaf() {
+                    return Ok(());
+                }
+
+                let mut child_id = node.leftmost_child();
+                for index in 0..node.count() {
+                    let separator = node.key(index).ok_or_else(|| {
+                        Error::Corruption("internal mutation key is malformed".into())
+                    })?;
+                    if key < separator.as_slice() {
+                        break;
+                    }
+                    child_id = node.child_id(index).ok_or_else(|| {
+                        Error::Corruption("internal mutation child is malformed".into())
+                    })?;
+                }
+                u32::try_from(child_id).map_err(|_| {
+                    Error::Corruption("internal mutation child exceeds logical ID width".into())
+                })?
+            };
+            current = next;
+        }
+    }
+
     /// Look up a key through either the resident mutation tree or the
     /// PMT-backed lazy generation selected at reopen.
     pub fn lookup(&self, key: &[u8]) -> Result<LookupResult> {
         if let Some(root_page_id) = self.lazy_root {
-            self.lookup_lazy(root_page_id, key)
+            if self.btree.dirty_page_ids().is_empty() {
+                return self.lookup_lazy(root_page_id, key);
+            }
+            match self.btree.lookup(key) {
+                Ok(result) => Ok(result),
+                Err(BTreeError::MissingPage(_)) => self.lookup_lazy(root_page_id, key),
+                Err(error) => Err(error.into()),
+            }
         } else {
             self.btree.lookup(key).map_err(Error::from)
         }
@@ -514,7 +574,22 @@ impl StorageEngine {
     /// PMT-backed lazy generation selected at reopen.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if let Some(root_page_id) = self.lazy_root {
-            self.range_lazy(root_page_id, start, end)
+            let base = self.range_lazy(root_page_id, start, end)?;
+            if self.btree.dirty_page_ids().is_empty() {
+                return Ok(base);
+            }
+            let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = base.into_iter().collect();
+            for (key, value) in self.btree.dirty_leaf_entries(start, end)? {
+                match value {
+                    LookupResult::Found(value) => {
+                        merged.insert(key, value);
+                    }
+                    LookupResult::Blob(_) | LookupResult::Deleted | LookupResult::NotFound => {
+                        merged.remove(&key);
+                    }
+                }
+            }
+            Ok(merged.into_iter().collect())
         } else {
             self.btree
                 .range_scan(start, end)
@@ -753,7 +828,13 @@ impl StorageEngine {
         }
 
         let allocator = self.btree.take_page_allocator();
-        self.btree = BTree::from_nodes_with_allocator(Vec::new(), root_page_id as u32, allocator);
+        let page_count = usize::try_from(
+            max_page_id
+                .checked_add(1)
+                .ok_or_else(|| Error::Corruption("manifest PMT page count overflow".into()))?,
+        )
+        .map_err(|_| Error::Corruption("manifest PMT page count overflow".into()))?;
+        self.btree = BTree::from_sparse_with_allocator(page_count, root_page_id as u32, allocator);
         self.lazy_root = Some(root_page_id as u32);
         self.next_offset = device_size;
         Ok(())

@@ -1,7 +1,8 @@
 //! B-tree operations: insert, lookup, delete, range scan.
 //!
-//! This module implements a B-tree that operates on nodes. For now it uses
-//! an in-memory store; later it will be integrated with the buffer manager.
+//! This module implements a B-tree over a sparse logical page store. Loaded
+//! pages are owned in memory; an outer storage engine may fill missing pages
+//! on demand before a mutation.
 //!
 //! # Design
 //!
@@ -12,8 +13,8 @@
 //!
 //! # Out-of-Place Writes
 //!
-//! In the full implementation, "modify" operations create new page versions.
-//! For now, we mutate nodes directly. The PMT integration comes later.
+//! Mutations still modify loaded nodes directly, while StorageEngine owns the
+//! page-loading and durable copy-on-write publication boundary.
 
 use crate::allocator::PageAllocator;
 use crate::btree::node::{BlobPointer, InsertError, Node, SplitError, ValueRef};
@@ -38,10 +39,12 @@ pub enum LookupResult {
 /// A simple in-memory B-tree.
 ///
 /// This is the core B-tree logic. In the full implementation, this will be
-/// backed by the buffer manager and PMT. For now, it stores nodes in a Vec.
+/// backed by the buffer manager and PMT. Missing slots represent pages that
+/// have not been loaded into this logical view yet.
 pub struct BTree {
-    /// All nodes stored in memory. Index 0 is always the root.
-    nodes: Vec<Node>,
+    /// Loaded nodes indexed by stable logical page ID. `None` is an unloaded
+    /// page in a sparse PMT-backed view.
+    nodes: Vec<Option<Node>>,
     /// Page ID of the root node.
     root: PageId,
     /// Logical pages that may have changed since the last published generation.
@@ -61,7 +64,7 @@ impl BTree {
     pub fn new() -> Self {
         let root = Node::new_leaf();
         Self {
-            nodes: vec![root],
+            nodes: vec![Some(root)],
             root: 0,
             dirty_pages: HashSet::from([0]),
             page_allocator: PageAllocator::new(),
@@ -81,7 +84,26 @@ impl BTree {
     ) -> Self {
         page_allocator.advance_next_id(nodes.len() as u64);
         Self {
-            nodes,
+            nodes: nodes.into_iter().map(Some).collect(),
+            root,
+            dirty_pages: HashSet::new(),
+            page_allocator,
+        }
+    }
+
+    /// Create a sparse logical view with slots for a PMT page range.
+    ///
+    /// The slots are intentionally unloaded. StorageEngine fills only the
+    /// pages needed by a mutation path and keeps the rest in the PMT-backed
+    /// immutable generation.
+    pub fn from_sparse_with_allocator(
+        page_count: usize,
+        root: PageId,
+        mut page_allocator: PageAllocator,
+    ) -> Self {
+        page_allocator.advance_next_id(page_count as u64);
+        Self {
+            nodes: vec![None; page_count],
             root,
             dirty_pages: HashSet::new(),
             page_allocator,
@@ -115,9 +137,9 @@ impl BTree {
     pub fn add_node(&mut self, node: Node, page_id: PageId) {
         let idx = page_id as usize;
         if idx >= self.nodes.len() {
-            self.nodes.resize_with(idx + 1, Node::new_leaf);
+            self.nodes.resize_with(idx + 1, || None);
         }
-        self.nodes[idx] = node;
+        self.nodes[idx] = Some(node);
         self.dirty_pages.remove(&page_id);
     }
 
@@ -128,7 +150,7 @@ impl BTree {
 
     /// Number of nodes in the tree.
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.nodes.iter().flatten().count()
     }
 
     /// Return the logical pages changed since the last published generation.
@@ -143,15 +165,57 @@ impl BTree {
         self.dirty_pages.clear();
     }
 
+    /// Return owned values for every dirty leaf entry in a key range.
+    ///
+    /// StorageEngine uses this to overlay sparse mutation pages over the
+    /// immutable PMT-backed generation without loading unrelated leaves.
+    pub fn dirty_leaf_entries(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<(Vec<u8>, LookupResult)>, BTreeError> {
+        let mut entries = Vec::new();
+        let mut page_ids: Vec<_> = self.dirty_pages.iter().copied().collect();
+        page_ids.sort_unstable();
+        for page_id in page_ids {
+            let Some(node) = self.node(page_id) else {
+                return Err(BTreeError::MissingPage(page_id));
+            };
+            if !node.is_leaf() {
+                continue;
+            }
+            for index in 0..node.count() {
+                let key = node
+                    .key(index)
+                    .ok_or_else(|| BTreeError::Corruption("dirty leaf key is malformed".into()))?;
+                if key.as_slice() < start || key.as_slice() >= end {
+                    continue;
+                }
+                let value = match node.value(index) {
+                    Some(ValueRef::Inline(value)) => LookupResult::Found(value.to_vec()),
+                    Some(ValueRef::Blob(pointer)) => LookupResult::Blob(pointer),
+                    Some(ValueRef::Tombstone) => LookupResult::Deleted,
+                    None => {
+                        return Err(BTreeError::Corruption(
+                            "dirty leaf value payload is malformed".into(),
+                        ));
+                    }
+                };
+                entries.push((key, value));
+            }
+        }
+        Ok(entries)
+    }
+
     /// Get a reference to a node by page ID.
     pub fn node(&self, id: PageId) -> Option<&Node> {
-        self.nodes.get(id as usize)
+        self.nodes.get(id as usize).and_then(Option::as_ref)
     }
 
     /// Get a mutable reference to a node by page ID.
     fn node_mut(&mut self, id: PageId) -> Option<&mut Node> {
         self.dirty_pages.insert(id);
-        self.nodes.get_mut(id as usize)
+        self.nodes.get_mut(id as usize).and_then(Option::as_mut)
     }
 
     /// Allocate a new node and return its page ID.
@@ -162,9 +226,9 @@ impl BTree {
         }
         let id = id as PageId;
         if id as usize >= self.nodes.len() {
-            self.nodes.resize_with(id as usize + 1, Node::new_leaf);
+            self.nodes.resize_with(id as usize + 1, || None);
         }
-        self.nodes[id as usize] = node;
+        self.nodes[id as usize] = Some(node);
         self.dirty_pages.insert(id);
         Ok(id)
     }
@@ -302,6 +366,30 @@ impl BTree {
         Ok(())
     }
 
+    /// Insert or replace a blob pointer for a key.
+    pub fn upsert_blob(&mut self, key: &[u8], ptr: BlobPointer) -> Result<(), BTreeError> {
+        let leaf_id = self.find_leaf(key)?;
+        let snapshot = self.nodes.clone();
+        let dirty_pages = self.dirty_pages.clone();
+        let result = (|| {
+            if let Some(index) = self.node(leaf_id).and_then(|node| node.search(key).ok()) {
+                self.node_mut(leaf_id)
+                    .ok_or(BTreeError::MissingPage(leaf_id))?
+                    .remove_entry(index)
+                    .map_err(BTreeError::InsertFailed)?;
+            }
+            self.node_mut(leaf_id)
+                .ok_or(BTreeError::MissingPage(leaf_id))?
+                .insert_blob(key, ptr)
+                .map_err(BTreeError::InsertFailed)
+        })();
+        if result.is_err() {
+            self.nodes = snapshot;
+            self.dirty_pages = dirty_pages;
+        }
+        result
+    }
+
     /// Create a forward range scan over [start, end).
     pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<RangeScan<'_>, BTreeError> {
         RangeScan::new(self, start.to_vec(), end.to_vec())
@@ -322,7 +410,7 @@ impl BTree {
             }
             let node = self
                 .node(current)
-                .ok_or_else(|| BTreeError::Corruption("B-tree child page is missing".into()))?;
+                .ok_or(BTreeError::MissingPage(current))?;
             if node.is_leaf() {
                 return Ok(current);
             }
@@ -691,6 +779,8 @@ pub enum BTreeError {
     SplitFailed(SplitError),
     #[error("logical page ID exhausted")]
     PageIdExhausted,
+    #[error("B-tree page {0} is not loaded")]
+    MissingPage(PageId),
     #[error("B-tree corruption: {0}")]
     Corruption(String),
 }
