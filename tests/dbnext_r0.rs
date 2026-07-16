@@ -253,10 +253,8 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
                     if db.put(key.as_bytes(), key.as_bytes()).is_err() {
                         return;
                     }
-                    if sequence % 32 == 31 {
-                        if db.flush().is_ok() {
-                            started.store(true, Ordering::Release);
-                        }
+                    if sequence % 32 == 31 && db.flush().is_ok() {
+                        started.store(true, Ordering::Release);
                     }
                 }
             });

@@ -32,6 +32,8 @@
 //! - WiscKey (FAST 2016): key-value separation for reduced write amplification
 //! - Tidehunter (2026): WAL-as-store architecture (reference for I/O patterns)
 
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod allocator;
 pub mod blob;
 pub mod btree;

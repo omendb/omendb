@@ -166,7 +166,7 @@ mod tests {
     fn test_free_and_reuse() {
         let mut alloc = PageAllocator::new();
         let id1 = alloc.alloc();
-        let id2 = alloc.alloc();
+        let _id2 = alloc.alloc();
 
         assert!(alloc.free(id1));
         assert_eq!(alloc.free_count(), 1);

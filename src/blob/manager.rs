@@ -256,7 +256,6 @@ mod tests {
 
         let ptr = bm.append(b"test_key", value.clone());
         assert_eq!(ptr.length, 2000);
-        assert!(ptr.offset > 0 || ptr.offset == 0);
 
         let read_value = bm.read(&ptr).unwrap();
         assert_eq!(read_value, &value);
