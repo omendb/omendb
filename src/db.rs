@@ -24,6 +24,7 @@ use crate::storage::format::{
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -44,6 +45,7 @@ const MANIFEST_FILE: &str = "MANIFEST";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 =
     (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Blob GC statistics.
 pub struct BlobStats {
@@ -100,6 +102,76 @@ pub struct SnapshotReport {
     pub copied_files: u32,
     /// Number of destination pages verified after reopen.
     pub verified_pages: u64,
+}
+
+/// An owned, read-only snapshot view backed by an independently verified
+/// directory copy.
+///
+/// The copy-backed implementation is intentionally conservative: source page
+/// reclamation cannot invalidate the snapshot, and dropping or releasing the
+/// handle removes its temporary directory. A future shared-page snapshot can
+/// preserve this API while replacing the copy mechanism.
+pub struct Snapshot {
+    db: Option<DB>,
+    path: PathBuf,
+    released: bool,
+}
+
+impl Snapshot {
+    /// Return the snapshot directory path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Get a value from the retained snapshot.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .get(key)
+    }
+
+    /// Scan a range in the retained snapshot.
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .range(start, end)
+    }
+
+    /// Verify the retained snapshot independently.
+    pub fn verify(&mut self) -> Result<VerificationReport> {
+        self.db
+            .as_mut()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .verify()
+    }
+
+    /// Return the durable identity captured by this snapshot.
+    pub fn durability_status(&self) -> Result<DurabilityStatus> {
+        Ok(self
+            .db
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .durability_status())
+    }
+
+    /// Release the snapshot directory immediately.
+    pub fn release(mut self) -> Result<()> {
+        self.db.take();
+        fs::remove_dir_all(&self.path)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        self.db.take();
+        if !self.released {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Results from trimming reclaimable trailing data pages.
@@ -865,6 +937,54 @@ impl DB {
             let _ = fs::remove_dir_all(&temporary);
         }
         result
+    }
+
+    /// Create an owned read-only snapshot handle.
+    ///
+    /// The handle owns a verified temporary directory and removes it on
+    /// `release()` or `Drop`. Use [`DB::snapshot`] when the archive should
+    /// survive independently of this process.
+    pub fn begin_snapshot(&mut self) -> Result<Snapshot> {
+        self.check_writable()?;
+        let destination = self.next_snapshot_path()?;
+        self.snapshot(&destination)?;
+        let db = match DB::open(&destination, self.options.clone()) {
+            Ok(db) => db,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&destination);
+                return Err(error);
+            }
+        };
+        Ok(Snapshot {
+            db: Some(db),
+            path: destination,
+            released: false,
+        })
+    }
+
+    fn next_snapshot_path(&self) -> Result<PathBuf> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("seerdb");
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let id = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+        let destination = parent.join(format!(
+            ".{name}.snapshot-{}-{timestamp}-{id}",
+            std::process::id()
+        ));
+        if destination.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot destination already exists: {}",
+                destination.display()
+            )));
+        }
+        Ok(destination)
     }
 
     /// Reclaim trailing data pages that are no longer referenced by either

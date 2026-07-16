@@ -358,6 +358,32 @@ fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
 }
 
 #[test]
+fn dbnext_r0_owned_snapshot_releases_retained_copy() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("owned-snapshot-source.db");
+    let large_value = vec![0x3Cu8; 2_048];
+    let mut source = DB::open(&path, Options::default()).unwrap();
+    source.put(b"inline", b"before").unwrap();
+    source.put(b"large", &large_value).unwrap();
+    source.flush().unwrap();
+
+    let mut snapshot = source.begin_snapshot().unwrap();
+    let snapshot_path = snapshot.path().to_path_buf();
+    assert_eq!(snapshot.verify().unwrap().wal_bytes, 0);
+
+    source.put(b"inline", b"after").unwrap();
+    source.delete(b"large").unwrap();
+    source.flush().unwrap();
+    source.compact().unwrap();
+
+    assert_eq!(snapshot.get(b"inline").unwrap(), Some(b"before".to_vec()));
+    assert_eq!(snapshot.get(b"large").unwrap(), Some(large_value));
+
+    snapshot.release().unwrap();
+    assert!(!snapshot_path.exists());
+}
+
+#[test]
 fn dbnext_r0_rejects_corrupt_blob_artifact() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-blob.db");
