@@ -554,13 +554,21 @@ impl DB {
 
     /// Run garbage collection on blob files.
     ///
+    /// Pending mutations are published before reclaiming blobs so an older
+    /// durable generation never loses a pointer. Only fully dead blob files
+    /// are currently reclaimable without pointer rewriting.
+    ///
     /// Returns the number of entries reclaimed.
     pub fn gc(&mut self) -> Result<usize> {
-        self.check_open()?;
+        self.check_writable()?;
+        self.flush()?;
         let reclaimed = self.blobs.gc();
         if reclaimed > 0 {
-            // Flush after GC to persist changes.
-            self.flush()?;
+            let blob_path = self.path.join(BLOB_FILE);
+            if let Err(error) = atomic_write(&blob_path, &self.blobs.to_bytes()) {
+                self.write_fenced = true;
+                return Err(error);
+            }
         }
         Ok(reclaimed)
     }
@@ -1981,10 +1989,22 @@ mod tests {
 
         // Run GC.
         let reclaimed = db.gc().unwrap();
-        assert!(reclaimed > 0);
+        assert_eq!(reclaimed, 0);
+        assert_eq!(db.get(b"key3").unwrap(), Some(large_value));
 
         // Check stats after GC.
         let stats = db.blob_stats();
-        assert_eq!(stats.files_needing_gc, 0);
+        assert_eq!(stats.files_needing_gc, 1);
+
+        db.delete(b"key3").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.gc().unwrap(), 3);
+        assert_eq!(db.blob_stats().files_needing_gc, 0);
+
+        drop(db);
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key1").unwrap(), None);
+        assert_eq!(reopened.get(b"key2").unwrap(), None);
+        assert_eq!(reopened.get(b"key3").unwrap(), None);
     }
 }

@@ -96,9 +96,16 @@ impl BlobManager {
 
     /// Run garbage collection on files that need it.
     ///
+    /// Only fully dead files are reclaimable without rewriting live pointers.
+    /// Mixed files remain available for a future pointer-rewriting compactor.
     /// Returns the number of entries reclaimed.
     pub fn gc(&mut self) -> usize {
-        let files_to_gc = self.files_needing_gc();
+        let files_to_gc: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| file.needs_gc() && file.valid_count() == 0)
+            .map(|file| file.file_id())
+            .collect();
         if files_to_gc.is_empty() {
             return 0;
         }
@@ -111,17 +118,7 @@ impl BlobManager {
                 let file = &self.files[idx];
                 let total = file.record_count();
                 let valid = file.valid_count();
-
-                // In a real implementation, we would:
-                // 1. Read valid entries from the old file
-                // 2. Write them to a new file
-                // 3. Update the blob pointers in the B-tree
-                // 4. Remove the old file
-
-                // For now, just count the reclaimed entries.
                 reclaimed += total - valid;
-
-                // Remove the file (in a real implementation, we'd keep valid entries).
                 self.files.remove(idx);
             }
         }
@@ -291,6 +288,18 @@ mod tests {
         bm.mark_deleted(&ptr2);
 
         assert!(!bm.files_needing_gc().is_empty());
+        assert_eq!(bm.gc(), 0);
+        assert_eq!(bm.read(&ptr3), Some(&vec![3; 1500][..]));
+    }
+
+    #[test]
+    fn test_blob_gc_reclaims_fully_dead_file() {
+        let mut bm = BlobManager::new();
+        let ptr = bm.append(b"key", vec![1; 1500]);
+        bm.mark_deleted(&ptr);
+
+        assert_eq!(bm.gc(), 1);
+        assert_eq!(bm.file_count(), 0);
     }
 
     #[test]
