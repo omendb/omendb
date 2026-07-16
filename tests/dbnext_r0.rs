@@ -1027,3 +1027,26 @@ fn dbnext_r0_reopens_deep_tree_with_internal_routing() {
         );
     }
 }
+
+#[test]
+fn dbnext_r0_blob_upserts_split_leaves_and_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-split.db");
+    let value = vec![0xB7u8; 2_048];
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        for index in 0..192 {
+            let key = format!("blob-key-{index:04}");
+            db.put(key.as_bytes(), &value).unwrap();
+        }
+        db.flush().unwrap();
+        assert_eq!(db.get(b"blob-key-0000").unwrap(), Some(value.clone()));
+        assert_eq!(db.get(b"blob-key-0096").unwrap(), Some(value.clone()));
+        assert_eq!(db.get(b"blob-key-0191").unwrap(), Some(value.clone()));
+    }
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"blob-key-0000").unwrap(), Some(value.clone()));
+    assert_eq!(reopened.get(b"blob-key-0096").unwrap(), Some(value.clone()));
+    assert_eq!(reopened.get(b"blob-key-0191").unwrap(), Some(value));
+}

@@ -360,32 +360,82 @@ impl BTree {
     /// This stores the blob pointer in the B-tree instead of the actual value.
     pub fn insert_blob(&mut self, key: &[u8], ptr: BlobPointer) -> Result<(), BTreeError> {
         let leaf_id = self.find_leaf(key)?;
-        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
-        node.insert_blob(key, ptr)
-            .map_err(BTreeError::InsertFailed)?;
-        Ok(())
+        match self
+            .node_mut(leaf_id)
+            .expect("leaf_id should be valid")
+            .insert_blob(key, ptr)
+        {
+            Ok(()) => Ok(()),
+            Err(InsertError::PageFull) => {
+                let snapshot = self.nodes.clone();
+                let root = self.root;
+                let dirty_pages = self.dirty_pages.clone();
+                let page_allocator = self.page_allocator.clone();
+                let result = self.split_and_insert_blob_leaf(leaf_id, key, ptr);
+                if result.is_err() {
+                    self.nodes = snapshot;
+                    self.root = root;
+                    self.dirty_pages = dirty_pages;
+                    self.page_allocator = page_allocator;
+                }
+                result
+            }
+            Err(error) => Err(BTreeError::InsertFailed(error)),
+        }
     }
 
     /// Insert or replace a blob pointer for a key.
     pub fn upsert_blob(&mut self, key: &[u8], ptr: BlobPointer) -> Result<(), BTreeError> {
         let leaf_id = self.find_leaf(key)?;
-        let snapshot = self.nodes.clone();
-        let dirty_pages = self.dirty_pages.clone();
-        let result = (|| {
-            if let Some(index) = self.node(leaf_id).and_then(|node| node.search(key).ok()) {
-                self.node_mut(leaf_id)
-                    .ok_or(BTreeError::MissingPage(leaf_id))?
-                    .remove_entry(index)
-                    .map_err(BTreeError::InsertFailed)?;
-            }
-            self.node_mut(leaf_id)
+        let Some(index) = self.node(leaf_id).and_then(|node| node.search(key).ok()) else {
+            return match self
+                .node_mut(leaf_id)
                 .ok_or(BTreeError::MissingPage(leaf_id))?
                 .insert_blob(key, ptr)
-                .map_err(BTreeError::InsertFailed)
+            {
+                Ok(()) => Ok(()),
+                Err(InsertError::PageFull) => {
+                    let snapshot = self.nodes.clone();
+                    let root = self.root;
+                    let dirty_pages = self.dirty_pages.clone();
+                    let page_allocator = self.page_allocator.clone();
+                    let result = self.split_and_insert_blob_leaf(leaf_id, key, ptr);
+                    if result.is_err() {
+                        self.nodes = snapshot;
+                        self.root = root;
+                        self.dirty_pages = dirty_pages;
+                        self.page_allocator = page_allocator;
+                    }
+                    result
+                }
+                Err(error) => Err(BTreeError::InsertFailed(error)),
+            };
+        };
+
+        let snapshot = self.nodes.clone();
+        let root = self.root;
+        let dirty_pages = self.dirty_pages.clone();
+        let page_allocator = self.page_allocator.clone();
+        let result = (|| {
+            self.node_mut(leaf_id)
+                .ok_or(BTreeError::MissingPage(leaf_id))?
+                .remove_entry(index)
+                .map_err(BTreeError::InsertFailed)?;
+            match self
+                .node_mut(leaf_id)
+                .ok_or(BTreeError::MissingPage(leaf_id))?
+                .insert_blob(key, ptr)
+            {
+                Ok(()) => Ok(()),
+                Err(InsertError::PageFull) => self.split_and_insert_blob_leaf(leaf_id, key, ptr),
+                Err(error) => Err(BTreeError::InsertFailed(error)),
+            }
         })();
         if result.is_err() {
             self.nodes = snapshot;
+            self.root = root;
             self.dirty_pages = dirty_pages;
+            self.page_allocator = page_allocator;
         }
         result
     }
@@ -583,6 +633,46 @@ impl BTree {
         self.node_mut(target_id)
             .expect("target_id should be valid")
             .insert(key, value)
+            .map_err(BTreeError::InsertFailed)?;
+
+        if leaf_id == self.root {
+            self.create_new_root(leaf_id, &median_key, right_id)?;
+        } else {
+            let parent_id = self
+                .parent_of(leaf_id)
+                .expect("parent should exist for non-root node");
+            self.node_mut(right_id)
+                .expect("right node should be valid")
+                .set_parent_id(parent_id);
+            self.insert_into_internal(parent_id, &median_key, right_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Split a full leaf and insert a blob pointer, preserving the same
+    /// parent/root propagation rules as inline-value insertion.
+    fn split_and_insert_blob_leaf(
+        &mut self,
+        leaf_id: PageId,
+        key: &[u8],
+        ptr: BlobPointer,
+    ) -> Result<(), BTreeError> {
+        let (median_key, right_node) = {
+            let leaf = self.node_mut(leaf_id).expect("leaf_id should be valid");
+            leaf.split().map_err(BTreeError::SplitFailed)?
+        };
+
+        let right_id = self.alloc_node(right_node)?;
+        let target_id = if key >= median_key.as_slice() {
+            right_id
+        } else {
+            leaf_id
+        };
+
+        self.node_mut(target_id)
+            .expect("target_id should be valid")
+            .insert_blob(key, ptr)
             .map_err(BTreeError::InsertFailed)?;
 
         if leaf_id == self.root {
@@ -997,7 +1087,7 @@ mod tests {
         assert!(tree.range_scan(b"key", b"key~").unwrap().next().is_none());
         assert!(!tree.delete(b"key").unwrap());
 
-        assert_eq!(tree.delete(b"missing").unwrap(), false);
+        assert!(!tree.delete(b"missing").unwrap());
     }
 
     #[test]
@@ -1101,6 +1191,40 @@ mod tests {
             ));
         }
 
+        assert!(tree.node_count() > 2);
+    }
+
+    #[test]
+    fn test_btree_blob_upsert_splits_full_leaves() {
+        let mut tree = BTree::new();
+
+        for index in 0..1_000 {
+            let key = format!("blob-key-{index:04}");
+            let pointer = BlobPointer {
+                file_id: 1,
+                offset: index as u64 * 32,
+                length: 2_048,
+            };
+            let result = if index % 2 == 0 {
+                tree.insert_blob(key.as_bytes(), pointer)
+            } else {
+                tree.upsert_blob(key.as_bytes(), pointer)
+            };
+            result.unwrap_or_else(|error| panic!("blob insert {index} failed: {error:?}"));
+        }
+
+        for index in 0..1_000 {
+            let key = format!("blob-key-{index:04}");
+            let expected = BlobPointer {
+                file_id: 1,
+                offset: index as u64 * 32,
+                length: 2_048,
+            };
+            assert_eq!(
+                tree.lookup(key.as_bytes()).unwrap(),
+                LookupResult::Blob(expected)
+            );
+        }
         assert!(tree.node_count() > 2);
     }
 
