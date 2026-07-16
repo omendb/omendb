@@ -98,7 +98,8 @@ impl StorageEngine {
     /// Before that point, the old generation may still be the authoritative
     /// root after a crash and its physical pages must remain untouched.
     pub fn complete_generation(&mut self) {
-        self.free_offsets.append(&mut self.pending_reclaimed_offsets);
+        self.free_offsets
+            .append(&mut self.pending_reclaimed_offsets);
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
     }
@@ -151,7 +152,10 @@ impl StorageEngine {
                 if let Some(mapping) = self.pmt.get(page_id as u64) {
                     retired_offsets.push(mapping.offset);
                 }
-                let offset = self.free_offsets.pop().unwrap_or(self.next_offset);
+                let (offset, reuses_retired_slot) = match self.free_offsets.last() {
+                    Some(&offset) => (offset, true),
+                    None => (self.next_offset, false),
+                };
 
                 // Stage the page through the buffer manager, then write the
                 // clean flushed image to the out-of-place device version.
@@ -165,7 +169,11 @@ impl StorageEngine {
                     Error::Buffer(format!("page {page_id} was not dirty after staging"))
                 })?;
                 self.device.write_page(offset, &flushed_page)?;
-                self.next_offset += PAGE_SIZE as u64;
+                if reuses_retired_slot {
+                    self.free_offsets.pop();
+                } else {
+                    self.next_offset += PAGE_SIZE as u64;
+                }
                 self.pmt.insert(page_id as u64, 0, offset);
             }
         }
