@@ -72,6 +72,12 @@ impl StorageCounters {
     }
 }
 
+struct TreeVerification<'a> {
+    pmt: &'a PMT,
+    visited: &'a mut HashSet<u32>,
+    blob_pointers: &'a mut Vec<BlobPointer>,
+}
+
 /// Storage engine that coordinates all components.
 ///
 /// Provides persistent storage by serializing B-tree nodes to pages
@@ -1126,9 +1132,22 @@ impl StorageEngine {
     /// bounds, cycles, and that every mapped logical page is reachable. Blob
     /// pointers are returned for validation by the owning database.
     pub fn verify_tree(&self, root_page_id: u64) -> Result<Vec<BlobPointer>> {
+        self.verify_tree_with_pmt(&self.pmt, root_page_id)
+    }
+
+    /// Verify a B-tree graph rooted in an explicitly selected historical PMT.
+    ///
+    /// This is used before creating a late historical retention lease so a
+    /// root whose physical pages have already been truncated or reused fails
+    /// closed instead of becoming a durable lease to an invalid image.
+    pub fn verify_tree_at(&self, root_page_id: u64, pmt: &PMT) -> Result<Vec<BlobPointer>> {
+        self.verify_tree_with_pmt(pmt, root_page_id)
+    }
+
+    fn verify_tree_with_pmt(&self, pmt: &PMT, root_page_id: u64) -> Result<Vec<BlobPointer>> {
         let root = u32::try_from(root_page_id)
             .map_err(|_| Error::Corruption("root page exceeds logical ID width".into()))?;
-        if self.pmt.is_empty() {
+        if pmt.is_empty() {
             if root != 0 {
                 return Err(Error::Corruption(format!(
                     "empty PMT names non-zero root page {root}"
@@ -1137,13 +1156,12 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        if !self.pmt.contains(root as u64) {
+        if !pmt.contains(root as u64) {
             return Err(Error::Corruption(format!(
                 "root page {root} is absent from PMT"
             )));
         }
-        if self
-            .pmt
+        if pmt
             .iter()
             .any(|(page_id, _)| page_id > u32::MAX as u64)
         {
@@ -1154,11 +1172,15 @@ impl StorageEngine {
 
         let mut visited = HashSet::new();
         let mut blob_pointers = Vec::new();
-        self.verify_tree_node(root, 0, None, None, &mut visited, &mut blob_pointers)?;
+        let mut verification = TreeVerification {
+            pmt,
+            visited: &mut visited,
+            blob_pointers: &mut blob_pointers,
+        };
+        self.verify_tree_node(&mut verification, root, 0, None, None)?;
 
-        if visited.len() != self.pmt.len() {
-            let unreachable = self
-                .pmt
+        if visited.len() != pmt.len() {
+            let unreachable = pmt
                 .iter()
                 .map(|(page_id, _)| page_id)
                 .find(|page_id| !visited.contains(&(*page_id as u32)));
@@ -1173,20 +1195,19 @@ impl StorageEngine {
 
     fn verify_tree_node(
         &self,
+        verification: &mut TreeVerification<'_>,
         page_id: u32,
         expected_parent: u32,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
-        visited: &mut HashSet<u32>,
-        blob_pointers: &mut Vec<BlobPointer>,
     ) -> Result<()> {
-        if !visited.insert(page_id) {
+        if !verification.visited.insert(page_id) {
             return Err(Error::Corruption(format!(
                 "B-tree cycle reaches page {page_id}"
             )));
         }
 
-        let node = self.read_node(page_id as u64)?;
+        let node = self.read_node_from_pmt(verification.pmt, page_id as u64)?;
         if node.parent_id() != expected_parent {
             return Err(Error::Corruption(format!(
                 "page {page_id} names parent {}, expected {expected_parent}",
@@ -1222,7 +1243,7 @@ impl StorageEngine {
         if node.is_leaf() {
             for index in 0..node.count() {
                 match node.value(index) {
-                    Some(ValueRef::Blob(pointer)) => blob_pointers.push(pointer),
+                    Some(ValueRef::Blob(pointer)) => verification.blob_pointers.push(pointer),
                     Some(ValueRef::Inline(_) | ValueRef::Tombstone) => {}
                     None => {
                         return Err(Error::Corruption(format!(
@@ -1246,7 +1267,7 @@ impl StorageEngine {
             let child = u32::try_from(child).map_err(|_| {
                 Error::Corruption(format!("internal page {page_id} child exceeds ID width"))
             })?;
-            if !self.pmt.contains(child as u64) {
+            if !verification.pmt.contains(child as u64) {
                 return Err(Error::Corruption(format!(
                     "internal page {page_id} references missing child {child}"
                 )));
@@ -1261,14 +1282,7 @@ impl StorageEngine {
             } else {
                 upper.clone()
             };
-            self.verify_tree_node(
-                child,
-                page_id,
-                child_lower,
-                child_upper,
-                visited,
-                blob_pointers,
-            )?;
+            self.verify_tree_node(verification, child, page_id, child_lower, child_upper)?;
         }
 
         Ok(())

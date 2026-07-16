@@ -18,7 +18,7 @@ use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord
 use crate::space::{Device, DeviceOptions, preallocate_file, reserve_file};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, SnapshotId,
+    ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, SnapshotId,
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
@@ -54,6 +54,7 @@ const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
+const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
 const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
@@ -575,6 +576,8 @@ pub struct DB {
     txn_manager: TransactionManager,
     /// Authoritative root-generation publication store.
     manifest: ManifestStore,
+    /// Durable descriptors for historical roots that can be retained later.
+    manifest_history: ManifestHistory,
     /// Stable database identity.
     database_id: DatabaseId,
     /// Stable logical history identity.
@@ -754,6 +757,32 @@ impl DB {
                 )
             };
 
+        let manifest_history_path = path.join(MANIFEST_HISTORY_FILE);
+        let mut manifest_history = if manifest_history_path.exists() {
+            let bytes = fs::read(&manifest_history_path)?;
+            ManifestHistory::from_bytes(&bytes)
+                .map_err(|message| Error::Corruption(format!("manifest history {message}")))?
+        } else {
+            ManifestHistory::new()
+        };
+        if let Some(current) = current_manifest {
+            manifest_history
+                .reconcile_current(current)
+                .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+            if !read_only {
+                let bytes = manifest_history
+                    .to_bytes()
+                    .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
+                // Rewrite only at open/reconciliation boundaries. Normal
+                // commits append one checksummed frame below.
+                atomic_write(&manifest_history_path, &bytes)?;
+            }
+        } else if manifest_history.latest().is_some() {
+            return Err(Error::Corruption(
+                "manifest history exists without an authoritative manifest".into(),
+            ));
+        }
+
         let protected_offsets = Arc::new(Mutex::new(HashSet::new()));
         let retention_path = path.join(RETENTION_FILE);
         let retention = Arc::new(Mutex::new(
@@ -921,6 +950,7 @@ impl DB {
             retention,
             txn_manager: TransactionManager::new(),
             manifest,
+            manifest_history,
             database_id,
             history_id,
             generation_id,
@@ -937,7 +967,7 @@ impl DB {
         };
 
         if !check_only && current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
-            db.manifest.publish(Manifest {
+            let initial = Manifest {
                 database_id: db.database_id,
                 history_id: db.history_id,
                 generation_id: GenerationId::new(0),
@@ -950,7 +980,10 @@ impl DB {
                 mutation_count: 0,
                 digest: 0,
                 format_version: FORMAT_VERSION,
-            })?;
+            };
+            db.manifest_history.reset(initial);
+            db.persist_manifest_history(&db.manifest_history)?;
+            db.manifest.publish(initial)?;
         }
 
         if let Some(recovery) = recovery {
@@ -1565,6 +1598,42 @@ impl DB {
         atomic_write(path, data)
     }
 
+    fn persist_manifest_history(&self, history: &ManifestHistory) -> Result<()> {
+        let bytes = history
+            .to_bytes()
+            .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
+        atomic_write(&self.path.join(MANIFEST_HISTORY_FILE), &bytes)
+    }
+
+    fn append_manifest_history(&self, manifest: Manifest) -> Result<()> {
+        let path = self.path.join(MANIFEST_HISTORY_FILE);
+        let existing_len = fs::metadata(&path)?.len();
+        let header_len = u64::try_from(ManifestHistory::header_bytes().len())
+            .map_err(|_| Error::Corruption("manifest history header is too large".into()))?;
+        let entry_len = u64::try_from(ManifestHistory::entry_bytes(manifest).len())
+            .map_err(|_| Error::Corruption("manifest history entry is too large".into()))?;
+        if existing_len < header_len {
+            return Err(Error::Corruption("manifest history is truncated".into()));
+        }
+
+        // A crash may leave a partial final frame. Remove only that tail before
+        // appending so recovery never has to scan through a misaligned frame.
+        let complete_len = header_len
+            + (existing_len - header_len) / entry_len * entry_len;
+        if complete_len != existing_len {
+            let file = OpenOptions::new().write(true).open(&path)?;
+            file.set_len(complete_len)?;
+            file.sync_all()?;
+            sync_directory(&self.path)?;
+        }
+
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(&ManifestHistory::entry_bytes(manifest))?;
+        file.flush()?;
+        file.sync_all()?;
+        sync_directory(&self.path)
+    }
+
     /// Publish a generation after its pages and checkpoints are durable.
     fn publish_generation(
         &mut self,
@@ -1620,6 +1689,16 @@ impl DB {
             digest: commit.digest,
             format_version: FORMAT_VERSION,
         };
+        let mut manifest_history = self.manifest_history.clone();
+        manifest_history
+            .push(manifest)
+            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history(manifest)?;
+        } else {
+            self.persist_manifest_history(&manifest_history)?;
+        }
+        self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -2270,6 +2349,62 @@ impl DB {
             .manifest
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        let snapshot_id = self.register_retained_manifest(manifest)?;
+
+        Ok(RetainedSnapshot {
+            snapshot: Some(snapshot),
+            lease: Some(RetentionLease {
+                state: Arc::clone(&self.retention),
+                snapshot_id,
+                released: false,
+            }),
+        })
+    }
+
+    /// Retain an arbitrary published commit for shared historical reads.
+    ///
+    /// The returned ID is stable across reopen because the commit-to-root
+    /// descriptor is recorded in the durable retention registry. Callers can
+    /// use [`DB::get_at`] and [`DB::range_at`] with that ID without copying the
+    /// database directory.
+    pub fn retain_commit(&mut self, commit_id: CommitId) -> Result<SnapshotId> {
+        self.check_writable()?;
+        self.flush()?;
+        if let Some(snapshot_id) = self.retained_snapshot_id(commit_id) {
+            return Ok(snapshot_id);
+        }
+        let manifest = self
+            .manifest_history
+            .find_commit(commit_id)
+            .ok_or_else(|| {
+                Error::SnapshotUnavailable(format!("commit {} is not retained", commit_id.get()))
+            })?;
+        self.register_retained_manifest(manifest)
+    }
+
+    /// Return the active retention ID for a commit, if one exists.
+    pub fn retained_snapshot_id(&self, commit_id: CommitId) -> Option<SnapshotId> {
+        self.retention
+            .lock()
+            .ok()?
+            .roots()
+            .iter()
+            .find_map(|root| (root.manifest.commit_id == commit_id).then_some(root.snapshot_id))
+    }
+
+    /// Release a durable historical retention lease by ID.
+    pub fn release_snapshot(&mut self, snapshot_id: SnapshotId) -> Result<()> {
+        self.check_writable()?;
+        self.retention
+            .lock()
+            .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?
+            .remove(snapshot_id)
+    }
+
+    fn register_retained_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+        if let Some(snapshot_id) = self.retained_snapshot_id(manifest.commit_id) {
+            return Ok(snapshot_id);
+        }
         let snapshot_id = {
             let state = self
                 .retention
@@ -2283,9 +2418,47 @@ impl DB {
         } else {
             self.blobs.to_bytes()
         };
+        let mut retained_blobs = BlobManager::from_bytes(&blob_bytes).ok_or_else(|| {
+            Error::Corruption("current blob image is invalid while retaining a commit".into())
+        })?;
+        // Deletion markers describe the active root. An older retained root
+        // may still legitimately reference a value that a later commit
+        // replaced, so its immutable sidecar must preserve the append-only
+        // record bytes while omitting active-root deletion metadata.
+        retained_blobs.clear_deletion_metadata();
+        let blob_bytes = retained_blobs.to_bytes();
         if let Err(error) = atomic_write(&retained_blob, &blob_bytes) {
             let _ = fs::remove_file(&retained_blob);
             return Err(error);
+        }
+        if manifest.pmt_checkpoint_id.get() != 0 {
+            let checkpoint = self
+                .path
+                .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
+            let (pmt, _) = match Self::load_meta(&checkpoint) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    let _ = fs::remove_file(&retained_blob);
+                    return Err(error);
+                }
+            };
+            let pointers = match self.engine.verify_tree_at(manifest.root_page_id, &pmt) {
+                Ok(pointers) => pointers,
+                Err(error) => {
+                    let _ = fs::remove_file(&retained_blob);
+                    return Err(error);
+                }
+            };
+            if pointers
+                .iter()
+                .any(|pointer| retained_blobs.read(pointer).is_none())
+            {
+                let _ = fs::remove_file(&retained_blob);
+                return Err(Error::SnapshotUnavailable(format!(
+                    "commit {} has no complete historical blob image",
+                    manifest.commit_id.get()
+                )));
+            }
         }
         let offsets = match Self::load_manifest_offsets(&self.path, manifest, snapshot_id) {
             Ok(offsets) => offsets,
@@ -2305,7 +2478,6 @@ impl DB {
             }
             snapshot_id
         };
-
         let protected = {
             let state = self
                 .retention
@@ -2321,15 +2493,7 @@ impl DB {
             self.write_fenced = true;
             return Err(error);
         }
-
-        Ok(RetainedSnapshot {
-            snapshot: Some(snapshot),
-            lease: Some(RetentionLease {
-                state: Arc::clone(&self.retention),
-                snapshot_id,
-                released: false,
-            }),
-        })
+        Ok(snapshot_id)
     }
 
     fn next_snapshot_path(&self) -> Result<PathBuf> {
@@ -2377,7 +2541,11 @@ impl DB {
             history_id,
             ..manifest
         };
+        let mut manifest_history = self.manifest_history.clone();
+        manifest_history.reset(forked);
+        self.persist_manifest_history(&manifest_history)?;
         self.manifest.publish_replicated(forked)?;
+        self.manifest_history = manifest_history;
         self.history_id = history_id;
         Ok(())
     }
@@ -2726,10 +2894,26 @@ impl DB {
             )));
         }
         let mut protected = HashSet::new();
+        let data_bytes = fs::metadata(path.join(DATA_FILE))?.len();
         for (_, mapping) in pmt.iter() {
             if mapping.file_id != 0 || !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
                 return Err(Error::Corruption(format!(
                     "retained snapshot {} names an invalid page mapping",
+                    snapshot_id.get()
+                )));
+            }
+            let end = mapping
+                .offset
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "retained snapshot {} has an overflowing page mapping",
+                        snapshot_id.get()
+                    ))
+                })?;
+            if end > data_bytes {
+                return Err(Error::SnapshotUnavailable(format!(
+                    "retained snapshot {} names pages beyond the data file",
                     snapshot_id.get()
                 )));
             }
@@ -3248,6 +3432,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
             || name == LOCK_FILE
             || name == ARCHIVE_MARKER_FILE
             || !(name == MANIFEST_FILE
+                || name == MANIFEST_HISTORY_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
                 || name == META_FILE

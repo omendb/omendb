@@ -254,6 +254,89 @@ fn dbnext_r0_stale_expected_base_is_rejected_without_side_effects() {
 }
 
 #[test]
+fn dbnext_r0_retains_arbitrary_historical_commit_across_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("historical-commit.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"old".to_vec(),
+        }])
+        .unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"versioned".to_vec(),
+        value: b"new".to_vec(),
+    }])
+    .unwrap();
+
+    let snapshot_id = db.retain_commit(first.commit_id).unwrap();
+    assert_eq!(db.get(b"versioned").unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        db.get_at(snapshot_id, b"versioned").unwrap(),
+        Some(b"old".to_vec())
+    );
+    assert_eq!(
+        db.range_at(snapshot_id, b"versioned", b"versioned~")
+            .unwrap(),
+        vec![(b"versioned".to_vec(), b"old".to_vec())]
+    );
+    db.close().unwrap();
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(
+        reopened.retained_snapshot_id(first.commit_id),
+        Some(snapshot_id)
+    );
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"versioned").unwrap(),
+        Some(b"old".to_vec())
+    );
+    reopened.release_snapshot(snapshot_id).unwrap();
+    assert!(matches!(
+        reopened.get_at(snapshot_id, b"versioned"),
+        Err(Error::SnapshotUnavailable(_))
+    ));
+}
+
+#[test]
+fn dbnext_r0_historical_retention_preserves_replaced_blob_values() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("historical-blob.db");
+    let options = Options {
+        blob_threshold: 4,
+        ..Options::for_test()
+    };
+    let mut db = DB::open(&path, options.clone()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"blob-key".to_vec(),
+            value: b"old-large-value".to_vec(),
+        }])
+        .unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"blob-key".to_vec(),
+        value: b"new-large-value".to_vec(),
+    }])
+    .unwrap();
+
+    let snapshot_id = db.retain_commit(first.commit_id).unwrap();
+    assert_eq!(
+        db.get_at(snapshot_id, b"blob-key").unwrap(),
+        Some(b"old-large-value".to_vec())
+    );
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = DB::open(&path, options).unwrap();
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"blob-key").unwrap(),
+        Some(b"old-large-value".to_vec())
+    );
+}
+
+#[test]
 fn dbnext_r0_atomic_batch_wal_failure_drops_the_whole_candidate() {
     fn run_case<F>(root: &Path, name: &str, options: Options, inject: F)
     where
