@@ -3,9 +3,7 @@
 
 use seerdb::blob::BlobManager;
 use seerdb::recovery::WalRecord;
-use seerdb::storage::format::{
-    CommitId, CommitRecord, GenerationId, Manifest, FORMAT_VERSION,
-};
+use seerdb::storage::format::{CommitId, CommitRecord, FORMAT_VERSION, GenerationId, Manifest};
 use seerdb::{BatchMutation, CheckFailureKind, DB, Error, Options, RepairAction, WalCheckStatus};
 use std::collections::BTreeMap;
 use std::fs;
@@ -133,8 +131,7 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
     db.close().unwrap();
 
     let restored_path = root.path().join("restored.db");
-    let restore_report =
-        DB::restore(&archive_path, &restored_path, Options::default()).unwrap();
+    let restore_report = DB::restore(&archive_path, &restored_path, Options::default()).unwrap();
     let mut restored = DB::open(&restored_path, Options::default()).unwrap();
     assert_model(&restored, &committed);
     assert_eq!(
@@ -689,7 +686,10 @@ fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
     source.delete(b"large").unwrap();
     source.flush().unwrap();
     source.compact().unwrap();
-    assert_eq!(source.get(b"inline").unwrap(), Some(b"source-updated".to_vec()));
+    assert_eq!(
+        source.get(b"inline").unwrap(),
+        Some(b"source-updated".to_vec())
+    );
     assert_eq!(source.get(b"large").unwrap(), None);
 
     // The verified snapshot is an independent retained root, so source
@@ -722,6 +722,70 @@ fn dbnext_r0_owned_snapshot_releases_retained_copy() {
 
     snapshot.release().unwrap();
     assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn dbnext_r0_retained_root_pins_page_reuse_until_release() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-root.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"before").unwrap();
+    db.flush().unwrap();
+
+    let retained = db.retain_current().unwrap();
+    let snapshot_id = retained.snapshot_id();
+    assert!(path.join("seerdb.retained").is_file());
+    assert_eq!(retained.get(b"key").unwrap(), Some(b"before".to_vec()));
+
+    db.put(b"key", b"after-one").unwrap();
+    db.flush().unwrap();
+    let first_growth = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert_eq!(db.metrics().unwrap().reclaimable_pages, 0);
+    assert_eq!(db.gc().unwrap(), 0);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"after-one".to_vec()));
+    assert_eq!(retained.get(b"key").unwrap(), Some(b"before".to_vec()));
+    reopened.put(b"key", b"after-two").unwrap();
+    reopened.flush().unwrap();
+    let second_growth = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert!(second_growth > first_growth);
+    // The retained first generation keeps offset zero live; the intermediate
+    // generation can already be reused after the second publication.
+    assert_eq!(reopened.metrics().unwrap().reclaimable_pages, 1);
+
+    retained.release().unwrap();
+    drop(reopened);
+
+    let mut released = DB::open(&path, Options::default()).unwrap();
+    released.put(b"key", b"after-release").unwrap();
+    released.flush().unwrap();
+    let after_release = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert_eq!(after_release, second_growth);
+    assert!(!path.join("seerdb.retained").exists());
+    assert_ne!(snapshot_id.get(), 0);
+}
+
+#[test]
+fn dbnext_r0_corrupt_retention_registry_refuses_open() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("retained-corrupt.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.flush().unwrap();
+    let retained = db.retain_current().unwrap();
+    drop(db);
+
+    let retention_path = path.join("seerdb.retained");
+    let mut bytes = fs::read(&retention_path).unwrap();
+    bytes[0] ^= 0xFF;
+    fs::write(&retention_path, bytes).unwrap();
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("retention registry")
+    ));
+    drop(retained);
 }
 
 #[test]
@@ -837,7 +901,10 @@ fn dbnext_r0_blob_to_inline_retires_old_value() {
     }
 
     let reopened = DB::open(&path, Options::default()).unwrap();
-    assert_eq!(reopened.get(b"key").unwrap(), Some(b"inline-value".to_vec()));
+    assert_eq!(
+        reopened.get(b"key").unwrap(),
+        Some(b"inline-value".to_vec())
+    );
     let stats = reopened.blob_stats();
     assert_eq!(stats.files_needing_gc, 0);
     assert_eq!(stats.total_valid, 0);
@@ -1023,7 +1090,10 @@ fn dbnext_r0_repair_replays_committed_wal_into_new_location() {
 
     let repaired = DB::open(&destination_path, Options::default()).unwrap();
     assert_eq!(repaired.get(b"stable").unwrap(), Some(b"value-1".to_vec()));
-    assert_eq!(repaired.get(b"replayed").unwrap(), Some(b"value-2".to_vec()));
+    assert_eq!(
+        repaired.get(b"replayed").unwrap(),
+        Some(b"value-2".to_vec())
+    );
     assert_eq!(
         repaired.durability_status().generation_id.get(),
         current.generation_id.get() + 1
@@ -1206,7 +1276,10 @@ fn dbnext_r0_rejects_future_meta_version() {
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
-        Err(Error::Check { kind: CheckFailureKind::Format, .. })
+        Err(Error::Check {
+            kind: CheckFailureKind::Format,
+            ..
+        })
     ));
 }
 
@@ -1336,10 +1409,7 @@ fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
         inject(&db);
         assert!(matches!(db.flush(), Err(Error::Io(_))));
         assert!(db.durability_status().write_fenced);
-        assert_eq!(
-            path.join("seerdb.wal").exists(),
-            expect_wal_before_reopen
-        );
+        assert_eq!(path.join("seerdb.wal").exists(), expect_wal_before_reopen);
 
         drop(db);
         let reopened = DB::open(&path, Options::default()).unwrap();

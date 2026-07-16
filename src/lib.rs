@@ -49,8 +49,9 @@ pub mod storage;
 // Re-export main types at crate root.
 pub use db::{
     BatchMutation, CheckReport, CompactionReport, DB, DBMetrics, DurabilityStatus, Options,
-    RepairAction, RepairReport, RestoreReport, Snapshot, SnapshotReport, VerificationReport,
-    WalCheckStatus,
+    RepairAction, RepairReport, RestoreReport, RetainedSnapshot, Snapshot, SnapshotReport,
+    VerificationReport, WalCheckStatus,
 };
 pub use error::{CheckFailureKind, Error, Result};
 pub use storage::StorageMetrics;
+pub use storage::format::SnapshotId;

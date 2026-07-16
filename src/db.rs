@@ -9,23 +9,25 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BlobPointer, BTree, LookupResult, PAGE_SIZE};
+use crate::btree::{BTree, BlobPointer, LookupResult, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
-use crate::space::{preallocate_file, reserve_file, Device, DeviceOptions};
-use crate::storage::{StorageEngine, StorageMetrics};
+use crate::space::{Device, DeviceOptions, preallocate_file, reserve_file};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestStore, PmtCheckpointId,
+    ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, SnapshotId,
 };
+use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -52,12 +54,12 @@ const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
+const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
 const META_MAGIC: [u8; 8] = *b"SEERMET1";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
-const WAL_COMMIT_RECORD_BYTES: u64 =
-    (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
+const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +249,29 @@ pub struct Snapshot {
     released: bool,
 }
 
+/// An owned retained snapshot backed by a verified read-only copy and a
+/// durable root-generation retention lease.
+///
+/// The copy is the current read implementation; the lease is the physical
+/// safety boundary. Retained page versions are not reused while the lease is
+/// live, so the eventual in-history reader can replace the copy without
+/// changing the reclamation contract.
+pub struct RetainedSnapshot {
+    snapshot: Option<Snapshot>,
+    lease: Option<RetentionLease>,
+}
+
+struct RetentionState {
+    path: PathBuf,
+    registry: RetentionRegistry,
+}
+
+struct RetentionLease {
+    state: Arc<Mutex<RetentionState>>,
+    snapshot_id: SnapshotId,
+    released: bool,
+}
+
 impl Snapshot {
     /// Return the snapshot directory path.
     pub fn path(&self) -> &Path {
@@ -304,6 +329,142 @@ impl Drop for Snapshot {
     }
 }
 
+impl RetentionState {
+    fn load(path: PathBuf) -> Result<Self> {
+        let registry = if path.exists() {
+            let bytes = fs::read(&path)?;
+            RetentionRegistry::from_bytes(&bytes)
+                .map_err(|message| Error::Corruption(format!("retention registry {message}")))?
+        } else {
+            RetentionRegistry::new()
+        };
+        Ok(Self { path, registry })
+    }
+
+    fn persist(&self, registry: &RetentionRegistry) -> Result<()> {
+        if registry.is_empty() {
+            if self.path.exists() {
+                fs::remove_file(&self.path)?;
+                sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))?;
+            }
+            return Ok(());
+        }
+        let bytes = registry
+            .to_bytes()
+            .ok_or_else(|| Error::Wal("retention registry is too large".into()))?;
+        atomic_write(&self.path, &bytes)
+    }
+
+    fn insert(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+        let mut candidate = self.registry.clone();
+        let snapshot_id = candidate
+            .insert(manifest)
+            .ok_or_else(|| Error::Wal("snapshot ID overflow".into()))?;
+        self.persist(&candidate)?;
+        self.registry = candidate;
+        Ok(snapshot_id)
+    }
+
+    fn remove(&mut self, snapshot_id: SnapshotId) -> Result<()> {
+        let mut candidate = self.registry.clone();
+        if candidate.remove(snapshot_id).is_none() {
+            return Err(Error::InvalidArgument(format!(
+                "unknown retained snapshot {}",
+                snapshot_id.get()
+            )));
+        }
+        self.persist(&candidate)?;
+        self.registry = candidate;
+        Ok(())
+    }
+
+    fn roots(&self) -> &[RetainedRoot] {
+        self.registry.roots()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.registry.is_empty()
+    }
+}
+
+impl RetentionLease {
+    fn release(mut self) -> Result<()> {
+        if !self.released {
+            self.state
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?
+                .remove(self.snapshot_id)?;
+            self.released = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RetentionLease {
+    fn drop(&mut self) {
+        if !self.released {
+            if let Ok(mut state) = self.state.lock() {
+                let _ = state.remove(self.snapshot_id);
+            }
+            self.released = true;
+        }
+    }
+}
+
+impl RetainedSnapshot {
+    /// Return the durable retention identifier.
+    pub fn snapshot_id(&self) -> SnapshotId {
+        self.lease
+            .as_ref()
+            .map(|lease| lease.snapshot_id)
+            .unwrap_or_default()
+    }
+
+    /// Return the path of the conservative read copy while it is live.
+    pub fn path(&self) -> Option<&Path> {
+        self.snapshot.as_ref().map(Snapshot::path)
+    }
+
+    /// Read a value from the retained snapshot.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.snapshot
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .get(key)
+    }
+
+    /// Scan a range in the retained snapshot.
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.snapshot
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .range(start, end)
+    }
+
+    /// Verify the retained snapshot independently.
+    pub fn verify(&mut self) -> Result<VerificationReport> {
+        self.snapshot
+            .as_mut()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .verify()
+    }
+
+    /// Return the durable identity captured by this retained snapshot.
+    pub fn durability_status(&self) -> Result<DurabilityStatus> {
+        self.snapshot
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
+            .durability_status()
+    }
+
+    /// Release the physical root-retention lease and temporary read copy.
+    pub fn release(mut self) -> Result<()> {
+        let lease_result = self.lease.take().map_or(Ok(()), RetentionLease::release);
+        let snapshot_result = self.snapshot.take().map_or(Ok(()), Snapshot::release);
+        lease_result.and(snapshot_result)
+    }
+}
+
 /// Results from trimming reclaimable trailing data pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionReport {
@@ -358,6 +519,8 @@ pub struct DB {
     wal: WalManager,
     /// Blob manager.
     blobs: BlobManager,
+    /// Durable retained-root registry shared with retained snapshot handles.
+    retention: Arc<Mutex<RetentionState>>,
     /// Transaction manager for MVCC.
     txn_manager: TransactionManager,
     /// Authoritative root-generation publication store.
@@ -401,9 +564,7 @@ impl DB {
     pub fn check<P: AsRef<Path>>(path: P, options: Options) -> Result<CheckReport> {
         let mut db = Self::open_with_mode(path, options, OpenMode::Check)
             .map_err(Self::map_check_open_error)?;
-        let verification = db
-            .verify_inner()
-            .map_err(VerificationFailure::into_error)?;
+        let verification = db.verify_inner().map_err(VerificationFailure::into_error)?;
         let wal_status = db
             .wal_check_status()
             .map_err(|error| Self::map_check_error(CheckFailureKind::Wal, error))?;
@@ -452,11 +613,7 @@ impl DB {
         }
     }
 
-    fn open_with_mode<P: AsRef<Path>>(
-        path: P,
-        options: Options,
-        mode: OpenMode,
-    ) -> Result<Self> {
+    fn open_with_mode<P: AsRef<Path>>(path: P, options: Options, mode: OpenMode) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let check_only = mode == OpenMode::Check;
 
@@ -506,9 +663,8 @@ impl DB {
         }
 
         let mut manifest = if check_only {
-            ManifestStore::open_read_only(&manifest_path).map_err(|error| {
-                Self::map_check_error(CheckFailureKind::Manifest, error)
-            })?
+            ManifestStore::open_read_only(&manifest_path)
+                .map_err(|error| Self::map_check_error(CheckFailureKind::Manifest, error))?
         } else {
             ManifestStore::open(&manifest_path)?
         };
@@ -547,6 +703,31 @@ impl DB {
                     CommitId::new(0),
                 )
             };
+
+        let retention_path = path.join(RETENTION_FILE);
+        let retention = Arc::new(Mutex::new(RetentionState::load(retention_path).map_err(
+            |error| {
+                if check_only {
+                    Self::map_check_error(CheckFailureKind::Format, error)
+                } else {
+                    error
+                }
+            },
+        )?));
+        let retained_offsets = {
+            let state = retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            Self::load_retained_offsets(&path, &state, database_id, history_id).map_err(
+                |error| {
+                    if check_only {
+                        Self::map_check_error(CheckFailureKind::Checkpoint, error)
+                    } else {
+                        error
+                    }
+                },
+            )?
+        };
 
         // Open the data file.
         let device_opts = DeviceOptions {
@@ -593,9 +774,9 @@ impl DB {
         } else {
             BlobManager::with_threshold(options.blob_threshold)
         };
-        if current_manifest.is_some_and(|current| {
-            blobs.generation_id() != current.generation_id.get()
-        }) {
+        if current_manifest
+            .is_some_and(|current| blobs.generation_id() != current.generation_id.get())
+        {
             // A blob image is written before its manifest. If publication
             // stopped between those boundaries, deletion marks from the
             // newer image must not make pages referenced by the older
@@ -633,6 +814,7 @@ impl DB {
 
         // Create storage engine.
         let mut engine = StorageEngine::new(BTree::new(), buffer, pmt, allocator, device);
+        engine.set_protected_offsets(retained_offsets)?;
 
         // A published manifest selects the PMT locations for the latest
         // generation. Without one, retain the legacy scan as a migration path.
@@ -666,6 +848,7 @@ impl DB {
             engine,
             wal,
             blobs,
+            retention,
             txn_manager: TransactionManager::new(),
             manifest,
             database_id,
@@ -1161,7 +1344,9 @@ impl DB {
         let remainder = self.options.max_wal_bytes % WAL_RESERVATION_SEGMENT_BYTES;
         self.options
             .max_wal_bytes
-            .checked_add((WAL_RESERVATION_SEGMENT_BYTES - remainder) % WAL_RESERVATION_SEGMENT_BYTES)
+            .checked_add(
+                (WAL_RESERVATION_SEGMENT_BYTES - remainder) % WAL_RESERVATION_SEGMENT_BYTES,
+            )
             .ok_or(Error::DiskFull)
     }
 
@@ -1345,6 +1530,17 @@ impl DB {
     pub fn gc(&mut self) -> Result<usize> {
         self.check_writable()?;
         self.flush()?;
+        if !self
+            .retention
+            .lock()
+            .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?
+            .is_empty()
+        {
+            // The current retained read view is copy-backed, but retaining the
+            // root still establishes the conservative physical contract. Do
+            // not delete blob history until the lease is released.
+            return Ok(0);
+        }
         if self.blobs.has_reclaimable_files() {
             // Admission must precede removal from the in-memory catalog. The
             // current image is an upper bound for the compacted image, so a
@@ -1484,11 +1680,9 @@ impl DB {
             let bytes = fs::read(&blob_path).map_err(|error| {
                 VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
             })?;
-            BlobManager::from_bytes(&bytes).ok_or_else(|| {
-                VerificationFailure {
-                    kind: CheckFailureKind::Blob,
-                    message: "blob file failed integrity verification".into(),
-                }
+            BlobManager::from_bytes(&bytes).ok_or_else(|| VerificationFailure {
+                kind: CheckFailureKind::Blob,
+                message: "blob file failed integrity verification".into(),
             })?;
             bytes.len() as u64
         } else {
@@ -1860,6 +2054,49 @@ impl DB {
         })
     }
 
+    /// Retain the current root generation with a durable physical lease.
+    ///
+    /// The current read implementation is an independently verified copy,
+    /// while the source registry pins every page named by the retained PMT.
+    /// This makes reclamation safe today and leaves the public contract ready
+    /// for a shared in-history reader in a later slice.
+    pub fn retain_current(&mut self) -> Result<RetainedSnapshot> {
+        self.check_writable()?;
+        let snapshot = self.begin_snapshot()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        let snapshot_id = {
+            let mut state = self
+                .retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            state.insert(manifest)?
+        };
+
+        let protected = {
+            let state = self
+                .retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            Self::load_retained_offsets(&self.path, &state, self.database_id, self.history_id)?
+        };
+        if let Err(error) = self.engine.set_protected_offsets(protected) {
+            self.write_fenced = true;
+            return Err(error);
+        }
+
+        Ok(RetainedSnapshot {
+            snapshot: Some(snapshot),
+            lease: Some(RetentionLease {
+                state: Arc::clone(&self.retention),
+                snapshot_id,
+                released: false,
+            }),
+        })
+    }
+
     fn next_snapshot_path(&self) -> Result<PathBuf> {
         Self::next_derived_path(&self.path, "snapshot")
     }
@@ -2180,6 +2417,67 @@ impl DB {
         Self::load_legacy_meta(&data)
     }
 
+    fn load_retained_offsets(
+        path: &Path,
+        state: &RetentionState,
+        database_id: DatabaseId,
+        history_id: HistoryId,
+    ) -> Result<HashSet<u64>> {
+        let mut protected = HashSet::new();
+        for root in state.roots() {
+            if root.manifest.database_id != database_id {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} belongs to another database",
+                    root.snapshot_id.get()
+                )));
+            }
+            if root.manifest.history_id != history_id {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} belongs to another history",
+                    root.snapshot_id.get()
+                )));
+            }
+            if root.manifest.page_size as usize != PAGE_SIZE {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} has page size {}",
+                    root.snapshot_id.get(),
+                    root.manifest.page_size
+                )));
+            }
+            if root.manifest.pmt_checkpoint_id.get() == 0 {
+                if root.manifest.root_page_id != 0 {
+                    return Err(Error::Corruption(format!(
+                        "retained snapshot {} has a root without a checkpoint",
+                        root.snapshot_id.get()
+                    )));
+                }
+                continue;
+            }
+
+            let checkpoint = path.join(format!(
+                "seerdb.meta.{}",
+                root.manifest.pmt_checkpoint_id.get()
+            ));
+            let (pmt, _) = Self::load_meta(&checkpoint)?;
+            if !pmt.contains(root.manifest.root_page_id) {
+                return Err(Error::Corruption(format!(
+                    "retained snapshot {} names a root missing from its checkpoint",
+                    root.snapshot_id.get()
+                )));
+            }
+            for (_, mapping) in pmt.iter() {
+                if mapping.file_id != 0 || !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
+                    return Err(Error::Corruption(format!(
+                        "retained snapshot {} names an invalid page mapping",
+                        root.snapshot_id.get()
+                    )));
+                }
+                protected.insert(mapping.offset);
+            }
+        }
+        Ok(protected)
+    }
+
     fn load_versioned_meta(data: &[u8]) -> Result<(PMT, PageAllocator)> {
         const HEADER_SIZE: usize = META_MAGIC.len() + 4;
         const CHECKSUM_SIZE: usize = 4;
@@ -2187,9 +2485,11 @@ impl DB {
             return Err(Error::Corruption("meta file is truncated".into()));
         }
 
-        let version = u32::from_le_bytes(data[META_MAGIC.len()..HEADER_SIZE].try_into().map_err(
-            |_| Error::Corruption("meta version is truncated".into()),
-        )?);
+        let version = u32::from_le_bytes(
+            data[META_MAGIC.len()..HEADER_SIZE]
+                .try_into()
+                .map_err(|_| Error::Corruption("meta version is truncated".into()))?,
+        );
         if version != FORMAT_VERSION {
             return Err(Error::Corruption(format!(
                 "unsupported meta format version {version}"
@@ -2211,7 +2511,6 @@ impl DB {
     }
 
     fn load_legacy_meta(data: &[u8]) -> Result<(PMT, PageAllocator)> {
-
         if data.len() < 4 {
             return Err(Error::Corruption("meta file too small".into()));
         }
@@ -2446,10 +2745,8 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
             apply_put_mutation(key, value, btree, blobs)?;
         }
         RecordType::Delete | RecordType::DeleteV2 => {
-            let key = decode_delete_payload(
-                record.record_type == RecordType::DeleteV2,
-                &record.payload,
-            )?;
+            let key =
+                decode_delete_payload(record.record_type == RecordType::DeleteV2, &record.payload)?;
             let previous_blob = match btree.lookup(key)? {
                 LookupResult::Blob(pointer) => Some(pointer),
                 _ => None,
@@ -2504,10 +2801,8 @@ fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
     if payload.len() < value_len_offset + 2 {
         return Err(Error::Corruption("WAL put key is truncated".into()));
     }
-    let value_len = u16::from_le_bytes([
-        payload[value_len_offset],
-        payload[value_len_offset + 1],
-    ]) as usize;
+    let value_len =
+        u16::from_le_bytes([payload[value_len_offset], payload[value_len_offset + 1]]) as usize;
     let value_offset = value_len_offset + 2;
     if payload.len() != value_offset + value_len {
         return Err(Error::Corruption("WAL put value is truncated".into()));
@@ -2922,9 +3217,7 @@ mod tests {
         db.put(b"key", &value).unwrap();
         assert!(path.join(WAL_FILE).is_file());
         assert!(!path.join(WAL_RESERVATION_FILE).exists());
-        assert!(
-            fs::metadata(path.join(WAL_FILE)).unwrap().len() < WAL_RESERVATION_SEGMENT_BYTES
-        );
+        assert!(fs::metadata(path.join(WAL_FILE)).unwrap().len() < WAL_RESERVATION_SEGMENT_BYTES);
         assert!(path.join(BLOB_RESERVATION_FILE).is_file());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(
@@ -3070,7 +3363,10 @@ mod tests {
             Some(b"updated-250".to_vec())
         );
         assert_eq!(reopened.get(b"key-000300").unwrap(), None);
-        assert_eq!(reopened.get(b"key-000450").unwrap(), Some(b"updated-450".to_vec()));
+        assert_eq!(
+            reopened.get(b"key-000450").unwrap(),
+            Some(b"updated-450".to_vec())
+        );
     }
 
     #[test]
@@ -3107,7 +3403,10 @@ mod tests {
             .range(b"key-000250-new-000", b"key-000250-new-120")
             .unwrap();
         assert_eq!(values.len(), 120);
-        assert_eq!(values[0], (b"key-000250-new-000".to_vec(), b"new-value".to_vec()));
+        assert_eq!(
+            values[0],
+            (b"key-000250-new-000".to_vec(), b"new-value".to_vec())
+        );
         assert_eq!(values[119].0, b"key-000250-new-119");
     }
 
@@ -3195,7 +3494,10 @@ mod tests {
         ));
         assert!(matches!(
             DB::check(&path, Options::default()),
-            Err(Error::Check { kind: CheckFailureKind::DataPage, .. })
+            Err(Error::Check {
+                kind: CheckFailureKind::DataPage,
+                ..
+            })
         ));
     }
 
@@ -3566,14 +3868,13 @@ mod tests {
         // must still name value-2 even though the failed generation reused an
         // older physical page.
         let manifest_path = path.join(MANIFEST_FILE);
-        let mut manifest_file = OpenOptions::new()
-            .write(true)
-            .open(&manifest_path)
-            .unwrap();
+        let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
         manifest_file
             .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
             .unwrap();
-        manifest_file.write_all(&[0xA5; MANIFEST_SLOT_SIZE]).unwrap();
+        manifest_file
+            .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
+            .unwrap();
         manifest_file.sync_all().unwrap();
 
         let reopened = DB::open(&path, Options::default()).unwrap();

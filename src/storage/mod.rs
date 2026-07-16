@@ -6,14 +6,14 @@
 pub mod format;
 
 use crate::allocator::PageAllocator;
-use crate::btree::{BlobPointer, BTree, BTreeError, LookupResult, Node, ValueRef, PAGE_SIZE};
+use crate::btree::{BTree, BTreeError, BlobPointer, LookupResult, Node, PAGE_SIZE, ValueRef};
 use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 /// Cumulative physical work performed by one storage-engine handle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +94,11 @@ pub struct StorageEngine {
     /// Cache identities retired by the last flush, pending manifest
     /// publication. They cannot be evicted before the old root is fenced off.
     pending_reclaimed_cache_keys: Vec<PageCacheKey>,
+    /// Physical page offsets referenced by retained root generations. These
+    /// pages remain unavailable for reuse until the corresponding retention
+    /// lease is released and the database is reopened or refreshes its
+    /// reclamation view.
+    protected_offsets: HashSet<u64>,
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
@@ -119,6 +124,7 @@ impl StorageEngine {
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
+            protected_offsets: HashSet::new(),
             lazy_root: None,
             metrics: StorageCounters::default(),
         }
@@ -171,6 +177,31 @@ impl StorageEngine {
     /// Number of physical page slots available for safe reuse.
     pub fn reclaimable_page_count(&self) -> usize {
         self.free_offsets.len()
+    }
+
+    /// Install the physical offsets protected by retained root generations.
+    ///
+    /// Recomputing from the device extent is intentionally conservative: a
+    /// newly retained root can protect pages that were previously considered
+    /// free, while a released root is allowed to remain under-reclaimed until
+    /// the next reopen/refresh boundary.
+    pub fn set_protected_offsets(&mut self, protected_offsets: HashSet<u64>) -> Result<()> {
+        self.protected_offsets = protected_offsets;
+        self.refresh_reclaimable_offsets()
+    }
+
+    fn refresh_reclaimable_offsets(&mut self) -> Result<()> {
+        let device_size = self.device.size()?;
+        let active_offsets: HashSet<_> =
+            self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        self.free_offsets = (0..device_size)
+            .step_by(PAGE_SIZE)
+            .filter(|offset| {
+                !active_offsets.contains(offset) && !self.protected_offsets.contains(offset)
+            })
+            .collect();
+        self.next_offset = device_size;
+        Ok(())
     }
 
     /// Return the current data size and the size after trimming only trailing
@@ -226,7 +257,11 @@ impl StorageEngine {
     /// Before that point, the old generation may still be the authoritative
     /// root after a crash and its physical pages must remain untouched.
     pub fn complete_generation(&mut self) {
-        let reclaimed_pages = self.pending_reclaimed_offsets.len() as u64;
+        let reclaimed_pages = self
+            .pending_reclaimed_offsets
+            .iter()
+            .filter(|offset| !self.protected_offsets.contains(offset))
+            .count() as u64;
         self.metrics
             .reclaimed_pages
             .fetch_add(reclaimed_pages, Ordering::Relaxed);
@@ -234,8 +269,11 @@ impl StorageEngine {
             reclaimed_pages.saturating_mul(PAGE_SIZE as u64),
             Ordering::Relaxed,
         );
-        self.free_offsets
-            .append(&mut self.pending_reclaimed_offsets);
+        self.free_offsets.extend(
+            self.pending_reclaimed_offsets
+                .drain(..)
+                .filter(|offset| !self.protected_offsets.contains(offset)),
+        );
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
         if let Ok(mut buffer) = self.buffer.lock() {
@@ -398,10 +436,7 @@ impl StorageEngine {
                 // the resulting PMT only after all data is durable.
                 if let Some(mapping) = self.pmt.get(page_id as u64) {
                     retired_offsets.push(mapping.offset);
-                    retired_cache_keys.push(PageCacheKey::new(
-                        page_id as u64,
-                        mapping.version,
-                    ));
+                    retired_cache_keys.push(PageCacheKey::new(page_id as u64, mapping.version));
                 }
                 let (offset, reuses_retired_slot) = match self.free_offsets.last() {
                     Some(&offset) => (offset, true),
@@ -440,10 +475,7 @@ impl StorageEngine {
                     .get(page_id as u64)
                     .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
                     .version;
-                pending_rekeys.push((
-                    pending_key,
-                    PageCacheKey::new(page_id as u64, version),
-                ));
+                pending_rekeys.push((pending_key, PageCacheKey::new(page_id as u64, version)));
             }
         }
 
@@ -747,9 +779,9 @@ impl StorageEngine {
                 if key < separator.as_slice() {
                     break;
                 }
-                child_id = node.child_id(index).ok_or_else(|| {
-                    Error::Corruption("lazy internal child is malformed".into())
-                })?;
+                child_id = node
+                    .child_id(index)
+                    .ok_or_else(|| Error::Corruption("lazy internal child is malformed".into()))?;
             }
             current = u32::try_from(child_id).map_err(|_| {
                 Error::Corruption("lazy internal child ID exceeds logical width".into())
@@ -780,9 +812,9 @@ impl StorageEngine {
                 Error::Corruption("lazy internal child ID exceeds logical width".into())
             })?);
             for index in 0..node.count() {
-                let child = node.child_id(index).ok_or_else(|| {
-                    Error::Corruption("lazy internal child is malformed".into())
-                })?;
+                let child = node
+                    .child_id(index)
+                    .ok_or_else(|| Error::Corruption("lazy internal child is malformed".into()))?;
                 children.push(u32::try_from(child).map_err(|_| {
                     Error::Corruption("lazy internal child ID exceeds logical width".into())
                 })?);
@@ -829,9 +861,9 @@ impl StorageEngine {
         for (parent_id, child_position) in path.into_iter().rev() {
             let parent = self.read_node(parent_id as u64)?;
             if child_position < parent.count() {
-                let child = parent.child_id(child_position).ok_or_else(|| {
-                    Error::Corruption("lazy internal child is malformed".into())
-                })?;
+                let child = parent
+                    .child_id(child_position)
+                    .ok_or_else(|| Error::Corruption("lazy internal child is malformed".into()))?;
                 return self.leftmost_leaf_page(u32::try_from(child).map_err(|_| {
                     Error::Corruption("lazy internal child ID exceeds logical width".into())
                 })?);
@@ -860,7 +892,9 @@ impl StorageEngine {
             self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
-            .filter(|offset| !active_offsets.contains(offset))
+            .filter(|offset| {
+                !active_offsets.contains(offset) && !self.protected_offsets.contains(offset)
+            })
             .collect();
         self.pending_reclaimed_offsets.clear();
         self.pending_reclaimed_cache_keys.clear();
@@ -990,7 +1024,11 @@ impl StorageEngine {
                 "root page {root} is absent from PMT"
             )));
         }
-        if self.pmt.iter().any(|(page_id, _)| page_id > u32::MAX as u64) {
+        if self
+            .pmt
+            .iter()
+            .any(|(page_id, _)| page_id > u32::MAX as u64)
+        {
             return Err(Error::Corruption(
                 "PMT contains a page ID outside the logical width".into(),
             ));
@@ -998,14 +1036,7 @@ impl StorageEngine {
 
         let mut visited = HashSet::new();
         let mut blob_pointers = Vec::new();
-        self.verify_tree_node(
-            root,
-            0,
-            None,
-            None,
-            &mut visited,
-            &mut blob_pointers,
-        )?;
+        self.verify_tree_node(root, 0, None, None, &mut visited, &mut blob_pointers)?;
 
         if visited.len() != self.pmt.len() {
             let unreachable = self
@@ -1051,7 +1082,9 @@ impl StorageEngine {
                 .key(index)
                 .ok_or_else(|| Error::Corruption(format!("page {page_id} has malformed key")))?;
             if lower.as_deref().is_some_and(|bound| key.as_slice() < bound)
-                || upper.as_deref().is_some_and(|bound| key.as_slice() >= bound)
+                || upper
+                    .as_deref()
+                    .is_some_and(|bound| key.as_slice() >= bound)
             {
                 return Err(Error::Corruption(format!(
                     "page {page_id} key violates routing bounds"
@@ -1157,9 +1190,8 @@ impl StorageEngine {
             };
 
             // Deserialize the node and fail closed on malformed legacy data.
-            let node = Node::from_bytes(buffered_page).ok_or_else(|| {
-                Error::Corruption(format!("invalid page at offset {offset}"))
-            })?;
+            let node = Node::from_bytes(buffered_page)
+                .ok_or_else(|| Error::Corruption(format!("invalid page at offset {offset}")))?;
             if !node.verify_checksum() {
                 return Err(Error::Corruption(format!(
                     "page checksum mismatch at offset {offset}"
