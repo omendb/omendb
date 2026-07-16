@@ -197,3 +197,29 @@ fn dbnext_r0_capacity_limit_preserves_last_generation() {
         committed_status.commit_id
     );
 }
+
+#[test]
+fn dbnext_r0_rejects_future_manifest_version() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("future-format.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let manifest_path = path.join("MANIFEST");
+    let slot_size = seerdb::storage::format::MANIFEST_SLOT_SIZE;
+    let mut manifest = fs::read(&manifest_path).unwrap();
+    for slot in manifest.chunks_exact_mut(slot_size) {
+        slot[8..12].copy_from_slice(&(seerdb::storage::format::FORMAT_VERSION + 1).to_le_bytes());
+        let checksum = crc32c::crc32c(&slot[..252]);
+        slot[252..].copy_from_slice(&checksum.to_le_bytes());
+    }
+    fs::write(manifest_path, manifest).unwrap();
+
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(_))
+    ));
+}
