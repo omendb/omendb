@@ -2066,6 +2066,11 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         .truncate(true)
         .write(true)
         .open(&temporary)?;
+    if let Err(error) = preallocate_file(&file, data.len() as u64) {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     file.write_all(data)?;
     file.flush()?;
     file.sync_all()?;
