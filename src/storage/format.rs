@@ -9,6 +9,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+#[cfg(any(test, feature = "fault-injection"))]
+use std::cell::Cell;
+
+#[cfg(any(test, feature = "fault-injection"))]
+thread_local! {
+    static FAIL_NEXT_MANIFEST_SYNC: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Current durable format version.
 pub const FORMAT_VERSION: u32 = 2;
 
@@ -400,6 +408,12 @@ impl ManifestStore {
         let bytes = manifest.to_bytes();
         self.write_slot(target_slot, &bytes)?;
         self.file.flush()?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected manifest sync failure").into());
+        }
+
         self.file.sync_all()?;
         Ok(())
     }
@@ -414,8 +428,20 @@ impl ManifestStore {
         self.write_slot(0, &bytes)?;
         self.write_slot(1, &bytes)?;
         self.file.flush()?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected manifest sync failure").into());
+        }
+
         self.file.sync_all()?;
         Ok(())
+    }
+
+    /// Inject one failure at the next manifest sync boundary.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_sync_failure(&self) {
+        FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.set(true));
     }
 
     fn write_slot(&mut self, slot: usize, bytes: &[u8; MANIFEST_SLOT_SIZE]) -> Result<()> {

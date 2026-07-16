@@ -34,6 +34,9 @@ use std::cell::Cell;
 #[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     static FAIL_NEXT_ATOMIC_RENAME: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_WAL_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_WAL_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_WAL_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
@@ -808,12 +811,24 @@ impl DB {
                 .open(&wal_path)?;
             if !wal_buf.is_empty() {
                 // Append to WAL file (not overwrite).
+                #[cfg(any(test, feature = "fault-injection"))]
+                if FAIL_NEXT_WAL_WRITE.with(|failure| failure.replace(false)) {
+                    return Err(std::io::Error::other("injected WAL append failure").into());
+                }
                 use std::io::Write;
                 file.write_all(&wal_buf)?;
+                #[cfg(any(test, feature = "fault-injection"))]
+                if FAIL_NEXT_WAL_AFTER_WRITE.with(|failure| failure.replace(false)) {
+                    return Err(std::io::Error::other("injected post-append WAL failure").into());
+                }
             }
             if should_sync {
                 // The commit boundary and any configured per-mutation policy
                 // force the WAL before dependent page publication.
+                #[cfg(any(test, feature = "fault-injection"))]
+                if FAIL_NEXT_WAL_SYNC.with(|failure| failure.replace(false)) {
+                    return Err(std::io::Error::other("injected WAL sync failure").into());
+                }
                 match self.wal.sync_policy() {
                     SyncPolicy::SyncAll => file.sync_all()?,
                     SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data()?,
@@ -1746,6 +1761,30 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_atomic_rename_failure(&self) {
         inject_atomic_rename_failure();
+    }
+
+    /// Inject one failure before the next WAL append.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_wal_write_failure(&self) {
+        FAIL_NEXT_WAL_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after the next WAL append but before its sync.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_wal_after_write_failure(&self) {
+        FAIL_NEXT_WAL_AFTER_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure at the next WAL sync boundary.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_wal_sync_failure(&self) {
+        FAIL_NEXT_WAL_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure at the next manifest sync boundary.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_manifest_sync_failure(&self) {
+        self.manifest.inject_sync_failure();
     }
 
     /// Begin a new transaction.

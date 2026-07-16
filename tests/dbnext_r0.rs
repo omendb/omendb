@@ -251,6 +251,59 @@ fn dbnext_r0_capacity_limit_preserves_last_generation() {
 }
 
 #[test]
+fn dbnext_r0_wal_mutation_faults_fence_and_recover_prior_state() {
+    fn run_case<F>(root: &Path, name: &str, options: Options, inject: F)
+    where
+        F: FnOnce(&DB),
+    {
+        let path = root.join(name);
+        let mut db = DB::open(&path, options).unwrap();
+        db.put(b"stable", b"before-wal-fault").unwrap();
+        db.flush().unwrap();
+
+        inject(&db);
+        assert!(matches!(
+            db.put(b"pending", b"must-not-commit"),
+            Err(Error::Io(_))
+        ));
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(
+            reopened.get(b"stable").unwrap(),
+            Some(b"before-wal-fault".to_vec())
+        );
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        assert!(!reopened.durability_status().write_fenced);
+        assert!(!path.join("seerdb.wal").exists());
+    }
+
+    let root = tempdir().unwrap();
+    run_case(
+        root.path(),
+        "wal-before-append.db",
+        Options::default(),
+        DB::inject_wal_write_failure,
+    );
+    run_case(
+        root.path(),
+        "wal-after-append.db",
+        Options::default(),
+        DB::inject_wal_after_write_failure,
+    );
+    run_case(
+        root.path(),
+        "wal-sync.db",
+        Options {
+            sync_writes: true,
+            ..Options::default()
+        },
+        DB::inject_wal_sync_failure,
+    );
+}
+
+#[test]
 fn dbnext_r0_rejects_future_manifest_version() {
     let root = tempdir().unwrap();
     let path = root.path().join("future-format.db");
@@ -989,6 +1042,33 @@ fn dbnext_r0_compact_failure_fences_writer_until_reopen() {
     db.flush().unwrap();
 
     db.inject_sync_failure();
+    assert!(matches!(db.compact(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    assert!(matches!(
+        db.put(b"after-fault", b"value"),
+        Err(Error::NeedsRecovery(_))
+    ));
+
+    drop(db);
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn dbnext_r0_manifest_sync_fault_fences_compaction_and_recovers() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("manifest-sync-fault.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-2").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-3").unwrap();
+    db.flush().unwrap();
+
+    db.inject_manifest_sync_failure();
     assert!(matches!(db.compact(), Err(Error::Io(_))));
     assert!(db.durability_status().write_fenced);
     assert!(matches!(
