@@ -316,3 +316,58 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
     assert_eq!(recovered.durability_status().pending_mutations, 0);
     assert!(!recovered.durability_status().write_fenced);
 }
+
+#[test]
+fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
+    let root = tempdir().unwrap();
+    let source_path = root.path().join("snapshot-source.db");
+    let snapshot_path = root.path().join("snapshot-copy.db");
+    let large_value = vec![0x5Au8; 2_048];
+    let mut source = DB::open(&source_path, Options::default()).unwrap();
+    source.put(b"inline", b"value").unwrap();
+    source.put(b"large", &large_value).unwrap();
+    source.flush().unwrap();
+
+    let source_report = source.verify().unwrap();
+    assert!(source_report.verified_pages > 0);
+    assert_eq!(source_report.wal_bytes, 0);
+
+    let snapshot = source.snapshot(&snapshot_path).unwrap();
+    assert_eq!(snapshot.source, source_report.durability);
+    assert_eq!(snapshot.destination, source_report.durability);
+    assert!(snapshot.copied_files >= 3);
+    assert_eq!(snapshot.verified_pages, source_report.verified_pages);
+    assert_eq!(source.get(b"inline").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(source.get(b"large").unwrap(), Some(large_value.clone()));
+
+    let mut restored = DB::open(&snapshot_path, Options::default()).unwrap();
+    let restored_report = restored.verify().unwrap();
+    assert_eq!(restored_report.durability, source_report.durability);
+    assert_eq!(restored.get(b"inline").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(restored.get(b"large").unwrap(), Some(large_value));
+}
+
+#[test]
+fn dbnext_r0_rejects_corrupt_blob_artifact() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("corrupt-blob.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"large", &vec![0xA5; 2_048]).unwrap();
+    db.flush().unwrap();
+
+    let blob_path = path.join("seerdb.blob");
+    let mut blob = fs::read(&blob_path).unwrap();
+    let corrupt_at = blob.len() - 1;
+    blob[corrupt_at] ^= 0xFF;
+    fs::write(&blob_path, blob).unwrap();
+
+    assert!(matches!(
+        db.verify(),
+        Err(Error::Corruption(message)) if message.contains("blob")
+    ));
+    drop(db);
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message)) if message.contains("blob")
+    ));
+}

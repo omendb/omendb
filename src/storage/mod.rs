@@ -260,6 +260,74 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Verify every active PMT page and its checksum without changing the
+    /// logical tree or publication state.
+    pub fn verify_pages(&mut self, root_page_id: u64) -> Result<(u64, u64)> {
+        let device_size = self.device.size()?;
+        if self.pmt.is_empty() {
+            if root_page_id != 0 {
+                return Err(Error::Corruption(format!(
+                    "empty PMT names non-zero root page {root_page_id}"
+                )));
+            }
+            return Ok((0, device_size));
+        }
+
+        let max_page_id = self
+            .pmt
+            .iter()
+            .map(|(page_id, _)| page_id)
+            .max()
+            .ok_or_else(|| Error::Corruption("PMT unexpectedly has no maximum page".into()))?;
+        if root_page_id > u32::MAX as u64 || root_page_id > max_page_id {
+            return Err(Error::Corruption(format!(
+                "root page {root_page_id} is outside PMT"
+            )));
+        }
+
+        let mut verified_pages = 0u64;
+        for page_id in 0..=max_page_id {
+            let mapping = self
+                .pmt
+                .get(page_id)
+                .ok_or_else(|| Error::Corruption(format!("PMT missing page {page_id}")))?;
+            if !mapping.offset.is_multiple_of(PAGE_SIZE as u64) {
+                return Err(Error::Corruption(format!(
+                    "page {page_id} has unaligned offset {}",
+                    mapping.offset
+                )));
+            }
+            let end = mapping
+                .offset
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| Error::Corruption(format!("page {page_id} offset overflows")))?;
+            if end > device_size {
+                return Err(Error::Corruption(format!(
+                    "page {page_id} at offset {} exceeds data file size {device_size}",
+                    mapping.offset
+                )));
+            }
+
+            let mut page = [0u8; PAGE_SIZE];
+            self.device.read_page(mapping.offset, &mut page)?;
+            let node = Node::from_bytes(Box::new(page)).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "invalid page {page_id} at offset {}",
+                    mapping.offset
+                ))
+            })?;
+            if !node.verify_checksum() {
+                return Err(Error::Corruption(format!(
+                    "page checksum mismatch at offset {}",
+                    mapping.offset
+                )));
+            }
+            verified_pages += 1;
+        }
+
+        Ok((verified_pages, device_size))
+    }
+
     /// Load all pages from disk into the B-tree.
     ///
     /// This is a temporary implementation for bootstrapping.

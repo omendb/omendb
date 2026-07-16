@@ -68,6 +68,36 @@ pub struct DurabilityStatus {
     pub write_fenced: bool,
 }
 
+/// Results from a read-only integrity verification pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerificationReport {
+    /// Durable identity and publication state that was verified.
+    pub durability: DurabilityStatus,
+    /// Number of active PMT pages with valid checksums.
+    pub verified_pages: u64,
+    /// Current data-file size in bytes.
+    pub data_bytes: u64,
+    /// Current serialized blob-file size in bytes.
+    pub blob_bytes: u64,
+    /// Current WAL size in bytes, if a pending batch exists.
+    pub wal_bytes: u64,
+    /// Physical page slots currently safe for reuse.
+    pub reclaimable_pages: u64,
+}
+
+/// Results from creating and independently verifying a snapshot directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotReport {
+    /// Source durability state at the snapshot boundary.
+    pub source: DurabilityStatus,
+    /// Destination durability state after reopen and verification.
+    pub destination: DurabilityStatus,
+    /// Number of durable artifacts copied into the snapshot.
+    pub copied_files: u32,
+    /// Number of destination pages verified after reopen.
+    pub verified_pages: u64,
+}
+
 /// A seerdb database instance.
 ///
 /// Provides key-value storage with:
@@ -79,7 +109,6 @@ pub struct DB {
     /// Database directory path.
     path: PathBuf,
     /// Configuration options.
-    #[expect(dead_code)]
     options: Options,
     /// Storage engine (coordinates B-tree, buffer, PMT, device).
     engine: StorageEngine,
@@ -173,8 +202,9 @@ impl DB {
         let mut blobs = if blob_path.exists() {
             // Load blob files from disk.
             let blob_data = fs::read(&blob_path)?;
-            BlobManager::from_bytes(&blob_data)
-                .unwrap_or_else(|| BlobManager::with_threshold(options.blob_threshold))
+            BlobManager::from_bytes(&blob_data).ok_or_else(|| {
+                Error::Corruption("blob file is truncated or has an invalid checksum".into())
+            })?
         } else {
             BlobManager::with_threshold(options.blob_threshold)
         };
@@ -512,6 +542,138 @@ impl DB {
         }
     }
 
+    /// Verify the active manifest, checkpoint, pages, blob file, and WAL.
+    ///
+    /// This pass does not mutate logical state and is intended for DBNext
+    /// check/repair tooling and pre-snapshot validation.
+    pub fn verify(&mut self) -> Result<VerificationReport> {
+        self.check_open()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+        if manifest.database_id != self.database_id
+            || manifest.history_id != self.history_id
+            || manifest.generation_id != self.generation_id
+            || manifest.commit_id != self.commit_id
+        {
+            return Err(Error::Corruption(
+                "manifest identity does not match the open database".into(),
+            ));
+        }
+
+        let (verified_pages, data_bytes) = self.engine.verify_pages(manifest.root_page_id)?;
+
+        if manifest.pmt_checkpoint_id.get() != 0 {
+            let checkpoint_path = self
+                .path
+                .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
+            let (checkpoint_pmt, checkpoint_allocator) = Self::load_meta(&checkpoint_path)?;
+            if checkpoint_pmt.to_bytes() != self.engine.pmt().to_bytes()
+                || checkpoint_allocator.to_bytes() != self.engine.allocator().to_bytes()
+            {
+                return Err(Error::Corruption(
+                    "manifest checkpoint does not match active PMT or allocator".into(),
+                ));
+            }
+        }
+
+        let blob_path = self.path.join(BLOB_FILE);
+        let blob_bytes = if blob_path.exists() {
+            let bytes = fs::read(&blob_path)?;
+            BlobManager::from_bytes(&bytes).ok_or_else(|| {
+                Error::Corruption("blob file failed integrity verification".into())
+            })?;
+            bytes.len() as u64
+        } else {
+            0
+        };
+
+        let wal_path = self.path.join(WAL_FILE);
+        let wal_bytes = if wal_path.exists() {
+            let bytes = fs::read(&wal_path)?;
+            let (_, status) = WalManager::parse_records_with_status(&bytes);
+            if status != ParseStatus::Complete {
+                return Err(Error::Corruption(format!(
+                    "WAL integrity status is {status:?}"
+                )));
+            }
+            bytes.len() as u64
+        } else {
+            0
+        };
+
+        Ok(VerificationReport {
+            durability: self.durability_status(),
+            verified_pages,
+            data_bytes,
+            blob_bytes,
+            wal_bytes,
+            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
+        })
+    }
+
+    /// Flush and create an atomically published, independently verified
+    /// snapshot in a new directory without mutating the source directory.
+    pub fn snapshot<P: AsRef<Path>>(&mut self, destination: P) -> Result<SnapshotReport> {
+        self.check_writable()?;
+        self.flush()?;
+        let source_report = self.verify()?;
+        let destination = destination.as_ref().to_path_buf();
+        if destination.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot destination already exists: {}",
+                destination.display()
+            )));
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = destination.with_extension("seerdb.snapshot.tmp");
+        if temporary.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot temporary path already exists: {}",
+                temporary.display()
+            )));
+        }
+
+        let result = (|| {
+            fs::create_dir_all(&temporary)?;
+            let copied_files = copy_snapshot_artifacts(&self.path, &temporary)?;
+            sync_directory(&temporary)?;
+
+            let mut restored = DB::open(&temporary, self.options.clone())?;
+            let restored_report = restored.verify()?;
+            if restored_report.durability != source_report.durability
+                || restored_report.verified_pages != source_report.verified_pages
+            {
+                return Err(Error::Corruption(
+                    "snapshot verification does not match source durability state".into(),
+                ));
+            }
+            let destination_status = restored_report.durability;
+            drop(restored);
+
+            fs::rename(&temporary, &destination)?;
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent)?;
+            }
+
+            Ok(SnapshotReport {
+                source: source_report.durability,
+                destination: destination_status,
+                copied_files,
+                verified_pages: restored_report.verified_pages,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        result
+    }
+
     /// Inject one device sync failure for the feature-gated fault harness.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_sync_failure(&self) {
@@ -795,6 +957,40 @@ fn sync_directory(path: &Path) -> Result<()> {
         File::open(path)?.sync_all()?;
     }
     Ok(())
+}
+
+fn copy_snapshot_artifacts(source: &Path, destination: &Path) -> Result<u32> {
+    let mut copied_files = 0u32;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".tmp")
+            || !(name == MANIFEST_FILE
+                || name == DATA_FILE
+                || name == BLOB_FILE
+                || name == META_FILE
+                || name.starts_with("seerdb.meta."))
+        {
+            continue;
+        }
+
+        let destination_file = destination.join(name.as_ref());
+        fs::copy(entry.path(), &destination_file)?;
+        OpenOptions::new()
+            .read(true)
+            .open(destination_file)?
+            .sync_all()?;
+        copied_files = copied_files
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgument("too many snapshot artifacts".into()))?;
+    }
+
+    Ok(copied_files)
 }
 
 impl Drop for DB {

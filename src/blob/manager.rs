@@ -189,12 +189,10 @@ impl BlobManager {
                 return None;
             }
 
-            let file_id = u32::from_le_bytes([
-                buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3],
-            ]);
-            let data_len = u32::from_le_bytes([
-                buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7],
-            ]) as usize;
+            let file_id = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
+            let data_len =
+                u32::from_le_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]])
+                    as usize;
             pos += 8;
 
             if buf.len() < pos + data_len {
@@ -205,6 +203,10 @@ impl BlobManager {
             next_file_id = next_file_id.max(file_id + 1);
             files.push(file);
             pos += data_len;
+        }
+
+        if pos != buf.len() {
+            return None;
         }
 
         Some(Self {
@@ -230,6 +232,16 @@ mod tests {
         let bm = BlobManager::new();
         assert_eq!(bm.threshold(), DEFAULT_BLOB_THRESHOLD);
         assert_eq!(bm.file_count(), 0);
+    }
+
+    #[test]
+    fn test_blob_manager_rejects_trailing_bytes() {
+        let mut bm = BlobManager::new();
+        bm.append(b"key", vec![1; 1500]);
+        let mut bytes = bm.to_bytes();
+        bytes.push(0xA5);
+
+        assert!(BlobManager::from_bytes(&bytes).is_none());
     }
 
     #[test]

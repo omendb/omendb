@@ -189,14 +189,10 @@ impl BlobFile {
         let mut pos = 0;
 
         while pos < buf.len() {
-            match BlobRecord::from_bytes(&buf[pos..]) {
-                Some(record) => {
-                    let size = record.serialized_size();
-                    records.push(record);
-                    pos += size;
-                }
-                None => break,
-            }
+            let record = BlobRecord::from_bytes(&buf[pos..])?;
+            let size = record.serialized_size();
+            records.push(record);
+            pos += size;
         }
 
         let offset = records.iter().map(|r| r.serialized_size() as u64).sum();
@@ -282,5 +278,15 @@ mod tests {
         bytes[len - 5] ^= 0xFF;
 
         assert!(BlobRecord::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_blob_file_rejects_truncated_record() {
+        let mut file = BlobFile::new(1);
+        file.append([0; 8], vec![1, 2, 3]);
+        let mut bytes = file.to_bytes();
+        bytes.pop();
+
+        assert!(BlobFile::from_bytes(1, &bytes).is_none());
     }
 }
