@@ -13,6 +13,8 @@ use std::io::Read;
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
 #[cfg(any(test, feature = "fault-injection"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -237,6 +239,18 @@ impl Device {
         self.file.metadata().map(|m| m.len())
     }
 
+    /// Physically reserve space through `length` where the host exposes a
+    /// filesystem preallocation primitive, then make that extent visible as
+    /// the file's logical length.
+    ///
+    /// Linux uses `fallocate` and macOS uses `F_PREALLOCATE` with a contiguous
+    /// allocation attempt followed by the filesystem-wide allocation mode.
+    /// Other platforms retain the portable `set_len` behavior, which grows a
+    /// logical file but does not promise physical block reservation.
+    pub fn preallocate(&self, length: u64) -> io::Result<()> {
+        preallocate_file(&self.file, length)
+    }
+
     /// Truncate the page file to a durable, page-aligned length.
     pub fn truncate(&mut self, length: u64) -> io::Result<()> {
         if !length.is_multiple_of(PAGE_SIZE as u64) {
@@ -260,6 +274,66 @@ impl Device {
     pub fn uses_odirect(&self) -> bool {
         self.use_odirect
     }
+}
+
+/// Reserve a file extent before a durability-critical write.
+pub(crate) fn preallocate_file(file: &File, length: u64) -> io::Result<()> {
+    let current = file.metadata()?.len();
+    if current >= length {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let offset = libc::off_t::try_from(current).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "preallocation offset overflows")
+        })?;
+        let size = libc::off_t::try_from(length - current).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "preallocation length overflows")
+        })?;
+        // SAFETY: the descriptor is borrowed from a live `File`, and the
+        // checked offsets/lengths are valid `off_t` values.
+        let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, size) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let size = libc::off_t::try_from(length - current).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "preallocation length overflows")
+        })?;
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATECONTIG,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: size,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: the descriptor is borrowed from a live `File` and `store`
+        // is the platform-defined `fstore_t` passed to `F_PREALLOCATE`.
+        let mut result = unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store)
+        };
+        if result == -1 {
+            store.fst_flags = libc::F_ALLOCATEALL;
+            store.fst_bytesalloc = 0;
+            // SAFETY: the same live descriptor and initialized `fstore_t` are
+            // reused for the documented non-contiguous fallback.
+            result = unsafe {
+                libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store)
+            };
+        }
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    // The platform calls reserve blocks but do not replace the logical file
+    // length contract. Keep the final length explicit and identical across
+    // all supported platforms.
+    file.set_len(length)
 }
 
 /// Allocate a page-aligned buffer for O_DIRECT I/O.
@@ -368,6 +442,23 @@ mod tests {
         let buf = [0u8; PAGE_SIZE];
         device.write_page(0, &buf).unwrap();
         assert_eq!(device.size().unwrap(), PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn test_device_preallocate_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let options = DeviceOptions {
+            use_odirect: false,
+            sync_writes: false,
+            create: true,
+        };
+
+        let device = Device::open(&path, &options).unwrap();
+        let length = (PAGE_SIZE * 2) as u64;
+        device.preallocate(length).unwrap();
+        device.preallocate(length).unwrap();
+        assert_eq!(device.size().unwrap(), length);
     }
 
     #[test]

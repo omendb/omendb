@@ -20,6 +20,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 fs2 = "0.4"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -30,9 +31,6 @@ rand = "0.8"
 [[bench]]
 name = "seerdb"
 harness = false
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 
 [features]
 default = []

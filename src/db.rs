@@ -15,7 +15,7 @@ use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
-use crate::space::{Device, DeviceOptions};
+use crate::space::{preallocate_file, Device, DeviceOptions};
 use crate::storage::{StorageEngine, StorageMetrics};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
@@ -817,7 +817,7 @@ impl DB {
             .open(&path)?;
         let current = file.metadata()?.len();
         if current < target {
-            file.set_len(target)?;
+            preallocate_file(&file, target)?;
             file.sync_data()?;
             sync_directory(&self.path)?;
         }
@@ -2158,6 +2158,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::io::{Seek, SeekFrom, Write};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::MetadataExt;
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -2348,6 +2350,14 @@ mod tests {
                 .unwrap()
                 .len(),
             WAL_RESERVATION_SEGMENT_BYTES
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            fs::metadata(path.join(WAL_RESERVATION_FILE))
+                .unwrap()
+                .blocks()
+                > 0,
+            "WAL reservation should own physical blocks on this platform"
         );
         assert_eq!(
             db.metrics().unwrap().wal_reserved_bytes,
