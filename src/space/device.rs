@@ -144,10 +144,7 @@ impl Device {
     ///
     /// The buffer must be page-aligned for O_DIRECT.
     pub fn write_page(&mut self, offset: u64, buf: &[u8; PAGE_SIZE]) -> io::Result<()> {
-        #[cfg(any(test, feature = "fault-injection"))]
-        if offset.saturating_add(PAGE_SIZE as u64) > self.capacity_limit.load(Ordering::Acquire) {
-            return Err(io::Error::from(io::ErrorKind::StorageFull));
-        }
+        self.check_write_capacity(offset)?;
         #[cfg(any(test, feature = "fault-injection"))]
         if self.fail_next_disk_full.swap(false, Ordering::AcqRel) {
             return Err(io::Error::from(io::ErrorKind::StorageFull));
@@ -163,6 +160,26 @@ impl Device {
             self.file.sync_data()?;
         }
 
+        Ok(())
+    }
+
+    /// Check whether a page can be written at the requested offset.
+    ///
+    /// Production filesystems perform the final admission check during the
+    /// write itself. The deterministic capacity hook is checked separately so
+    /// StorageEngine can preflight an entire generation before issuing its
+    /// first page write.
+    pub fn check_write_capacity(&self, _offset: u64) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if _offset.saturating_add(PAGE_SIZE as u64)
+            > self.capacity_limit.load(Ordering::Acquire)
+        {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_next_disk_full.load(Ordering::Acquire) {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
+        }
         Ok(())
     }
 

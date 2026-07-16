@@ -268,6 +268,7 @@ impl StorageEngine {
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
         let dirty_page_ids = self.btree.dirty_page_ids();
+        self.preflight_flush_capacity(&dirty_page_ids)?;
         let mut retired_offsets = Vec::new();
         let mut retired_cache_keys = Vec::new();
 
@@ -334,6 +335,34 @@ impl StorageEngine {
         self.pending_reclaimed_offsets = retired_offsets;
         self.pending_reclaimed_cache_keys = retired_cache_keys;
 
+        Ok(())
+    }
+
+    /// Admit the full generation before beginning any physical page writes.
+    ///
+    /// This closes the deterministic capacity/ENOSPC boundary for the active
+    /// page set. Reuse of retired slots is always admitted; only newly growing
+    /// data-file slots can fail this preflight. Real filesystem ENOSPC can
+    /// still occur during the write itself and remains fenced/recoverable.
+    fn preflight_flush_capacity(&self, dirty_page_ids: &[u32]) -> Result<()> {
+        let mut free_index = self.free_offsets.len();
+        let mut next_offset = self.next_offset;
+        for &page_id in dirty_page_ids {
+            if self.btree.node(page_id).is_none() {
+                continue;
+            }
+            let offset = if free_index > 0 {
+                free_index -= 1;
+                self.free_offsets[free_index]
+            } else {
+                let offset = next_offset;
+                next_offset = next_offset
+                    .checked_add(PAGE_SIZE as u64)
+                    .ok_or(Error::DiskFull)?;
+                offset
+            };
+            self.device.check_write_capacity(offset)?;
+        }
         Ok(())
     }
 
@@ -951,5 +980,34 @@ mod tests {
         assert!(
             matches!(engine.flush(), Err(Error::Buffer(message)) if message.contains("no frames"))
         );
+    }
+
+    #[test]
+    fn capacity_preflight_rejects_before_page_io() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+        engine.btree_mut().insert(b"key", b"value").unwrap();
+        engine.inject_capacity_limit(0);
+
+        assert!(matches!(engine.flush(), Err(Error::DiskFull)));
+        assert_eq!(engine.device.size().unwrap(), 0);
+        let stats = engine.buffer_stats();
+        assert_eq!(stats.reads, 0);
+        assert_eq!(stats.writes, 0);
     }
 }
