@@ -40,6 +40,8 @@ thread_local! {
     static FAIL_NEXT_WAL_AFTER_SYNC: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_AFTER_MANIFEST: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_WAL_TRUNCATE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
@@ -1824,6 +1826,19 @@ impl DB {
         FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.set(true));
     }
 
+    /// Inject one truncated atomic checkpoint image before manifest publish.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_atomic_short_write_failure(&self) {
+        FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one checksum-corrupted atomic checkpoint image before manifest
+    /// publish.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_atomic_torn_write_failure(&self) {
+        FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.set(true));
+    }
+
     /// Begin a new transaction.
     ///
     /// Returns a transaction handle that can be used to commit or abort.
@@ -2326,7 +2341,28 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
-    file.write_all(data)?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    let short_write = FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.replace(false));
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    let short_write = false;
+    #[cfg(any(test, feature = "fault-injection"))]
+    let torn_write = FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.replace(false));
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    let torn_write = false;
+
+    if short_write {
+        let prefix_len = data.len() / 2;
+        file.set_len(prefix_len as u64)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&data[..prefix_len])?;
+    } else {
+        file.write_all(data)?;
+        if torn_write && !data.is_empty() {
+            let offset = data.len() / 2;
+            file.seek(SeekFrom::Start(offset as u64))?;
+            file.write_all(&[data[offset] ^ 0xA5])?;
+        }
+    }
     file.flush()?;
     file.sync_all()?;
     drop(file);
@@ -2339,6 +2375,12 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
 
     fs::rename(&temporary, path)?;
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    if short_write || torn_write {
+        return Err(std::io::Error::other("injected atomic artifact write failure").into());
+    }
+
     sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 

@@ -1134,6 +1134,42 @@ fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
 }
 
 #[test]
+fn dbnext_r0_short_and_torn_checkpoint_images_preserve_prior_generation() {
+    fn run_case<F>(root: &Path, name: &str, inject: F)
+    where
+        F: FnOnce(&DB),
+    {
+        let path = root.join(name);
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+
+        inject(&db);
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+        assert!(!reopened.durability_status().write_fenced);
+        assert!(path.join("seerdb.meta.2").is_file());
+    }
+
+    let root = tempdir().unwrap();
+    run_case(
+        root.path(),
+        "short-checkpoint.db",
+        DB::inject_atomic_short_write_failure,
+    );
+    run_case(
+        root.path(),
+        "torn-checkpoint.db",
+        DB::inject_atomic_torn_write_failure,
+    );
+}
+
+#[test]
 fn dbnext_r0_reopens_deep_tree_with_internal_routing() {
     let root = tempdir().unwrap();
     let path = root.path().join("deep-tree.db");
