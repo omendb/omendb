@@ -341,7 +341,7 @@ impl DB {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_open()?;
 
-        match self.engine.btree().lookup(key) {
+        match self.engine.btree().lookup(key)? {
             LookupResult::Found(value) => Ok(Some(value)),
             LookupResult::Blob(ptr) => {
                 // Read from blob file.
@@ -362,7 +362,7 @@ impl DB {
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
 
-        if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key) {
+        if let LookupResult::Blob(ptr) = self.engine.btree().lookup(key)? {
             self.blobs.mark_deleted(&ptr);
         }
 
@@ -374,7 +374,11 @@ impl DB {
     /// Range scan over [start, end).
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
-        Ok(self.engine.btree().range_scan(start, end).collect())
+        Ok(self
+            .engine
+            .btree()
+            .range_scan(start, end)?
+            .collect())
     }
 
     /// Write buffered WAL records to disk and sync the mutation prefix.
@@ -1000,7 +1004,7 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
                 return Err(Error::Corruption("WAL delete key is truncated".into()));
             }
             let key = &record.payload[2..];
-            if let LookupResult::Blob(pointer) = btree.lookup(key) {
+            if let LookupResult::Blob(pointer) = btree.lookup(key)? {
                 blobs.mark_deleted(&pointer);
             }
             btree.delete(key)?;

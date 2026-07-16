@@ -62,7 +62,7 @@ fn bench_btree_point_lookup(c: &mut Criterion) {
     let mut group = configure_group(c, "btree_point_lookup");
     group.bench_function(BenchmarkId::new("keys", DEFAULT_KEYS), |benchmark| {
         benchmark.iter(|| {
-            let result = tree.lookup(black_box(probe_key.as_bytes()));
+                let result = tree.lookup(black_box(probe_key.as_bytes())).unwrap();
             black_box(
                 matches!(result, LookupResult::Found(value) if value == probe_value.as_bytes()),
             );
@@ -82,7 +82,10 @@ fn bench_btree_range_scan(c: &mut Criterion) {
             |benchmark, &scan_size| {
                 benchmark.iter(|| {
                     let end = key(scan_size);
-                    let count = tree.range_scan(b"key-00000000", end.as_bytes()).count();
+                    let count = tree
+                        .range_scan(b"key-00000000", end.as_bytes())
+                        .unwrap()
+                        .count();
                     black_box(count);
                 });
             },

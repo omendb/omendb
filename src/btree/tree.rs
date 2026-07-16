@@ -174,7 +174,7 @@ impl BTree {
     /// If the key already exists, returns an error.
     /// May cause node splits if the leaf is full.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
-        let leaf_id = self.find_leaf(key);
+        let leaf_id = self.find_leaf(key)?;
         let result = self
             .node_mut(leaf_id)
             .expect("leaf_id should be valid")
@@ -206,7 +206,7 @@ impl BTree {
     /// If the key already exists, replaces the value.
     /// May cause node splits if the leaf is full.
     pub fn upsert(&mut self, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
-        let leaf_id = self.find_leaf(key);
+        let leaf_id = self.find_leaf(key)?;
         let existing_index = self.node(leaf_id).and_then(|node| node.search(key).ok());
 
         let Some(index) = existing_index else {
@@ -250,26 +250,32 @@ impl BTree {
     }
 
     /// Lookup a key in the B-tree.
-    pub fn lookup(&self, key: &[u8]) -> LookupResult {
-        let leaf_id = self.find_leaf(key);
-        let node = self.node(leaf_id).expect("leaf_id should be valid");
+    pub fn lookup(&self, key: &[u8]) -> Result<LookupResult, BTreeError> {
+        let leaf_id = self.find_leaf(key)?;
+        let node = self
+            .node(leaf_id)
+            .ok_or_else(|| BTreeError::Corruption("leaf page is missing".into()))?;
 
-        match node.search(key) {
+        Ok(match node.search(key) {
             Ok(idx) => match node.value(idx) {
                 Some(ValueRef::Inline(data)) => LookupResult::Found(data.to_vec()),
                 Some(ValueRef::Blob(ptr)) => LookupResult::Blob(ptr),
                 Some(ValueRef::Tombstone) => LookupResult::Deleted,
-                None => LookupResult::NotFound,
+                None => {
+                    return Err(BTreeError::Corruption(
+                        "leaf value payload is malformed".into(),
+                    ));
+                }
             },
             Err(_) => LookupResult::NotFound,
-        }
+        })
     }
 
     /// Delete a key by inserting a tombstone.
     ///
     /// Returns true if the key was found (even if already deleted).
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, BTreeError> {
-        let leaf_id = self.find_leaf(key);
+        let leaf_id = self.find_leaf(key)?;
         let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
 
         let index = match node.search(key) {
@@ -289,7 +295,7 @@ impl BTree {
     ///
     /// This stores the blob pointer in the B-tree instead of the actual value.
     pub fn insert_blob(&mut self, key: &[u8], ptr: BlobPointer) -> Result<(), BTreeError> {
-        let leaf_id = self.find_leaf(key);
+        let leaf_id = self.find_leaf(key)?;
         let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
         node.insert_blob(key, ptr)
             .map_err(BTreeError::InsertFailed)?;
@@ -297,20 +303,28 @@ impl BTree {
     }
 
     /// Create a forward range scan over [start, end).
-    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> RangeScan<'_> {
+    pub fn range_scan(&self, start: &[u8], end: &[u8]) -> Result<RangeScan<'_>, BTreeError> {
         RangeScan::new(self, start.to_vec(), end.to_vec())
     }
 
     // -- Internal helpers --
 
     /// Find the leaf node where `key` should reside.
-    fn find_leaf(&self, key: &[u8]) -> PageId {
+    fn find_leaf(&self, key: &[u8]) -> Result<PageId, BTreeError> {
         let mut current = self.root;
+        let mut visited = HashSet::new();
 
         loop {
-            let node = self.node(current).expect("current should be valid");
+            if !visited.insert(current) {
+                return Err(BTreeError::Corruption(
+                    "cycle detected during B-tree descent".into(),
+                ));
+            }
+            let node = self
+                .node(current)
+                .ok_or_else(|| BTreeError::Corruption("B-tree child page is missing".into()))?;
             if node.is_leaf() {
-                return current;
+                return Ok(current);
             }
 
             // Internal node: find the child to descend into.
@@ -324,14 +338,22 @@ impl BTree {
             let mut child_id = node.leftmost_child();
 
             for i in 0..count {
-                if let Some(sep_key) = node.key(i)
-                    && key < sep_key.as_slice()
-                {
+                let sep_key = node
+                    .key(i)
+                    .ok_or_else(|| BTreeError::Corruption("internal key is malformed".into()))?;
+                if key < sep_key.as_slice() {
                     break;
                 }
-                child_id = node.child_id(i).unwrap_or(0);
+                child_id = node
+                    .child_id(i)
+                    .ok_or_else(|| BTreeError::Corruption("internal child is malformed".into()))?;
             }
 
+            if child_id > u32::MAX as u64 {
+                return Err(BTreeError::Corruption(
+                    "internal child page ID exceeds the logical ID width".into(),
+                ));
+            }
             current = child_id as u32;
         }
     }
@@ -623,6 +645,8 @@ pub enum BTreeError {
     SplitFailed(SplitError),
     #[error("logical page ID exhausted")]
     PageIdExhausted,
+    #[error("B-tree corruption: {0}")]
+    Corruption(String),
 }
 
 /// Cursor for range scanning the B-tree.
@@ -636,23 +660,25 @@ pub struct RangeScan<'a> {
 }
 
 impl<'a> RangeScan<'a> {
-    fn new(tree: &'a BTree, start: Vec<u8>, end: Vec<u8>) -> Self {
-        let leaf_id = tree.find_leaf(&start);
-        let node = tree.node(leaf_id).expect("leaf_id should be valid");
+    fn new(tree: &'a BTree, start: Vec<u8>, end: Vec<u8>) -> Result<Self, BTreeError> {
+        let leaf_id = tree.find_leaf(&start)?;
+        let node = tree
+            .node(leaf_id)
+            .ok_or_else(|| BTreeError::Corruption("range leaf page is missing".into()))?;
 
         let start_index = match node.search(&start) {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
 
-        Self {
+        Ok(Self {
             tree,
             start,
             end,
             current_node: leaf_id,
             current_index: start_index,
             done: false,
-        }
+        })
     }
 }
 
@@ -723,18 +749,18 @@ mod tests {
         tree.insert(b"aaa", b"bbb").unwrap();
 
         assert!(matches!(
-            tree.lookup(b"hello"),
+            tree.lookup(b"hello").unwrap(),
             LookupResult::Found(value) if value == b"world"
         ));
         assert!(matches!(
-            tree.lookup(b"foo"),
+            tree.lookup(b"foo").unwrap(),
             LookupResult::Found(value) if value == b"bar"
         ));
         assert!(matches!(
-            tree.lookup(b"aaa"),
+            tree.lookup(b"aaa").unwrap(),
             LookupResult::Found(value) if value == b"bbb"
         ));
-        assert!(matches!(tree.lookup(b"missing"), LookupResult::NotFound));
+        assert!(matches!(tree.lookup(b"missing").unwrap(), LookupResult::NotFound));
     }
 
     #[test]
@@ -756,20 +782,20 @@ mod tests {
         tree.upsert(b"key", b"a value with a different size")
             .unwrap();
         assert!(matches!(
-            tree.lookup(b"key"),
+            tree.lookup(b"key").unwrap(),
             LookupResult::Found(value) if value == b"a value with a different size"
         ));
 
         tree.upsert(b"key", b"x").unwrap();
         assert!(matches!(
-            tree.lookup(b"key"),
+            tree.lookup(b"key").unwrap(),
             LookupResult::Found(value) if value == b"x"
         ));
 
         tree.delete(b"key").unwrap();
         tree.upsert(b"key", b"restored").unwrap();
         assert!(matches!(
-            tree.lookup(b"key"),
+            tree.lookup(b"key").unwrap(),
             LookupResult::Found(value) if value == b"restored"
         ));
     }
@@ -779,7 +805,7 @@ mod tests {
         let mut tree = BTree::new();
         tree.insert(b"key", b"before").unwrap();
 
-        let value = match tree.lookup(b"key") {
+        let value = match tree.lookup(b"key").unwrap() {
             LookupResult::Found(value) => value,
             other => panic!("unexpected lookup result: {other:?}"),
         };
@@ -787,7 +813,7 @@ mod tests {
 
         assert_eq!(value, b"before");
         assert!(matches!(
-            tree.lookup(b"key"),
+            tree.lookup(b"key").unwrap(),
             LookupResult::Found(value) if value == b"after"
         ));
     }
@@ -797,11 +823,11 @@ mod tests {
         let mut tree = BTree::new();
 
         tree.insert(b"key", b"value").unwrap();
-        assert!(matches!(tree.lookup(b"key"), LookupResult::Found(_)));
+        assert!(matches!(tree.lookup(b"key").unwrap(), LookupResult::Found(_)));
 
         tree.delete(b"key").unwrap();
-        assert!(matches!(tree.lookup(b"key"), LookupResult::Deleted));
-        assert!(tree.range_scan(b"key", b"key~").next().is_none());
+        assert!(matches!(tree.lookup(b"key").unwrap(), LookupResult::Deleted));
+        assert!(tree.range_scan(b"key", b"key~").unwrap().next().is_none());
         assert!(!tree.delete(b"key").unwrap());
 
         assert_eq!(tree.delete(b"missing").unwrap(), false);
@@ -821,7 +847,7 @@ mod tests {
             let key = format!("key_{:06}", i);
             let val = format!("val_{:06}", i);
             assert!(matches!(
-                tree.lookup(key.as_bytes()),
+                tree.lookup(key.as_bytes()).unwrap(),
                 LookupResult::Found(v) if v == val.as_bytes()
             ));
         }
@@ -839,7 +865,7 @@ mod tests {
         tree.insert(b"d", b"4").unwrap();
         tree.insert(b"e", b"5").unwrap();
 
-        let results: Vec<_> = tree.range_scan(b"b", b"e").collect();
+        let results: Vec<_> = tree.range_scan(b"b", b"e").unwrap().collect();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, b"b");
         assert_eq!(results[1].0, b"c");
@@ -859,7 +885,7 @@ mod tests {
         for i in 0..500 {
             let key = format!("key_{:06}", i);
             assert!(matches!(
-                tree.lookup(key.as_bytes()),
+                tree.lookup(key.as_bytes()).unwrap(),
                 LookupResult::Found(_)
             ));
         }
@@ -878,7 +904,7 @@ mod tests {
         for i in 0..50 {
             let key = format!("key_{:04}", i);
             assert!(matches!(
-                tree.lookup(key.as_bytes()),
+                tree.lookup(key.as_bytes()).unwrap(),
                 LookupResult::Found(_)
             ));
         }
@@ -899,7 +925,7 @@ mod tests {
             let value = format!("updated value with a different size {i}");
             tree.upsert(key.as_bytes(), value.as_bytes()).unwrap();
             assert!(matches!(
-                tree.lookup(key.as_bytes()),
+                tree.lookup(key.as_bytes()).unwrap(),
                 LookupResult::Found(found) if found == value.as_bytes()
             ));
         }
@@ -916,7 +942,10 @@ mod tests {
             tree.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
 
-        let results: Vec<_> = tree.range_scan(b"key_000050", b"key_000450").collect();
+        let results: Vec<_> = tree
+            .range_scan(b"key_000050", b"key_000450")
+            .unwrap()
+            .collect();
         assert_eq!(results.len(), 400);
         assert_eq!(results.first().unwrap().0, b"key_000050");
         assert_eq!(results.last().unwrap().0, b"key_000449");
@@ -945,13 +974,16 @@ mod tests {
 
                 for (reference_key, reference_value) in &reference {
                     prop_assert!(matches!(
-                        tree.lookup(reference_key),
+                        tree.lookup(reference_key).unwrap(),
                         LookupResult::Found(value) if value == reference_value.as_slice()
                     ));
                 }
             }
 
-            let actual: Vec<_> = tree.range_scan(b"key-000", b"key-999").collect();
+            let actual: Vec<_> = tree
+                .range_scan(b"key-000", b"key-999")
+                .unwrap()
+                .collect();
             let expected: Vec<_> = reference.into_iter().collect();
             prop_assert_eq!(actual, expected);
         }
