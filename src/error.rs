@@ -19,6 +19,14 @@ pub enum Error {
     #[error("write backpressure: requires {required} WAL bytes, {available} available")]
     Backpressure { required: u64, available: u64 },
 
+    /// Another writable handle owns the database directory.
+    #[error("database is busy")]
+    DatabaseBusy,
+
+    /// The opened directory is an immutable archive/snapshot.
+    #[error("database is read-only")]
+    ReadOnly,
+
     /// Key not found.
     #[error("key not found")]
     NotFound,

@@ -386,11 +386,30 @@ impl ManifestStore {
         let current_slot = self.current_slot()?;
         let target_slot = current_slot.map_or(0, |slot| 1 - slot);
         let bytes = manifest.to_bytes();
-        self.file
-            .seek(SeekFrom::Start((target_slot * MANIFEST_SLOT_SIZE) as u64))?;
-        self.file.write_all(&bytes)?;
+        self.write_slot(target_slot, &bytes)?;
         self.file.flush()?;
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Publish identical metadata into both slots.
+    ///
+    /// This is used when a copied archive becomes a new history. Equal
+    /// generation/commit identities otherwise make the normal alternating
+    /// publisher continue selecting the same slot.
+    pub fn publish_replicated(&mut self, manifest: Manifest) -> Result<()> {
+        let bytes = manifest.to_bytes();
+        self.write_slot(0, &bytes)?;
+        self.write_slot(1, &bytes)?;
+        self.file.flush()?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    fn write_slot(&mut self, slot: usize, bytes: &[u8; MANIFEST_SLOT_SIZE]) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start((slot * MANIFEST_SLOT_SIZE) as u64))?;
+        self.file.write_all(bytes)?;
         Ok(())
     }
 

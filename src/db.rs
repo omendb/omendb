@@ -21,6 +21,7 @@ use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
     ManifestStore, PmtCheckpointId,
 };
+use fs2::FileExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,8 @@ const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
+const LOCK_FILE: &str = "seerdb.lock";
+const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 =
     (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
@@ -101,6 +104,19 @@ pub struct SnapshotReport {
     /// Number of durable artifacts copied into the snapshot.
     pub copied_files: u32,
     /// Number of destination pages verified after reopen.
+    pub verified_pages: u64,
+}
+
+/// Results from restoring an immutable archive into a new writable history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Archive durability state used as the restore source.
+    pub source: DurabilityStatus,
+    /// New writable history state after restore.
+    pub destination: DurabilityStatus,
+    /// Number of durable artifacts copied into the new history.
+    pub copied_files: u32,
+    /// Number of destination pages verified after history fork.
     pub verified_pages: u64,
 }
 
@@ -250,6 +266,10 @@ pub struct DB {
     is_open: bool,
     /// Whether a failed publication fenced this writer until reopen.
     write_fenced: bool,
+    /// Whether this handle opened an immutable archive/snapshot.
+    read_only: bool,
+    /// Advisory writer ownership for the database directory.
+    lock_file: Option<File>,
     /// Number of retryable WAL admission rejections for this handle.
     wal_admission_failures: u64,
 }
@@ -268,6 +288,24 @@ impl DB {
         let wal_path = path.join(WAL_FILE);
         let meta_path = path.join(META_FILE);
         let manifest_path = path.join(MANIFEST_FILE);
+        let read_only = path.join(ARCHIVE_MARKER_FILE).is_file();
+        if read_only {
+            if !manifest_path.is_file() || !data_path.is_file() {
+                return Err(Error::Corruption(
+                    "read-only archive is missing required artifacts".into(),
+                ));
+            }
+            if wal_path.exists() {
+                return Err(Error::NeedsRecovery(
+                    "read-only archive contains a pending WAL".into(),
+                ));
+            }
+        }
+        let lock_file = if read_only {
+            None
+        } else {
+            Some(Self::acquire_writer_lock(&path.join(LOCK_FILE))?)
+        };
 
         let mut manifest = ManifestStore::open(&manifest_path)?;
         let current_manifest = manifest.load_latest()?;
@@ -298,7 +336,7 @@ impl DB {
         let device_opts = DeviceOptions {
             use_odirect: options.use_odirect,
             sync_writes: options.sync_writes,
-            create: true,
+            create: !read_only,
         };
         let device = Device::open(&data_path, &device_opts)?;
 
@@ -324,6 +362,15 @@ impl DB {
         } else {
             BlobManager::with_threshold(options.blob_threshold)
         };
+        if current_manifest.is_some_and(|current| {
+            blobs.generation_id() != current.generation_id.get()
+        }) {
+            // A blob image is written before its manifest. If publication
+            // stopped between those boundaries, deletion marks from the
+            // newer image must not make pages referenced by the older
+            // manifest reclaimable.
+            blobs.clear_deletion_metadata();
+        }
 
         // A published manifest selects an immutable PMT checkpoint. Never
         // pair an older manifest with a newer mutable metadata file.
@@ -387,6 +434,8 @@ impl DB {
             pending_digest: 0,
             is_open: true,
             write_fenced: false,
+            read_only,
+            lock_file,
             wal_admission_failures: 0,
         };
 
@@ -638,6 +687,7 @@ impl DB {
         Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
 
         let blob_path = self.path.join(BLOB_FILE);
+        self.blobs.set_generation(commit.generation_id.get());
         atomic_write(&blob_path, &self.blobs.to_bytes())?;
 
         let wal_path = self.path.join(WAL_FILE);
@@ -735,8 +785,13 @@ impl DB {
     /// Close the database (flush and sync).
     pub fn close(&mut self) -> Result<()> {
         if self.is_open {
-            self.flush()?;
+            if !self.read_only {
+                self.flush()?;
+            }
             self.is_open = false;
+            if let Some(lock_file) = self.lock_file.take() {
+                let _ = lock_file.unlock();
+            }
         }
         Ok(())
     }
@@ -906,6 +961,9 @@ impl DB {
         let result = (|| {
             fs::create_dir_all(&temporary)?;
             let copied_files = copy_snapshot_artifacts(&self.path, &temporary)?;
+            let marker_path = temporary.join(ARCHIVE_MARKER_FILE);
+            fs::write(&marker_path, b"SEERDB-ARCHIVE-V1\n")?;
+            File::open(&marker_path)?.sync_all()?;
             sync_directory(&temporary)?;
 
             let mut restored = DB::open(&temporary, self.options.clone())?;
@@ -926,6 +984,77 @@ impl DB {
             }
 
             Ok(SnapshotReport {
+                source: source_report.durability,
+                destination: destination_status,
+                copied_files,
+                verified_pages: restored_report.verified_pages,
+            })
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        result
+    }
+
+    /// Restore an immutable archive into a new writable history.
+    ///
+    /// The archive is verified before copying. The destination receives a new
+    /// `HistoryId` while preserving the source's database identity and
+    /// durable root, so it can advance independently without sharing future
+    /// history IDs with the archive.
+    pub fn restore<P: AsRef<Path>, Q: AsRef<Path>>(
+        archive: P,
+        destination: Q,
+        options: Options,
+    ) -> Result<RestoreReport> {
+        let archive = archive.as_ref().to_path_buf();
+        if !archive.join(ARCHIVE_MARKER_FILE).is_file() {
+            return Err(Error::InvalidArgument(
+                "restore source is not an immutable SeerDB archive".into(),
+            ));
+        }
+        let mut source = DB::open(&archive, options.clone())?;
+        let source_report = source.verify()?;
+        let destination = destination.as_ref().to_path_buf();
+        if destination.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "restore destination already exists: {}",
+                destination.display()
+            )));
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = Self::next_derived_path(&destination, "restore")?;
+        let result = (|| {
+            fs::create_dir_all(&temporary)?;
+            let copied_files = copy_snapshot_artifacts(&archive, &temporary)?;
+            sync_directory(&temporary)?;
+
+            let mut restored = DB::open(&temporary, options.clone())?;
+            restored.fork_history()?;
+            let restored_report = restored.verify()?;
+            if restored_report.durability.database_id != source_report.durability.database_id
+                || restored_report.durability.generation_id
+                    != source_report.durability.generation_id
+                || restored_report.durability.commit_id != source_report.durability.commit_id
+                || restored_report.verified_pages != source_report.verified_pages
+            {
+                return Err(Error::Corruption(
+                    "restored history does not match archive root".into(),
+                ));
+            }
+            let destination_status = restored_report.durability;
+            drop(restored);
+
+            fs::rename(&temporary, &destination)?;
+            if let Some(parent) = destination.parent() {
+                sync_directory(parent)?;
+            }
+
+            Ok(RestoreReport {
                 source: source_report.durability,
                 destination: destination_status,
                 copied_files,
@@ -963,9 +1092,12 @@ impl DB {
     }
 
     fn next_snapshot_path(&self) -> Result<PathBuf> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let name = self
-            .path
+        Self::next_derived_path(&self.path, "snapshot")
+    }
+
+    fn next_derived_path(path: &Path, kind: &str) -> Result<PathBuf> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("seerdb");
@@ -975,7 +1107,7 @@ impl DB {
             .as_nanos();
         let id = NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
         let destination = parent.join(format!(
-            ".{name}.snapshot-{}-{timestamp}-{id}",
+            ".{name}.{kind}-{}-{timestamp}-{id}",
             std::process::id()
         ));
         if destination.exists() {
@@ -985,6 +1117,28 @@ impl DB {
             )));
         }
         Ok(destination)
+    }
+
+    fn fork_history(&mut self) -> Result<()> {
+        self.check_writable()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+        let history_id = HistoryId::new(
+            manifest
+                .history_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("history ID overflow".into()))?,
+        );
+        let forked = Manifest {
+            history_id,
+            ..manifest
+        };
+        self.manifest.publish_replicated(forked)?;
+        self.history_id = history_id;
+        Ok(())
     }
 
     /// Reclaim trailing data pages that are no longer referenced by either
@@ -1109,12 +1263,31 @@ impl DB {
     /// Reject writes after a failed publication until the database is reopened.
     fn check_writable(&self) -> Result<()> {
         self.check_open()?;
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
         if self.write_fenced {
             return Err(Error::NeedsRecovery(
                 "writer fenced after a failed durable publication; reopen required".into(),
             ));
         }
         Ok(())
+    }
+
+    fn acquire_writer_lock(path: &Path) -> Result<File> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(Error::DatabaseBusy)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Generate a stable-enough identity for a newly created database.
@@ -1484,6 +1657,8 @@ fn copy_snapshot_artifacts(source: &Path, destination: &Path) -> Result<u32> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.ends_with(".tmp")
+            || name == LOCK_FILE
+            || name == ARCHIVE_MARKER_FILE
             || !(name == MANIFEST_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
@@ -1513,6 +1688,9 @@ impl Drop for DB {
         // The user should explicitly call close() or flush() to ensure
         // data is persisted and WAL is cleaned up.
         // If the process crashes, the WAL file will be preserved for recovery.
+        if let Some(lock_file) = self.lock_file.take() {
+            let _ = lock_file.unlock();
+        }
     }
 }
 
@@ -1531,6 +1709,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = DB::open(dir.path().join("test.db"), Options::default());
         assert!(db.is_ok());
+    }
+
+    #[test]
+    fn test_db_allows_only_one_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let db = DB::open(&path, Options::default()).unwrap();
+        assert!(matches!(
+            DB::open(&path, Options::default()),
+            Err(Error::DatabaseBusy)
+        ));
+        drop(db);
+        assert!(DB::open(&path, Options::default()).is_ok());
     }
 
     #[test]

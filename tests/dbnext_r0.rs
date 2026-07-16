@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use seerdb::{DB, Error, Options};
+use seerdb::blob::BlobManager;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,24 +36,6 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     assert_eq!(db.range(b"key-00", b"key-99").unwrap(), expected_range);
-}
-
-fn copy_database(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination).unwrap();
-    for entry in fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        if !entry.file_type().unwrap().is_file() {
-            continue;
-        }
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "tmp")
-        {
-            continue;
-        }
-        fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
-    }
 }
 
 #[test]
@@ -114,19 +97,26 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
     }
 
     let final_status = db.durability_status();
+    let archive_path = root.path().join("archive.db");
+    db.snapshot(&archive_path).unwrap();
     db.close().unwrap();
 
     let restored_path = root.path().join("restored.db");
-    copy_database(&source_path, &restored_path);
-    let restored = DB::open(&restored_path, Options::default()).unwrap();
+    let restore_report =
+        DB::restore(&archive_path, &restored_path, Options::default()).unwrap();
+    let mut restored = DB::open(&restored_path, Options::default()).unwrap();
     assert_model(&restored, &committed);
     assert_eq!(
         restored.durability_status().database_id,
         initial_status.database_id
     );
-    assert_eq!(
+    assert_ne!(
         restored.durability_status().history_id,
         initial_status.history_id
+    );
+    assert_eq!(
+        restore_report.destination.history_id,
+        restored.durability_status().history_id
     );
     assert_eq!(
         restored.durability_status().commit_id,
@@ -138,6 +128,16 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
     );
     assert_eq!(restored.durability_status().pending_mutations, 0);
     assert!(!restored.durability_status().write_fenced);
+    restored.put(b"fork-only", b"child-history").unwrap();
+    restored.flush().unwrap();
+    assert_eq!(
+        restored.get(b"fork-only").unwrap(),
+        Some(b"child-history".to_vec())
+    );
+    assert_eq!(
+        restored.durability_status().history_id,
+        restore_report.destination.history_id
+    );
 }
 
 #[test]
@@ -341,6 +341,10 @@ fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
     let mut restored = DB::open(&snapshot_path, Options::default()).unwrap();
     let restored_report = restored.verify().unwrap();
     assert_eq!(restored_report.durability, source_report.durability);
+    assert!(matches!(
+        restored.put(b"must-not-write", b"value"),
+        Err(Error::ReadOnly)
+    ));
 
     source.put(b"inline", b"source-updated").unwrap();
     source.delete(b"large").unwrap();
@@ -379,6 +383,60 @@ fn dbnext_r0_owned_snapshot_releases_retained_copy() {
 
     snapshot.release().unwrap();
     assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn dbnext_r0_blob_reclamation_survives_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-reclamation.db");
+    let value = vec![0x6Du8; 2_048];
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"large-a", &value).unwrap();
+        db.put(b"large-b", &value).unwrap();
+        db.flush().unwrap();
+        db.delete(b"large-a").unwrap();
+        db.delete(b"large-b").unwrap();
+        db.flush().unwrap();
+    }
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.blob_stats().total_valid, 0);
+    assert_eq!(reopened.blob_stats().total_deleted, 2);
+    assert_eq!(reopened.gc().unwrap(), 2);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+    assert_eq!(reopened.verify().unwrap().blob_bytes, 44);
+}
+
+#[test]
+fn dbnext_r0_newer_blob_image_cannot_reclaim_manifest_value() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-publication-fence.db");
+    let old_value = vec![0x11u8; 2_048];
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"large", &old_value).unwrap();
+        db.flush().unwrap();
+    }
+
+    // Simulate a blob image written for a newer generation whose manifest
+    // publication did not complete. The old manifest still owns offset 0.
+    let mut newer = BlobManager::new();
+    let old_pointer = newer.append(b"large", old_value.clone());
+    newer.append(b"large", vec![0x22; 2_048]);
+    assert!(newer.mark_deleted(&old_pointer));
+    let mut bytes = newer.to_bytes();
+    bytes[20..28].copy_from_slice(&2u64.to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[..bytes.len() - 4]);
+    let checksum_offset = bytes.len() - 4;
+    bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(path.join("seerdb.blob"), bytes).unwrap();
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"large").unwrap(), Some(old_value));
+    assert_eq!(reopened.blob_stats().total_deleted, 0);
+    assert_eq!(reopened.gc().unwrap(), 0);
+    assert_eq!(reopened.get(b"large").unwrap(), Some(vec![0x11; 2_048]));
 }
 
 #[test]

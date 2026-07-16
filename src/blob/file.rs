@@ -5,6 +5,8 @@
 //! [key_prefix: 8 bytes] [length: u32] [value: bytes] [crc32c: u32]
 //! ```
 
+use std::collections::BTreeSet;
+
 /// A blob record stored in a blob file.
 #[derive(Debug, Clone)]
 pub struct BlobRecord {
@@ -89,6 +91,8 @@ pub struct BlobFile {
     valid_count: usize,
     /// Number of deleted entries.
     deleted_count: usize,
+    /// Record offsets that have been logically deleted.
+    deleted_offsets: BTreeSet<u64>,
 }
 
 impl BlobFile {
@@ -100,6 +104,7 @@ impl BlobFile {
             offset: 0,
             valid_count: 0,
             deleted_count: 0,
+            deleted_offsets: BTreeSet::new(),
         }
     }
 
@@ -165,13 +170,46 @@ impl BlobFile {
     }
 
     /// Mark an entry as deleted (for GC).
-    pub fn mark_deleted(&mut self, _offset: u64) {
-        // In a real implementation, we'd track which offsets are deleted.
-        // For now, just increment the deleted count.
-        self.deleted_count += 1;
-        if self.valid_count > 0 {
-            self.valid_count -= 1;
+    pub fn mark_deleted(&mut self, offset: u64) -> bool {
+        if !self.has_record_at(offset) || !self.deleted_offsets.insert(offset) {
+            return false;
         }
+
+        self.deleted_count += 1;
+        self.valid_count = self.valid_count.saturating_sub(1);
+        true
+    }
+
+    /// Restore persisted deletion metadata after loading the record stream.
+    pub(crate) fn restore_deleted(&mut self, offsets: &[u64]) -> Option<()> {
+        for &offset in offsets {
+            if !self.mark_deleted(offset) {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// Return deleted record offsets in stable order for persistence.
+    pub(crate) fn deleted_offsets(&self) -> impl Iterator<Item = u64> + '_ {
+        self.deleted_offsets.iter().copied()
+    }
+
+    pub(crate) fn clear_deletion_metadata(&mut self) {
+        self.deleted_offsets.clear();
+        self.deleted_count = 0;
+        self.valid_count = self.records.len();
+    }
+
+    fn has_record_at(&self, offset: u64) -> bool {
+        let mut current_offset = 0u64;
+        for record in &self.records {
+            if current_offset == offset {
+                return true;
+            }
+            current_offset = current_offset.saturating_add(record.serialized_size() as u64);
+        }
+        false
     }
 
     /// Serialize all records to bytes.
@@ -204,6 +242,7 @@ impl BlobFile {
             offset,
             valid_count,
             deleted_count: 0,
+            deleted_offsets: BTreeSet::new(),
         })
     }
 }
@@ -244,14 +283,15 @@ mod tests {
     #[test]
     fn test_blob_file_gc() {
         let mut file = BlobFile::new(1);
-        file.append([0; 8], vec![1]);
-        file.append([0; 8], vec![2]);
+        let (offset1, _) = file.append([0; 8], vec![1]);
+        let (offset2, _) = file.append([0; 8], vec![2]);
         file.append([0; 8], vec![3]);
 
         assert!(!file.needs_gc());
 
-        file.mark_deleted(0);
-        file.mark_deleted(1);
+        assert!(file.mark_deleted(offset1));
+        assert!(file.mark_deleted(offset2));
+        assert!(!file.mark_deleted(offset2));
 
         assert!(file.needs_gc());
     }
