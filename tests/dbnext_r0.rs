@@ -408,6 +408,33 @@ fn dbnext_r0_vacuum_write_failure_preserves_prior_generation() {
 }
 
 #[test]
+fn dbnext_r0_vacuum_capacity_refusal_is_retryable_before_rebuild() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("vacuum-capacity.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    db.put(b"keep", b"old").unwrap();
+    db.put(b"remove", b"tombstoned").unwrap();
+    db.flush().unwrap();
+    db.delete(b"remove").unwrap();
+    db.flush().unwrap();
+
+    let before = db.durability_status();
+    db.inject_capacity_limit(0);
+    assert!(matches!(db.vacuum(), Err(Error::DiskFull)));
+    assert_eq!(db.durability_status(), before);
+    assert!(!db.durability_status().write_fenced);
+    assert_eq!(db.get(b"keep").unwrap(), Some(b"old".to_vec()));
+    assert_eq!(db.get(b"remove").unwrap(), None);
+
+    db.inject_capacity_limit(u64::MAX);
+    let report = db.vacuum().unwrap();
+    assert_eq!(report.live_entries, 1);
+    assert_eq!(db.get(b"keep").unwrap(), Some(b"old".to_vec()));
+    assert_eq!(db.get(b"remove").unwrap(), None);
+    assert!(db.verify().is_ok());
+}
+
+#[test]
 fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     let root = tempdir().unwrap();
     let path = root.path().join("history-prune.db");
