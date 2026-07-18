@@ -2199,6 +2199,107 @@ fn dbnext_r0_bounded_compaction_reopens_between_maintenance_steps() {
 }
 
 #[test]
+fn dbnext_r0_sustained_reclamation_preserves_retained_root_and_recovers_space() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("sustained-reclamation.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let value = vec![0x31u8; 192];
+    let key_count = 64usize;
+    let mut model = BTreeMap::new();
+
+    for key_id in 0..key_count {
+        let key = format!("key-{key_id:04}");
+        db.put(key.as_bytes(), &value).unwrap();
+        model.insert(key.into_bytes(), value.clone());
+    }
+    db.flush().unwrap();
+    let retained_commit = db.durability_status().commit_id;
+    let retained = db.retain_commit(retained_commit).unwrap();
+    let retained_value = db.get_at(retained, b"key-0000").unwrap();
+    let initial_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    let mut peak_bytes = initial_bytes;
+
+    for round in 0..24usize {
+        for offset in 0..8usize {
+            let key_id = (round * 8 + offset) % key_count;
+            let key = format!("key-{key_id:04}");
+            if (round + offset).is_multiple_of(7) {
+                db.delete(key.as_bytes()).unwrap();
+                model.remove(key.as_bytes());
+            } else {
+                let next_value = vec![(0x40 + (round % 32)) as u8; 192 + (offset % 3) * 16];
+                db.put(key.as_bytes(), &next_value).unwrap();
+                model.insert(key.into_bytes(), next_value);
+            }
+        }
+        db.flush().unwrap();
+
+        for _ in 0..8 {
+            let report = db.compact_with_limit(2).unwrap();
+            assert!(report.relocated_pages <= 2);
+            assert!(db.verify().is_ok());
+            if report.relocated_pages == 0 && report.data_bytes_before == report.data_bytes_after {
+                break;
+            }
+        }
+
+        let current_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+        peak_bytes = peak_bytes.max(current_bytes);
+        for key_id in 0..key_count {
+            let key = format!("key-{key_id:04}");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap(),
+                model.get(key.as_bytes()).cloned()
+            );
+        }
+        assert_eq!(db.get_at(retained, b"key-0000").unwrap(), retained_value);
+
+        if round % 6 == 5 {
+            drop(db);
+            db = DB::open(&path, Options::default()).unwrap();
+            assert!(db.verify().is_ok());
+            assert_eq!(db.get_at(retained, b"key-0000").unwrap(), retained_value);
+        }
+    }
+
+    let protected_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert!(
+        peak_bytes > initial_bytes,
+        "retained history did not exercise physical growth"
+    );
+    db.release_snapshot(retained).unwrap();
+    for _ in 0..32 {
+        let report = db.compact_with_limit(4).unwrap();
+        if report.relocated_pages == 0 && report.data_bytes_before == report.data_bytes_after {
+            break;
+        }
+    }
+    let report = db.vacuum().unwrap();
+    assert_eq!(report.live_entries, model.len() as u64);
+    db.compact().unwrap();
+    let final_bytes = fs::metadata(path.join("seerdb.data")).unwrap().len();
+    assert!(
+        final_bytes < peak_bytes,
+        "maintenance did not recover space"
+    );
+    assert!(
+        final_bytes < protected_bytes,
+        "releasing the retained root did not make its pages reclaimable"
+    );
+    for (key, value) in &model {
+        assert_eq!(db.get(key).unwrap(), Some(value.clone()));
+    }
+    assert!(db.verify().is_ok());
+
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    for (key, value) in &model {
+        assert_eq!(reopened.get(key).unwrap(), Some(value.clone()));
+    }
+    assert!(reopened.verify().is_ok());
+}
+
+#[test]
 fn dbnext_r0_interior_compaction_sync_failure_recovers_old_generation() {
     let root = tempdir().unwrap();
     let path = root.path().join("compact-interior-fault.db");
