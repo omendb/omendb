@@ -301,6 +301,165 @@ fn dbnext_r0_retains_arbitrary_historical_commit_across_reopen() {
 }
 
 #[test]
+fn dbnext_r0_vacuum_rebuilds_live_tree_and_preserves_retained_root() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("vacuum.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+
+    for id in 0..200 {
+        let key = format!("key-{id:04}");
+        let value = format!("value-before-{id:04}");
+        db.put(key.as_bytes(), value.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+    let first = db.durability_status();
+
+    for id in 0..150 {
+        let key = format!("key-{id:04}");
+        assert!(db.delete(key.as_bytes()).unwrap());
+    }
+    db.flush().unwrap();
+    let snapshot_id = db.retain_commit(first.commit_id).unwrap();
+
+    let report = db.vacuum().unwrap();
+    assert_eq!(report.live_entries, 50);
+    assert!(report.logical_pages_before >= report.logical_pages_after);
+    assert_eq!(db.get(b"key-0000").unwrap(), None);
+    assert_eq!(
+        db.get(b"key-0199").unwrap(),
+        Some(b"value-before-0199".to_vec())
+    );
+    assert_eq!(
+        db.get_at(snapshot_id, b"key-0000").unwrap(),
+        Some(b"value-before-0000".to_vec())
+    );
+    assert!(db.verify().is_ok());
+
+    db.compact().unwrap();
+    assert_eq!(
+        db.get_at(snapshot_id, b"key-0149").unwrap(),
+        Some(b"value-before-0149".to_vec())
+    );
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(reopened.get(b"key-0000").unwrap(), None);
+    assert_eq!(
+        reopened.get(b"key-0199").unwrap(),
+        Some(b"value-before-0199".to_vec())
+    );
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"key-0000").unwrap(),
+        Some(b"value-before-0000".to_vec())
+    );
+    reopened.release_snapshot(snapshot_id).unwrap();
+}
+
+#[test]
+fn dbnext_r0_vacuum_write_failure_preserves_prior_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("vacuum-failure.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    db.put(b"keep", b"old").unwrap();
+    db.put(b"remove", b"tombstoned").unwrap();
+    db.flush().unwrap();
+    db.delete(b"remove").unwrap();
+    db.flush().unwrap();
+
+    db.inject_write_failure();
+    assert!(db.vacuum().is_err());
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(reopened.get(b"keep").unwrap(), Some(b"old".to_vec()));
+    assert_eq!(reopened.get(b"remove").unwrap(), None);
+    assert!(reopened.verify().is_ok());
+}
+
+#[test]
+fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("history-prune.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"one".to_vec(),
+        }])
+        .unwrap();
+    let snapshot_id = db.retain_commit(first.commit_id).unwrap();
+    let second = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"two".to_vec(),
+        }])
+        .unwrap();
+    let third = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"three".to_vec(),
+        }])
+        .unwrap();
+
+    let second_checkpoint = path.join(format!("seerdb.meta.{}", second.generation_id.get()));
+    let first_checkpoint = path.join(format!("seerdb.meta.{}", first.generation_id.get()));
+    let third_checkpoint = path.join(format!("seerdb.meta.{}", third.generation_id.get()));
+    assert!(first_checkpoint.is_file());
+    assert!(second_checkpoint.is_file());
+    assert!(third_checkpoint.is_file());
+
+    let report = db.prune_history().unwrap();
+    assert_eq!(report.retained_generations, 2);
+    assert_eq!(report.removed_checkpoints, 1);
+    assert!(!second_checkpoint.exists());
+    assert!(first_checkpoint.is_file());
+    assert!(third_checkpoint.is_file());
+    assert_eq!(
+        db.get_at(snapshot_id, b"versioned").unwrap(),
+        Some(b"one".to_vec())
+    );
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"versioned").unwrap(),
+        Some(b"one".to_vec())
+    );
+    reopened.release_snapshot(snapshot_id).unwrap();
+    let report = reopened.prune_history().unwrap();
+    assert_eq!(report.retained_generations, 1);
+    assert!(!first_checkpoint.exists());
+    assert!(third_checkpoint.is_file());
+    assert!(matches!(
+        reopened.get_at(snapshot_id, b"versioned"),
+        Err(Error::SnapshotUnavailable(_))
+    ));
+}
+
+#[test]
+fn dbnext_r0_history_prune_rename_failure_preserves_old_sidecar() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("history-prune-failure.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    db.put(b"versioned", b"one").unwrap();
+    db.flush().unwrap();
+    let first_checkpoint = path.join("seerdb.meta.1");
+    db.put(b"versioned", b"two").unwrap();
+    db.flush().unwrap();
+    assert!(first_checkpoint.is_file());
+
+    db.inject_atomic_rename_failure();
+    assert!(db.prune_history().is_err());
+    assert!(first_checkpoint.is_file());
+    assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
+
+    let report = db.prune_history().unwrap();
+    assert_eq!(report.removed_checkpoints, 1);
+    assert!(!first_checkpoint.exists());
+}
+
+#[test]
 fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
     let root = tempdir().unwrap();
     let path = root.path().join("batch-transaction.db");

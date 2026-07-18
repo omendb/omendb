@@ -122,6 +122,14 @@ impl PMT {
         self.mappings.is_empty()
     }
 
+    /// Remove all mappings while preserving the monotonic version frontier.
+    ///
+    /// A logical rebuild reuses page IDs in a new tree, but versioned buffer
+    /// cache keys must not alias pages from the prior generation.
+    pub fn clear(&mut self) {
+        self.mappings.clear();
+    }
+
     /// Iterate over all mappings.
     pub fn iter(&self) -> impl Iterator<Item = (u64, &PageMapping)> {
         self.mappings.iter().map(|(&k, v)| (k, v))

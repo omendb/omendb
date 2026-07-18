@@ -22,7 +22,7 @@ use crate::storage::format::{
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -809,6 +809,32 @@ pub struct CompactionReport {
     pub relocated_pages: u64,
     /// Whether the active manifest was mirrored before truncation.
     pub manifest_replicated: bool,
+}
+
+/// Results from a logical mark-and-rebuild vacuum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// Durable identity after the rebuild generation.
+    pub durability: DurabilityStatus,
+    /// Number of live key-value entries copied into the new tree.
+    pub live_entries: u64,
+    /// Active logical page count before rebuilding.
+    pub logical_pages_before: u64,
+    /// Active logical page count after rebuilding.
+    pub logical_pages_after: u64,
+}
+
+/// Results from pruning superseded manifests and checkpoint files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryPruneReport {
+    /// Number of generations retained for the current root and snapshots.
+    pub retained_generations: u64,
+    /// Number of manifest descriptors removed from the history sidecar.
+    pub removed_manifests: u64,
+    /// Number of superseded checkpoint files removed.
+    pub removed_checkpoints: u64,
+    /// Bytes reclaimed from removed checkpoint files.
+    pub reclaimed_checkpoint_bytes: u64,
 }
 
 /// Cumulative storage work and current artifact sizes for diagnostics.
@@ -3076,6 +3102,123 @@ impl DB {
         result
     }
 
+    /// Rebuild the active tree from live entries and publish it as a new
+    /// maintenance generation.
+    ///
+    /// This is the first complete logical reclamation primitive: tombstones
+    /// and obsolete versions are omitted from the rebuilt tree, while the
+    /// old PMT and blob image remain protected until the new manifest is
+    /// authoritative. The rebuild is intentionally whole-database for now;
+    /// bounded scheduling can be layered on the same publication protocol.
+    pub fn vacuum(&mut self) -> Result<VacuumReport> {
+        self.check_writable()?;
+        self.flush()?;
+        self.mirror_current_manifest()?;
+
+        let logical_pages_before = self.engine.pmt().len() as u64;
+        let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
+        let entries = self.range(&[], &end)?;
+        let mut candidate_tree = BTree::new();
+        let mut candidate_blobs = BlobManager::with_threshold(self.blobs.threshold());
+        for (key, value) in &entries {
+            if candidate_blobs.should_separate(value.len()) {
+                let pointer = candidate_blobs.append(key, value.clone());
+                candidate_tree.upsert_blob(key, pointer)?;
+            } else {
+                candidate_tree.upsert(key, value)?;
+            }
+        }
+
+        let candidate_blob_bytes = candidate_blobs.to_bytes();
+        self.engine
+            .check_artifact_capacity(candidate_blob_bytes.len() as u64)?;
+        self.reserve_blob_image(candidate_blob_bytes.len() as u64)?;
+
+        let result = (|| {
+            self.engine.prepare_logical_rebuild(candidate_tree)?;
+            self.blobs = candidate_blobs;
+            self.engine.flush()?;
+            self.publish_blob_rewrite_generation()?;
+            Ok(VacuumReport {
+                durability: self.durability_status(),
+                live_entries: entries.len() as u64,
+                logical_pages_before,
+                logical_pages_after: self.engine.pmt().len() as u64,
+            })
+        })();
+        if result.is_err() {
+            self.write_fenced = true;
+        }
+        result
+    }
+
+    /// Remove historical manifests and PMT checkpoints that are not needed
+    /// by the current root or a durable retained snapshot.
+    ///
+    /// The history sidecar is atomically replaced before any checkpoint is
+    /// deleted. A crash during cleanup therefore leaves harmless extra files,
+    /// never a history entry that names a missing checkpoint.
+    pub fn prune_history(&mut self) -> Result<HistoryPruneReport> {
+        self.check_writable()?;
+        self.flush()?;
+        let current = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+
+        let mut retained = BTreeSet::from([current.generation_id]);
+        let state = self
+            .retention
+            .lock()
+            .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+        retained.extend(state.all_roots().map(|root| root.manifest.generation_id));
+        drop(state);
+
+        let mut history = self.manifest_history.clone();
+        history
+            .reconcile_current(current)
+            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        let removed_manifests = history.prune_to_generations(&retained) as u64;
+        if history != self.manifest_history {
+            self.persist_manifest_history(&history)?;
+            self.manifest_history = history;
+        }
+
+        let mut removed_checkpoints = 0u64;
+        let mut reclaimed_checkpoint_bytes = 0u64;
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(generation) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("seerdb.meta."))
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if retained.contains(&GenerationId::new(generation)) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() {
+                continue;
+            }
+            fs::remove_file(entry.path())?;
+            removed_checkpoints = removed_checkpoints.saturating_add(1);
+            reclaimed_checkpoint_bytes = reclaimed_checkpoint_bytes.saturating_add(metadata.len());
+        }
+        if removed_checkpoints > 0 {
+            sync_directory(&self.path)?;
+        }
+
+        Ok(HistoryPruneReport {
+            retained_generations: retained.len() as u64,
+            removed_manifests,
+            removed_checkpoints,
+            reclaimed_checkpoint_bytes,
+        })
+    }
+
     /// Publish a PMT relocation without inventing a logical user commit.
     ///
     /// The caller must have mirrored the current manifest before writing the
@@ -3106,6 +3249,7 @@ impl DB {
         let manifest = Manifest {
             generation_id,
             pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
+            root_page_id: self.engine.btree().root_id() as u64,
             ..current
         };
         let mut manifest_history = self.manifest_history.clone();
@@ -3152,11 +3296,14 @@ impl DB {
         self.blobs.set_generation(generation_id.get());
         let blob_path = self.path.join(BLOB_FILE);
         let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
+        let had_blob_image = blob_path.is_file();
         if backup_path.exists() {
             fs::remove_file(&backup_path)?;
         }
-        fs::rename(&blob_path, &backup_path)?;
-        sync_directory(&self.path)?;
+        if had_blob_image {
+            fs::rename(&blob_path, &backup_path)?;
+            sync_directory(&self.path)?;
+        }
         self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -3167,6 +3314,7 @@ impl DB {
         let manifest = Manifest {
             generation_id,
             pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
+            root_page_id: self.engine.btree().root_id() as u64,
             ..current
         };
         let mut manifest_history = self.manifest_history.clone();
@@ -3182,8 +3330,10 @@ impl DB {
         self.manifest.publish(manifest)?;
         self.engine.complete_generation();
         self.generation_id = generation_id;
-        fs::remove_file(&backup_path)?;
-        sync_directory(&self.path)?;
+        if had_blob_image {
+            fs::remove_file(&backup_path)?;
+            sync_directory(&self.path)?;
+        }
         Ok(())
     }
 

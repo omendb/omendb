@@ -448,6 +448,18 @@ impl ManifestHistory {
         Err("manifest history disagrees with authoritative manifest")
     }
 
+    /// Retain only the generations that are still needed by the active
+    /// manifest and durable snapshot registry.
+    ///
+    /// The caller is responsible for atomically persisting the resulting
+    /// history before deleting any superseded checkpoint files.
+    pub fn prune_to_generations(&mut self, retained: &BTreeSet<GenerationId>) -> usize {
+        let before = self.manifests.len();
+        self.manifests
+            .retain(|manifest| retained.contains(&manifest.generation_id));
+        before.saturating_sub(self.manifests.len())
+    }
+
     /// Return the append-only history log header.
     pub fn header_bytes() -> [u8; 12] {
         let mut bytes = [0; 12];

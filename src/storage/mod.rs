@@ -104,6 +104,10 @@ pub struct StorageEngine {
     /// pages remain unavailable for reuse until the corresponding retention
     /// lease is released and the allocator refreshes its reclamation view.
     protected_offsets: Arc<Mutex<HashSet<u64>>>,
+    /// Active-generation offsets held aside while a logical rebuild is being
+    /// published. Resetting the PMT before the new root is authoritative must
+    /// not make the old root's pages reusable after a crash.
+    rebuild_reserved_offsets: HashSet<u64>,
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
@@ -150,6 +154,7 @@ impl StorageEngine {
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
             protected_offsets,
+            rebuild_reserved_offsets: HashSet::new(),
             lazy_root: None,
             metrics: StorageCounters::default(),
         }
@@ -234,10 +239,13 @@ impl StorageEngine {
             .lock()
             .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
             .clone();
+        let rebuild_reserved_offsets = &self.rebuild_reserved_offsets;
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
             .filter(|offset| {
-                !active_offsets.contains(offset) && !protected_offsets.contains(offset)
+                !active_offsets.contains(offset)
+                    && !protected_offsets.contains(offset)
+                    && !rebuild_reserved_offsets.contains(offset)
             })
             .collect();
         self.next_offset = device_size;
@@ -410,6 +418,11 @@ impl StorageEngine {
                 .drain(..)
                 .filter(|offset| !protected_offsets.contains(offset)),
         );
+        self.free_offsets.extend(
+            self.rebuild_reserved_offsets
+                .drain()
+                .filter(|offset| !protected_offsets.contains(offset)),
+        );
         self.free_offsets.sort_unstable();
         self.free_offsets.dedup();
         if let Ok(mut buffer) = self.buffer.lock() {
@@ -503,6 +516,33 @@ impl StorageEngine {
     /// Get mutable access to the page mapping table for recovery.
     pub fn pmt_mut(&mut self) -> &mut PMT {
         &mut self.pmt
+    }
+
+    /// Replace the active logical tree as part of a full mark-and-rebuild
+    /// maintenance generation.
+    ///
+    /// The old PMT locations are reserved until the caller publishes the new
+    /// manifest and invokes [`Self::complete_generation`]. If maintenance
+    /// fails before that barrier, reopening selects the old PMT and the
+    /// speculative pages remain unreachable rather than overwriting the old
+    /// root.
+    pub(crate) fn prepare_logical_rebuild(&mut self, btree: BTree) -> Result<()> {
+        if !self.pending_reclaimed_offsets.is_empty()
+            || !self.pending_reclaimed_cache_keys.is_empty()
+        {
+            return Err(Error::NeedsRecovery(
+                "logical rebuild has an unpublished retired-page set".into(),
+            ));
+        }
+
+        self.rebuild_reserved_offsets =
+            self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        self.pmt.clear();
+        self.btree = btree;
+        self.lazy_root = None;
+        self.free_offsets.clear();
+        self.next_offset = self.device.size()?;
+        Ok(())
     }
 
     /// Inject one device sync failure for publication-boundary tests.
