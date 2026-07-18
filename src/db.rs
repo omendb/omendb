@@ -2350,7 +2350,10 @@ impl DB {
             .manifest
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
-        let snapshot_id = self.register_retained_manifest(manifest)?;
+        // Each owned handle needs its own durable lease. Reusing a commit's
+        // existing root here would let releasing one handle unprotect the
+        // pages still needed by another handle.
+        let snapshot_id = self.register_retained_manifest(manifest, false)?;
 
         Ok(RetainedSnapshot {
             snapshot: Some(snapshot),
@@ -2380,7 +2383,7 @@ impl DB {
             .ok_or_else(|| {
                 Error::SnapshotUnavailable(format!("commit {} is not retained", commit_id.get()))
             })?;
-        self.register_retained_manifest(manifest)
+        self.register_retained_manifest(manifest, true)
     }
 
     /// Return the active retention ID for a commit, if one exists.
@@ -2402,8 +2405,14 @@ impl DB {
             .remove(snapshot_id)
     }
 
-    fn register_retained_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
-        if let Some(snapshot_id) = self.retained_snapshot_id(manifest.commit_id) {
+    fn register_retained_manifest(
+        &mut self,
+        manifest: Manifest,
+        deduplicate_commit: bool,
+    ) -> Result<SnapshotId> {
+        if deduplicate_commit
+            && let Some(snapshot_id) = self.retained_snapshot_id(manifest.commit_id)
+        {
             return Ok(snapshot_id);
         }
         let snapshot_id = {

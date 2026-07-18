@@ -906,6 +906,38 @@ fn dbnext_r0_owned_snapshot_releases_retained_copy() {
 }
 
 #[test]
+fn dbnext_r0_owned_retention_handles_keep_independent_leases() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("owned-retention-leases.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"before").unwrap();
+    db.flush().unwrap();
+
+    let first = db.retain_current().unwrap();
+    let first_id = first.snapshot_id();
+    let second = db.retain_current().unwrap();
+    let second_id = second.snapshot_id();
+    assert_ne!(first_id, second_id);
+    assert_eq!(first.get(b"key").unwrap(), Some(b"before".to_vec()));
+    assert_eq!(second.get(b"key").unwrap(), Some(b"before".to_vec()));
+
+    db.put(b"key", b"after").unwrap();
+    db.flush().unwrap();
+    first.release().unwrap();
+
+    assert!(matches!(
+        db.get_at(first_id, b"key"),
+        Err(Error::SnapshotUnavailable(_))
+    ));
+    assert_eq!(
+        db.get_at(second_id, b"key").unwrap(),
+        Some(b"before".to_vec())
+    );
+    second.release().unwrap();
+    assert!(!path.join("seerdb.retained").exists());
+}
+
+#[test]
 fn dbnext_r0_retained_root_pins_page_reuse_until_release() {
     let root = tempdir().unwrap();
     let path = root.path().join("retained-root.db");
