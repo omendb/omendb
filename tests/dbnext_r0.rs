@@ -775,6 +775,64 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
 }
 
 #[test]
+fn dbnext_r0_process_crash_publication_matrix() {
+    if let Some(path) = std::env::var_os("SEERDB_R0_PROCESS_CRASH_PATH") {
+        let path = Path::new(&path);
+        let fault = std::env::var("SEERDB_R0_PROCESS_CRASH_FAULT").unwrap();
+        let mut db = DB::open(path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+
+        match fault.as_str() {
+            "wal-sync" => db.inject_wal_sync_failure(),
+            "page-write" => db.inject_write_failure(),
+            "page-sync" => db.inject_page_range_sync_failure(),
+            "manifest-sync" => db.inject_manifest_sync_failure(),
+            "after-manifest" => db.inject_after_manifest_failure(),
+            "wal-truncate" => db.inject_wal_truncate_failure(),
+            "final-disk-full" => db.inject_final_write_disk_full(),
+            _ => panic!("unknown process crash fault {fault}"),
+        }
+        let _ = db.flush();
+
+        // Do not run destructors: the parent must recover the on-disk state
+        // from the exact process-termination boundary above.
+        std::process::exit(137);
+    }
+
+    let cases = [
+        ("wal-sync", false),
+        ("page-write", false),
+        ("page-sync", false),
+        ("manifest-sync", false),
+        ("after-manifest", true),
+        ("wal-truncate", true),
+        ("final-disk-full", false),
+    ];
+    let root = tempdir().unwrap();
+    for (fault, expect_new) in cases {
+        let path = root.path().join(format!("process-crash-{fault}.db"));
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("dbnext_r0_process_crash_publication_matrix")
+            .arg("--nocapture")
+            .env("SEERDB_R0_PROCESS_CRASH_PATH", &path)
+            .env("SEERDB_R0_PROCESS_CRASH_FAULT", fault)
+            .status()
+            .unwrap();
+        assert!(!status.success(), "crash child exited cleanly for {fault}");
+
+        let mut recovered = DB::open(&path, Options::default()).unwrap();
+        let expected = if expect_new { b"value-2" } else { b"value-1" };
+        assert_eq!(recovered.get(b"key").unwrap(), Some(expected.to_vec()));
+        assert_eq!(recovered.durability_status().pending_mutations, 0);
+        assert!(!recovered.durability_status().write_fenced);
+        assert!(recovered.verify().is_ok());
+    }
+}
+
+#[test]
 fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
     let root = tempdir().unwrap();
     let source_path = root.path().join("snapshot-source.db");
