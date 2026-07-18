@@ -896,6 +896,12 @@ pub struct DB {
     pending_mutations: u64,
     /// Logical WAL bytes admitted for the pending generation.
     pending_wal_bytes: u64,
+    /// Physical WAL reservation extent already established for this handle.
+    ///
+    /// Keep-size reservation is a handle-level high-water mark. Reissuing a
+    /// full APFS `F_PREALLOCATE` request on every mutation can eventually
+    /// report `ENOSPC` even though the original extent is already reserved.
+    wal_reserved_extent: u64,
     /// Digest over pending mutation records.
     pending_digest: u32,
     /// Whether the database is open.
@@ -1274,6 +1280,7 @@ impl DB {
             commit_id,
             pending_mutations: 0,
             pending_wal_bytes: 0,
+            wal_reserved_extent: 0,
             pending_digest: 0,
             is_open: true,
             write_fenced: false,
@@ -1865,10 +1872,14 @@ impl DB {
     /// mutation changes tree or blob state. The extent is rounded to fixed
     /// segments so future WAL growth has a bounded, stable admission domain;
     /// the logical WAL remains separately length-delimited and checksummed.
-    fn ensure_wal_reservation(&self) -> Result<u64> {
+    fn ensure_wal_reservation(&mut self) -> Result<u64> {
         let target = self.wal_reservation_target()?;
         if target == 0 {
+            self.wal_reserved_extent = 0;
             return Ok(0);
+        }
+        if self.wal_reserved_extent >= target {
+            return Ok(self.wal_reserved_extent);
         }
 
         // Reserve the physical extent on the file that will receive WAL
@@ -1892,6 +1903,7 @@ impl DB {
             file.sync_data()?;
             sync_directory(&self.path)?;
         }
+        self.wal_reserved_extent = target;
         Ok(current.max(target))
     }
 
@@ -2121,6 +2133,7 @@ impl DB {
 
             sync_directory(&self.path)?;
         }
+        self.wal_reserved_extent = 0;
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
@@ -2373,11 +2386,7 @@ impl DB {
             data_bytes: artifact_size(DATA_FILE)?,
             blob_bytes: artifact_size(BLOB_FILE)?,
             wal_bytes: artifact_size(WAL_FILE)?,
-            wal_reserved_bytes: if self.path.join(WAL_FILE).is_file() {
-                self.wal_reservation_target()?
-            } else {
-                0
-            },
+            wal_reserved_bytes: self.wal_reserved_extent,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
         })
     }
