@@ -117,8 +117,7 @@ impl BTree {
     /// Replace the tree's logical page allocator during storage bootstrap.
     pub fn with_page_allocator(mut self, page_allocator: PageAllocator) -> Self {
         self.page_allocator = page_allocator;
-        self.page_allocator
-            .advance_next_id(self.nodes.len() as u64);
+        self.page_allocator.advance_next_id(self.nodes.len() as u64);
         self
     }
 
@@ -468,9 +467,7 @@ impl BTree {
                     "cycle detected during B-tree descent".into(),
                 ));
             }
-            let node = self
-                .node(current)
-                .ok_or(BTreeError::MissingPage(current))?;
+            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;
             if node.is_leaf() {
                 return Ok(current);
             }
@@ -539,9 +536,9 @@ impl BTree {
             let mut children = Vec::with_capacity(node.count() + 1);
             children.push(leftmost as PageId);
             for index in 0..node.count() {
-                let child = node.child_id(index).ok_or_else(|| {
-                    BTreeError::Corruption("internal child is malformed".into())
-                })?;
+                let child = node
+                    .child_id(index)
+                    .ok_or_else(|| BTreeError::Corruption("internal child is malformed".into()))?;
                 if child > u32::MAX as u64 {
                     return Err(BTreeError::Corruption(
                         "internal child page ID exceeds the logical ID width".into(),
@@ -606,9 +603,9 @@ impl BTree {
                 .node(parent_id)
                 .ok_or_else(|| BTreeError::Corruption("range parent page is missing".into()))?;
             if child_position < parent.count() {
-                let next_child = parent.child_id(child_position).ok_or_else(|| {
-                    BTreeError::Corruption("internal child is malformed".into())
-                })?;
+                let next_child = parent
+                    .child_id(child_position)
+                    .ok_or_else(|| BTreeError::Corruption("internal child is malformed".into()))?;
                 if next_child > u32::MAX as u64 {
                     return Err(BTreeError::Corruption(
                         "internal child page ID exceeds the logical ID width".into(),
@@ -762,23 +759,34 @@ impl BTree {
         None
     }
 
-    /// Return a node's recorded parent, validating it before falling back to
-    /// a structural search for legacy or externally loaded pages.
+    /// Return a node's recorded parent when it points back to this child,
+    /// otherwise find the structural parent.
+    ///
+    /// Parent IDs are a cache used for persistence and diagnostics, but split
+    /// propagation must not trust a stale cache entry: an existing internal
+    /// page is not necessarily the page that currently references `node_id`.
+    /// Validating the edge preserves the O(1) common path while keeping the
+    /// structural walk as a safe fallback for legacy or malformed metadata.
     fn parent_of(&self, node_id: PageId) -> Option<PageId> {
         if node_id == self.root {
             return None;
         }
 
-        let recorded = self.node(node_id).map(Node::parent_id);
-        if let Some(parent_id) = recorded.filter(|&parent_id| parent_id != 0)
+        if let Some(recorded_parent) = self.node(node_id).map(Node::parent_id)
+            && recorded_parent != 0
             && self
-                .node(parent_id)
-                .is_some_and(|parent| !parent.is_leaf())
+                .node(recorded_parent)
+                .is_some_and(|parent| self.references_child(parent, node_id))
         {
-            return Some(parent_id);
+            return Some(recorded_parent);
         }
 
         self.find_parent(self.root, node_id)
+    }
+
+    fn references_child(&self, parent: &Node, child_id: PageId) -> bool {
+        parent.leftmost_child() == child_id as u64
+            || (0..parent.count()).any(|index| parent.child_id(index) == Some(child_id as u64))
     }
 
     /// Insert a key and right child into an internal node.
@@ -813,6 +821,7 @@ impl BTree {
         };
 
         let right_id = self.alloc_node(right_node)?;
+        self.set_direct_children_parent(right_id, right_id)?;
 
         let target_id = if key >= median_key.as_slice() {
             right_id
@@ -824,6 +833,9 @@ impl BTree {
             .expect("target_id should be valid")
             .insert_child(key, right_child_id as u64)
             .map_err(BTreeError::InsertFailed)?;
+        self.node_mut(right_child_id)
+            .ok_or(BTreeError::MissingPage(right_child_id))?
+            .set_parent_id(target_id);
 
         if node_id == self.root {
             self.create_new_root(node_id, &median_key, right_id)?;
@@ -837,6 +849,37 @@ impl BTree {
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
 
+        Ok(())
+    }
+
+    fn set_direct_children_parent(
+        &mut self,
+        node_id: PageId,
+        parent_id: PageId,
+    ) -> Result<(), BTreeError> {
+        let children =
+            {
+                let node = self.node(node_id).ok_or(BTreeError::MissingPage(node_id))?;
+                if node.is_leaf() {
+                    return Ok(());
+                }
+                let mut children = Vec::with_capacity(node.count() + 1);
+                children.push(node.leftmost_child());
+                for index in 0..node.count() {
+                    children.push(node.child_id(index).ok_or_else(|| {
+                        BTreeError::Corruption("internal child is malformed".into())
+                    })?);
+                }
+                children
+            };
+        for child in children {
+            let child = u32::try_from(child).map_err(|_| {
+                BTreeError::Corruption("internal child page ID exceeds width".into())
+            })?;
+            self.node_mut(child)
+                .ok_or(BTreeError::MissingPage(child))?
+                .set_parent_id(parent_id);
+        }
         Ok(())
     }
 
@@ -929,17 +972,13 @@ impl<'a> Iterator for RangeScan<'a> {
         loop {
             let Some(node) = self.tree.node(self.current_node) else {
                 self.done = true;
-                return Some(Err(BTreeError::Corruption(
-                    "range page is missing".into(),
-                )));
+                return Some(Err(BTreeError::Corruption("range page is missing".into())));
             };
 
             if self.current_index < node.count() {
                 let Some(key) = node.key(self.current_index) else {
                     self.done = true;
-                    return Some(Err(BTreeError::Corruption(
-                        "range key is malformed".into(),
-                    )));
+                    return Some(Err(BTreeError::Corruption("range key is malformed".into())));
                 };
 
                 if key >= self.end {
@@ -1027,7 +1066,10 @@ mod tests {
             tree.lookup(b"aaa").unwrap(),
             LookupResult::Found(value) if value == b"bbb"
         ));
-        assert!(matches!(tree.lookup(b"missing").unwrap(), LookupResult::NotFound));
+        assert!(matches!(
+            tree.lookup(b"missing").unwrap(),
+            LookupResult::NotFound
+        ));
     }
 
     #[test]
@@ -1113,10 +1155,16 @@ mod tests {
         let mut tree = BTree::new();
 
         tree.insert(b"key", b"value").unwrap();
-        assert!(matches!(tree.lookup(b"key").unwrap(), LookupResult::Found(_)));
+        assert!(matches!(
+            tree.lookup(b"key").unwrap(),
+            LookupResult::Found(_)
+        ));
 
         tree.delete(b"key").unwrap();
-        assert!(matches!(tree.lookup(b"key").unwrap(), LookupResult::Deleted));
+        assert!(matches!(
+            tree.lookup(b"key").unwrap(),
+            LookupResult::Deleted
+        ));
         assert!(tree.range_scan(b"key", b"key~").unwrap().next().is_none());
         assert!(!tree.delete(b"key").unwrap());
 
@@ -1182,6 +1230,80 @@ mod tests {
                 tree.lookup(key.as_bytes()).unwrap(),
                 LookupResult::Found(_)
             ));
+        }
+    }
+
+    #[test]
+    fn test_btree_large_range_scan_preserves_all_keys() {
+        let mut tree = BTree::new();
+        for index in 0..2_000 {
+            let key = format!("index/{:04}/{:04}", index % 32, index);
+            tree.upsert(key.as_bytes(), b"value").unwrap();
+        }
+
+        let entries = tree
+            .range_scan(b"index/", b"index/\xFF")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 2_000);
+    }
+
+    #[test]
+    fn test_btree_large_namespace_batch_preserves_ranges() {
+        let mut tree = BTree::new();
+        let mut row_prefix = vec![0x10];
+        row_prefix.extend_from_slice(&10_u64.to_be_bytes());
+        let mut index_prefix = vec![0x20];
+        index_prefix.extend_from_slice(&10_u64.to_be_bytes());
+        index_prefix.extend_from_slice(&10_u64.to_be_bytes());
+
+        for document_id in 1..=2_000_u64 {
+            let mut row_key = row_prefix.clone();
+            row_key.extend_from_slice(&10_u64.to_be_bytes());
+            row_key.extend_from_slice(&document_id.to_be_bytes());
+            tree.upsert(&row_key, b"row").unwrap();
+
+            for index_id in 0..3_u64 {
+                let mut index_key = index_prefix.clone();
+                index_key[9..17].copy_from_slice(&index_id.to_be_bytes());
+                index_key.push(0x04);
+                index_key.extend_from_slice(&(document_id % 32).to_be_bytes());
+                index_key.extend_from_slice(&10_u64.to_be_bytes());
+                index_key.extend_from_slice(&document_id.to_be_bytes());
+                tree.upsert(&index_key, b"index").unwrap();
+            }
+        }
+
+        for document_id in 1..=2_000_u64 {
+            let mut row_key = row_prefix.clone();
+            row_key.extend_from_slice(&10_u64.to_be_bytes());
+            row_key.extend_from_slice(&document_id.to_be_bytes());
+            assert!(matches!(tree.lookup(&row_key), Ok(LookupResult::Found(_))));
+        }
+
+        let mut row_end = row_prefix.clone();
+        row_end.push(u8::MAX);
+        let rows = tree
+            .range_scan(&row_prefix, &row_end)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2_000);
+
+        let mut pending = vec![tree.root];
+        while let Some(parent_id) = pending.pop() {
+            let parent = tree.node(parent_id).unwrap();
+            if parent.is_leaf() {
+                continue;
+            }
+            let mut children = vec![parent.leftmost_child() as PageId];
+            children
+                .extend((0..parent.count()).map(|index| parent.child_id(index).unwrap() as PageId));
+            for child_id in children {
+                assert_eq!(tree.node(child_id).unwrap().parent_id(), parent_id);
+                pending.push(child_id);
+            }
         }
     }
 

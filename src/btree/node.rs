@@ -230,9 +230,7 @@ impl Node {
     ///
     /// Returns `None` if the header or slotted-page layout is invalid.
     pub fn from_bytes(data: Box<[u8; PAGE_SIZE]>) -> Option<Self> {
-        let node = Self {
-            data,
-        };
+        let node = Self { data };
         let mut header_bytes = [0u8; HEADER_SIZE];
         header_bytes.copy_from_slice(&node.data[..HEADER_SIZE]);
         NodeHeader::try_from_bytes(&header_bytes)?;
@@ -288,7 +286,10 @@ impl Node {
 
         let mut sorted_offsets = offsets.clone();
         sorted_offsets.sort_unstable();
-        if sorted_offsets.windows(2).any(|window| window[0] == window[1]) {
+        if sorted_offsets
+            .windows(2)
+            .any(|window| window[0] == window[1])
+        {
             return false;
         }
 
@@ -349,7 +350,9 @@ impl Node {
                 let value_start = suffix_end + 1;
                 match value_type {
                     0x00 | 0x02 => {}
-                    0x01 if value_start.checked_add(BLOB_POINTER_SIZE).is_some_and(|end| end <= entry_end) => {}
+                    0x01 if value_start
+                        .checked_add(BLOB_POINTER_SIZE)
+                        .is_some_and(|end| end <= entry_end) => {}
                     _ => return false,
                 }
             }
@@ -439,6 +442,10 @@ impl Node {
     fn entry_suffix_len(&self, index: usize) -> u16 {
         let off = self.slot_offset(index) + 2;
         u16::from_le_bytes([self.data[off], self.data[off + 1]])
+    }
+
+    fn has_prefix_compression(&self) -> bool {
+        (0..self.count()).any(|index| self.entry_prefix_len(index) != 0)
     }
 
     /// Reconstruct the full key at slot `index`.
@@ -634,18 +641,66 @@ impl Node {
         value: &[u8],
         insertion_point: usize,
     ) -> Result<(), InsertError> {
+        if !self.is_leaf() || insertion_point > self.count() {
+            return Err(InsertError::WrongNodeType);
+        }
+
+        // Prefix compression is relative to the preceding key. Inserting in
+        // the middle changes that predecessor for every following entry, so
+        // retain the logical entries and rebuild their encoded forms instead
+        // of leaving stale prefix lengths in place.
+        if insertion_point < self.count() && self.has_prefix_compression() {
+            let parent_id = self.parent_id();
+            let mut entries = Vec::with_capacity(self.count() + 1);
+            for index in 0..self.count() {
+                let entry_key = self.key(index).ok_or(InsertError::WrongNodeType)?;
+                let (entry_type, entry_value) =
+                    match self.value(index).ok_or(InsertError::WrongNodeType)? {
+                        ValueRef::Inline(data) => (ValueType::Inline, data.to_vec()),
+                        ValueRef::Blob(pointer) => {
+                            (ValueType::BlobPointer, pointer.to_bytes().to_vec())
+                        }
+                        ValueRef::Tombstone => (ValueType::Tombstone, Vec::new()),
+                    };
+                entries.push((entry_key, entry_type, entry_value));
+            }
+            entries.insert(insertion_point, (key.to_vec(), value_type, value.to_vec()));
+
+            let mut replacement = Self::new_leaf();
+            replacement.set_parent_id(parent_id);
+            for (entry_key, entry_type, entry_value) in entries {
+                let append_at = replacement.count();
+                replacement.insert_leaf_value_raw(
+                    &entry_key,
+                    entry_type,
+                    &entry_value,
+                    append_at,
+                )?;
+            }
+            *self = replacement;
+            return Ok(());
+        }
+
+        self.insert_leaf_value_raw(key, value_type, value, insertion_point)
+    }
+
+    fn insert_leaf_value_raw(
+        &mut self,
+        key: &[u8],
+        value_type: ValueType,
+        value: &[u8],
+        insertion_point: usize,
+    ) -> Result<(), InsertError> {
         if !self.is_leaf() {
             return Err(InsertError::WrongNodeType);
         }
 
-        // Calculate prefix compression.
-        let (prefix_len, suffix) = if insertion_point > 0 {
-            let prev_key = self.key(insertion_point - 1).unwrap_or_default();
-            let common = common_prefix(&prev_key, key);
-            (common as u16, &key[common..])
-        } else {
-            (0u16, key)
-        };
+        // New mutations use self-contained keys. This keeps middle inserts
+        // O(1) and avoids changing the decode context of following entries;
+        // existing compressed pages are normalized by the wrapper above when
+        // a middle mutation first touches them.
+        let prefix_len = 0_u16;
+        let suffix = key;
 
         // Build entry: prefix_len(2) + suffix_len(2) + suffix + value_type(1) + value
         let entry_size = 4 + suffix.len() + 1 + value.len();
@@ -871,13 +926,47 @@ impl Node {
             Err(idx) => idx,
         };
 
-        let (prefix_len, suffix) = if insertion_point > 0 {
-            let prev_key = self.key(insertion_point - 1).unwrap_or_default();
-            let common = common_prefix(&prev_key, key);
-            (common as u16, &key[common..])
-        } else {
-            (0u16, key)
-        };
+        // Internal keys use the same predecessor-relative compression as
+        // leaf keys. Rebuild when inserting into the middle so subsequent
+        // separators remain decodable and keep their routing bounds.
+        if insertion_point < self.count() && self.has_prefix_compression() {
+            let parent_id = self.parent_id();
+            let leftmost_child = self.leftmost_child();
+            let mut entries = Vec::with_capacity(self.count() + 1);
+            for index in 0..self.count() {
+                let entry_key = self.key(index).ok_or(InsertError::WrongNodeType)?;
+                let entry_child = self.child_id(index).ok_or(InsertError::WrongNodeType)?;
+                entries.push((entry_key, entry_child));
+            }
+            entries.insert(insertion_point, (key.to_vec(), child_id));
+
+            let mut replacement = Self::new_internal();
+            replacement.set_parent_id(parent_id);
+            replacement.set_leftmost_child(leftmost_child);
+            for (entry_key, entry_child) in entries {
+                let append_at = replacement.count();
+                replacement.insert_child_raw(&entry_key, entry_child, append_at)?;
+            }
+            *self = replacement;
+            return Ok(());
+        }
+
+        self.insert_child_raw(key, child_id, insertion_point)
+    }
+
+    fn insert_child_raw(
+        &mut self,
+        key: &[u8],
+        child_id: u64,
+        insertion_point: usize,
+    ) -> Result<(), InsertError> {
+        if !self.is_internal() || insertion_point > self.count() {
+            return Err(InsertError::WrongNodeType);
+        }
+
+        // Keep new internal entries self-contained for stable middle inserts.
+        let prefix_len = 0_u16;
+        let suffix = key;
 
         // entry = prefix_len(2) + suffix_len(2) + suffix + child_id(8)
         let entry_size = 4 + suffix.len() + 8;
@@ -1116,11 +1205,6 @@ pub enum SplitError {
     Corruption,
     #[error("failed to insert into new node")]
     InsertFailed,
-}
-
-/// Count the number of leading bytes common to both slices.
-fn common_prefix(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
