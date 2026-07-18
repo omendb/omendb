@@ -187,9 +187,12 @@ impl PMT {
             let mapping = PageMapping::from_bytes(&mapping_buf);
             pos += PageMapping::SERIALIZED_SIZE;
 
-            // Track the highest version.
+            // `u64::MAX` cannot have a successor and is therefore not a
+            // valid persisted mapping version. Reject it instead of allowing
+            // a corrupted checkpoint to panic while rebuilding the frontier.
+            let next_version = mapping.version.checked_add(1)?;
             if mapping.version >= pmt.next_version {
-                pmt.next_version = mapping.version + 1;
+                pmt.next_version = next_version;
             }
 
             pmt.mappings.insert(page_id, mapping);
@@ -264,6 +267,16 @@ mod tests {
         assert_eq!(restored.get(1).unwrap().offset, 4096);
         assert_eq!(restored.get(2).unwrap().file_id, 1);
         assert_eq!(restored.get(3).unwrap().version, 3);
+    }
+
+    #[test]
+    fn test_pmt_rejects_exhausted_mapping_version() {
+        let mut bytes = Vec::with_capacity(4 + 8 + PageMapping::SERIALIZED_SIZE);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&PageMapping::new(0, 0, u64::MAX).to_bytes());
+
+        assert!(PMT::from_bytes(&bytes).is_none());
     }
 
     #[test]
