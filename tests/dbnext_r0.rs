@@ -346,6 +346,39 @@ fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
 }
 
 #[test]
+fn dbnext_r0_batch_transaction_pin_is_not_durable_snapshot_state() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("ephemeral-transaction.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.flush().unwrap();
+
+    let mut transaction = db.begin_batch_transaction().unwrap();
+    let retained_blob = fs::read_dir(&path)
+        .unwrap()
+        .find_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            name.to_str()
+                .filter(|name| name.starts_with("seerdb.blob.retained."))
+                .map(|_| entry.path())
+        })
+        .unwrap();
+    assert!(!path.join("seerdb.retained").exists());
+
+    let orphan = path.join("seerdb.blob.retained.18446744073709551614");
+    fs::copy(&retained_blob, &orphan).unwrap();
+    transaction.abort().unwrap();
+    assert!(!retained_blob.exists());
+
+    db.close().unwrap();
+    let reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+    assert!(!orphan.exists());
+    assert!(!path.join("seerdb.retained").exists());
+}
+
+#[test]
 fn dbnext_r0_historical_retention_preserves_replaced_blob_values() {
     let root = tempdir().unwrap();
     let path = root.path().join("historical-blob.db");

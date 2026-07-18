@@ -444,6 +444,11 @@ struct RetentionState {
     path: PathBuf,
     root_path: PathBuf,
     registry: RetentionRegistry,
+    /// Process-local transaction roots. These intentionally do not enter the
+    /// durable named-snapshot registry: a crashed process must not leave a
+    /// short-lived transaction pin blocking reclamation after reopen.
+    ephemeral_roots: BTreeMap<SnapshotId, RetainedRoot>,
+    next_ephemeral_snapshot_id: SnapshotId,
     protected_offsets: Arc<Mutex<HashSet<u64>>>,
     offsets_by_snapshot: BTreeMap<SnapshotId, HashSet<u64>>,
 }
@@ -527,6 +532,8 @@ impl RetentionState {
                 .to_path_buf(),
             path,
             registry,
+            ephemeral_roots: BTreeMap::new(),
+            next_ephemeral_snapshot_id: SnapshotId::new(u64::MAX),
             protected_offsets,
             offsets_by_snapshot: BTreeMap::new(),
         })
@@ -580,6 +587,16 @@ impl RetentionState {
     }
 
     fn remove(&mut self, snapshot_id: SnapshotId) -> Result<()> {
+        if let Some(root) = self.ephemeral_roots.remove(&snapshot_id) {
+            self.offsets_by_snapshot.remove(&snapshot_id);
+            self.replace_protected_offsets()?;
+            let blob_path = retained_blob_path(&self.root_path, root.snapshot_id);
+            if blob_path.exists() {
+                fs::remove_file(blob_path)?;
+                sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))?;
+            }
+            return Ok(());
+        }
         let mut candidate = self.registry.clone();
         if candidate.remove(snapshot_id).is_none() {
             return Err(Error::InvalidArgument(format!(
@@ -603,12 +620,51 @@ impl RetentionState {
         self.registry.roots()
     }
 
+    fn all_roots(&self) -> impl Iterator<Item = &RetainedRoot> {
+        self.registry
+            .roots()
+            .iter()
+            .chain(self.ephemeral_roots.values())
+    }
+
     fn is_empty(&self) -> bool {
-        self.registry.is_empty()
+        self.registry.is_empty() && self.ephemeral_roots.is_empty()
     }
 
     fn next_snapshot_id(&self) -> SnapshotId {
         self.registry.next_snapshot_id()
+    }
+
+    fn next_ephemeral_snapshot_id(&self) -> SnapshotId {
+        self.next_ephemeral_snapshot_id
+    }
+
+    fn insert_ephemeral(
+        &mut self,
+        manifest: Manifest,
+        offsets: HashSet<u64>,
+    ) -> Result<SnapshotId> {
+        let snapshot_id = self.next_ephemeral_snapshot_id;
+        if snapshot_id.get() == 0
+            || self
+                .registry
+                .roots()
+                .iter()
+                .any(|root| root.snapshot_id == snapshot_id)
+        {
+            return Err(Error::Wal("ephemeral snapshot ID overflow".into()));
+        }
+        self.next_ephemeral_snapshot_id = SnapshotId::new(snapshot_id.get() - 1);
+        self.ephemeral_roots.insert(
+            snapshot_id,
+            RetainedRoot {
+                snapshot_id,
+                manifest,
+            },
+        );
+        self.offsets_by_snapshot.insert(snapshot_id, offsets);
+        self.replace_protected_offsets()?;
+        Ok(snapshot_id)
     }
 }
 
@@ -975,6 +1031,9 @@ impl DB {
                 },
             )?,
         ));
+        if !read_only && !check_only {
+            Self::cleanup_orphaned_retained_blobs(&path, &retention)?;
+        }
         {
             let mut state = retention
                 .lock()
@@ -1420,7 +1479,11 @@ impl DB {
         }
     }
 
-    /// Get a value from a durably retained historical root.
+    /// Get a value from a retained historical root.
+    ///
+    /// IDs returned by [`DB::retain_commit`] are durable across reopen. IDs
+    /// owned by [`DB::begin_batch_transaction`] are process-local and expire
+    /// when the transaction or process ends.
     ///
     /// The page lookup uses the retained PMT over this handle's device and
     /// buffer pool. Blob values resolve through the immutable blob image
@@ -1478,7 +1541,10 @@ impl DB {
             .collect()
     }
 
-    /// Scan a range from a durably retained historical root.
+    /// Scan a range from a retained historical root.
+    ///
+    /// Named retention IDs are durable across reopen; transaction-owned IDs
+    /// are process-local and are not persisted in the named registry.
     pub fn range_at(
         &self,
         snapshot_id: SnapshotId,
@@ -1523,8 +1589,7 @@ impl DB {
             .lock()
             .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
         state
-            .roots()
-            .iter()
+            .all_roots()
             .find(|root| root.snapshot_id == snapshot_id)
             .map(|root| root.manifest)
             .ok_or_else(|| {
@@ -2587,6 +2652,19 @@ impl DB {
         manifest: Manifest,
         deduplicate_commit: bool,
     ) -> Result<SnapshotId> {
+        self.register_manifest(manifest, deduplicate_commit, false)
+    }
+
+    fn register_ephemeral_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+        self.register_manifest(manifest, false, true)
+    }
+
+    fn register_manifest(
+        &mut self,
+        manifest: Manifest,
+        deduplicate_commit: bool,
+        ephemeral: bool,
+    ) -> Result<SnapshotId> {
         if deduplicate_commit
             && let Some(snapshot_id) = self.retained_snapshot_id(manifest.commit_id)
         {
@@ -2597,7 +2675,11 @@ impl DB {
                 .retention
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-            state.next_snapshot_id()
+            if ephemeral {
+                state.next_ephemeral_snapshot_id()
+            } else {
+                state.next_snapshot_id()
+            }
         };
         let retained_blob = retained_blob_path(&self.path, snapshot_id);
         let blob_bytes = if self.path.join(BLOB_FILE).is_file() {
@@ -2659,7 +2741,12 @@ impl DB {
                 .retention
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-            if let Err(error) = state.insert(manifest, offsets) {
+            let result = if ephemeral {
+                state.insert_ephemeral(manifest, offsets)
+            } else {
+                state.insert(manifest, offsets)
+            };
+            if let Err(error) = result {
                 let _ = fs::remove_file(&retained_blob);
                 return Err(error);
             }
@@ -2970,9 +3057,10 @@ impl DB {
     /// Begin a root-bound byte transaction.
     ///
     /// The transaction captures the current published commit and retains its
-    /// physical root before returning. It can therefore read a stable version
-    /// while the database advances and can commit only against that expected
-    /// base.
+    /// physical root in a process-local lease before returning. It can
+    /// therefore read a stable version while the database advances and can
+    /// commit only against that expected base. The short-lived transaction pin
+    /// is intentionally not persisted as a named historical snapshot.
     pub fn begin_batch_transaction(&mut self) -> Result<BatchTransaction> {
         self.check_writable()?;
         self.flush()?;
@@ -2980,7 +3068,7 @@ impl DB {
             .manifest
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
-        let snapshot_id = self.register_retained_manifest(manifest, false)?;
+        let snapshot_id = self.register_ephemeral_manifest(manifest)?;
         Ok(BatchTransaction {
             base_commit: self.commit_id,
             snapshot_id,
@@ -3106,6 +3194,45 @@ impl DB {
             return Self::load_versioned_meta(&data);
         }
         Self::load_legacy_meta(&data)
+    }
+
+    fn cleanup_orphaned_retained_blobs(
+        path: &Path,
+        retention: &Arc<Mutex<RetentionState>>,
+    ) -> Result<()> {
+        let state = retention
+            .lock()
+            .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+        let retained_ids = state
+            .roots()
+            .iter()
+            .map(|root| root.snapshot_id)
+            .collect::<HashSet<_>>();
+        drop(state);
+
+        let prefix = format!("{BLOB_FILE}.retained.");
+        let mut removed = false;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_prefix(&prefix)
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if !retained_ids.contains(&SnapshotId::new(id)) {
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_directory(path)?;
+        }
+        Ok(())
     }
 
     fn load_retained_offset_map(
