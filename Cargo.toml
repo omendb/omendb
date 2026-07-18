@@ -33,6 +33,10 @@ serde_json = "1.0.150"
 name = "seerdb"
 harness = false
 
+[[bench]]
+name = "ycsb"
+harness = false
+
 [features]
 default = []
 # ZNS SSD support (Linux only)
