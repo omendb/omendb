@@ -320,7 +320,7 @@ impl StorageEngine {
             .filter(|(_, mapping)| !protected_offsets.contains(&mapping.offset))
             .map(|(page_id, mapping)| (page_id, *mapping))
             .collect();
-        active_pages.sort_unstable_by(|(_, left), (_, right)| right.offset.cmp(&left.offset));
+        active_pages.sort_unstable_by_key(|(_, mapping)| std::cmp::Reverse(mapping.offset));
 
         let mut moves = Vec::new();
         let mut free_index = 0;
