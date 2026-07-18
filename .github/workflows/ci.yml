@@ -46,3 +46,20 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-features -- -D warnings
+
+  real-enospc:
+    name: Real filesystem ENOSPC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mount dedicated size-limited filesystem
+        run: |
+          sudo mkdir -p /mnt/seerdb-enospc
+          sudo mount -t tmpfs -o size=64m,nr_inodes=10000 tmpfs /mnt/seerdb-enospc
+          echo "SEERDB_ENOSPC_ROOT=/mnt/seerdb-enospc" >> "$GITHUB_ENV"
+      - name: Exercise real capacity refusal and retry
+        run: cargo test --all-features --test real_enospc -- --ignored --exact real_filesystem_enospc_preflight_is_retryable
+      - name: Unmount dedicated filesystem
+        if: always()
+        run: sudo umount /mnt/seerdb-enospc

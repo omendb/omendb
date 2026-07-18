@@ -413,17 +413,14 @@ pub(crate) fn reserve_file(file: &File, length: u64) -> io::Result<bool> {
         };
         // SAFETY: the descriptor is borrowed from a live `File` and `store`
         // is the platform-defined `fstore_t` passed to `F_PREALLOCATE`.
-        let mut result = unsafe {
-            libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store)
-        };
-        if result == -1 {
+        let mut result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+        if result == -1 || (result == 0 && store.fst_bytesalloc > 0 && store.fst_bytesalloc < size)
+        {
             store.fst_flags = libc::F_ALLOCATEALL;
             store.fst_bytesalloc = 0;
             // SAFETY: the same live descriptor and initialized `fstore_t` are
             // reused for the documented non-contiguous fallback.
-            result = unsafe {
-                libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store)
-            };
+            result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
         }
         if result == -1 {
             return Err(io::Error::last_os_error());
@@ -431,7 +428,11 @@ pub(crate) fn reserve_file(file: &File, length: u64) -> io::Result<bool> {
         // F_PREALLOCATE can report success after allocating less than the
         // requested extent. Treat that as capacity failure instead of
         // claiming a reservation that the later write is not protected by.
-        if store.fst_bytesalloc < size {
+        // Some APFS-backed descriptors report zero here even though the
+        // reservation is visible in `st_blocks`; zero therefore means the
+        // filesystem did not provide accounting, not that no bytes were
+        // reserved. Reject only a positive, short report.
+        if store.fst_bytesalloc > 0 && store.fst_bytesalloc < size {
             return Err(io::Error::from(io::ErrorKind::StorageFull));
         }
         Ok(true)
