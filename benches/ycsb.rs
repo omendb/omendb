@@ -16,14 +16,16 @@ enum Profile {
     ReadHeavy,
     ReadOnly,
     ScanHeavy,
+    InsertHeavy,
 }
 
 impl Profile {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ReadUpdate,
         Self::ReadHeavy,
         Self::ReadOnly,
         Self::ScanHeavy,
+        Self::InsertHeavy,
     ];
 
     const fn name(self) -> &'static str {
@@ -32,6 +34,7 @@ impl Profile {
             Self::ReadHeavy => "b_read_heavy",
             Self::ReadOnly => "c_read_only",
             Self::ScanHeavy => "e_scan_heavy",
+            Self::InsertHeavy => "insert_heavy",
         }
     }
 }
@@ -41,6 +44,7 @@ enum Operation {
     Read,
     Update,
     Scan,
+    Insert,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -95,13 +99,20 @@ fn operation_for(profile: Profile, bucket: u64) -> Operation {
                 Operation::Update
             }
         }
+        Profile::InsertHeavy => {
+            if bucket < 80 {
+                Operation::Insert
+            } else {
+                Operation::Read
+            }
+        }
     }
 }
 
 fn fixture(profile: Profile) -> WorkloadFixture {
     let directory = tempdir().unwrap();
     let mut db = DB::open(directory.path().join("db"), Options::default()).unwrap();
-    let keys: Vec<_> = (0..KEY_COUNT).map(workload_key).collect();
+    let keys: Vec<_> = (0..KEY_COUNT + OPERATION_COUNT).map(workload_key).collect();
     let values: Vec<_> = (0..KEY_COUNT)
         .map(|index| workload_value(index, 0))
         .collect();
@@ -118,11 +129,16 @@ fn fixture(profile: Profile) -> WorkloadFixture {
 
     let mut state = 0x5EED_DA7A_2026_u64 ^ profile.name().len() as u64;
     let operations = (0..OPERATION_COUNT)
-        .map(|_| {
+        .map(|operation_index| {
             let random = next_random(&mut state);
+            let operation = operation_for(profile, random % 100);
             WorkloadOperation {
-                operation: operation_for(profile, random % 100),
-                key: (random >> 16) as usize % KEY_COUNT,
+                operation,
+                key: if matches!(operation, Operation::Insert) {
+                    KEY_COUNT + operation_index
+                } else {
+                    (random >> 16) as usize % KEY_COUNT
+                },
             }
         })
         .collect();
@@ -136,6 +152,7 @@ fn fixture(profile: Profile) -> WorkloadFixture {
 
 fn run_workload(mut fixture: WorkloadFixture) {
     let mut updates = 0;
+    let mut inserts = 0;
     let mut observed = 0usize;
     for operation in fixture.operations {
         let key = &fixture.keys[operation.key];
@@ -149,6 +166,11 @@ fn run_workload(mut fixture: WorkloadFixture) {
                 let value = workload_value(operation.key, updates);
                 fixture.db.put(key, &value).unwrap();
             }
+            Operation::Insert => {
+                inserts += 1;
+                let value = workload_value(operation.key, inserts);
+                fixture.db.put(key, &value).unwrap();
+            }
             Operation::Scan => {
                 let end = (operation.key + 32).min(KEY_COUNT - 1);
                 observed = observed
@@ -157,7 +179,7 @@ fn run_workload(mut fixture: WorkloadFixture) {
         }
     }
     fixture.db.flush().unwrap();
-    black_box((observed, updates, fixture.db.metrics().unwrap()));
+    black_box((observed, updates, inserts, fixture.db.metrics().unwrap()));
 }
 
 fn bench_ycsb_profiles(c: &mut Criterion) {
