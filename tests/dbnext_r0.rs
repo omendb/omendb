@@ -301,6 +301,51 @@ fn dbnext_r0_retains_arbitrary_historical_commit_across_reopen() {
 }
 
 #[test]
+fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("batch-transaction.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    db.put(b"key", b"before").unwrap();
+    db.flush().unwrap();
+
+    let mut transaction = db.begin_batch_transaction().unwrap();
+    assert_eq!(transaction.snapshot().get(), 1);
+    assert_eq!(
+        transaction.get(&db, b"key").unwrap(),
+        Some(b"before".to_vec())
+    );
+    transaction.put(b"key", b"staged").unwrap();
+    assert_eq!(
+        transaction.get(&db, b"key").unwrap(),
+        Some(b"staged".to_vec())
+    );
+
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"key".to_vec(),
+        value: b"outside".to_vec(),
+    }])
+    .unwrap();
+    assert_eq!(
+        transaction.get(&db, b"key").unwrap(),
+        Some(b"staged".to_vec())
+    );
+    assert!(matches!(
+        transaction.commit(&mut db),
+        Err(Error::SerializationConflict { expected, current })
+            if expected.get() == 1 && current.get() == 2
+    ));
+    assert!(transaction.is_active());
+    transaction.abort().unwrap();
+    assert_eq!(db.get(b"key").unwrap(), Some(b"outside".to_vec()));
+
+    let mut committed = db.begin_batch_transaction().unwrap();
+    committed.put(b"key", b"committed").unwrap();
+    let status = committed.commit(&mut db).unwrap();
+    assert_eq!(status.commit_id.get(), 3);
+    assert_eq!(db.get(b"key").unwrap(), Some(b"committed".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_historical_retention_preserves_replaced_blob_values() {
     let root = tempdir().unwrap();
     let path = root.path().join("historical-blob.db");

@@ -106,6 +106,17 @@ pub enum Error {
         current: CommitId,
     },
 
+    /// A batch commit is durable, but releasing its temporary root lease
+    /// failed. The transaction is committed; the caller may retry cleanup or
+    /// drop the transaction so its lease drop guard can retry it.
+    #[error("commit {commit:?} succeeded but transaction cleanup failed: {cleanup}")]
+    CommitCleanup {
+        /// Durable commit identity published before cleanup failed.
+        commit: CommitId,
+        /// Cleanup error that should be retried or reported.
+        cleanup: Box<Error>,
+    },
+
     /// B-tree operation failed.
     #[error("btree error: {0}")]
     BTree(String),

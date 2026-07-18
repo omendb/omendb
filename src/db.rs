@@ -128,6 +128,180 @@ pub enum BatchMutation {
     },
 }
 
+/// Lifecycle state of a root-bound byte transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchTransactionState {
+    /// The transaction can stage mutations and be committed or aborted.
+    Active,
+    /// The transaction published its expected-base batch successfully.
+    Committed,
+    /// The transaction was explicitly aborted.
+    Aborted,
+}
+
+/// A root-bound byte transaction over SeerDB.
+///
+/// The transaction captures one durable commit root and keeps its physical
+/// pages/blob image protected while it is active. Reads use that root and
+/// overlay staged mutations, while commit uses expected-base validation so a
+/// stale writer cannot publish against a newer root. The existing
+/// `concurrency::Transaction` type remains a low-level ID/read-set primitive;
+/// this type is the data-bearing transaction boundary.
+pub struct BatchTransaction {
+    base_commit: CommitId,
+    snapshot_id: SnapshotId,
+    lease: Option<RetentionLease>,
+    mutations: Vec<BatchMutation>,
+    state: BatchTransactionState,
+}
+
+impl BatchTransaction {
+    /// Return the immutable commit root captured at transaction start.
+    #[must_use]
+    pub fn snapshot(&self) -> CommitId {
+        self.base_commit
+    }
+
+    /// Return the transaction lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> BatchTransactionState {
+        self.state
+    }
+
+    /// Whether the transaction can still stage or publish work.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state == BatchTransactionState::Active
+    }
+
+    /// Return the staged byte mutations in commit order.
+    #[must_use]
+    pub fn mutations(&self) -> &[BatchMutation] {
+        &self.mutations
+    }
+
+    /// Stage an insert/upsert in this transaction.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_active()?;
+        validate_wal_put_lengths(key, value)?;
+        self.mutations.push(BatchMutation::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Stage a delete in this transaction.
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.check_active()?;
+        validate_wal_key_length(key)?;
+        self.mutations
+            .push(BatchMutation::Delete { key: key.to_vec() });
+        Ok(())
+    }
+
+    /// Read through the captured root and staged mutations.
+    pub fn get(&self, db: &DB, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_active()?;
+        for mutation in self.mutations.iter().rev() {
+            match mutation {
+                BatchMutation::Put {
+                    key: mutation_key,
+                    value,
+                } if mutation_key.as_slice() == key => return Ok(Some(value.clone())),
+                BatchMutation::Delete { key: mutation_key } if mutation_key.as_slice() == key => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        db.get_at(self.snapshot_id, key)
+    }
+
+    /// Scan through the captured root and staged mutations over `[start,end)`.
+    pub fn range(&self, db: &DB, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_active()?;
+        let mut values = db
+            .range_at(self.snapshot_id, start, end)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        for mutation in &self.mutations {
+            match mutation {
+                BatchMutation::Put { key, value }
+                    if key.as_slice() >= start && key.as_slice() < end =>
+                {
+                    values.insert(key.clone(), value.clone());
+                }
+                BatchMutation::Delete { key }
+                    if key.as_slice() >= start && key.as_slice() < end =>
+                {
+                    values.remove(key);
+                }
+                _ => {}
+            }
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    /// Publish the staged mutations against the captured commit root.
+    ///
+    /// A serialization conflict leaves this transaction active so the caller
+    /// can inspect the error and explicitly abort it. Once publication
+    /// succeeds, the transaction is committed even if releasing its temporary
+    /// root lease fails; that cleanup failure is returned explicitly.
+    pub fn commit(&mut self, db: &mut DB) -> Result<DurabilityStatus> {
+        self.check_active()?;
+        let status = db.commit_batch_at(self.base_commit, &self.mutations)?;
+        self.state = BatchTransactionState::Committed;
+        if let Some(lease) = self.lease.as_mut()
+            && let Err(cleanup) = lease.release()
+        {
+            return Err(Error::CommitCleanup {
+                commit: status.commit_id,
+                cleanup: Box::new(cleanup),
+            });
+        }
+        self.lease.take();
+        Ok(status)
+    }
+
+    /// Abort the transaction and release its retained root.
+    pub fn abort(&mut self) -> Result<()> {
+        self.check_active()?;
+        if let Some(lease) = self.lease.as_mut() {
+            lease.release()?;
+            self.lease.take();
+        }
+        self.state = BatchTransactionState::Aborted;
+        Ok(())
+    }
+
+    /// Retry releasing the root lease after a committed cleanup failure.
+    pub fn release(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease.as_mut() {
+            lease.release()?;
+            self.lease.take();
+        }
+        Ok(())
+    }
+
+    fn check_active(&self) -> Result<()> {
+        if self.is_active() {
+            Ok(())
+        } else {
+            Err(Error::InvalidArgument(
+                "transaction is no longer active".into(),
+            ))
+        }
+    }
+}
+
+impl Drop for BatchTransaction {
+    fn drop(&mut self) {
+        let _ = self.lease.take();
+    }
+}
+
 /// Durable identity and publication state exposed for recovery diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurabilityStatus {
@@ -439,7 +613,7 @@ impl RetentionState {
 }
 
 impl RetentionLease {
-    fn release(mut self) -> Result<()> {
+    fn release(&mut self) -> Result<()> {
         if !self.released {
             self.state
                 .lock()
@@ -510,8 +684,11 @@ impl RetainedSnapshot {
 
     /// Release the physical root-retention lease and temporary read copy.
     pub fn release(mut self) -> Result<()> {
-        let lease_result = self.lease.take().map_or(Ok(()), RetentionLease::release);
+        let lease_result = self.lease.as_mut().map_or(Ok(()), RetentionLease::release);
         let snapshot_result = self.snapshot.take().map_or(Ok(()), Snapshot::release);
+        if lease_result.is_ok() {
+            self.lease.take();
+        }
         lease_result.and(snapshot_result)
     }
 }
@@ -2790,9 +2967,37 @@ impl DB {
         FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.set(true));
     }
 
-    /// Begin a new transaction.
+    /// Begin a root-bound byte transaction.
     ///
-    /// Returns a transaction handle that can be used to commit or abort.
+    /// The transaction captures the current published commit and retains its
+    /// physical root before returning. It can therefore read a stable version
+    /// while the database advances and can commit only against that expected
+    /// base.
+    pub fn begin_batch_transaction(&mut self) -> Result<BatchTransaction> {
+        self.check_writable()?;
+        self.flush()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        let snapshot_id = self.register_retained_manifest(manifest, false)?;
+        Ok(BatchTransaction {
+            base_commit: self.commit_id,
+            snapshot_id,
+            lease: Some(RetentionLease {
+                state: Arc::clone(&self.retention),
+                snapshot_id,
+                released: false,
+            }),
+            mutations: Vec::new(),
+            state: BatchTransactionState::Active,
+        })
+    }
+
+    /// Begin the legacy transaction-ID bookkeeping primitive.
+    ///
+    /// This does not bind reads or writes to a durable SeerDB root. Use
+    /// [`DB::begin_batch_transaction`] for the data-bearing transaction API.
     pub fn begin_transaction(&self) -> crate::concurrency::Transaction {
         self.txn_manager.begin()
     }
