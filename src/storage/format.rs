@@ -374,6 +374,7 @@ impl ManifestHistory {
     pub fn find_commit(&self, commit_id: CommitId) -> Option<Manifest> {
         self.manifests
             .iter()
+            .rev()
             .find(|manifest| manifest.commit_id == commit_id)
             .copied()
     }

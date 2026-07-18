@@ -527,6 +527,8 @@ pub struct CompactionReport {
     pub data_bytes_after: u64,
     /// Number of physical page slots removed from the tail.
     pub reclaimed_pages: u64,
+    /// Number of active page versions moved out of interior holes.
+    pub relocated_pages: u64,
     /// Whether the active manifest was mirrored before truncation.
     pub manifest_replicated: bool,
 }
@@ -2549,15 +2551,13 @@ impl DB {
         Ok(())
     }
 
-    /// Reclaim trailing data pages that are no longer referenced by either
-    /// manifest slot.
+    /// Reclaim data pages that are no longer referenced by either manifest
+    /// slot.
     ///
-    /// This is intentionally a bounded first compaction operation. It does
-    /// not move interior free pages and does not claim retained in-process
-    /// snapshot support. A pending generation is flushed first; then the
-    /// active manifest is mirrored into the other slot before truncation so a
-    /// torn maintenance operation cannot fall back to a root that needs the
-    /// removed tail pages.
+    /// A pending generation is flushed first. Unprotected active pages are
+    /// then copied from high offsets into lower interior holes, published as
+    /// a maintenance generation, and finally followed by crash-safe tail
+    /// truncation. Retained-root pages are never overwritten or reclaimed.
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.check_writable()?;
         let result = self.compact_inner();
@@ -2570,22 +2570,77 @@ impl DB {
         result
     }
 
+    /// Publish a PMT relocation without inventing a logical user commit.
+    ///
+    /// The caller must have mirrored the current manifest before writing the
+    /// relocated pages. A new generation ID makes the physical checkpoint
+    /// authoritative while preserving commit identity and WAL digest.
+    fn publish_compaction_generation(&mut self) -> Result<()> {
+        let current = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+        let generation_id = GenerationId::new(
+            current
+                .generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
+        let checkpoint_path = self
+            .path
+            .join(format!("seerdb.meta.{}", generation_id.get()));
+        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
+        Self::save_meta(
+            &self.path.join(META_FILE),
+            self.engine.pmt(),
+            self.engine.allocator(),
+        )?;
+
+        let manifest = Manifest {
+            generation_id,
+            pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
+            ..current
+        };
+        let mut manifest_history = self.manifest_history.clone();
+        manifest_history
+            .push(manifest)
+            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history(manifest)?;
+        } else {
+            self.persist_manifest_history(&manifest_history)?;
+        }
+        self.manifest_history = manifest_history;
+        self.manifest.publish(manifest)?;
+        self.engine.complete_generation();
+        self.generation_id = generation_id;
+        Ok(())
+    }
+
     fn compact_inner(&mut self) -> Result<CompactionReport> {
         self.flush()?;
+        self.engine.refresh_reclamation()?;
 
-        let (before, after) = self.engine.reclaimable_tail_range()?;
+        let (before, _) = self.engine.reclaimable_tail_range()?;
+        let has_reclaimable_pages = self.engine.reclaimable_page_count() > 0;
         let mut manifest_replicated = false;
-        if after < before {
-            let manifest = self
-                .manifest
-                .load_latest()?
-                .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
-            self.manifest.publish(manifest)?;
+        let mut relocated_pages = 0;
+        if has_reclaimable_pages {
+            // Both slots must continue to name the old PMT until all moved
+            // copies are durable. This is the maintenance equivalent of the
+            // normal generation reuse barrier.
+            self.mirror_current_manifest()?;
             manifest_replicated = true;
+            relocated_pages = self.engine.relocate_interior_pages()? as u64;
+            if relocated_pages > 0 {
+                self.publish_compaction_generation()?;
+            }
         }
 
+        let (planned_before, planned_after) = self.engine.reclaimable_tail_range()?;
         let (actual_before, actual_after) = self.engine.truncate_reclaimable_tail()?;
-        if actual_before != before || actual_after != after {
+        if actual_before != planned_before || actual_after != planned_after {
             return Err(Error::NeedsRecovery(
                 "data file changed during compaction planning".into(),
             ));
@@ -2593,9 +2648,10 @@ impl DB {
 
         Ok(CompactionReport {
             durability: self.durability_status(),
-            data_bytes_before: actual_before,
+            data_bytes_before: before,
             data_bytes_after: actual_after,
-            reclaimed_pages: (actual_before - actual_after) / PAGE_SIZE as u64,
+            reclaimed_pages: (before - actual_after) / PAGE_SIZE as u64,
+            relocated_pages,
             manifest_replicated,
         })
     }

@@ -1587,6 +1587,70 @@ fn dbnext_r0_compact_truncates_reclaimable_tail() {
 }
 
 #[test]
+fn dbnext_r0_compact_relocates_interior_pages_before_truncation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("compact-interior.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let value = vec![0x2Au8; 128];
+
+    for key_id in 0..256 {
+        let key = format!("key-{key_id:04}");
+        db.put(key.as_bytes(), &value).unwrap();
+    }
+    db.flush().unwrap();
+
+    let updated = vec![0x3Bu8; 128];
+    db.put(b"key-0128", &updated).unwrap();
+    db.flush().unwrap();
+    let before = fs::metadata(path.join("seerdb.data")).unwrap().len();
+
+    let report = db.compact().unwrap();
+    assert!(
+        report.relocated_pages > 0,
+        "expected an interior relocation"
+    );
+    assert!(report.data_bytes_after < before);
+    assert_eq!(db.get(b"key-0128").unwrap(), Some(updated.clone()));
+    assert!(db.verify().is_ok());
+    let retained = db.retain_commit(db.durability_status().commit_id).unwrap();
+    assert_eq!(
+        db.get_at(retained, b"key-0128").unwrap(),
+        Some(updated.clone())
+    );
+    db.release_snapshot(retained).unwrap();
+
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key-0128").unwrap(), Some(updated));
+    assert!(reopened.verify().is_ok());
+}
+
+#[test]
+fn dbnext_r0_interior_compaction_sync_failure_recovers_old_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("compact-interior-fault.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let value = vec![0x4Cu8; 128];
+    for key_id in 0..256 {
+        let key = format!("key-{key_id:04}");
+        db.put(key.as_bytes(), &value).unwrap();
+    }
+    db.flush().unwrap();
+    let updated = vec![0x5Du8; 128];
+    db.put(b"key-0128", &updated).unwrap();
+    db.flush().unwrap();
+
+    db.inject_sync_failure();
+    assert!(matches!(db.compact(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key-0128").unwrap(), Some(updated));
+    assert!(reopened.verify().is_ok());
+}
+
+#[test]
 fn dbnext_r0_compact_failure_fences_writer_until_reopen() {
     let root = tempdir().unwrap();
     let path = root.path().join("compact-fault.db");

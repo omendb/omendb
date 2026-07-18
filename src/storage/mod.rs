@@ -9,7 +9,7 @@ use crate::allocator::PageAllocator;
 use crate::btree::{BTree, BTreeError, BlobPointer, LookupResult, Node, PAGE_SIZE, ValueRef};
 use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
-use crate::mvcc::PMT;
+use crate::mvcc::{PMT, PageMapping};
 use crate::space::Device;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,6 +219,12 @@ impl StorageEngine {
         self.refresh_reclaimable_offsets()
     }
 
+    /// Refresh the physical reuse view after retention leases or device
+    /// state changed without a normal mutation flush.
+    pub fn refresh_reclamation(&mut self) -> Result<()> {
+        self.refresh_reclaimable_offsets()
+    }
+
     fn refresh_reclaimable_offsets(&mut self) -> Result<()> {
         let device_size = self.device.size()?;
         let active_offsets: HashSet<_> =
@@ -283,6 +289,82 @@ impl StorageEngine {
         self.free_offsets.truncate(retained);
         self.next_offset = after;
         Ok((before, after))
+    }
+
+    /// Relocate active pages from high offsets into lower unprotected holes.
+    ///
+    /// This is the interior-compaction half of the maintenance protocol. It
+    /// writes copies first and changes the in-memory PMT only after every
+    /// copy has been synced. The caller must have mirrored the current
+    /// manifest before invoking this method; if a write or sync fails, the
+    /// old manifest and all of its source pages remain authoritative after
+    /// reopen.
+    pub fn relocate_interior_pages(&mut self) -> Result<usize> {
+        if !self.pending_reclaimed_offsets.is_empty() {
+            return Err(Error::NeedsRecovery(
+                "cannot relocate pages before generation publication".into(),
+            ));
+        }
+
+        let protected_offsets = self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+            .clone();
+        let mut free_offsets = self.free_offsets.clone();
+        free_offsets.sort_unstable();
+
+        let mut active_pages: Vec<(u64, PageMapping)> = self
+            .pmt
+            .iter()
+            .filter(|(_, mapping)| !protected_offsets.contains(&mapping.offset))
+            .map(|(page_id, mapping)| (page_id, *mapping))
+            .collect();
+        active_pages.sort_unstable_by(|(_, left), (_, right)| right.offset.cmp(&left.offset));
+
+        let mut moves = Vec::new();
+        let mut free_index = 0;
+        for (page_id, mapping) in active_pages {
+            while free_index < free_offsets.len() && free_offsets[free_index] >= mapping.offset {
+                free_index += 1;
+            }
+            let Some(&target) = free_offsets.get(free_index) else {
+                break;
+            };
+            free_index += 1;
+
+            let node = self.read_node_from_pmt(&self.pmt, page_id)?;
+            moves.push((page_id, mapping, target, *node.as_bytes()));
+        }
+
+        if moves.is_empty() {
+            return Ok(0);
+        }
+
+        for (_, _, target, page) in &moves {
+            self.device.write_page(*target, page)?;
+            self.metrics
+                .physical_page_writes
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .page_bytes_written
+                .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
+        }
+        self.device.sync()?;
+        self.metrics.syncs.fetch_add(1, Ordering::Relaxed);
+
+        let mut retired_offsets = Vec::with_capacity(moves.len());
+        let mut retired_cache_keys = Vec::with_capacity(moves.len());
+        let targets: HashSet<_> = moves.iter().map(|(_, _, target, _)| *target).collect();
+        for (page_id, mapping, target, _) in moves {
+            retired_offsets.push(mapping.offset);
+            retired_cache_keys.push(PageCacheKey::new(page_id, mapping.version));
+            self.pmt.insert(page_id, mapping.file_id, target);
+        }
+        self.free_offsets.retain(|offset| !targets.contains(offset));
+        self.pending_reclaimed_offsets = retired_offsets;
+        self.pending_reclaimed_cache_keys = retired_cache_keys;
+        Ok(self.pending_reclaimed_offsets.len())
     }
 
     /// Make the previous generation's retired pages reusable.
