@@ -4,7 +4,8 @@
 //! - **Out-of-place writes** (LeanStore-inspired): pages are never updated in place
 //! - **KV separation** (WiscKey-inspired): large values stored separately
 //! - **SSD-native design**: FDP/ZNS support for minimal write amplification
-//! - **MVCC**: copy-on-write concurrency control
+//! - **Snapshots**: immutable root generations with explicit retained
+//!   historical reads; durable data-version MVCC remains a future extension
 //!
 //! # Architecture
 //!
@@ -12,6 +13,10 @@
 //! instead of modifying pages in place. A mapping table tracks page locations,
 //! and garbage collection reclaims invalidated pages. Large values are stored
 //! separately in an append-only blob log.
+//!
+//! The current durable contract uses one serialized writer lane with concurrent
+//! readers and explicit root-generation retention. It does not yet claim full
+//! durable data-version MVCC or multi-writer transaction semantics.
 //!
 //! # Example
 //!

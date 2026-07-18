@@ -9,7 +9,8 @@ An embedded key-value storage engine designed from scratch for modern hardware:
 - **Out-of-place writes** (LeanStore-inspired): immutable page versions reduce rewrite amplification; SeerDB performance claims remain to be benchmarked
 - **KV separation** (WiscKey-inspired): large values stored separately for lower write amplification
 - **SSD-native**: designed for NVMe, with optional FDP/ZNS support
-- **MVCC**: copy-on-write concurrency control, snapshot isolation
+- **Snapshots**: immutable root generations with explicit retained historical
+  reads; durable data-version MVCC remains a future extension
 
 ## Direction
 
@@ -22,7 +23,10 @@ current design and staged optimization plan.
 
 ## Status
 
-Early development. See [ai/STATUS.md](ai/STATUS.md) for current state.
+The current Rust lane is a single-writer durable kernel with concurrent reads,
+root-generation retention, WAL recovery, and crash-safe reclamation baselines.
+It is still under production qualification; see [ai/STATUS.md](ai/STATUS.md)
+for the open ENOSPC, soak, MVCC, migration, and performance gates.
 
 ## References
 
