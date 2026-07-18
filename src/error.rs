@@ -124,7 +124,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        if error.kind() == std::io::ErrorKind::StorageFull {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+        ) {
             Self::DiskFull
         } else {
             Self::Io(error)
@@ -169,5 +172,29 @@ impl From<BTreeError> for Error {
 impl From<BufferError> for Error {
     fn from(error: BufferError) -> Self {
         Self::Buffer(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::io::{Error as IoError, ErrorKind};
+
+    #[test]
+    fn storage_full_and_quota_exceeded_are_typed_as_disk_full() {
+        assert!(matches!(
+            Error::from(IoError::from(ErrorKind::StorageFull)),
+            Error::DiskFull
+        ));
+        assert!(matches!(
+            Error::from(IoError::from(ErrorKind::QuotaExceeded)),
+            Error::DiskFull
+        ));
+    }
+
+    #[test]
+    fn unrelated_io_errors_keep_their_source() {
+        let error = Error::from(IoError::from(ErrorKind::PermissionDenied));
+        assert!(matches!(error, Error::Io(_)));
     }
 }
