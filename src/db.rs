@@ -72,6 +72,7 @@ fn retained_blob_path(path: &Path, snapshot_id: SnapshotId) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     Normal,
+    Create,
     Check,
 }
 
@@ -924,6 +925,17 @@ impl DB {
         Self::open_with_mode(path, options, OpenMode::Normal)
     }
 
+    /// Create a new database and refuse an existing store.
+    ///
+    /// The final directory is created with an atomic no-replace operation so
+    /// callers cannot accidentally attach an empty logical catalog to an
+    /// existing durable store. An already-created empty directory is accepted
+    /// for callers that reserve a directory before opening it. Use
+    /// [`DB::open`] when reopening is intended.
+    pub fn create<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
+        Self::open_with_mode(path, options, OpenMode::Create)
+    }
+
     /// Check an existing database without taking writer ownership or
     /// replaying, truncating, or publishing its WAL.
     pub fn check<P: AsRef<Path>>(path: P, options: Options) -> Result<CheckReport> {
@@ -982,15 +994,33 @@ impl DB {
         let path = path.as_ref().to_path_buf();
         let check_only = mode == OpenMode::Check;
 
-        // Create directory if it doesn't exist.
-        if !path.exists() {
-            if check_only {
+        match mode {
+            OpenMode::Check if !path.exists() => {
                 return Err(Error::InvalidArgument(format!(
                     "check path does not exist: {}",
                     path.display()
                 )));
             }
-            fs::create_dir_all(&path)?;
+            OpenMode::Create => {
+                if path.exists() {
+                    let mut entries = fs::read_dir(&path)?;
+                    if entries.next().transpose()?.is_some() {
+                        return Err(Error::InvalidArgument(format!(
+                            "database path already contains a store: {}",
+                            path.display()
+                        )));
+                    }
+                } else {
+                    if let Some(parent) = path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::create_dir(&path)?;
+                }
+            }
+            OpenMode::Normal if !path.exists() => fs::create_dir_all(&path)?,
+            OpenMode::Check | OpenMode::Normal => {}
         }
 
         let data_path = path.join(DATA_FILE);
@@ -4411,6 +4441,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = DB::open(dir.path().join("test.db"), Options::default());
         assert!(db.is_ok());
+    }
+
+    #[test]
+    fn test_db_create_refuses_existing_store_without_reinterpreting_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("created.db");
+        let mut db = DB::create(&path, Options::default()).unwrap();
+        db.put(b"catalog", b"durable").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        assert!(matches!(
+            DB::create(&path, Options::default()),
+            Err(Error::InvalidArgument(message)) if message.contains("already contains a store")
+        ));
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"catalog").unwrap(), Some(b"durable".to_vec()));
     }
 
     #[test]
