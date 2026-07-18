@@ -59,7 +59,7 @@ jobs:
           sudo mount -t tmpfs -o size=64m,nr_inodes=10000 tmpfs /mnt/seerdb-enospc
           echo "SEERDB_ENOSPC_ROOT=/mnt/seerdb-enospc" >> "$GITHUB_ENV"
       - name: Exercise real capacity refusal and retry
-        run: cargo test --all-features --test real_enospc -- --ignored --exact real_filesystem_enospc_preflight_is_retryable
+        run: cargo test --all-features --test real_enospc -- --ignored
       - name: Unmount dedicated filesystem
         if: always()
         run: sudo umount /mnt/seerdb-enospc
