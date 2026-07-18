@@ -9,7 +9,7 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BTree, BlobPointer, LookupResult, PAGE_SIZE};
+use crate::btree::{BTree, BlobPointer, LookupResult, MAX_KEY_SIZE, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
@@ -1618,8 +1618,7 @@ impl DB {
 
         // A crash may leave a partial final frame. Remove only that tail before
         // appending so recovery never has to scan through a misaligned frame.
-        let complete_len = header_len
-            + (existing_len - header_len) / entry_len * entry_len;
+        let complete_len = header_len + (existing_len - header_len) / entry_len * entry_len;
         if complete_len != existing_len {
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(complete_len)?;
@@ -3255,6 +3254,11 @@ fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
 }
 
 fn validate_wal_key_length(key: &[u8]) -> Result<()> {
+    if key.len() > MAX_KEY_SIZE {
+        return Err(Error::InvalidArgument(
+            "key exceeds the maximum B-tree page key size".into(),
+        ));
+    }
     if u32::try_from(key.len()).is_err() {
         return Err(Error::InvalidArgument(
             "key exceeds the durable WAL length limit".into(),
@@ -3546,6 +3550,22 @@ mod tests {
         assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
         assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
         assert_eq!(db.get(b"key3").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_rejects_key_larger_than_page_format_before_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversized-key.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        let key = vec![0xA5; MAX_KEY_SIZE + 1];
+
+        assert!(matches!(
+            db.put(&key, b"value"),
+            Err(Error::InvalidArgument(message))
+                if message.contains("maximum B-tree page key size")
+        ));
+        assert_eq!(db.durability_status().pending_mutations, 0);
+        assert!(!path.join(WAL_FILE).exists());
     }
 
     #[test]
@@ -3853,6 +3873,38 @@ mod tests {
             (b"key-000250-new-000".to_vec(), b"new-value".to_vec())
         );
         assert_eq!(values[119].0, b"key-000250-new-119");
+    }
+
+    #[test]
+    fn test_db_sparse_deep_internal_split_does_not_require_unloaded_children() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sparse-deep-split.db");
+
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            for index in 0..2_000 {
+                let key = format!("key-{index:06}");
+                db.put(key.as_bytes(), b"value").unwrap();
+            }
+            db.flush().unwrap();
+        }
+
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        for index in 0..600 {
+            let key = format!("key-000800-new-{index:04}");
+            db.put(key.as_bytes(), b"new-value").unwrap();
+        }
+        db.flush().unwrap();
+        drop(db);
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(
+            reopened
+                .range(b"key-000800-new-0000", b"key-000800-new-0600")
+                .unwrap()
+                .len(),
+            600
+        );
     }
 
     #[test]

@@ -456,6 +456,12 @@ impl StorageEngine {
     }
 
     /// Flush all dirty pages to disk.
+    ///
+    /// Small generations keep staging images resident until the device sync,
+    /// preserving the strongest buffer retry diagnostics. Larger generations
+    /// stream one image at a time through the fixed-size pool; the logical
+    /// B-tree remains dirty until publication, so a later write or sync error
+    /// is still retryable and cannot make an uncommitted generation visible.
     pub fn flush(&mut self) -> Result<()> {
         // A lease may have been released since the last publication. Refresh
         // the allocator view before choosing a reusable physical slot.
@@ -465,10 +471,15 @@ impl StorageEngine {
         // invariant needed by manifest publication.
         let dirty_page_ids = self.btree.dirty_page_ids();
         self.preflight_flush_capacity(&dirty_page_ids)?;
+        let stream_writebacks = {
+            let buffer = self.buffer_lock()?;
+            dirty_page_ids.len() > buffer.capacity()
+        };
         let mut retired_offsets = Vec::new();
         let mut retired_cache_keys = Vec::new();
-        let mut pending_writebacks = Vec::with_capacity(dirty_page_ids.len());
-        let mut pending_rekeys = Vec::with_capacity(dirty_page_ids.len());
+        let pending_capacity = usize::from(!stream_writebacks) * dirty_page_ids.len();
+        let mut pending_writebacks = Vec::with_capacity(pending_capacity);
+        let mut pending_rekeys = Vec::with_capacity(pending_capacity);
 
         for page_id in dirty_page_ids {
             let node = self.btree.node(page_id);
@@ -507,7 +518,12 @@ impl StorageEngine {
                     })?
                 };
                 self.device.write_page(offset, writeback.data())?;
-                pending_writebacks.push(writeback);
+                if stream_writebacks {
+                    let mut buffer = self.buffer_lock()?;
+                    buffer.discard_writeback(writeback)?;
+                } else {
+                    pending_writebacks.push(writeback);
+                }
                 self.metrics
                     .physical_page_writes
                     .fetch_add(1, Ordering::Relaxed);
@@ -525,7 +541,9 @@ impl StorageEngine {
                     .get(page_id as u64)
                     .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
                     .version;
-                pending_rekeys.push((pending_key, PageCacheKey::new(page_id as u64, version)));
+                if !stream_writebacks {
+                    pending_rekeys.push((pending_key, PageCacheKey::new(page_id as u64, version)));
+                }
             }
         }
 
@@ -1128,9 +1146,11 @@ impl StorageEngine {
     /// Verify the logical B-tree graph rooted at the active manifest.
     ///
     /// This traverses PMT-backed pages without materializing the resident
-    /// mutation tree. It validates parent links, child existence, routing
-    /// bounds, cycles, and that every mapped logical page is reachable. Blob
-    /// pointers are returned for validation by the owning database.
+    /// mutation tree. It validates forward child edges, routing bounds,
+    /// cycles, and that every mapped logical page is reachable. Parent IDs in
+    /// the page header are non-authoritative mutation hints and are therefore
+    /// not part of the durable graph contract. Blob pointers are returned for
+    /// validation by the owning database.
     pub fn verify_tree(&self, root_page_id: u64) -> Result<Vec<BlobPointer>> {
         self.verify_tree_with_pmt(&self.pmt, root_page_id)
     }
@@ -1161,10 +1181,7 @@ impl StorageEngine {
                 "root page {root} is absent from PMT"
             )));
         }
-        if pmt
-            .iter()
-            .any(|(page_id, _)| page_id > u32::MAX as u64)
-        {
+        if pmt.iter().any(|(page_id, _)| page_id > u32::MAX as u64) {
             return Err(Error::Corruption(
                 "PMT contains a page ID outside the logical width".into(),
             ));
@@ -1177,7 +1194,7 @@ impl StorageEngine {
             visited: &mut visited,
             blob_pointers: &mut blob_pointers,
         };
-        self.verify_tree_node(&mut verification, root, 0, None, None)?;
+        self.verify_tree_node(&mut verification, root, None, None)?;
 
         if visited.len() != pmt.len() {
             let unreachable = pmt
@@ -1197,7 +1214,6 @@ impl StorageEngine {
         &self,
         verification: &mut TreeVerification<'_>,
         page_id: u32,
-        expected_parent: u32,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
     ) -> Result<()> {
@@ -1208,13 +1224,6 @@ impl StorageEngine {
         }
 
         let node = self.read_node_from_pmt(verification.pmt, page_id as u64)?;
-        if node.parent_id() != expected_parent {
-            return Err(Error::Corruption(format!(
-                "page {page_id} names parent {}, expected {expected_parent}",
-                node.parent_id()
-            )));
-        }
-
         let mut keys = Vec::with_capacity(node.count());
         for index in 0..node.count() {
             let key = node
@@ -1282,7 +1291,7 @@ impl StorageEngine {
             } else {
                 upper.clone()
             };
-            self.verify_tree_node(verification, child, page_id, child_lower, child_upper)?;
+            self.verify_tree_node(verification, child, child_lower, child_upper)?;
         }
 
         Ok(())
@@ -1412,6 +1421,83 @@ mod tests {
         assert_eq!(second.hits, 0);
         assert_eq!(second.writes, 2);
         assert_eq!(second.dirty_frames, 0);
+    }
+
+    #[test]
+    fn large_generation_streams_through_small_buffer_pool() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        for index in 0..200 {
+            let key = format!("key-{index:04}");
+            engine
+                .btree_mut()
+                .insert(key.as_bytes(), b"value")
+                .expect("test key should fit");
+        }
+        assert!(engine.btree().dirty_page_ids().len() > 2);
+
+        engine.flush().unwrap();
+        engine.complete_generation();
+        assert_eq!(engine.buffer_stats().dirty_frames, 0);
+        assert_eq!(
+            engine.lookup(b"key-0199").unwrap(),
+            LookupResult::Found(b"value".to_vec())
+        );
+    }
+
+    #[test]
+    fn streamed_generation_sync_failure_remains_retryable() {
+        let dir = tempdir().unwrap();
+        let device = Device::open(
+            dir.path().join("data"),
+            &DeviceOptions {
+                use_odirect: false,
+                sync_writes: false,
+                create: true,
+            },
+        )
+        .unwrap();
+        let mut engine = StorageEngine::new(
+            BTree::new(),
+            BufferManager::new(PAGE_SIZE * 2),
+            PMT::new(),
+            PageAllocator::new(),
+            device,
+        );
+
+        for index in 0..200 {
+            let key = format!("key-{index:04}");
+            engine
+                .btree_mut()
+                .insert(key.as_bytes(), b"value")
+                .expect("test key should fit");
+        }
+        engine.inject_sync_failure();
+
+        assert!(matches!(engine.flush(), Err(Error::Io(_))));
+        assert!(!engine.btree().dirty_page_ids().is_empty());
+        engine.flush().unwrap();
+        engine.complete_generation();
+        assert_eq!(
+            engine.lookup(b"key-0199").unwrap(),
+            LookupResult::Found(b"value".to_vec())
+        );
     }
 
     #[test]

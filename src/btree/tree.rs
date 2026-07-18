@@ -876,9 +876,13 @@ impl BTree {
             let child = u32::try_from(child).map_err(|_| {
                 BTreeError::Corruption("internal child page ID exceeds width".into())
             })?;
-            self.node_mut(child)
-                .ok_or(BTreeError::MissingPage(child))?
-                .set_parent_id(parent_id);
+            // Parent IDs are non-authoritative hints. A sparse tree may not
+            // have the moved child resident; its forward edge is persisted by
+            // the new internal node and the hint can be repaired if/when the
+            // child is loaded for a later mutation.
+            if let Some(child_node) = self.node_mut(child) {
+                child_node.set_parent_id(parent_id);
+            }
         }
         Ok(())
     }

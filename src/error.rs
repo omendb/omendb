@@ -98,9 +98,7 @@ pub enum Error {
     SnapshotUnavailable(String),
 
     /// The caller attempted to commit against a stale published state.
-    #[error(
-        "serialization conflict: expected commit {expected:?}, current commit {current:?}"
-    )]
+    #[error("serialization conflict: expected commit {expected:?}, current commit {current:?}")]
     SerializationConflict {
         /// Commit the caller used as its expected base.
         expected: CommitId,
@@ -138,6 +136,9 @@ impl From<InsertError> for Error {
     fn from(e: InsertError) -> Self {
         match e {
             InsertError::PageFull => Error::PageFull,
+            InsertError::EntryTooLarge => {
+                Error::InvalidArgument("entry is too large for a B-tree page".into())
+            }
             InsertError::WrongNodeType => Error::BTree("wrong node type for operation".into()),
             InsertError::DuplicateKey(_) => Error::DuplicateKey,
         }

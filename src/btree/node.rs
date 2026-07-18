@@ -8,13 +8,18 @@
 //!
 //! - **Header**: page metadata
 //! - **Slot Array**: fixed-size entries pointing to variable-length data (grows forward)
-//! - **Entries**: prefix-compressed key-value pairs packed from the end (grows backward)
+//! - **Entries**: self-contained live-mutation keys packed from the end (grows backward)
 //!
-//! Prefix compression: each key stores only the bytes that differ from the
-//! previous key in sorted order.
+//! The decoder remains compatible with the older prefix-compressed v2 entry
+//! form. New mutations intentionally use self-contained keys until a bounded
+//! restart-point compression scheme is implemented and benchmarked.
 
 /// Page size in bytes (4KB).
 pub const PAGE_SIZE: usize = 4096;
+
+/// Maximum key length that fits in both a leaf entry and a promoted internal
+/// separator, including one slot and the fixed page header.
+pub const MAX_KEY_SIZE: usize = PAGE_SIZE - 40 - 4 - 4 - 8;
 
 /// Header size in bytes.
 const HEADER_SIZE: usize = 40;
@@ -381,14 +386,17 @@ impl Node {
         self.header().count as usize
     }
 
-    /// Set the parent page ID.
+    /// Set the cached parent page ID.
+    ///
+    /// Forward child edges are authoritative for the durable tree. The hint
+    /// may be stale for an unloaded page after an out-of-place internal split.
     pub fn set_parent_id(&mut self, parent_id: u32) {
         let mut header = self.header();
         header.parent_id = parent_id;
         self.set_header(&header);
     }
 
-    /// Parent page ID (0 if root).
+    /// Cached parent page ID (0 if root in a fully resident tree).
     pub fn parent_id(&self) -> u32 {
         self.header().parent_id
     }
@@ -704,6 +712,9 @@ impl Node {
 
         // Build entry: prefix_len(2) + suffix_len(2) + suffix + value_type(1) + value
         let entry_size = 4 + suffix.len() + 1 + value.len();
+        if entry_size > PAGE_SIZE - HEADER_SIZE - SLOT_SIZE {
+            return Err(InsertError::EntryTooLarge);
+        }
         let count = self.count();
 
         // Check if there's room: need space for new slot + entry
@@ -970,6 +981,9 @@ impl Node {
 
         // entry = prefix_len(2) + suffix_len(2) + suffix + child_id(8)
         let entry_size = 4 + suffix.len() + 8;
+        if entry_size > PAGE_SIZE - HEADER_SIZE - SLOT_SIZE {
+            return Err(InsertError::EntryTooLarge);
+        }
         let count = self.count();
 
         let slot_array_end = Self::slot_array_start() + (count + 1) * SLOT_SIZE;
@@ -1190,6 +1204,8 @@ pub enum ValueRef<'a> {
 pub enum InsertError {
     #[error("page is full")]
     PageFull,
+    #[error("entry is too large for a page")]
+    EntryTooLarge,
     #[error("wrong node type for this operation")]
     WrongNodeType,
     #[error("duplicate key at index {0}")]
@@ -1263,9 +1279,10 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_compression() {
+    fn test_shared_prefix_keys_roundtrip() {
         let mut node = Node::new_leaf();
-        // Keys with common prefix should compress well.
+        // Shared-prefix keys must remain lossless under the self-contained
+        // live-mutation encoding.
         node.insert(b"key_001", b"v1").unwrap();
         node.insert(b"key_002", b"v2").unwrap();
         node.insert(b"key_003", b"v3").unwrap();
@@ -1273,6 +1290,18 @@ mod tests {
         assert_eq!(node.key(0), Some(b"key_001".to_vec()));
         assert_eq!(node.key(1), Some(b"key_002".to_vec()));
         assert_eq!(node.key(2), Some(b"key_003".to_vec()));
+        assert_eq!(node.entry_prefix_len(1), 0);
+        assert_eq!(node.entry_prefix_len(2), 0);
+    }
+
+    #[test]
+    fn test_entry_too_large_is_typed() {
+        let mut node = Node::new_leaf();
+        let key = vec![0xA5; PAGE_SIZE];
+        assert!(matches!(
+            node.insert(&key, b"value"),
+            Err(InsertError::EntryTooLarge)
+        ));
     }
 
     #[test]

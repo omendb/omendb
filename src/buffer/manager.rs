@@ -354,6 +354,32 @@ impl BufferManager {
         Ok(())
     }
 
+    /// Discard a successfully written staging image without treating the
+    /// logical page as clean.
+    ///
+    /// Storage uses this bounded path when one generation contains more
+    /// dirty pages than the pool has frames. The B-tree remains dirty until
+    /// manifest publication; only the cache copy is removed so the next page
+    /// can reuse the frame. A failed later write or sync therefore leaves the
+    /// logical generation retryable while avoiding a dirty-frame eviction.
+    pub fn discard_writeback(&mut self, writeback: Writeback) -> Result<(), BufferError> {
+        let page_id = writeback.page_key.logical_page_id();
+        let Some(&frame_idx) = self.page_map.get(&writeback.page_key) else {
+            return Err(BufferError::StaleWriteback(page_id));
+        };
+        let frame = &self.frames[frame_idx];
+        if frame.is_pinned() {
+            return Err(BufferError::PinnedPage(page_id));
+        }
+        if !frame.is_dirty() || frame.data.as_ref() != writeback.data.as_ref() {
+            return Err(BufferError::StaleWriteback(page_id));
+        }
+        self.page_map.remove(&writeback.page_key);
+        self.frames[frame_idx].clear();
+        self.stats.free_frames += 1;
+        Ok(())
+    }
+
     /// Begin write-back for all dirty pages.
     ///
     /// No frame is marked clean until each returned token is completed.
