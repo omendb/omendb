@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-seerdb = { path = ".." }
+seerdb = { path = "..", features = ["fault-injection"] }
 
 [[bin]]
 name = "fuzz_btree_operations"
@@ -42,6 +42,13 @@ bench = false
 [[bin]]
 name = "fuzz_format_parsing"
 path = "fuzz_targets/fuzz_format_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crash_recovery"
+path = "fuzz_targets/fuzz_crash_recovery.rs"
 test = false
 doc = false
 bench = false

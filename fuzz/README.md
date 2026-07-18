@@ -11,7 +11,11 @@ cargo +nightly fuzz run fuzz_wal_parsing -- -max_total_time=300
 cargo +nightly fuzz run fuzz_blob_parsing -- -max_total_time=300
 cargo +nightly fuzz run fuzz_format_parsing -- -max_total_time=300
 cargo +nightly fuzz run fuzz_btree_operations -- -max_total_time=300
+cargo +nightly fuzz run fuzz_crash_recovery -- -max_total_time=300
 ```
 
-Crash-recovery fuzzing is intentionally separate: it needs a deterministic
-fault harness and durable corpus contract before it is added here.
+`fuzz_crash_recovery` drives bounded atomic mutations through the deterministic
+publication seams, reopens after each injected failure, and accepts only the
+old complete generation or the complete new generation. It is a
+process-local crash/reopen model, not a substitute for SIGKILL campaigns or
+filesystem fault injection; those remain separate evidence gates.
