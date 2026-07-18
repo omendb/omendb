@@ -32,7 +32,7 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
 }
 
 fn inject_fault(db: &DB, fault: u8) {
-    match fault % 12 {
+    match fault % 13 {
         0 => db.inject_sync_failure(),
         1 => db.inject_write_failure(),
         2 => db.inject_after_write_failure(),
@@ -44,6 +44,7 @@ fn inject_fault(db: &DB, fault: u8) {
         8 => db.inject_wal_after_write_failure(),
         9 => db.inject_wal_sync_failure(),
         10 => db.inject_manifest_sync_failure(),
+        11 => db.inject_manifest_mirror_sync_failure(),
         _ => db.inject_after_manifest_failure(),
     }
 }

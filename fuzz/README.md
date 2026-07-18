@@ -15,7 +15,8 @@ cargo +nightly fuzz run fuzz_crash_recovery -- -max_total_time=300
 ```
 
 `fuzz_crash_recovery` drives bounded atomic mutations through the deterministic
-publication seams, reopens after each injected failure, and accepts only the
-old complete generation or the complete new generation. It is a
+publication and capacity seams, including the pre-reuse manifest mirror,
+reopens after each injected failure, and accepts only the old complete
+generation or the complete new generation. It is a
 process-local crash/reopen model, not a substitute for SIGKILL campaigns or
 filesystem fault injection; those remain separate evidence gates.
