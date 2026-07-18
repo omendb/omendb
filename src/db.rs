@@ -2560,11 +2560,27 @@ impl DB {
     /// truncation. Retained-root pages are never overwritten or reclaimed.
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.check_writable()?;
-        let result = self.compact_inner();
+        let result = self.compact_inner(None);
         if result.is_err() {
             // A maintenance failure can occur after the manifest barrier or
             // after the file length changed. Reopen is the only universally
             // safe way to reconstruct the active generation and allocator.
+            self.write_fenced = true;
+        }
+        result
+    }
+
+    /// Reclaim data pages while bounding one maintenance generation.
+    ///
+    /// At most `max_relocated_pages` active pages are copied into lower
+    /// unprotected holes in this call. A zero limit still trims an already
+    /// reclaimable tail but performs no interior relocation. Callers can
+    /// schedule repeated calls to keep maintenance latency and staging memory
+    /// bounded without weakening the manifest publication barrier.
+    pub fn compact_with_limit(&mut self, max_relocated_pages: usize) -> Result<CompactionReport> {
+        self.check_writable()?;
+        let result = self.compact_inner(Some(max_relocated_pages));
+        if result.is_err() {
             self.write_fenced = true;
         }
         result
@@ -2618,7 +2634,7 @@ impl DB {
         Ok(())
     }
 
-    fn compact_inner(&mut self) -> Result<CompactionReport> {
+    fn compact_inner(&mut self, max_relocated_pages: Option<usize>) -> Result<CompactionReport> {
         self.flush()?;
         self.engine.refresh_reclamation()?;
 
@@ -2632,7 +2648,10 @@ impl DB {
             // normal generation reuse barrier.
             self.mirror_current_manifest()?;
             manifest_replicated = true;
-            relocated_pages = self.engine.relocate_interior_pages()? as u64;
+            relocated_pages = match max_relocated_pages {
+                Some(limit) => self.engine.relocate_interior_pages_with_limit(limit)? as u64,
+                None => self.engine.relocate_interior_pages()? as u64,
+            };
             if relocated_pages > 0 {
                 self.publish_compaction_generation()?;
             }

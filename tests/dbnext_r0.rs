@@ -1626,6 +1626,49 @@ fn dbnext_r0_compact_relocates_interior_pages_before_truncation() {
 }
 
 #[test]
+fn dbnext_r0_bounded_compaction_reopens_between_maintenance_steps() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("compact-bounded.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let value = vec![0x52u8; 128];
+
+    for key_id in 0..256 {
+        let key = format!("key-{key_id:04}");
+        db.put(key.as_bytes(), &value).unwrap();
+    }
+    db.flush().unwrap();
+
+    let updated = vec![0x63u8; 128];
+    db.put(b"key-0128", &updated).unwrap();
+    db.flush().unwrap();
+
+    let mut reports = Vec::new();
+    for _ in 0..8 {
+        let report = db.compact_with_limit(1).unwrap();
+        assert!(report.relocated_pages <= 1);
+        assert_eq!(db.get(b"key-0128").unwrap(), Some(updated.clone()));
+        assert!(db.verify().is_ok());
+        let finished =
+            report.relocated_pages == 0 && report.data_bytes_after == report.data_bytes_before;
+        reports.push(report);
+
+        drop(db);
+        db = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(db.get(b"key-0128").unwrap(), Some(updated.clone()));
+        assert!(db.verify().is_ok());
+        if finished {
+            break;
+        }
+    }
+
+    assert!(reports.iter().any(|report| report.relocated_pages == 1));
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key-0128").unwrap(), Some(updated));
+    assert!(reopened.verify().is_ok());
+}
+
+#[test]
 fn dbnext_r0_interior_compaction_sync_failure_recovers_old_generation() {
     let root = tempdir().unwrap();
     let path = root.path().join("compact-interior-fault.db");

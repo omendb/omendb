@@ -300,10 +300,23 @@ impl StorageEngine {
     /// old manifest and all of its source pages remain authoritative after
     /// reopen.
     pub fn relocate_interior_pages(&mut self) -> Result<usize> {
+        self.relocate_interior_pages_with_limit(usize::MAX)
+    }
+
+    /// Relocate at most `max_pages` active pages into lower unprotected holes.
+    ///
+    /// The limit bounds the write set and temporary page-image memory for one
+    /// maintenance generation. The caller may invoke this method repeatedly;
+    /// each successful batch still requires the same manifest publication
+    /// barrier before its source pages can be reused.
+    pub fn relocate_interior_pages_with_limit(&mut self, max_pages: usize) -> Result<usize> {
         if !self.pending_reclaimed_offsets.is_empty() {
             return Err(Error::NeedsRecovery(
                 "cannot relocate pages before generation publication".into(),
             ));
+        }
+        if max_pages == 0 {
+            return Ok(0);
         }
 
         let protected_offsets = self
@@ -325,6 +338,9 @@ impl StorageEngine {
         let mut moves = Vec::new();
         let mut free_index = 0;
         for (page_id, mapping) in active_pages {
+            if moves.len() >= max_pages {
+                break;
+            }
             while free_index < free_offsets.len() && free_offsets[free_index] >= mapping.offset {
                 free_index += 1;
             }
