@@ -47,6 +47,12 @@ pub enum Error {
     #[error("disk full")]
     DiskFull,
 
+    /// Capacity admission failed before the generation issued physical page
+    /// writes. The caller may restore capacity and retry this operation on
+    /// the same handle; no ambiguous media state has been created.
+    #[error("capacity preflight refused")]
+    CapacityPreflight,
+
     /// The configured WAL admission budget cannot cover this mutation and
     /// its closing commit envelope. The caller may flush and retry.
     #[error("write backpressure: requires {required} WAL bytes, {available} available")]

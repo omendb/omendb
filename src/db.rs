@@ -2174,7 +2174,14 @@ impl DB {
         };
 
         if let Err(error) = self.publish_generation(commit, true, 0) {
-            self.write_fenced = true;
+            // StorageEngine performs capacity admission before any page
+            // write. A refusal at that boundary leaves only an uncommitted
+            // WAL mutation prefix, so callers can restore capacity and retry
+            // without reopening. Any other publication error may have
+            // reached durable media and must fence this handle.
+            if !matches!(&error, Error::CapacityPreflight) {
+                self.write_fenced = true;
+            }
             return Err(error);
         }
         Ok(())
@@ -5226,6 +5233,31 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_db_capacity_preflight_is_retryable_without_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("retryable-capacity.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+
+        let capacity = fs::metadata(path.join(DATA_FILE)).unwrap().len();
+        db.inject_capacity_limit(capacity);
+        db.put(b"key", b"value-2").unwrap();
+
+        assert!(matches!(db.flush(), Err(Error::CapacityPreflight)));
+        assert!(!db.durability_status().write_fenced);
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+
+        db.inject_capacity_limit(u64::MAX);
+        db.flush().unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+
+        drop(db);
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
     }
 
     #[test]

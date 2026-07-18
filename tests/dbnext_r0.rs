@@ -940,8 +940,8 @@ fn dbnext_r0_capacity_limit_preserves_last_generation() {
 
     db.inject_capacity_limit(capacity);
     db.put(b"uncommitted", b"value-2").unwrap();
-    assert!(matches!(db.flush(), Err(Error::DiskFull)));
-    assert!(db.durability_status().write_fenced);
+    assert!(matches!(db.flush(), Err(Error::CapacityPreflight)));
+    assert!(!db.durability_status().write_fenced);
     drop(db);
 
     let reopened = DB::open(&path, Options::default()).unwrap();

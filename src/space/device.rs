@@ -222,10 +222,6 @@ impl Device {
             .checked_add(PAGE_SIZE as u64)
             .ok_or_else(|| io::Error::from(io::ErrorKind::StorageFull))?;
         self.check_capacity(end)?;
-        #[cfg(any(test, feature = "fault-injection"))]
-        if self.fail_next_disk_full.load(Ordering::Acquire) {
-            return Err(io::Error::from(io::ErrorKind::StorageFull));
-        }
         Ok(())
     }
 
@@ -431,6 +427,12 @@ pub(crate) fn reserve_file(file: &File, length: u64) -> io::Result<bool> {
         }
         if result == -1 {
             return Err(io::Error::last_os_error());
+        }
+        // F_PREALLOCATE can report success after allocating less than the
+        // requested extent. Treat that as capacity failure instead of
+        // claiming a reservation that the later write is not protected by.
+        if store.fst_bytesalloc < size {
+            return Err(io::Error::from(io::ErrorKind::StorageFull));
         }
         Ok(true)
     }

@@ -72,6 +72,17 @@ impl StorageCounters {
     }
 }
 
+fn capacity_preflight_error(error: std::io::Error) -> Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        Error::CapacityPreflight
+    } else {
+        Error::from(error)
+    }
+}
+
 struct TreeVerification<'a> {
     pmt: &'a PMT,
     visited: &'a mut HashSet<u32>,
@@ -738,7 +749,7 @@ impl StorageEngine {
                 self.metrics
                     .capacity_preflight_failures
                     .fetch_add(1, Ordering::Relaxed);
-                return Err(Error::from(error));
+                return Err(capacity_preflight_error(error));
             }
         }
         if let Some(end) = required_data_end
@@ -747,7 +758,7 @@ impl StorageEngine {
             self.metrics
                 .capacity_preflight_failures
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(Error::from(error));
+            return Err(capacity_preflight_error(error));
         }
         Ok(())
     }
@@ -1880,7 +1891,7 @@ mod tests {
         engine.btree_mut().insert(b"key", b"value").unwrap();
         engine.inject_capacity_limit(0);
 
-        assert!(matches!(engine.flush(), Err(Error::DiskFull)));
+        assert!(matches!(engine.flush(), Err(Error::CapacityPreflight)));
         assert_eq!(engine.device.size().unwrap(), 0);
         let stats = engine.buffer_stats();
         assert_eq!(stats.reads, 0);
