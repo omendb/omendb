@@ -301,6 +301,36 @@ fn dbnext_r0_retains_arbitrary_historical_commit_across_reopen() {
 }
 
 #[test]
+fn dbnext_r0_late_retention_rejects_reused_physical_generation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("late-retention.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"one".to_vec(),
+        }])
+        .unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"versioned".to_vec(),
+        value: b"two".to_vec(),
+    }])
+    .unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"versioned".to_vec(),
+        value: b"three".to_vec(),
+    }])
+    .unwrap();
+
+    assert!(matches!(
+        db.retain_commit(first.commit_id),
+        Err(Error::SnapshotUnavailable(message))
+            if message.contains("physical pages reused")
+    ));
+    assert_eq!(db.get(b"versioned").unwrap(), Some(b"three".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_vacuum_rebuilds_live_tree_and_preserves_retained_root() {
     let root = tempdir().unwrap();
     let path = root.path().join("vacuum.db");

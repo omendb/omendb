@@ -2954,6 +2954,10 @@ impl DB {
                     return Err(error);
                 }
             };
+            if let Err(error) = self.validate_historical_page_liveness(manifest, &pmt) {
+                let _ = fs::remove_file(&retained_blob);
+                return Err(error);
+            }
             let pointers = match self.engine.verify_tree_at(manifest.root_page_id, &pmt) {
                 Ok(pointers) => pointers,
                 Err(error) => {
@@ -3011,6 +3015,55 @@ impl DB {
             return Err(error);
         }
         Ok(snapshot_id)
+    }
+
+    /// Refuse a historical retention request once a later published
+    /// generation has reused one of the target root's physical page slots.
+    ///
+    /// Manifest history is the durable reuse ledger: even if the later page
+    /// has since become inactive, its checkpoint proves that the target bytes
+    /// were overwritten. Retention must fail closed rather than treating a
+    /// different, structurally valid page as the requested historical value.
+    fn validate_historical_page_liveness(&self, target: Manifest, target_pmt: &PMT) -> Result<()> {
+        let target_by_offset: BTreeMap<_, _> = target_pmt
+            .iter()
+            .map(|(_, mapping)| (mapping.offset, *mapping))
+            .collect();
+        if target_by_offset.is_empty() {
+            return Ok(());
+        }
+
+        for later in self
+            .manifest_history
+            .manifests()
+            .iter()
+            .filter(|manifest| manifest.generation_id > target.generation_id)
+        {
+            if later.pmt_checkpoint_id.get() == 0 {
+                continue;
+            }
+            let checkpoint = self
+                .path
+                .join(format!("seerdb.meta.{}", later.pmt_checkpoint_id.get()));
+            let (later_pmt, _) = Self::load_meta(&checkpoint).map_err(|error| {
+                Error::SnapshotUnavailable(format!(
+                    "commit {} cannot establish page liveness through generation {}: {error}",
+                    target.commit_id.get(),
+                    later.generation_id.get()
+                ))
+            })?;
+            if later_pmt.iter().any(|(_, mapping)| {
+                target_by_offset
+                    .get(&mapping.offset)
+                    .is_some_and(|target_mapping| *target_mapping != *mapping)
+            }) {
+                return Err(Error::SnapshotUnavailable(format!(
+                    "commit {} has physical pages reused by a later generation",
+                    target.commit_id.get()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn next_snapshot_path(&self) -> Result<PathBuf> {
