@@ -2171,7 +2171,7 @@ impl DB {
     /// new generation may reuse pages from older slots.
     fn mirror_current_manifest(&mut self) -> Result<()> {
         if let Some(current) = self.manifest.load_latest()? {
-            self.manifest.publish(current)?;
+            self.manifest.publish_mirrored(current)?;
         }
         Ok(())
     }
@@ -3550,6 +3550,12 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_manifest_sync_failure(&self) {
         self.manifest.inject_sync_failure();
+    }
+
+    /// Inject one failure at the safety mirror sync boundary before page reuse.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_manifest_mirror_sync_failure(&self) {
+        self.manifest.inject_mirror_sync_failure();
     }
 
     /// Inject one failure after the next manifest becomes authoritative.
@@ -5371,6 +5377,32 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+    }
+
+    #[test]
+    fn test_db_mirror_manifest_sync_failure_precedes_page_reuse() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("manifest-mirror-fault.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+        let data_bytes_before = fs::metadata(path.join(DATA_FILE)).unwrap().len();
+
+        db.put(b"key", b"value-3").unwrap();
+        db.inject_manifest_mirror_sync_failure();
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+        assert_eq!(
+            fs::metadata(path.join(DATA_FILE)).unwrap().len(),
+            data_bytes_before
+        );
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+        reopened.verify().unwrap();
     }
 
     #[test]

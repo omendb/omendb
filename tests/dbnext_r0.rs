@@ -563,7 +563,13 @@ fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
 
 #[test]
 fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
-    fn run_case(root: &Path, name: &str, inject: fn(&DB), expected_after_reopen: &'static [u8]) {
+    fn run_case(
+        root: &Path,
+        name: &str,
+        inject: fn(&DB),
+        expected_after_reopen: &'static [u8],
+        allow_complete_new: bool,
+    ) {
         let path = root.join(name);
         let mut db = DB::open(&path, Options::for_test()).unwrap();
         db.put(b"key", b"before").unwrap();
@@ -597,10 +603,15 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
         drop(db);
 
         let mut reopened = DB::open(&path, Options::for_test()).unwrap();
-        assert_eq!(
-            reopened.get(b"key").unwrap(),
-            Some(expected_after_reopen.to_vec())
-        );
+        let recovered = reopened.get(b"key").unwrap();
+        if allow_complete_new {
+            assert!(
+                recovered == Some(b"before".to_vec()) || recovered == Some(b"after".to_vec()),
+                "ambiguous manifest publication exposed an invalid state: {recovered:?}"
+            );
+        } else {
+            assert_eq!(recovered, Some(expected_after_reopen.to_vec()));
+        }
         assert!(!reopened.durability_status().write_fenced);
         reopened.verify().unwrap();
     }
@@ -611,30 +622,42 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
         "transaction-before-wal.db",
         DB::inject_wal_write_failure,
         b"before",
+        false,
     );
     run_case(
         root.path(),
         "transaction-page-sync.db",
         DB::inject_page_range_sync_failure,
         b"before",
+        false,
     );
     run_case(
         root.path(),
         "transaction-manifest-sync.db",
         DB::inject_manifest_sync_failure,
         b"before",
+        true,
+    );
+    run_case(
+        root.path(),
+        "transaction-manifest-mirror-sync.db",
+        DB::inject_manifest_mirror_sync_failure,
+        b"before",
+        false,
     );
     run_case(
         root.path(),
         "transaction-after-manifest.db",
         DB::inject_after_manifest_failure,
         b"after",
+        false,
     );
     run_case(
         root.path(),
         "transaction-wal-truncate.db",
         DB::inject_wal_truncate_failure,
         b"after",
+        false,
     );
 }
 
@@ -1159,6 +1182,7 @@ fn dbnext_r0_process_crash_publication_matrix() {
             "wal-sync" => db.inject_wal_sync_failure(),
             "page-write" => db.inject_write_failure(),
             "page-sync" => db.inject_page_range_sync_failure(),
+            "manifest-mirror-sync" => db.inject_manifest_mirror_sync_failure(),
             "manifest-sync" => db.inject_manifest_sync_failure(),
             "after-manifest" => db.inject_after_manifest_failure(),
             "wal-truncate" => db.inject_wal_truncate_failure(),
@@ -1172,17 +1196,24 @@ fn dbnext_r0_process_crash_publication_matrix() {
         std::process::exit(137);
     }
 
+    #[derive(Clone, Copy)]
+    enum Expected {
+        Old,
+        New,
+        Either,
+    }
     let cases = [
-        ("wal-sync", false),
-        ("page-write", false),
-        ("page-sync", false),
-        ("manifest-sync", false),
-        ("after-manifest", true),
-        ("wal-truncate", true),
-        ("final-disk-full", false),
+        ("wal-sync", Expected::Old),
+        ("page-write", Expected::Old),
+        ("page-sync", Expected::Old),
+        ("manifest-mirror-sync", Expected::Old),
+        ("manifest-sync", Expected::Either),
+        ("after-manifest", Expected::New),
+        ("wal-truncate", Expected::New),
+        ("final-disk-full", Expected::Old),
     ];
     let root = tempdir().unwrap();
-    for (fault, expect_new) in cases {
+    for (fault, expected) in cases {
         let path = root.path().join(format!("process-crash-{fault}.db"));
         let status = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
@@ -1195,8 +1226,16 @@ fn dbnext_r0_process_crash_publication_matrix() {
         assert!(!status.success(), "crash child exited cleanly for {fault}");
 
         let mut recovered = DB::open(&path, Options::default()).unwrap();
-        let expected = if expect_new { b"value-2" } else { b"value-1" };
-        assert_eq!(recovered.get(b"key").unwrap(), Some(expected.to_vec()));
+        let recovered_value = recovered.get(b"key").unwrap();
+        match expected {
+            Expected::Old => assert_eq!(recovered_value, Some(b"value-1".to_vec())),
+            Expected::New => assert_eq!(recovered_value, Some(b"value-2".to_vec())),
+            Expected::Either => assert!(
+                recovered_value == Some(b"value-1".to_vec())
+                    || recovered_value == Some(b"value-2".to_vec()),
+                "ambiguous fault {fault} exposed an invalid state: {recovered_value:?}"
+            ),
+        }
         assert_eq!(recovered.durability_status().pending_mutations, 0);
         assert!(!recovered.durability_status().write_fenced);
         assert!(recovered.verify().is_ok());
@@ -2357,11 +2396,14 @@ fn dbnext_r0_manifest_sync_fault_fences_compaction_and_recovers() {
     let path = root.path().join("manifest-sync-fault.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
 
-    db.put(b"key", b"value-1").unwrap();
+    let value = vec![0x4Cu8; 128];
+    for key_id in 0..256 {
+        let key = format!("key-{key_id:04}");
+        db.put(key.as_bytes(), &value).unwrap();
+    }
     db.flush().unwrap();
-    db.put(b"key", b"value-2").unwrap();
-    db.flush().unwrap();
-    db.put(b"key", b"value-3").unwrap();
+    let updated = vec![0x5Du8; 128];
+    db.put(b"key-0128", &updated).unwrap();
     db.flush().unwrap();
 
     db.inject_manifest_sync_failure();
@@ -2374,7 +2416,7 @@ fn dbnext_r0_manifest_sync_fault_fences_compaction_and_recovers() {
 
     drop(db);
     let reopened = DB::open(&path, Options::default()).unwrap();
-    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-3".to_vec()));
+    assert_eq!(reopened.get(b"key-0128").unwrap(), Some(updated));
     assert!(!reopened.durability_status().write_fenced);
 }
 

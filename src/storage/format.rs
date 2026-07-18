@@ -16,6 +16,7 @@ use std::cell::Cell;
 #[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     static FAIL_NEXT_MANIFEST_SYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_MIRROR_MANIFEST_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Current durable format version.
@@ -800,8 +801,28 @@ impl ManifestStore {
         self.write_slot(target_slot, &bytes)?;
         self.file.flush()?;
 
+        self.sync_manifest(false)
+    }
+
+    /// Copy the current manifest into the inactive slot before a maintenance
+    /// or user generation may reuse pages named by the older slot.
+    pub fn publish_mirrored(&mut self, manifest: Manifest) -> Result<()> {
+        let current_slot = self.current_slot()?;
+        let target_slot = current_slot.map_or(0, |slot| 1 - slot);
+        let bytes = manifest.to_bytes();
+        self.write_slot(target_slot, &bytes)?;
+        self.file.flush()?;
+
+        self.sync_manifest(true)
+    }
+
+    fn sync_manifest(&mut self, mirror: bool) -> Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
-        if FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
+        if mirror {
+            if FAIL_NEXT_MIRROR_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
+                return Err(std::io::Error::other("injected mirror manifest sync failure").into());
+            }
+        } else if FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected manifest sync failure").into());
         }
 
@@ -820,19 +841,19 @@ impl ManifestStore {
         self.write_slot(1, &bytes)?;
         self.file.flush()?;
 
-        #[cfg(any(test, feature = "fault-injection"))]
-        if FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
-            return Err(std::io::Error::other("injected manifest sync failure").into());
-        }
-
-        self.file.sync_all()?;
-        Ok(())
+        self.sync_manifest(false)
     }
 
     /// Inject one failure at the next manifest sync boundary.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_sync_failure(&self) {
         FAIL_NEXT_MANIFEST_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure at the next safety-mirror sync boundary.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_mirror_sync_failure(&self) {
+        FAIL_NEXT_MIRROR_MANIFEST_SYNC.with(|failure| failure.set(true));
     }
 
     fn write_slot(&mut self, slot: usize, bytes: &[u8; MANIFEST_SLOT_SIZE]) -> Result<()> {
@@ -971,6 +992,25 @@ mod tests {
         store.publish(manifest(1, 1)).unwrap();
         store.publish(manifest(2, 2)).unwrap();
         assert_eq!(store.load_latest().unwrap(), Some(manifest(2, 2)));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn manifest_sync_faults_distinguish_candidate_and_safety_mirror() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        let mut store = ManifestStore::open(&path).unwrap();
+        let first = manifest(1, 1);
+        let second = manifest(2, 2);
+
+        store.publish(first).unwrap();
+        store.inject_sync_failure();
+        store.publish_mirrored(first).unwrap();
+        assert!(store.publish(second).is_err());
+
+        store.inject_mirror_sync_failure();
+        assert!(store.publish_mirrored(first).is_err());
+        store.publish(second).unwrap();
     }
 
     #[test]
