@@ -237,6 +237,18 @@ impl BlobFile {
         self.valid_count = self.records.len();
     }
 
+    /// Mark every record deleted for a pointer-rewriting compaction.
+    pub(crate) fn mark_all_deleted(&mut self) {
+        self.deleted_offsets.clear();
+        let mut offset = 0u64;
+        for record in &self.records {
+            self.deleted_offsets.insert(offset);
+            offset = offset.saturating_add(record.serialized_size() as u64);
+        }
+        self.deleted_count = self.records.len();
+        self.valid_count = 0;
+    }
+
     fn has_record_at(&self, offset: u64) -> bool {
         let mut current_offset = 0u64;
         for record in &self.records {

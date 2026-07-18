@@ -44,12 +44,14 @@ thread_local! {
     static FAIL_NEXT_WAL_TRUNCATE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
 const BLOB_RESERVATION_FILE: &str = "seerdb.blob.reserve";
+const BLOB_REWRITE_BACKUP_FILE: &str = "seerdb.blob.rewrite-old";
 const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
@@ -1078,11 +1080,19 @@ impl DB {
         };
         let wal = WalManager::new(sync_policy);
 
+        // Recover an interrupted mixed-blob rewrite before loading the blob
+        // catalog. A rewrite keeps the previous image under a side filename
+        // until its maintenance manifest is authoritative.
+        let recovered_blob_bytes =
+            Self::recover_blob_rewrite_backup(&path, current_manifest, read_only)?;
+
         // Create blob manager.
         let blob_path = path.join(BLOB_FILE);
         let mut blobs = if blob_path.exists() {
             // Load blob files from disk.
-            let blob_data = fs::read(&blob_path)?;
+            let blob_data = recovered_blob_bytes
+                .as_deref()
+                .map_or_else(|| fs::read(&blob_path), |bytes| Ok(bytes.to_vec()))?;
             match BlobManager::from_bytes(&blob_data) {
                 Some(blobs) => blobs,
                 None if check_only => {
@@ -1842,6 +1852,87 @@ impl DB {
         atomic_write(path, data)
     }
 
+    /// Reconcile a blob image kept aside while a mixed-file rewrite crosses
+    /// the blob-image/manifest publication boundary.
+    ///
+    /// The backup has the generation selected by the current manifest. If
+    /// that generation is still authoritative, the rewrite did not publish and
+    /// the backup must be restored. If the manifest advanced, publication
+    /// completed and the backup is only stale cleanup state.
+    fn recover_blob_rewrite_backup(
+        path: &Path,
+        current_manifest: Option<Manifest>,
+        read_only: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let backup_path = path.join(BLOB_REWRITE_BACKUP_FILE);
+        if !backup_path.is_file() {
+            return Ok(None);
+        }
+
+        let backup_bytes = fs::read(&backup_path)?;
+        let backup_blobs = BlobManager::from_bytes(&backup_bytes).ok_or_else(|| {
+            Error::Corruption("interrupted blob rewrite backup is invalid".into())
+        })?;
+        let Some(manifest_generation) =
+            current_manifest.map(|manifest| manifest.generation_id.get())
+        else {
+            if read_only {
+                return Ok(Some(backup_bytes));
+            }
+            let blob_path = path.join(BLOB_FILE);
+            if blob_path.exists() {
+                fs::remove_file(&blob_path)?;
+            }
+            fs::rename(&backup_path, &blob_path)?;
+            sync_directory(path)?;
+            return Ok(None);
+        };
+
+        let backup_generation = backup_blobs.generation_id();
+        if backup_generation > manifest_generation {
+            return Err(Error::Corruption(format!(
+                "blob rewrite backup generation {} is newer than manifest {}",
+                backup_generation, manifest_generation
+            )));
+        }
+        if backup_generation < manifest_generation {
+            if !read_only {
+                fs::remove_file(&backup_path)?;
+                sync_directory(path)?;
+            }
+            return Ok(None);
+        }
+
+        let blob_path = path.join(BLOB_FILE);
+        let current_blobs = if blob_path.is_file() {
+            fs::read(&blob_path)
+                .ok()
+                .and_then(|bytes| BlobManager::from_bytes(&bytes))
+        } else {
+            None
+        };
+        let needs_restore = current_blobs
+            .as_ref()
+            .is_none_or(|blobs| blobs.generation_id() != manifest_generation);
+        if !needs_restore {
+            if !read_only {
+                fs::remove_file(&backup_path)?;
+                sync_directory(path)?;
+            }
+            return Ok(None);
+        }
+        if read_only {
+            return Ok(Some(backup_bytes));
+        }
+
+        if blob_path.exists() {
+            fs::remove_file(&blob_path)?;
+        }
+        fs::rename(&backup_path, &blob_path)?;
+        sync_directory(path)?;
+        Ok(None)
+    }
+
     fn persist_manifest_history(&self, history: &ManifestHistory) -> Result<()> {
         let bytes = history
             .to_bytes()
@@ -2048,8 +2139,9 @@ impl DB {
     /// Run garbage collection on blob files.
     ///
     /// Pending mutations are published before reclaiming blobs so an older
-    /// durable generation never loses a pointer. Only fully dead blob files
-    /// are currently reclaimable without pointer rewriting.
+    /// durable generation never loses a pointer. Fully dead files are removed
+    /// directly; mixed files are compacted by rewriting active B-tree pointers
+    /// into a new blob file and sweeping the old file after publication.
     ///
     /// Returns the number of entries reclaimed.
     pub fn gc(&mut self) -> Result<usize> {
@@ -2072,7 +2164,7 @@ impl DB {
             // successful reservation covers the subsequent atomic publish.
             self.admit_blob_image(None, None)?;
         }
-        let reclaimed = self.blobs.gc();
+        let mut reclaimed = self.blobs.gc();
         if reclaimed > 0 {
             let blob_path = self.path.join(BLOB_FILE);
             if let Err(error) = self.write_blob_image(&blob_path, &self.blobs.to_bytes()) {
@@ -2080,6 +2172,88 @@ impl DB {
                 return Err(error);
             }
         }
+        if !self.blobs.files_needing_gc().is_empty() {
+            let rewritten = match self.rewrite_mixed_blob_files() {
+                Ok(reclaimed) => reclaimed,
+                Err(error) => {
+                    self.write_fenced = true;
+                    return Err(error);
+                }
+            };
+            reclaimed = reclaimed.saturating_add(rewritten);
+        }
+        Ok(reclaimed)
+    }
+
+    /// Rewrite live blob values into a fresh file and publish their new
+    /// pointers as one physical maintenance generation.
+    ///
+    /// Existing records remain in the candidate blob image but carry deletion
+    /// metadata until the new manifest is durable. The prior blob image is
+    /// kept under a recovery name across that boundary, so an interrupted
+    /// rewrite restores the exact old root image. Once the new root is
+    /// authoritative, a second sweep removes the fully dead old files without
+    /// changing the logical tree again.
+    fn rewrite_mixed_blob_files(&mut self) -> Result<usize> {
+        self.engine.ensure_materialized()?;
+        let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
+        let entries = self
+            .engine
+            .btree()
+            .range_scan(&[], &end)
+            .map_err(Error::from)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)?;
+
+        let mut candidate_blobs = self.blobs.clone();
+        candidate_blobs
+            .begin_compaction_file()
+            .ok_or(Error::DiskFull)?;
+        candidate_blobs.mark_all_deleted();
+        let mut candidate_tree = self.engine.btree().clone();
+        let mut rewritten = 0usize;
+        for (key, result) in entries {
+            let LookupResult::Blob(pointer) = result else {
+                continue;
+            };
+            let value = self.blobs.read(&pointer).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "active B-tree blob pointer {}:{}:{} is unavailable",
+                    pointer.file_id, pointer.offset, pointer.length
+                ))
+            })?;
+            let replacement = candidate_blobs.append(&key, value.to_vec());
+            candidate_tree
+                .upsert_blob(&key, replacement)
+                .map_err(Error::from)?;
+            rewritten = rewritten.saturating_add(1);
+        }
+        if rewritten == 0 {
+            return Ok(0);
+        }
+
+        let blob_bytes = candidate_blobs.to_bytes();
+        self.engine
+            .check_artifact_capacity(blob_bytes.len() as u64)?;
+        self.reserve_blob_image(blob_bytes.len() as u64)?;
+        *self.engine.btree_mut() = candidate_tree;
+        self.blobs = candidate_blobs;
+
+        self.mirror_current_manifest()?;
+        self.engine.flush()?;
+        self.publish_blob_rewrite_generation()?;
+
+        let reclaimed = if self.blobs.has_reclaimable_files() {
+            self.admit_blob_image(None, None)?;
+            let reclaimed = self.blobs.gc();
+            if reclaimed > 0 {
+                let blob_path = self.path.join(BLOB_FILE);
+                self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
+            }
+            reclaimed
+        } else {
+            0
+        };
         Ok(reclaimed)
     }
 
@@ -2907,6 +3081,69 @@ impl DB {
         Ok(())
     }
 
+    /// Publish a blob-pointer rewrite without inventing a logical user
+    /// commit. The data pages, PMT, and blob image are all selected by the new
+    /// physical generation before its manifest becomes authoritative.
+    fn publish_blob_rewrite_generation(&mut self) -> Result<()> {
+        let current = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+        let generation_id = GenerationId::new(
+            current
+                .generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
+        let checkpoint_path = self
+            .path
+            .join(format!("seerdb.meta.{}", generation_id.get()));
+        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
+        Self::save_meta(
+            &self.path.join(META_FILE),
+            self.engine.pmt(),
+            self.engine.allocator(),
+        )?;
+
+        self.blobs.set_generation(generation_id.get());
+        let blob_path = self.path.join(BLOB_FILE);
+        let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
+        if backup_path.exists() {
+            fs::remove_file(&backup_path)?;
+        }
+        fs::rename(&blob_path, &backup_path)?;
+        sync_directory(&self.path)?;
+        self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected failure after blob rewrite image").into());
+        }
+
+        let manifest = Manifest {
+            generation_id,
+            pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
+            ..current
+        };
+        let mut manifest_history = self.manifest_history.clone();
+        manifest_history
+            .push(manifest)
+            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history(manifest)?;
+        } else {
+            self.persist_manifest_history(&manifest_history)?;
+        }
+        self.manifest_history = manifest_history;
+        self.manifest.publish(manifest)?;
+        self.engine.complete_generation();
+        self.generation_id = generation_id;
+        fs::remove_file(&backup_path)?;
+        sync_directory(&self.path)?;
+        Ok(())
+    }
+
     fn compact_inner(&mut self, max_relocated_pages: Option<usize>) -> Result<CompactionReport> {
         self.flush()?;
         self.engine.refresh_reclamation()?;
@@ -3052,6 +3289,13 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_atomic_torn_write_failure(&self) {
         FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after a mixed-blob rewrite image is durable but
+    /// before its maintenance manifest is published.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_after_blob_rewrite_image_failure(&self) {
+        FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE.with(|failure| failure.set(true));
     }
 
     /// Begin a root-bound byte transaction.
@@ -5061,16 +5305,18 @@ mod tests {
 
         // Run GC.
         let reclaimed = db.gc().unwrap();
-        assert_eq!(reclaimed, 0);
+        assert_eq!(reclaimed, 3);
         assert_eq!(db.get(b"key3").unwrap(), Some(large_value));
 
         // Check stats after GC.
         let stats = db.blob_stats();
-        assert_eq!(stats.files_needing_gc, 1);
+        assert_eq!(stats.total_valid, 1);
+        assert_eq!(stats.total_deleted, 0);
+        assert_eq!(stats.files_needing_gc, 0);
 
         db.delete(b"key3").unwrap();
         db.flush().unwrap();
-        assert_eq!(db.gc().unwrap(), 3);
+        assert_eq!(db.gc().unwrap(), 1);
         assert_eq!(db.blob_stats().files_needing_gc, 0);
 
         drop(db);

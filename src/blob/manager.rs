@@ -71,6 +71,18 @@ impl BlobManager {
         }
     }
 
+    /// Mark all existing records dead before a pointer-rewriting compaction.
+    ///
+    /// The active B-tree values are copied into a new file afterward. Keeping
+    /// the old records in the candidate image is required until its manifest
+    /// is durable; the database also keeps the prior serialized image aside so
+    /// an interrupted rewrite can restore the exact old root image.
+    pub(crate) fn mark_all_deleted(&mut self) {
+        for file in &mut self.files {
+            Arc::make_mut(file).mark_all_deleted();
+        }
+    }
+
     /// Number of blob files.
     pub fn file_count(&self) -> usize {
         self.files.len()
@@ -97,6 +109,17 @@ impl BlobManager {
             offset,
             length,
         }
+    }
+
+    /// Start a fresh file for pointer-rewriting compaction.
+    pub(crate) fn begin_compaction_file(&mut self) -> Option<u32> {
+        let file_id = self.next_file_id;
+        if file_id == 0 || file_id == u32::MAX {
+            return None;
+        }
+        self.next_file_id = file_id.checked_add(1)?;
+        self.files.push(Arc::new(BlobFile::new(file_id)));
+        Some(file_id)
     }
 
     /// Roll back a blob append whose B-tree pointer was not installed.
@@ -206,11 +229,11 @@ impl BlobManager {
             .any(|file| file.needs_gc() && file.valid_count() == 0)
     }
 
-    /// Run garbage collection on files that need it.
+    /// Run the low-level sweep on files that are fully dead.
     ///
-    /// Only fully dead files are reclaimable without rewriting live pointers.
-    /// Mixed files remain available for a future pointer-rewriting compactor.
-    /// Returns the number of entries reclaimed.
+    /// The database-level `DB::gc()` performs pointer rewriting for mixed
+    /// files before calling this method. This method itself never rewrites
+    /// live pointers.
     pub fn gc(&mut self) -> usize {
         let files_to_gc: Vec<_> = self
             .files
@@ -250,9 +273,8 @@ impl BlobManager {
 
     /// Create a new blob file.
     fn create_new_file(&mut self) {
-        let file_id = self.next_file_id;
-        self.next_file_id += 1;
-        self.files.push(Arc::new(BlobFile::new(file_id)));
+        self.begin_compaction_file()
+            .expect("blob file ID space exhausted");
     }
 
     /// Make a key prefix (first 8 bytes, padded with zeros if shorter).

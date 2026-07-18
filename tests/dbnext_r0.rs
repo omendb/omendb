@@ -1226,6 +1226,75 @@ fn dbnext_r0_blob_reclamation_survives_reopen() {
 }
 
 #[test]
+fn dbnext_r0_gc_rewrites_mixed_blob_files_and_reclaims_old_pointers() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-mixed-reclamation.db");
+    let first = vec![0x61u8; 2_048];
+    let second = vec![0x62u8; 2_048];
+    let third = vec![0x63u8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"large-a", &first).unwrap();
+    db.put(b"large-b", &second).unwrap();
+    db.put(b"large-c", &third).unwrap();
+    db.flush().unwrap();
+    db.delete(b"large-a").unwrap();
+    db.delete(b"large-b").unwrap();
+    db.flush().unwrap();
+
+    let before = db.blob_stats();
+    assert_eq!(before.total_valid, 1);
+    assert_eq!(before.total_deleted, 2);
+    assert_eq!(before.files_needing_gc, 1);
+
+    assert_eq!(db.gc().unwrap(), 3);
+    assert_eq!(db.get(b"large-a").unwrap(), None);
+    assert_eq!(db.get(b"large-b").unwrap(), None);
+    assert_eq!(db.get(b"large-c").unwrap(), Some(third.clone()));
+    assert_eq!(db.blob_stats().total_valid, 1);
+    assert_eq!(db.blob_stats().total_deleted, 0);
+    assert_eq!(db.blob_stats().files_needing_gc, 0);
+    drop(db);
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"large-a").unwrap(), None);
+    assert_eq!(reopened.get(b"large-b").unwrap(), None);
+    assert_eq!(reopened.get(b"large-c").unwrap(), Some(third));
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+}
+
+#[test]
+fn dbnext_r0_gc_mixed_blob_rewrite_failure_reopens_old_root() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("blob-mixed-reclamation-fault.db");
+    let first = vec![0x71u8; 2_048];
+    let second = vec![0x72u8; 2_048];
+    let third = vec![0x73u8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"large-a", &first).unwrap();
+    db.put(b"large-b", &second).unwrap();
+    db.put(b"large-c", &third).unwrap();
+    db.flush().unwrap();
+    db.delete(b"large-a").unwrap();
+    db.delete(b"large-b").unwrap();
+    db.flush().unwrap();
+
+    db.inject_after_blob_rewrite_image_failure();
+    let error = db.gc().unwrap_err();
+    assert!(matches!(error, Error::Io(_)));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"large-a").unwrap(), None);
+    assert_eq!(reopened.get(b"large-b").unwrap(), None);
+    assert_eq!(reopened.get(b"large-c").unwrap(), Some(third));
+    assert_eq!(reopened.blob_stats().total_valid, 1);
+    assert_eq!(reopened.blob_stats().total_deleted, 2);
+    assert_eq!(reopened.gc().unwrap(), 3);
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
 fn dbnext_r0_gc_capacity_refusal_preserves_blob_catalog() {
     let root = tempdir().unwrap();
     let path = root.path().join("blob-gc-capacity.db");
