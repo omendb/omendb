@@ -46,7 +46,9 @@ impl PageAllocator {
             freed
         } else {
             let id = self.next_id;
-            self.next_id += 1;
+            // Keep an exhausted frontier stable instead of wrapping it back
+            // to page zero after the final representable ID.
+            self.next_id = self.next_id.saturating_add(1);
             id
         };
 
@@ -111,6 +113,9 @@ impl PageAllocator {
         let next_id = u64::from_le_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ]);
+        if next_id == 0 {
+            return None;
+        }
         let free_count = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as usize;
 
         let expected = 12usize.checked_add(free_count.checked_mul(8)?)?;
@@ -119,6 +124,7 @@ impl PageAllocator {
         }
 
         let mut free_list = Vec::with_capacity(free_count);
+        let mut seen = HashSet::with_capacity(free_count);
         let mut pos = 12;
         for _ in 0..free_count {
             let id = u64::from_le_bytes([
@@ -131,6 +137,9 @@ impl PageAllocator {
                 buf[pos + 6],
                 buf[pos + 7],
             ]);
+            if id == 0 || id >= next_id || !seen.insert(id) {
+                return None;
+            }
             free_list.push(id);
             pos += 8;
         }
@@ -218,5 +227,32 @@ mod tests {
         bytes.push(0xA5);
 
         assert!(PageAllocator::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_deserialization_rejects_invalid_free_list_entries() {
+        let cases = [
+            (4u64, vec![2u64, 2]),
+            (4u64, vec![0u64]),
+            (4u64, vec![4u64]),
+        ];
+
+        for (next_id, free_list) in cases {
+            let mut bytes = Vec::with_capacity(12 + free_list.len() * 8);
+            bytes.extend_from_slice(&next_id.to_le_bytes());
+            bytes.extend_from_slice(&(free_list.len() as u32).to_le_bytes());
+            for id in free_list {
+                bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            assert!(PageAllocator::from_bytes(&bytes).is_none());
+        }
+    }
+
+    #[test]
+    fn test_alloc_does_not_wrap_exhausted_frontier() {
+        let mut alloc = PageAllocator::with_next_id(u64::MAX);
+
+        assert_eq!(alloc.alloc(), u64::MAX);
+        assert_eq!(alloc.next_id(), u64::MAX);
     }
 }
