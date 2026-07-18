@@ -346,6 +346,83 @@ fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
 }
 
 #[test]
+fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
+    fn run_case(root: &Path, name: &str, inject: fn(&DB), expected_after_reopen: &'static [u8]) {
+        let path = root.join(name);
+        let mut db = DB::open(&path, Options::for_test()).unwrap();
+        db.put(b"key", b"before").unwrap();
+        db.flush().unwrap();
+
+        let mut transaction = db.begin_batch_transaction().unwrap();
+        transaction.put(b"key", b"after").unwrap();
+        inject(&db);
+
+        assert!(matches!(
+            transaction.commit(&mut db),
+            Err(Error::NeedsRecovery(_))
+        ));
+        assert!(matches!(
+            transaction.state(),
+            seerdb::BatchTransactionState::RecoveryRequired { commit }
+                if commit.get() == 2
+        ));
+        assert_eq!(transaction.recovery_commit().unwrap().get(), 2);
+        assert!(db.durability_status().write_fenced);
+
+        // A fenced publication may already be durable. The transaction is
+        // therefore not semantically abortable; only its process-local root
+        // pin can be released before reopening to resolve the outcome.
+        assert!(matches!(transaction.abort(), Err(Error::NeedsRecovery(_))));
+        transaction.release().unwrap();
+        assert!(matches!(
+            transaction.put(b"after-recovery", b"nope"),
+            Err(Error::NeedsRecovery(_))
+        ));
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+        assert_eq!(
+            reopened.get(b"key").unwrap(),
+            Some(expected_after_reopen.to_vec())
+        );
+        assert!(!reopened.durability_status().write_fenced);
+        reopened.verify().unwrap();
+    }
+
+    let root = tempdir().unwrap();
+    run_case(
+        root.path(),
+        "transaction-before-wal.db",
+        DB::inject_wal_write_failure,
+        b"before",
+    );
+    run_case(
+        root.path(),
+        "transaction-page-sync.db",
+        DB::inject_page_range_sync_failure,
+        b"before",
+    );
+    run_case(
+        root.path(),
+        "transaction-manifest-sync.db",
+        DB::inject_manifest_sync_failure,
+        b"before",
+    );
+    run_case(
+        root.path(),
+        "transaction-after-manifest.db",
+        DB::inject_after_manifest_failure,
+        b"after",
+    );
+    run_case(
+        root.path(),
+        "transaction-wal-truncate.db",
+        DB::inject_wal_truncate_failure,
+        b"after",
+    );
+}
+
+#[test]
 fn dbnext_r0_batch_transaction_pin_is_not_durable_snapshot_state() {
     let root = tempdir().unwrap();
     let path = root.path().join("ephemeral-transaction.db");

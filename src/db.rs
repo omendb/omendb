@@ -139,6 +139,10 @@ pub enum BatchTransactionState {
     Committed,
     /// The transaction was explicitly aborted.
     Aborted,
+    /// Publication failed after the storage engine fenced the writer. The
+    /// commit may already be durable; reopen is required before deciding the
+    /// outcome, and only lease cleanup is permitted on this handle.
+    RecoveryRequired { commit: CommitId },
 }
 
 /// A root-bound byte transaction over SeerDB.
@@ -174,6 +178,15 @@ impl BatchTransaction {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.state == BatchTransactionState::Active
+    }
+
+    /// Return the attempted commit that requires reopen reconciliation.
+    #[must_use]
+    pub fn recovery_commit(&self) -> Option<CommitId> {
+        match self.state {
+            BatchTransactionState::RecoveryRequired { commit } => Some(commit),
+            _ => None,
+        }
     }
 
     /// Return the staged byte mutations in commit order.
@@ -247,13 +260,39 @@ impl BatchTransaction {
 
     /// Publish the staged mutations against the captured commit root.
     ///
-    /// A serialization conflict leaves this transaction active so the caller
-    /// can inspect the error and explicitly abort it. Once publication
-    /// succeeds, the transaction is committed even if releasing its temporary
-    /// root lease fails; that cleanup failure is returned explicitly.
+    /// A validation or serialization failure leaves this transaction active so
+    /// the caller can inspect the error and explicitly abort it. A fenced
+    /// publication failure transitions the transaction to
+    /// [`BatchTransactionState::RecoveryRequired`]: the commit may already be
+    /// durable, so callers must release the lease and reopen before deciding
+    /// the outcome. Once publication succeeds, the transaction is committed
+    /// even if releasing its temporary root lease fails; that cleanup failure
+    /// is returned explicitly.
     pub fn commit(&mut self, db: &mut DB) -> Result<DurabilityStatus> {
         self.check_active()?;
-        let status = db.commit_batch_at(self.base_commit, &self.mutations)?;
+        let attempted_commit = if self.mutations.is_empty() {
+            self.base_commit
+        } else {
+            CommitId::new(
+                self.base_commit
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("transaction commit ID overflow".into()))?,
+            )
+        };
+        let status = match db.commit_batch_at(self.base_commit, &self.mutations) {
+            Ok(status) => status,
+            Err(error) if db.durability_status().write_fenced => {
+                self.state = BatchTransactionState::RecoveryRequired {
+                    commit: attempted_commit,
+                };
+                return Err(Error::NeedsRecovery(format!(
+                    "transaction commit {:?} may be durable after publication failure: {error}",
+                    attempted_commit
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         self.state = BatchTransactionState::Committed;
         if let Some(lease) = self.lease.as_mut()
             && let Err(cleanup) = lease.release()
@@ -278,7 +317,9 @@ impl BatchTransaction {
         Ok(())
     }
 
-    /// Retry releasing the root lease after a committed cleanup failure.
+    /// Release the root lease after a committed cleanup failure or an
+    /// indeterminate publication outcome. Releasing does not resolve an
+    /// indeterminate commit; reopen is still required.
     pub fn release(&mut self) -> Result<()> {
         if let Some(lease) = self.lease.as_mut() {
             lease.release()?;
@@ -288,12 +329,14 @@ impl BatchTransaction {
     }
 
     fn check_active(&self) -> Result<()> {
-        if self.is_active() {
-            Ok(())
-        } else {
-            Err(Error::InvalidArgument(
-                "transaction is no longer active".into(),
-            ))
+        match self.state {
+            BatchTransactionState::Active => Ok(()),
+            BatchTransactionState::RecoveryRequired { commit } => Err(Error::NeedsRecovery(
+                format!("transaction commit {commit:?} requires database reopen"),
+            )),
+            BatchTransactionState::Committed | BatchTransactionState::Aborted => Err(
+                Error::InvalidArgument("transaction is no longer active".into()),
+            ),
         }
     }
 }
