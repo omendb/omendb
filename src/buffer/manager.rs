@@ -7,6 +7,7 @@
 use crate::btree::node::PAGE_SIZE;
 use crate::buffer::frame::Frame;
 use crate::buffer::guard::{GuardAccess, PageGuard};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -105,6 +106,19 @@ pub struct BufferStats {
     pub writes: u64,
     /// Cache hits.
     pub hits: u64,
+    /// Write-back tokens requested for dirty resident pages.
+    pub writeback_requests: u64,
+    /// Write-back requests or completions refused because their safety
+    /// preconditions were not satisfied.
+    pub writeback_refusals: u64,
+    /// Successfully discarded cache copies after streamed device writes.
+    pub writeback_discards: u64,
+    /// Clock or explicit victim-selection attempts.
+    pub eviction_attempts: u64,
+    /// Victim selections refused because every candidate was pinned or dirty.
+    pub eviction_refusals: u64,
+    /// Successfully removed clean frames through eviction.
+    pub evictions: u64,
 }
 
 /// A stable copy of a dirty frame awaiting durable write-back.
@@ -143,6 +157,15 @@ pub struct BufferManager {
     clock_hand: usize,
     /// Statistics.
     stats: BufferStats,
+    /// Shared-access write-back diagnostics. BufferManager is normally
+    /// protected by StorageEngine's mutex, while Cell preserves the existing
+    /// shared-access write-back API without introducing contended atomics.
+    writeback_requests: Cell<u64>,
+    writeback_refusals: Cell<u64>,
+}
+
+fn increment_counter(counter: &Cell<u64>) {
+    counter.set(counter.get().saturating_add(1));
 }
 
 impl BufferManager {
@@ -162,6 +185,8 @@ impl BufferManager {
                 free_frames: num_frames,
                 ..Default::default()
             },
+            writeback_requests: Cell::new(0),
+            writeback_refusals: Cell::new(0),
         }
     }
 
@@ -208,6 +233,8 @@ impl BufferManager {
         stats.free_frames = self.frames.iter().filter(|frame| frame.is_free()).count();
         stats.pinned_frames = self.frames.iter().filter(|frame| frame.is_pinned()).count();
         stats.dirty_frames = self.frames.iter().filter(|frame| frame.is_dirty()).count();
+        stats.writeback_requests = self.writeback_requests.get();
+        stats.writeback_refusals = self.writeback_refusals.get();
         stats
     }
 
@@ -327,7 +354,9 @@ impl BufferManager {
         if !frame.is_dirty() {
             return Ok(None);
         }
+        increment_counter(&self.writeback_requests);
         if frame.is_pinned() {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::PinnedPage(page_key.logical_page_id()));
         }
         Ok(Some(Writeback {
@@ -340,13 +369,16 @@ impl BufferManager {
     pub fn complete_writeback(&mut self, writeback: Writeback) -> Result<(), BufferError> {
         let page_id = writeback.page_key.logical_page_id();
         let Some(&frame_idx) = self.page_map.get(&writeback.page_key) else {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::StaleWriteback(page_id));
         };
         let frame = &mut self.frames[frame_idx];
         if frame.is_pinned() {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::PinnedPage(page_id));
         }
         if !frame.is_dirty() || frame.data.as_ref() != writeback.data.as_ref() {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::StaleWriteback(page_id));
         }
         frame.mark_clean();
@@ -365,18 +397,22 @@ impl BufferManager {
     pub fn discard_writeback(&mut self, writeback: Writeback) -> Result<(), BufferError> {
         let page_id = writeback.page_key.logical_page_id();
         let Some(&frame_idx) = self.page_map.get(&writeback.page_key) else {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::StaleWriteback(page_id));
         };
         let frame = &self.frames[frame_idx];
         if frame.is_pinned() {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::PinnedPage(page_id));
         }
         if !frame.is_dirty() || frame.data.as_ref() != writeback.data.as_ref() {
+            increment_counter(&self.writeback_refusals);
             return Err(BufferError::StaleWriteback(page_id));
         }
         self.page_map.remove(&writeback.page_key);
         self.frames[frame_idx].clear();
         self.stats.free_frames += 1;
+        self.stats.writeback_discards += 1;
         Ok(())
     }
 
@@ -409,18 +445,22 @@ impl BufferManager {
 
     /// Remove an exact physical page image from the buffer pool.
     pub fn evict_key(&mut self, page_key: PageCacheKey) -> Result<(), BufferError> {
+        self.stats.eviction_attempts += 1;
         if let Some(frame_idx) = self.page_map.remove(&page_key) {
             let frame = &self.frames[frame_idx];
             if frame.is_pinned() {
                 self.page_map.insert(page_key, frame_idx);
+                self.stats.eviction_refusals += 1;
                 return Err(BufferError::AllFramesPinned);
             }
             if frame.is_dirty() {
                 self.page_map.insert(page_key, frame_idx);
+                self.stats.eviction_refusals += 1;
                 return Err(BufferError::DirtyPage(page_key.logical_page_id()));
             }
             self.frames[frame_idx].clear();
             self.stats.free_frames += 1;
+            self.stats.evictions += 1;
         }
         Ok(())
     }
@@ -439,7 +479,14 @@ impl BufferManager {
         }
 
         // No free frames - use clock algorithm to evict.
-        self.clock_evict()
+        self.stats.eviction_attempts += 1;
+        match self.clock_evict() {
+            Ok(frame_idx) => Ok(frame_idx),
+            Err(error) => {
+                self.stats.eviction_refusals += 1;
+                Err(error)
+            }
+        }
     }
 
     /// Clock algorithm for eviction.
@@ -482,6 +529,7 @@ impl BufferManager {
             }
             frame.clear();
             self.stats.free_frames += 1;
+            self.stats.evictions += 1;
 
             return Ok(idx);
         }
@@ -563,6 +611,8 @@ mod tests {
         // Fetch a new page - should evict one.
         let g3 = bm.fetch(3, &data3, GuardAccess::Read).unwrap();
         assert_eq!(bm.stats().reads, 3);
+        assert_eq!(bm.stats().eviction_attempts, 1);
+        assert_eq!(bm.stats().evictions, 1);
         drop(g3);
     }
 
@@ -577,7 +627,10 @@ mod tests {
         let writeback = bm.begin_writeback(1).unwrap().unwrap();
         assert_eq!(writeback.data(), &data);
         bm.complete_writeback(writeback).unwrap();
-        assert_eq!(bm.stats().dirty_frames, 0);
+        let stats = bm.stats();
+        assert_eq!(stats.dirty_frames, 0);
+        assert_eq!(stats.writeback_requests, 1);
+        assert_eq!(stats.writeback_refusals, 0);
     }
 
     #[test]
@@ -624,6 +677,8 @@ mod tests {
             bm.fetch(2, &data, GuardAccess::Read),
             Err(BufferError::AllFramesPinned)
         ));
+        assert_eq!(bm.stats().eviction_attempts, 1);
+        assert_eq!(bm.stats().eviction_refusals, 1);
         drop(guard);
     }
 
@@ -638,6 +693,8 @@ mod tests {
             bm.fetch(2, &data, GuardAccess::Read),
             Err(BufferError::DirtyPage(1))
         ));
+        assert_eq!(bm.stats().eviction_attempts, 1);
+        assert_eq!(bm.stats().eviction_refusals, 1);
 
         let writeback = bm.begin_writeback(1).unwrap().unwrap();
         bm.complete_writeback(writeback).unwrap();
@@ -655,6 +712,8 @@ mod tests {
             bm.begin_writeback(1),
             Err(BufferError::PinnedPage(1))
         ));
+        assert_eq!(bm.stats().writeback_requests, 1);
+        assert_eq!(bm.stats().writeback_refusals, 1);
         drop(guard);
 
         let writeback = bm.begin_writeback(1).unwrap().unwrap();
@@ -682,6 +741,9 @@ mod tests {
             bm.complete_writeback(writeback),
             Err(BufferError::StaleWriteback(1))
         ));
-        assert_eq!(bm.stats().dirty_frames, 1);
+        let stats = bm.stats();
+        assert_eq!(stats.dirty_frames, 1);
+        assert_eq!(stats.writeback_requests, 1);
+        assert_eq!(stats.writeback_refusals, 1);
     }
 }

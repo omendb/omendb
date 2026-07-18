@@ -1592,7 +1592,9 @@ mod tests {
 
         engine.flush().unwrap();
         engine.complete_generation();
-        assert_eq!(engine.buffer_stats().dirty_frames, 0);
+        let stats = engine.buffer_stats();
+        assert_eq!(stats.dirty_frames, 0);
+        assert!(stats.writeback_discards > 0);
         assert_eq!(
             engine.lookup(b"key-0199").unwrap(),
             LookupResult::Found(b"value".to_vec())
