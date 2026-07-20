@@ -990,6 +990,7 @@ impl DB {
 
     fn open_with_mode<P: AsRef<Path>>(path: P, options: Options, mode: OpenMode) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let path_preexisted = path.exists();
         let check_only = mode == OpenMode::Check;
 
         match mode {
@@ -1023,6 +1024,18 @@ impl DB {
         let manifest_path = path.join(MANIFEST_FILE);
         let archive = path.join(ARCHIVE_MARKER_FILE).is_file();
         let read_only = check_only || archive;
+        if mode == OpenMode::Normal
+            && path_preexisted
+            && !manifest_path.is_file()
+            && !data_path.is_file()
+            && !wal_path.is_file()
+            && !meta_path.is_file()
+        {
+            return Err(Error::Corruption(format!(
+                "existing database path has no authoritative storage artifacts: {}",
+                path.display()
+            )));
+        }
         if check_only && (!manifest_path.is_file() || !data_path.is_file()) {
             return Err(Error::Check {
                 kind: CheckFailureKind::Target,
@@ -4444,6 +4457,27 @@ mod tests {
     }
 
     #[test]
+    fn test_db_open_rejects_existing_directory_without_storage_artifacts() {
+        let dir = tempdir().unwrap();
+        let empty_path = dir.path().join("empty.db");
+        fs::create_dir(&empty_path).unwrap();
+        assert!(matches!(
+            DB::open(&empty_path, Options::default()),
+            Err(Error::Corruption(message))
+                if message.contains("no authoritative storage artifacts")
+        ));
+
+        let orphan_path = dir.path().join("orphan.db");
+        fs::create_dir(&orphan_path).unwrap();
+        fs::write(orphan_path.join(BLOB_FILE), b"orphaned blob image").unwrap();
+        assert!(matches!(
+            DB::open(&orphan_path, Options::default()),
+            Err(Error::Corruption(message))
+                if message.contains("no authoritative storage artifacts")
+        ));
+    }
+
+    #[test]
     fn test_db_create_refuses_existing_store_without_reinterpreting_it() {
         let dir = tempdir().unwrap();
         let reserved_path = dir.path().join("reserved.db");
@@ -4691,7 +4725,8 @@ mod tests {
     fn test_db_removes_legacy_wal_reservation_sidecar_on_open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("legacy-wal-reservation.db");
-        fs::create_dir_all(&path).unwrap();
+        let db = DB::open(&path, Options::default()).unwrap();
+        drop(db);
         fs::write(path.join(WAL_RESERVATION_FILE), [0xA5; 4096]).unwrap();
 
         let db = DB::open(&path, Options::default()).unwrap();
