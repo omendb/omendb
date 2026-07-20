@@ -1169,6 +1169,74 @@ fn dbnext_r0_concurrent_process_crash_recovery() {
 }
 
 #[test]
+fn dbnext_r0_process_crash_discards_uncommitted_batch() {
+    if let Some(path) = std::env::var_os("SEERDB_R0_UNCOMMITTED_CRASH_PATH") {
+        let path = Path::new(&path);
+        let marker = PathBuf::from(
+            std::env::var_os("SEERDB_R0_UNCOMMITTED_CRASH_MARKER")
+                .expect("uncommitted crash child marker path"),
+        );
+        let mut db = DB::open(path, Options::default()).unwrap();
+        for sequence in 0..128 {
+            let key = format!("uncommitted-{sequence:03}");
+            let value = format!("value-{sequence:03}");
+            db.put(key.as_bytes(), value.as_bytes()).unwrap();
+        }
+        fs::write(marker, b"all uncommitted WAL mutations are ready").unwrap();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    let root = tempdir().unwrap();
+    let path = root.path().join("uncommitted-process-crash.db");
+    let marker = root.path().join("uncommitted-process-crash.ready");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"published", b"before-crash").unwrap();
+        db.flush().unwrap();
+    }
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("dbnext_r0_process_crash_discards_uncommitted_batch")
+        .arg("--nocapture")
+        .env("SEERDB_R0_UNCOMMITTED_CRASH_PATH", &path)
+        .env("SEERDB_R0_UNCOMMITTED_CRASH_MARKER", &marker)
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..3000 {
+        if marker.exists() {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("uncommitted crash child did not publish its ready marker");
+    }
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "crash child unexpectedly exited cleanly");
+
+    let mut recovered = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        recovered.get(b"published").unwrap(),
+        Some(b"before-crash".to_vec())
+    );
+    for sequence in 0..128 {
+        let key = format!("uncommitted-{sequence:03}");
+        assert_eq!(recovered.get(key.as_bytes()).unwrap(), None, "{key}");
+    }
+    assert_eq!(recovered.durability_status().pending_mutations, 0);
+    assert!(!recovered.durability_status().write_fenced);
+    recovered.verify().unwrap();
+}
+
+#[test]
 fn dbnext_r0_process_crash_publication_matrix() {
     if let Some(path) = std::env::var_os("SEERDB_R0_PROCESS_CRASH_PATH") {
         let path = Path::new(&path);
