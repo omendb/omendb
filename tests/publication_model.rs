@@ -22,6 +22,7 @@ const WAL_FILE: &str = "seerdb.wal";
 const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
 const META_FILE: &str = "seerdb.meta";
+const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Artifact {
@@ -31,6 +32,7 @@ enum Artifact {
     Wal,
     ManifestHistory,
     Manifest,
+    ReuseLedger,
 }
 
 const PUBLICATION_PREFIXES: &[(&str, &[Artifact], bool)] = &[
@@ -120,6 +122,7 @@ fn artifact_names(path: &Path, artifact: Artifact) -> Vec<PathBuf> {
             Artifact::Wal => name == WAL_FILE,
             Artifact::ManifestHistory => name == MANIFEST_HISTORY_FILE,
             Artifact::Manifest => name == MANIFEST_FILE,
+            Artifact::ReuseLedger => name == REUSE_LEDGER_FILE,
         };
         if matches {
             names.push(entry.path());
@@ -274,4 +277,50 @@ fn modeled_publication_prefixes_reopen_old_or_complete_new() {
         };
         assert_state(&materialized, &oracle);
     }
+}
+
+#[test]
+fn modeled_uncertain_reuse_ledger_fails_closed_for_retention() {
+    let root = tempdir().unwrap();
+    let live = root.path().join("live");
+    let old = root.path().join("old");
+    let failed = root.path().join("failed");
+    let materialized = root.path().join("materialized");
+
+    let first_commit = {
+        let mut db = DB::open(&live, Options::for_test()).unwrap();
+        let first = db
+            .commit_batch(&[BatchMutation::Put {
+                key: b"versioned".to_vec(),
+                value: b"one".to_vec(),
+            }])
+            .unwrap();
+        db.commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"two".to_vec(),
+        }])
+        .unwrap();
+        copy_tree(&live, &old);
+
+        db.put(b"versioned", b"three").unwrap();
+        db.inject_page_range_sync_failure();
+        assert!(db.flush().is_err());
+        drop(db);
+
+        copy_tree(&live, &failed);
+        first.commit_id
+    };
+
+    assert!(failed.join(REUSE_LEDGER_FILE).is_file());
+    copy_tree(&old, &materialized);
+    replace_artifact(&materialized, &failed, Artifact::ReuseLedger);
+
+    let mut db = DB::open(&materialized, Options::for_test()).unwrap();
+    assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
+    db.verify().unwrap();
+    assert!(matches!(
+        db.retain_commit(first_commit),
+        Err(seerdb::Error::SnapshotUnavailable(message))
+            if message.contains("physical pages reused")
+    ));
 }
