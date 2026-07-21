@@ -18,7 +18,8 @@ use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord
 use crate::space::{Device, DeviceOptions, preallocate_file, reserve_file};
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, SnapshotId,
+    ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, ReuseAttempt,
+    ReuseLedger, SnapshotId,
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
@@ -57,6 +58,7 @@ const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
+const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
@@ -885,6 +887,8 @@ pub struct DB {
     manifest: ManifestStore,
     /// Durable descriptors for historical roots that can be retained later.
     manifest_history: ManifestHistory,
+    /// Reuse attempts whose publication outcome may be indeterminate.
+    reuse_ledger: ReuseLedger,
     /// Stable database identity.
     database_id: DatabaseId,
     /// Stable logical history identity.
@@ -893,6 +897,14 @@ pub struct DB {
     generation_id: GenerationId,
     /// Latest published commit.
     commit_id: CommitId,
+    /// Next commit identity reserved for a new logical publication.
+    ///
+    /// This may be ahead of `commit_id` when a prior publication could have
+    /// reached durable WAL or page media but did not become authoritative.
+    /// Such an identity is never reused after reopen.
+    next_commit_id: CommitId,
+    /// Next physical generation identity reserved for a new publication.
+    next_generation_id: GenerationId,
     /// Number of mutation records since the last published generation.
     pending_mutations: u64,
     /// Logical WAL bytes admitted for the pending generation.
@@ -1166,6 +1178,65 @@ impl DB {
             ));
         }
 
+        let reuse_ledger_path = path.join(REUSE_LEDGER_FILE);
+        let mut reuse_ledger = if reuse_ledger_path.is_file() {
+            let bytes = fs::read(&reuse_ledger_path)?;
+            ReuseLedger::from_bytes(&bytes).map_err(|message| {
+                let error = Error::Corruption(format!("reuse ledger {message}"));
+                if check_only {
+                    Self::map_check_error(CheckFailureKind::Format, error)
+                } else {
+                    error
+                }
+            })?
+        } else {
+            ReuseLedger::new()
+        };
+        let pruned_reuse_attempts = reuse_ledger.prune_published(&manifest_history);
+        if pruned_reuse_attempts > 0 && !read_only && !check_only {
+            Self::persist_reuse_ledger_at(&path, &reuse_ledger)?;
+        }
+        if current_manifest.is_none() && !reuse_ledger.attempts().is_empty() {
+            return Err(Error::Corruption(
+                "reuse ledger exists without an authoritative manifest".into(),
+            ));
+        }
+
+        let mut next_commit_id = CommitId::new(
+            commit_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+        );
+        let mut next_generation_id = GenerationId::new(
+            generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
+        for attempt in reuse_ledger.attempts() {
+            let reserved_commit = CommitId::new(
+                attempt
+                    .commit_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+            );
+            let reserved_generation = GenerationId::new(
+                attempt
+                    .generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+            );
+            if reserved_commit > next_commit_id {
+                next_commit_id = reserved_commit;
+            }
+            if reserved_generation > next_generation_id {
+                next_generation_id = reserved_generation;
+            }
+        }
+
         let protected_offsets = Arc::new(Mutex::new(HashSet::new()));
         let retention_path = path.join(RETENTION_FILE);
         let retention = Arc::new(Mutex::new(
@@ -1345,10 +1416,13 @@ impl DB {
             txn_manager: TransactionManager::new(),
             manifest,
             manifest_history,
+            reuse_ledger,
             database_id,
             history_id,
             generation_id,
             commit_id,
+            next_commit_id,
+            next_generation_id,
             pending_mutations: 0,
             pending_wal_bytes: 0,
             wal_reserved_extent: 0,
@@ -2092,6 +2166,25 @@ impl DB {
         atomic_write(&self.path.join(MANIFEST_HISTORY_FILE), &bytes)
     }
 
+    fn persist_reuse_ledger(&self) -> Result<()> {
+        Self::persist_reuse_ledger_at(&self.path, &self.reuse_ledger)
+    }
+
+    fn persist_reuse_ledger_at(path: &Path, ledger: &ReuseLedger) -> Result<()> {
+        let ledger_path = path.join(REUSE_LEDGER_FILE);
+        if ledger.attempts().is_empty() {
+            if ledger_path.exists() {
+                fs::remove_file(ledger_path)?;
+                sync_directory(path)?;
+            }
+            return Ok(());
+        }
+        let bytes = ledger
+            .to_bytes()
+            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?;
+        atomic_write_without_fault_injection(&ledger_path, &bytes)
+    }
+
     fn append_manifest_history(&self, manifest: Manifest) -> Result<()> {
         let path = self.path.join(MANIFEST_HISTORY_FILE);
         let existing_len = fs::metadata(&path)?.len();
@@ -2134,7 +2227,27 @@ impl DB {
         // A non-syncing mutation path is still ordered before page writes and
         // the commit envelope is always forced at the publication boundary.
         self.write_wal_to_disk(true)?;
-        self.engine.flush()?;
+        let reuse_offsets = self.engine.pending_reuse_offsets();
+        self.reuse_ledger
+            .push(ReuseAttempt {
+                commit_id: commit.commit_id,
+                generation_id: commit.generation_id,
+                offsets: reuse_offsets,
+            })
+            .map_err(|message| Error::Corruption(format!("reuse ledger {message}")))?;
+        self.persist_reuse_ledger()?;
+        if let Err(error) = self.engine.flush() {
+            // Capacity preflight is guaranteed to issue no page I/O, so its
+            // reservation can be removed and the mutation remains retryable.
+            // Every other error leaves the reservation durable until reopen
+            // proves whether this generation reached manifest history.
+            if matches!(&error, Error::CapacityPreflight)
+                && self.reuse_ledger.remove_generation(commit.generation_id)
+            {
+                self.persist_reuse_ledger()?;
+            }
+            return Err(error);
+        }
 
         let checkpoint_path = self
             .path
@@ -2187,6 +2300,10 @@ impl DB {
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
 
+        if self.reuse_ledger.remove_generation(commit.generation_id) {
+            self.persist_reuse_ledger()?;
+        }
+
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected post-manifest failure").into());
@@ -2208,6 +2325,24 @@ impl DB {
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
+        self.next_generation_id = GenerationId::new(
+            self.next_generation_id.get().max(
+                commit
+                    .generation_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+            ),
+        );
+        self.next_commit_id = CommitId::new(
+            self.next_commit_id.get().max(
+                commit
+                    .commit_id
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+            ),
+        );
         self.pending_mutations = 0;
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;
@@ -2240,18 +2375,8 @@ impl DB {
         }
 
         let commit = CommitRecord {
-            commit_id: CommitId::new(
-                self.commit_id
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
-            ),
-            generation_id: GenerationId::new(
-                self.generation_id
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
-            ),
+            commit_id: self.next_commit_id,
+            generation_id: self.next_generation_id,
             root_page_id: self.engine.btree().root_id() as u64,
             mutation_count: self.pending_mutations,
             digest: self.pending_digest,
@@ -3107,10 +3232,10 @@ impl DB {
     /// Refuse a historical retention request once a later published
     /// generation has reused one of the target root's physical page slots.
     ///
-    /// Manifest history is the durable reuse ledger: even if the later page
-    /// has since become inactive, its checkpoint proves that the target bytes
-    /// were overwritten. Retention must fail closed rather than treating a
-    /// different, structurally valid page as the requested historical value.
+    /// Published manifest history and the durable pre-reuse ledger together
+    /// establish whether a later generation may have overwritten the target
+    /// bytes. Retention must fail closed rather than treating a different,
+    /// structurally valid page as the requested historical value.
     fn validate_historical_page_liveness(&self, target: Manifest, target_pmt: &PMT) -> Result<()> {
         let target_by_offset: BTreeMap<_, _> = target_pmt
             .iter()
@@ -3118,6 +3243,25 @@ impl DB {
             .collect();
         if target_by_offset.is_empty() {
             return Ok(());
+        }
+
+        for attempt in self
+            .reuse_ledger
+            .attempts()
+            .iter()
+            .filter(|attempt| attempt.generation_id > target.generation_id)
+        {
+            if attempt
+                .offsets
+                .iter()
+                .any(|offset| target_by_offset.contains_key(offset))
+            {
+                return Err(Error::SnapshotUnavailable(format!(
+                    "commit {} has physical pages reused by an uncertain generation {}",
+                    target.commit_id.get(),
+                    attempt.generation_id.get()
+                )));
+            }
         }
 
         for later in self
@@ -3369,13 +3513,7 @@ impl DB {
             .manifest
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
-        let generation_id = GenerationId::new(
-            current
-                .generation_id
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
-        );
+        let generation_id = self.next_generation_id;
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", generation_id.get()));
@@ -3405,6 +3543,12 @@ impl DB {
         self.manifest.publish(manifest)?;
         self.engine.complete_generation();
         self.generation_id = generation_id;
+        self.next_generation_id = GenerationId::new(
+            generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
         Ok(())
     }
 
@@ -3416,13 +3560,7 @@ impl DB {
             .manifest
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
-        let generation_id = GenerationId::new(
-            current
-                .generation_id
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
-        );
+        let generation_id = self.next_generation_id;
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", generation_id.get()));
@@ -3470,6 +3608,12 @@ impl DB {
         self.manifest.publish(manifest)?;
         self.engine.complete_generation();
         self.generation_id = generation_id;
+        self.next_generation_id = GenerationId::new(
+            generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
         if had_blob_image {
             fs::remove_file(&backup_path)?;
             sync_directory(&self.path)?;
@@ -4300,6 +4444,17 @@ fn decode_delete_payload(v2: bool, payload: &[u8]) -> Result<&[u8]> {
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_with_fault_injection(path, data, true)
+}
+
+/// Persist the reuse reservation without consuming a fault intended for a
+/// PMT/blob checkpoint. The ledger has its own real I/O error path; the
+/// publication-fault harness targets the artifact under test explicitly.
+fn atomic_write_without_fault_injection(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_with_fault_injection(path, data, false)
+}
+
+fn atomic_write_with_fault_injection(path: &Path, data: &[u8], inject_faults: bool) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)
@@ -4312,11 +4467,15 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         return Err(error.into());
     }
     #[cfg(any(test, feature = "fault-injection"))]
-    let short_write = FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.replace(false));
+    let short_write =
+        inject_faults && FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.replace(false));
     #[cfg(not(any(test, feature = "fault-injection")))]
     let short_write = false;
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    let _ = inject_faults;
     #[cfg(any(test, feature = "fault-injection"))]
-    let torn_write = FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.replace(false));
+    let torn_write =
+        inject_faults && FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.replace(false));
     #[cfg(not(any(test, feature = "fault-injection")))]
     let torn_write = false;
 
@@ -4338,7 +4497,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     drop(file);
 
     #[cfg(any(test, feature = "fault-injection"))]
-    let injected = FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.replace(false));
+    let injected = inject_faults && FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.replace(false));
     #[cfg(any(test, feature = "fault-injection"))]
     if injected {
         return Err(std::io::Error::other("injected atomic rename failure").into());
@@ -4466,6 +4625,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
             || name == ARCHIVE_MARKER_FILE
             || !(name == MANIFEST_FILE
                 || name == MANIFEST_HISTORY_FILE
+                || name == REUSE_LEDGER_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
                 || name == META_FILE

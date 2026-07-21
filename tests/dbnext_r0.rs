@@ -331,6 +331,66 @@ fn dbnext_r0_late_retention_rejects_reused_physical_generation() {
 }
 
 #[test]
+fn dbnext_r0_late_retention_rejects_reuse_after_failed_publication() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("late-retention-failed-publication.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    let first = db
+        .commit_batch(&[BatchMutation::Put {
+            key: b"versioned".to_vec(),
+            value: b"one".to_vec(),
+        }])
+        .unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"versioned".to_vec(),
+        value: b"two".to_vec(),
+    }])
+    .unwrap();
+
+    db.put(b"versioned", b"three").unwrap();
+    db.inject_page_range_sync_failure();
+    assert!(matches!(db.flush(), Err(Error::Io(_))));
+    assert!(db.durability_status().write_fenced);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"two".to_vec()));
+    assert_eq!(reopened.durability_status().commit_id.get(), 2);
+    assert!(matches!(
+        reopened.retain_commit(first.commit_id),
+        Err(Error::SnapshotUnavailable(message))
+            if message.contains("physical pages reused")
+    ));
+    reopened.put(b"versioned", b"four").unwrap();
+    reopened.flush().unwrap();
+    assert_eq!(reopened.durability_status().commit_id.get(), 4);
+    assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"four".to_vec()));
+    // The abandoned c3 reservation remains until history pruning proves that
+    // no retained root can refer to its possibly overwritten slots.
+    assert!(path.join("seerdb.reuse-ledger").exists());
+}
+
+#[test]
+fn dbnext_r0_ambiguous_new_page_reserves_commit_id() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("ambiguous-new-page.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+
+    // The first data page grows the file; no retired slot is available yet.
+    db.put(b"versioned", b"one").unwrap();
+    db.inject_page_range_sync_failure();
+    assert!(matches!(db.flush(), Err(Error::Io(_))));
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert_eq!(reopened.durability_status().commit_id.get(), 0);
+    reopened.put(b"versioned", b"two").unwrap();
+    reopened.flush().unwrap();
+    assert_eq!(reopened.durability_status().commit_id.get(), 2);
+    assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"two".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_vacuum_rebuilds_live_tree_and_preserves_retained_root() {
     let root = tempdir().unwrap();
     let path = root.path().join("vacuum.db");
@@ -559,6 +619,80 @@ fn dbnext_r0_batch_transaction_binds_root_and_detects_stale_commit() {
     let status = committed.commit(&mut db).unwrap();
     assert_eq!(status.commit_id.get(), 3);
     assert_eq!(db.get(b"key").unwrap(), Some(b"committed".to_vec()));
+}
+
+#[test]
+fn dbnext_r0_batch_transaction_range_overlay_is_root_bound() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("batch-transaction-range.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+    for index in 0..8 {
+        db.put(
+            format!("key-{index:02}").as_bytes(),
+            format!("before-{index}").as_bytes(),
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+
+    let mut transaction = db.begin_batch_transaction().unwrap();
+    assert_eq!(
+        transaction.range(&db, b"key-00", b"key-08").unwrap(),
+        (0..8)
+            .map(|index| {
+                (
+                    format!("key-{index:02}").into_bytes(),
+                    format!("before-{index}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+
+    transaction.put(b"key-02", b"staged-replacement").unwrap();
+    transaction.delete(b"key-04").unwrap();
+    transaction.put(b"key-07", b"staged-new-value").unwrap();
+    assert_eq!(
+        transaction.range(&db, b"key-00", b"key-08").unwrap(),
+        vec![
+            (b"key-00".to_vec(), b"before-0".to_vec()),
+            (b"key-01".to_vec(), b"before-1".to_vec()),
+            (b"key-02".to_vec(), b"staged-replacement".to_vec()),
+            (b"key-03".to_vec(), b"before-3".to_vec()),
+            (b"key-05".to_vec(), b"before-5".to_vec()),
+            (b"key-06".to_vec(), b"before-6".to_vec()),
+            (b"key-07".to_vec(), b"staged-new-value".to_vec()),
+        ]
+    );
+
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"key-02".to_vec(),
+        value: b"outside-replacement".to_vec(),
+    }])
+    .unwrap();
+    assert_eq!(
+        transaction.range(&db, b"key-00", b"key-08").unwrap(),
+        vec![
+            (b"key-00".to_vec(), b"before-0".to_vec()),
+            (b"key-01".to_vec(), b"before-1".to_vec()),
+            (b"key-02".to_vec(), b"staged-replacement".to_vec()),
+            (b"key-03".to_vec(), b"before-3".to_vec()),
+            (b"key-05".to_vec(), b"before-5".to_vec()),
+            (b"key-06".to_vec(), b"before-6".to_vec()),
+            (b"key-07".to_vec(), b"staged-new-value".to_vec()),
+        ]
+    );
+
+    assert!(matches!(
+        transaction.commit(&mut db),
+        Err(Error::SerializationConflict { expected, current })
+            if expected.get() == 1 && current.get() == 2
+    ));
+    transaction.abort().unwrap();
+    assert_eq!(
+        db.get(b"key-02").unwrap(),
+        Some(b"outside-replacement".to_vec())
+    );
+    assert_eq!(db.get(b"key-04").unwrap(), Some(b"before-4".to_vec()));
 }
 
 #[test]

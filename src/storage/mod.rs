@@ -220,6 +220,26 @@ impl StorageEngine {
         self.free_offsets.len()
     }
 
+    /// Return the physical slots selected by the next dirty-page flush.
+    ///
+    /// The caller persists these candidates before invoking `flush`, because
+    /// a failed publication may have written a reused slot before its new
+    /// manifest became authoritative.
+    pub fn pending_reuse_offsets(&self) -> Vec<u64> {
+        let dirty_pages = self
+            .btree
+            .dirty_page_ids()
+            .into_iter()
+            .filter(|page_id| self.btree.node(*page_id).is_some())
+            .count();
+        self.free_offsets
+            .iter()
+            .rev()
+            .take(dirty_pages)
+            .copied()
+            .collect()
+    }
+
     /// Install the physical offsets protected by retained root generations.
     ///
     /// Recomputing from the device extent is intentionally conservative: a

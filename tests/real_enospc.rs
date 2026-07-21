@@ -49,11 +49,10 @@ mod linux {
                 .expect("CI must provide SEERDB_ENOSPC_ROOT for this ignored test"),
         );
         let path = root.join("db");
-        fs::create_dir_all(&path).unwrap();
 
         let mut options = Options::for_test();
         options.max_wal_bytes = 1024 * 1024;
-        let mut db = DB::open(&path, options).unwrap();
+        let mut db = DB::create(&path, options).unwrap();
         db.put(b"base", b"value-1").unwrap();
         db.flush().unwrap();
 

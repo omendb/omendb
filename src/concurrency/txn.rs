@@ -1,7 +1,8 @@
-//! Transaction management for MVCC.
+//! Process-local transaction bookkeeping.
 //!
-//! Transactions provide snapshot isolation. Each transaction sees a consistent
-//! view of the database as of its start time. Writers don't block readers.
+//! This legacy primitive allocates transaction IDs and records lifecycle
+//! metadata; it does not bind data reads or writes to a durable snapshot. The
+//! data-bearing root-bound transaction API lives on [`crate::DB`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,7 +20,7 @@ pub enum TransactionState {
     Aborted,
 }
 
-/// A transaction providing snapshot isolation.
+/// A process-local transaction bookkeeping record.
 ///
 /// Each transaction has:
 /// - A unique ID
@@ -28,7 +29,7 @@ pub enum TransactionState {
 pub struct Transaction {
     /// Unique transaction ID.
     id: TransactionId,
-    /// Snapshot ID: the latest committed transaction ID at start time.
+    /// Latest committed transaction ID observed at begin time.
     snapshot_id: TransactionId,
     /// Current state.
     state: TransactionState,
@@ -190,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_isolation() {
+    fn test_transaction_id_observes_latest_commit() {
         let tm = TransactionManager::new();
 
         // Begin first transaction.
