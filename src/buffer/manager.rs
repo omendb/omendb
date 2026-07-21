@@ -62,6 +62,8 @@ pub enum BufferError {
     /// A write-back was attempted while a live guard or explicit pin owns the
     /// frame.
     PinnedPage(u64),
+    /// Mutable frame access was requested through a read-only guard.
+    ReadOnlyPage(u64),
     /// The frame changed after a write-back image was captured.
     StaleWriteback(u64),
 }
@@ -79,6 +81,9 @@ impl fmt::Display for BufferError {
             }
             Self::PinnedPage(page_id) => {
                 write!(f, "page {page_id} cannot be written back while pinned")
+            }
+            Self::ReadOnlyPage(page_id) => {
+                write!(f, "page {page_id} cannot be mutated through a read guard")
             }
             Self::StaleWriteback(page_id) => {
                 write!(f, "write-back image for page {page_id} is stale")
@@ -298,9 +303,15 @@ impl BufferManager {
         &self.frames[guard.frame_index()].data
     }
 
-    /// Get a mutable reference to the data in a frame.
-    pub fn frame_data_mut(&mut self, guard: &PageGuard) -> &mut [u8; PAGE_SIZE] {
-        &mut self.frames[guard.frame_index()].data
+    /// Get mutable access to a frame through a write guard.
+    pub fn frame_data_mut(
+        &mut self,
+        guard: &PageGuard,
+    ) -> Result<&mut [u8; PAGE_SIZE], BufferError> {
+        if !guard.is_writable() {
+            return Err(BufferError::ReadOnlyPage(guard.page_id()));
+        }
+        Ok(&mut self.frames[guard.frame_index()].data)
     }
 
     /// Mark a page as dirty (has been modified).
@@ -734,7 +745,7 @@ mod tests {
         let writeback = bm.begin_writeback(1).unwrap().unwrap();
 
         let guard = bm.fetch(1, &data, GuardAccess::Write).unwrap();
-        bm.frame_data_mut(&guard)[0] = 1;
+        bm.frame_data_mut(&guard).unwrap()[0] = 1;
         drop(guard);
 
         assert!(matches!(
@@ -745,5 +756,19 @@ mod tests {
         assert_eq!(stats.dirty_frames, 1);
         assert_eq!(stats.writeback_requests, 1);
         assert_eq!(stats.writeback_refusals, 1);
+    }
+
+    #[test]
+    fn test_read_guard_cannot_mutate_frame() {
+        let mut bm = BufferManager::new(PAGE_SIZE);
+        let data = [7u8; PAGE_SIZE];
+        let guard = bm.fetch(1, &data, GuardAccess::Read).unwrap();
+
+        assert!(matches!(
+            bm.frame_data_mut(&guard),
+            Err(BufferError::ReadOnlyPage(1))
+        ));
+        assert_eq!(bm.frame_data(&guard), &data);
+        drop(guard);
     }
 }

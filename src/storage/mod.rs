@@ -660,7 +660,7 @@ impl StorageEngine {
                 let writeback = {
                     let mut buffer = self.buffer_lock()?;
                     let guard = buffer.fetch_key(pending_key, &page, GuardAccess::Write)?;
-                    buffer.frame_data_mut(&guard).copy_from_slice(&page);
+                    buffer.frame_data_mut(&guard)?.copy_from_slice(&page);
                     drop(guard);
                     buffer.begin_writeback_key(pending_key)?.ok_or_else(|| {
                         Error::Buffer(format!("page {page_id} was not dirty after staging"))

@@ -1013,6 +1013,11 @@ impl DB {
                     fs::create_dir_all(parent)?;
                 }
                 fs::create_dir(&path)?;
+                // The directory entry itself is part of the acknowledged
+                // create boundary. Sync the parent chain before publishing
+                // any manifest/data artifacts so a power loss cannot lose the
+                // newly created database directory while retaining its files.
+                sync_directory_chain(path.parent().unwrap_or_else(|| Path::new(".")))?;
             }
             OpenMode::Normal if !path.exists() => fs::create_dir_all(&path)?,
             OpenMode::Check | OpenMode::Normal => {}
@@ -4390,6 +4395,36 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Sync a newly created directory and each newly reachable parent directory.
+///
+/// `create_dir_all` can create more than one ancestor. Syncing only the
+/// immediate parent would leave an outer directory entry vulnerable to being
+/// lost after an acknowledged create on filesystems that honor directory
+/// durability separately from file durability.
+fn sync_directory_chain(path: &Path) -> Result<()> {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    let mut current = path;
+    loop {
+        sync_directory(current)?;
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        if parent.as_os_str().is_empty() {
+            sync_directory(Path::new("."))?;
+            break;
+        }
+        current = parent;
+    }
+    Ok(())
+}
+
 fn clear_blob_reservation(path: &Path) -> Result<()> {
     let reservation = path.join(BLOB_RESERVATION_FILE);
     if reservation.exists() {
@@ -4578,7 +4613,7 @@ mod tests {
             Err(Error::InvalidArgument(message)) if message.contains("already exists")
         ));
 
-        let path = dir.path().join("created.db");
+        let path = dir.path().join("nested").join("created.db");
         let mut db = DB::create(&path, Options::default()).unwrap();
         db.put(b"catalog", b"durable").unwrap();
         db.flush().unwrap();
