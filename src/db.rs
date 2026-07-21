@@ -1077,6 +1077,35 @@ impl DB {
                 error
             }
         })?;
+        if let Some(current) = current_manifest {
+            if !data_path.is_file() {
+                let error = Error::Corruption(format!(
+                    "manifest generation {} is missing the data file",
+                    current.generation_id.get()
+                ));
+                return Err(if check_only {
+                    Self::map_check_error(CheckFailureKind::Target, error)
+                } else {
+                    error
+                });
+            }
+            if current.pmt_checkpoint_id.get() != 0 {
+                let checkpoint_path =
+                    path.join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
+                if !checkpoint_path.is_file() {
+                    let error = Error::Corruption(format!(
+                        "manifest generation {} is missing checkpoint {}",
+                        current.generation_id.get(),
+                        current.pmt_checkpoint_id.get()
+                    ));
+                    return Err(if check_only {
+                        Self::map_check_error(CheckFailureKind::Checkpoint, error)
+                    } else {
+                        error
+                    });
+                }
+            }
+        }
         if check_only && current_manifest.is_none() {
             return Err(Error::Check {
                 kind: CheckFailureKind::Manifest,
@@ -4475,6 +4504,35 @@ mod tests {
             Err(Error::Corruption(message))
                 if message.contains("no authoritative storage artifacts")
         ));
+    }
+
+    #[test]
+    fn test_db_open_rejects_missing_manifest_artifacts_without_recreating_them() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing-data.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        fs::remove_file(path.join(DATA_FILE)).unwrap();
+        let check = DB::check(&path, Options::default());
+        assert!(
+            matches!(
+                check,
+                Err(Error::Check {
+                    kind: CheckFailureKind::Target,
+                    ref message
+                }) if message.contains("required manifest or data artifacts")
+            ),
+            "check error: {check:?}"
+        );
+        assert!(matches!(
+            DB::open(&path, Options::default()),
+            Err(Error::Corruption(message))
+                if message.contains("is missing the data file")
+        ));
+        assert!(!path.join(DATA_FILE).exists());
     }
 
     #[test]
