@@ -28,6 +28,22 @@ root-generation retention, WAL recovery, and crash-safe reclamation baselines.
 It is still under production qualification; see [ai/STATUS.md](ai/STATUS.md)
 for the open ENOSPC, soak, MVCC, migration, and performance gates.
 
+## Portable qualification
+
+Run the deterministic mixed workload and emit a JSON qualification artifact:
+
+```bash
+cargo run --release --all-features --example seerdb_qualification -- \
+  --keys 128 --operations 512 --output /tmp/seerdb-qualification.json
+```
+
+The harness checks a reference model, retained-root reads, bounded compaction,
+vacuum, history pruning, offline `DB::check()`, verification, and close/reopen.
+It reports p50/p95/p99 operation latencies, page-write and space-amplification
+observations, physical counters, and the final digest. These are portable
+qualification measurements, not cross-engine or device-backed performance
+claims; the ext4/XFS power-loss runner remains a separate privileged gate.
+
 ## References
 
 - LeanStore (VLDB 2024, 2026) — out-of-place B-tree, SSD-aware buffer management
