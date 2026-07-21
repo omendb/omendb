@@ -4533,6 +4533,39 @@ mod tests {
                 if message.contains("is missing the data file")
         ));
         assert!(!path.join(DATA_FILE).exists());
+
+        let checkpoint_path = dir.path().join("missing-checkpoint.db");
+        let mut db = DB::open(&checkpoint_path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+        drop(db);
+        let checkpoint = fs::read_dir(&checkpoint_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("seerdb.meta."))
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                    .is_some()
+            })
+            .expect("published database has a numbered PMT checkpoint");
+        fs::remove_file(&checkpoint).unwrap();
+
+        let check = DB::check(&checkpoint_path, Options::default());
+        assert!(matches!(
+            check,
+            Err(Error::Check {
+                kind: CheckFailureKind::Checkpoint,
+                ref message
+            }) if message.contains("is missing checkpoint")
+        ));
+        assert!(matches!(
+            DB::open(&checkpoint_path, Options::default()),
+            Err(Error::Corruption(message))
+                if message.contains("is missing checkpoint")
+        ));
+        assert!(!checkpoint.exists());
     }
 
     #[test]
