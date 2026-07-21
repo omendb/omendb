@@ -1036,6 +1036,9 @@ impl ManifestStore {
     }
 
     fn sync_manifest(&mut self, mirror: bool) -> Result<()> {
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let _ = mirror;
+
         #[cfg(any(test, feature = "fault-injection"))]
         if mirror {
             if FAIL_NEXT_MIRROR_MANIFEST_SYNC.with(|failure| failure.replace(false)) {
