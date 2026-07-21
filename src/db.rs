@@ -2685,6 +2685,11 @@ impl DB {
             return Ok(0);
         }
         if self.blobs.has_reclaimable_files() {
+            // Fully-dead file removal changes the active blob image without
+            // publishing a new root. Fence the inactive manifest slot first;
+            // otherwise it could still name records removed below and become
+            // an invalid fallback after a torn newest-slot read.
+            self.mirror_current_manifest()?;
             // Admission must precede removal from the in-memory catalog. The
             // current image is an upper bound for the compacted image, so a
             // successful reservation covers the subsequent atomic publish.
@@ -3730,17 +3735,31 @@ impl DB {
     pub fn prune_history(&mut self) -> Result<HistoryPruneReport> {
         self.check_writable()?;
         self.flush()?;
-        let current = self
-            .manifest
-            .load_latest()?
+        let recovery_manifests = self.manifest.load_valid_manifests()?;
+        let current = recovery_manifests
+            .iter()
+            .copied()
+            .max_by_key(|manifest| (manifest.generation_id, manifest.commit_id))
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
 
-        let mut retained = BTreeSet::from([current.generation_id]);
+        // Both valid slots are recovery roots until a later publication has
+        // mirrored the current manifest. Pruning only from `current` can
+        // delete the checkpoint needed by the inactive fallback slot, turning
+        // a later torn newest-slot recovery into a missing-artifact failure.
+        let mut retained = recovery_manifests
+            .iter()
+            .map(|manifest| manifest.generation_id)
+            .collect::<BTreeSet<_>>();
+        retained.insert(current.generation_id);
         let state = self
             .retention
             .lock()
             .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
-        retained.extend(state.all_roots().map(|root| root.manifest.generation_id));
+        let retained_roots = state
+            .all_roots()
+            .map(|root| root.manifest)
+            .collect::<Vec<_>>();
+        retained.extend(retained_roots.iter().map(|manifest| manifest.generation_id));
         drop(state);
 
         let mut history = self.manifest_history.clone();
@@ -3748,11 +3767,16 @@ impl DB {
             .reconcile_current(current)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         let mut retained_checkpoints = BTreeSet::new();
-        for manifest in history
-            .manifests()
-            .iter()
-            .filter(|manifest| retained.contains(&manifest.generation_id))
-        {
+        let mut protected_manifests = recovery_manifests;
+        protected_manifests.extend(retained_roots);
+        protected_manifests.extend(
+            history
+                .manifests()
+                .iter()
+                .copied()
+                .filter(|manifest| retained.contains(&manifest.generation_id)),
+        );
+        for manifest in protected_manifests {
             if manifest.pmt_checkpoint_id.get() != 0 {
                 retained_checkpoints.extend(Self::load_meta_ancestors(
                     &self.path,
@@ -4309,7 +4333,9 @@ impl DB {
                     .map(|delta| delta.parent_checkpoint_id)
                     .ok_or_else(|| Error::Corruption("metadata delta disappeared".into()))?;
                 if parent == 0 {
-                    break (PMT::new(), PageAllocator::new());
+                    return Err(Error::Corruption(
+                        "metadata delta has no full checkpoint parent".into(),
+                    ));
                 }
                 current_path = current_path
                     .parent()
@@ -4821,7 +4847,9 @@ impl DB {
             }
             let delta = Self::load_meta_delta(&data)?;
             if delta.parent_checkpoint_id == 0 {
-                return Ok(ancestors);
+                return Err(Error::Corruption(
+                    "metadata delta has no full checkpoint parent".into(),
+                ));
             }
             current_id = delta.parent_checkpoint_id;
         }
@@ -5789,8 +5817,9 @@ mod tests {
         let checkpoint = path.join("seerdb.meta.2");
         let mut bytes = fs::read(&checkpoint).unwrap();
         assert!(bytes.starts_with(&META_DELTA_MAGIC));
+        let valid_delta = bytes.clone();
         bytes.push(0xA5);
-        fs::write(checkpoint, bytes).unwrap();
+        fs::write(&checkpoint, bytes).unwrap();
         assert!(matches!(
             DB::open(&path, Options::default()),
             Err(Error::Corruption(message)) if message.contains("metadata delta")
@@ -5802,6 +5831,21 @@ mod tests {
                 ..
             })
         ));
+
+        let mut anchorless = valid_delta;
+        anchorless[12..20].fill(0);
+        let checksum = crc32c::crc32c(&anchorless[..anchorless.len() - 4]);
+        let checksum_offset = anchorless.len() - 4;
+        anchorless[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        fs::write(&checkpoint, anchorless).unwrap();
+        let error = match DB::open(&path, Options::default()) {
+            Ok(_) => panic!("anchorless metadata delta unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::Corruption(ref message) if message.contains("no full checkpoint parent")),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -5820,13 +5864,18 @@ mod tests {
         let consolidation_generation = MAX_META_DELTA_CHAIN as u64 + 2;
         let consolidated = path.join(format!("seerdb.meta.{consolidation_generation}"));
         assert!(fs::read(&consolidated).unwrap().starts_with(&META_MAGIC));
+        // The inactive slot still names the immediately previous delta
+        // frontier. Publish one more generation so that fallback advances
+        // beyond the consolidation before pruning the old chain.
+        db.put(b"key", b"value-66").unwrap();
+        db.flush().unwrap();
         let report = db.prune_history().unwrap();
         assert_eq!(report.removed_checkpoints, MAX_META_DELTA_CHAIN as u64 + 1);
         assert!(consolidated.is_file());
-        assert_eq!(db.get(b"key").unwrap(), Some(b"value-65".to_vec()));
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value-66".to_vec()));
         db.close().unwrap();
         let reopened = DB::open(&path, Options::default()).unwrap();
-        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-65".to_vec()));
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-66".to_vec()));
     }
 
     #[test]
@@ -6576,6 +6625,69 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+    }
+
+    #[test]
+    fn test_db_prune_history_preserves_inactive_manifest_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prune-fallback.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+
+        let first_checkpoint = path.join("seerdb.meta.1");
+        assert!(first_checkpoint.is_file());
+        db.prune_history().unwrap();
+        assert!(first_checkpoint.is_file());
+        db.close().unwrap();
+
+        // The newest slot is corrupt, so reopen must use the independently
+        // valid older slot whose checkpoint pruning was required to preserve.
+        let manifest_path = path.join(MANIFEST_FILE);
+        let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
+        manifest_file
+            .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
+            .unwrap();
+        manifest_file
+            .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
+            .unwrap();
+        manifest_file.sync_all().unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    }
+
+    #[test]
+    fn test_db_gc_mirrors_manifest_before_removing_dead_blob_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gc-fallback.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"blob", &vec![0xA5; 2_000]).unwrap();
+        db.flush().unwrap();
+        db.delete(b"blob").unwrap();
+        db.flush().unwrap();
+
+        assert_eq!(db.gc().unwrap(), 1);
+        db.close().unwrap();
+
+        // GC is a maintenance mutation of the blob artifact without a new
+        // logical commit. Losing the newest slot must still reopen the
+        // manifest whose blob image is present, rather than a stale root
+        // whose record was just removed.
+        let manifest_path = path.join(MANIFEST_FILE);
+        let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
+        manifest_file
+            .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
+            .unwrap();
+        manifest_file
+            .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
+            .unwrap();
+        manifest_file.sync_all().unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"blob").unwrap(), None);
     }
 
     #[test]

@@ -528,8 +528,9 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     assert!(third_checkpoint.is_file());
 
     let report = db.prune_history().unwrap();
-    assert_eq!(report.retained_generations, 2);
-    // The current delta checkpoint still depends on its full and delta
+    assert_eq!(report.retained_generations, 3);
+    // Both manifest slots and the retained snapshot remain recovery roots.
+    // The current delta checkpoint also depends on its full and delta
     // ancestors even though the middle logical manifest is unretained.
     assert_eq!(report.removed_checkpoints, 0);
     assert!(second_checkpoint.exists());
@@ -548,7 +549,7 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     );
     reopened.release_snapshot(snapshot_id).unwrap();
     let report = reopened.prune_history().unwrap();
-    assert_eq!(report.retained_generations, 1);
+    assert_eq!(report.retained_generations, 2);
     assert_eq!(report.removed_checkpoints, 0);
     assert!(first_checkpoint.exists());
     assert!(third_checkpoint.is_file());

@@ -990,26 +990,35 @@ impl ManifestStore {
 
     /// Load the newest valid manifest generation.
     pub fn load_latest(&mut self) -> Result<Option<Manifest>> {
-        let mut newest = None;
+        let manifests = self.load_valid_manifests()?;
+        Ok(manifests
+            .into_iter()
+            .max_by_key(|manifest| (manifest.generation_id, manifest.commit_id)))
+    }
+
+    /// Load every independently valid manifest slot.
+    ///
+    /// Maintenance must treat both slots as recovery roots. The newest slot
+    /// is the normal authority, but the older slot is still the fallback until
+    /// the next publication has made it safe to overwrite or remove its
+    /// artifacts.
+    pub fn load_valid_manifests(&mut self) -> Result<Vec<Manifest>> {
+        let mut manifests = Vec::with_capacity(MANIFEST_SLOT_COUNT);
         let mut saw_invalid = false;
 
         for slot in 0..MANIFEST_SLOT_COUNT {
             let bytes = self.read_slot(slot)?;
             match Manifest::from_bytes(&bytes) {
-                Ok(Some(manifest)) => {
-                    if newest.is_none_or(|current| manifest.is_newer_than(current)) {
-                        newest = Some(manifest);
-                    }
-                }
+                Ok(Some(manifest)) => manifests.push(manifest),
                 Ok(None) => {}
                 Err(_) => saw_invalid = true,
             }
         }
 
-        if newest.is_none() && saw_invalid {
+        if manifests.is_empty() && saw_invalid {
             return Err(Error::Corruption("no valid manifest generation".into()));
         }
-        Ok(newest)
+        Ok(manifests)
     }
 
     /// Publish a new manifest into the inactive slot and sync it.
