@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use seerdb::{BatchMutation, DB, Options};
 use std::sync::Arc;
 use std::thread;
