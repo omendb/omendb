@@ -797,6 +797,133 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
 }
 
 #[test]
+fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
+    #[derive(Clone, Copy)]
+    enum RecoveryOutcome {
+        Old,
+        New,
+        OldOrNew,
+    }
+
+    fn run_case(root: &Path, name: &str, inject: fn(&DB), outcome: RecoveryOutcome) {
+        let path = root.join(name);
+        let old_blob = vec![0x11; 4096];
+        let new_blob = vec![0x22; 4096];
+        let mut db = DB::open(&path, Options::for_test()).unwrap();
+        db.commit_batch(&[
+            BatchMutation::Put {
+                key: b"key-a".to_vec(),
+                value: b"before-a".to_vec(),
+            },
+            BatchMutation::Put {
+                key: b"blob-key".to_vec(),
+                value: old_blob.clone(),
+            },
+            BatchMutation::Put {
+                key: b"remove-key".to_vec(),
+                value: b"before-remove".to_vec(),
+            },
+        ])
+        .unwrap();
+
+        let mut transaction = db.begin_batch_transaction().unwrap();
+        transaction.put(b"key-a", b"after-a").unwrap();
+        transaction.put(b"blob-key", &new_blob).unwrap();
+        transaction.delete(b"remove-key").unwrap();
+        transaction.put(b"new-key", b"after-new").unwrap();
+        inject(&db);
+
+        assert!(matches!(
+            transaction.commit(&mut db),
+            Err(Error::NeedsRecovery(_))
+        ));
+        assert!(matches!(
+            transaction.state(),
+            seerdb::BatchTransactionState::RecoveryRequired { commit }
+                if commit.get() == 2
+        ));
+        transaction.release().unwrap();
+        drop(transaction);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+        let new_state = reopened.get(b"key-a").unwrap() == Some(b"after-a".to_vec());
+        let old_state = reopened.get(b"key-a").unwrap() == Some(b"before-a".to_vec());
+        assert!(
+            old_state || new_state,
+            "grouped publication exposed a partial key-a state"
+        );
+        match outcome {
+            RecoveryOutcome::Old => assert!(old_state),
+            RecoveryOutcome::New => assert!(new_state),
+            RecoveryOutcome::OldOrNew => {}
+        }
+
+        let expected_new = new_state;
+        assert_eq!(
+            reopened.get(b"blob-key").unwrap(),
+            Some(if expected_new { new_blob } else { old_blob })
+        );
+        assert_eq!(
+            reopened.get(b"remove-key").unwrap(),
+            if expected_new {
+                None
+            } else {
+                Some(b"before-remove".to_vec())
+            }
+        );
+        assert_eq!(
+            reopened.get(b"new-key").unwrap(),
+            if expected_new {
+                Some(b"after-new".to_vec())
+            } else {
+                None
+            }
+        );
+        assert!(!reopened.durability_status().write_fenced);
+        reopened.verify().unwrap();
+    }
+
+    let root = tempdir().unwrap();
+    run_case(
+        root.path(),
+        "grouped-before-wal.db",
+        DB::inject_wal_write_failure,
+        RecoveryOutcome::Old,
+    );
+    run_case(
+        root.path(),
+        "grouped-page-sync.db",
+        DB::inject_page_range_sync_failure,
+        RecoveryOutcome::Old,
+    );
+    run_case(
+        root.path(),
+        "grouped-manifest-sync.db",
+        DB::inject_manifest_sync_failure,
+        RecoveryOutcome::OldOrNew,
+    );
+    run_case(
+        root.path(),
+        "grouped-manifest-mirror-sync.db",
+        DB::inject_manifest_mirror_sync_failure,
+        RecoveryOutcome::Old,
+    );
+    run_case(
+        root.path(),
+        "grouped-after-manifest.db",
+        DB::inject_after_manifest_failure,
+        RecoveryOutcome::New,
+    );
+    run_case(
+        root.path(),
+        "grouped-wal-truncate.db",
+        DB::inject_wal_truncate_failure,
+        RecoveryOutcome::New,
+    );
+}
+
+#[test]
 fn dbnext_r0_batch_transaction_pin_is_not_durable_snapshot_state() {
     let root = tempdir().unwrap();
     let path = root.path().join("ephemeral-transaction.db");
