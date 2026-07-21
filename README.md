@@ -41,7 +41,8 @@ The harness checks a reference model, retained-root reads, bounded compaction,
 periodic close/reopen verification, vacuum, history pruning, offline
 `DB::check()`, and final close/reopen.
 It reports p50/p95/p99 operation latencies, page-write and space-amplification
-observations, physical counters, and the final digest. These are portable
+observations, separates user-commit work from maintenance/restart work in its
+physical counters, and records the final digest. These are portable
 qualification measurements, not cross-engine or device-backed performance
 claims; the ext4/XFS power-loss runner remains a separate privileged gate.
 

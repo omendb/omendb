@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{BatchMutation, DB, Options};
+use seerdb::{BatchMutation, DB, Options, StorageMetrics};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
@@ -20,6 +20,31 @@ use tempfile::tempdir;
 
 type AnyResult<T> = Result<T, Box<dyn StdError>>;
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
+#[derive(Debug, Default)]
+struct CounterTotals {
+    page_bytes_written: u64,
+    physical_page_writes: u64,
+    syncs: u64,
+}
+
+impl CounterTotals {
+    fn add_delta(&mut self, before: StorageMetrics, after: StorageMetrics) {
+        self.page_bytes_written = self.page_bytes_written.saturating_add(
+            after
+                .page_bytes_written
+                .saturating_sub(before.page_bytes_written),
+        );
+        self.physical_page_writes = self.physical_page_writes.saturating_add(
+            after
+                .physical_page_writes
+                .saturating_sub(before.physical_page_writes),
+        );
+        self.syncs = self
+            .syncs
+            .saturating_add(after.syncs.saturating_sub(before.syncs));
+    }
+}
 
 const DEFAULT_KEYS: usize = 128;
 const DEFAULT_OPERATIONS: usize = 512;
@@ -189,12 +214,9 @@ fn main() -> AnyResult<()> {
     let mut maintenance_runs = 0u64;
     let mut reopen_runs = 0u64;
     let initial_metrics = db.metrics()?.storage;
-    let mut handle_page_bytes_written = initial_metrics.page_bytes_written;
-    let mut handle_physical_page_writes = initial_metrics.physical_page_writes;
-    let mut handle_syncs = initial_metrics.syncs;
-    let mut total_page_bytes_written = 0u64;
-    let mut total_physical_page_writes = 0u64;
-    let mut total_syncs = 0u64;
+    let mut handle_metrics = initial_metrics;
+    let mut commit_counters = CounterTotals::default();
+    let mut maintenance_counters = CounterTotals::default();
 
     for operation in 0..args.operations {
         let random = next_random(&mut state);
@@ -252,29 +274,18 @@ fn main() -> AnyResult<()> {
         }
 
         if (operation + 1) % (args.operations / 4).max(1) == 0 {
+            let before_maintenance = db.metrics()?.storage;
+            commit_counters.add_delta(handle_metrics, before_maintenance);
             let started = Instant::now();
             db.compact_with_limit(2)?;
             db.verify()?;
             maintenance_latency.push(started.elapsed().as_nanos());
             maintenance_runs = maintenance_runs.saturating_add(1);
-            let current_metrics = db.metrics()?.storage;
-            total_page_bytes_written = total_page_bytes_written.saturating_add(
-                current_metrics
-                    .page_bytes_written
-                    .saturating_sub(handle_page_bytes_written),
-            );
-            total_physical_page_writes = total_physical_page_writes.saturating_add(
-                current_metrics
-                    .physical_page_writes
-                    .saturating_sub(handle_physical_page_writes),
-            );
-            total_syncs =
-                total_syncs.saturating_add(current_metrics.syncs.saturating_sub(handle_syncs));
+            let after_maintenance = db.metrics()?.storage;
+            maintenance_counters.add_delta(before_maintenance, after_maintenance);
             db.close()?;
             db = DB::open(&path, Options::default())?;
-            handle_page_bytes_written = 0;
-            handle_physical_page_writes = 0;
-            handle_syncs = 0;
+            handle_metrics = StorageMetrics::default();
             db.verify()?;
             check_range(&db, &model, &[], &[u8::MAX; 64])?;
             reopen_runs = reopen_runs.saturating_add(1);
@@ -288,6 +299,8 @@ fn main() -> AnyResult<()> {
     retained.verify()?;
     retained.release()?;
 
+    let before_maintenance = db.metrics()?.storage;
+    commit_counters.add_delta(handle_metrics, before_maintenance);
     let started = Instant::now();
     let vacuum = db.vacuum()?;
     db.prune_history()?;
@@ -296,20 +309,16 @@ fn main() -> AnyResult<()> {
     db.verify()?;
     check_range(&db, &model, &[], &[u8::MAX; 64])?;
     let after_maintenance = db.metrics()?;
-    total_page_bytes_written = total_page_bytes_written.saturating_add(
-        after_maintenance
-            .storage
-            .page_bytes_written
-            .saturating_sub(handle_page_bytes_written),
-    );
-    total_physical_page_writes = total_physical_page_writes.saturating_add(
-        after_maintenance
-            .storage
-            .physical_page_writes
-            .saturating_sub(handle_physical_page_writes),
-    );
-    total_syncs =
-        total_syncs.saturating_add(after_maintenance.storage.syncs.saturating_sub(handle_syncs));
+    maintenance_counters.add_delta(before_maintenance, after_maintenance.storage);
+    let total_page_bytes_written = commit_counters
+        .page_bytes_written
+        .saturating_add(maintenance_counters.page_bytes_written);
+    let total_physical_page_writes = commit_counters
+        .physical_page_writes
+        .saturating_add(maintenance_counters.physical_page_writes);
+    let total_syncs = commit_counters
+        .syncs
+        .saturating_add(maintenance_counters.syncs);
     let final_space_bytes = after_maintenance
         .data_bytes
         .saturating_add(after_maintenance.blob_bytes)
@@ -359,6 +368,8 @@ fn main() -> AnyResult<()> {
             "reopen_runs_during_workload": reopen_runs,
             "logical_write_bytes": logical_write_bytes,
             "page_bytes_written_after_workload_start": total_page_bytes_written,
+            "page_bytes_written_by_commits": commit_counters.page_bytes_written,
+            "page_bytes_written_by_maintenance": maintenance_counters.page_bytes_written,
             "page_write_amplification": if logical_write_bytes == 0 {
                 Value::Null
             } else {
@@ -374,7 +385,11 @@ fn main() -> AnyResult<()> {
             "reclaimable_pages": after_maintenance.reclaimable_pages,
             "physical_page_reads": after_maintenance.storage.physical_page_reads,
             "physical_page_writes": total_physical_page_writes,
+            "physical_page_writes_by_commits": commit_counters.physical_page_writes,
+            "physical_page_writes_by_maintenance": maintenance_counters.physical_page_writes,
             "syncs": total_syncs,
+            "syncs_by_commits": commit_counters.syncs,
+            "syncs_by_maintenance": maintenance_counters.syncs,
         },
     });
     let serialized = serde_json::to_string_pretty(&report)?;
