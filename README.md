@@ -38,7 +38,8 @@ cargo run --release --all-features --example seerdb_qualification -- \
 ```
 
 The harness checks a reference model, retained-root reads, bounded compaction,
-vacuum, history pruning, offline `DB::check()`, verification, and close/reopen.
+periodic close/reopen verification, vacuum, history pruning, offline
+`DB::check()`, and final close/reopen.
 It reports p50/p95/p99 operation latencies, page-write and space-amplification
 observations, physical counters, and the final digest. These are portable
 qualification measurements, not cross-engine or device-backed performance

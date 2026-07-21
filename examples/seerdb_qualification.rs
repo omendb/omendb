@@ -187,6 +187,14 @@ fn main() -> AnyResult<()> {
     let mut maintenance_latency = Vec::new();
     let mut logical_write_bytes = 0u64;
     let mut maintenance_runs = 0u64;
+    let mut reopen_runs = 0u64;
+    let initial_metrics = db.metrics()?.storage;
+    let mut handle_page_bytes_written = initial_metrics.page_bytes_written;
+    let mut handle_physical_page_writes = initial_metrics.physical_page_writes;
+    let mut handle_syncs = initial_metrics.syncs;
+    let mut total_page_bytes_written = 0u64;
+    let mut total_physical_page_writes = 0u64;
+    let mut total_syncs = 0u64;
 
     for operation in 0..args.operations {
         let random = next_random(&mut state);
@@ -249,11 +257,31 @@ fn main() -> AnyResult<()> {
             db.verify()?;
             maintenance_latency.push(started.elapsed().as_nanos());
             maintenance_runs = maintenance_runs.saturating_add(1);
+            let current_metrics = db.metrics()?.storage;
+            total_page_bytes_written = total_page_bytes_written.saturating_add(
+                current_metrics
+                    .page_bytes_written
+                    .saturating_sub(handle_page_bytes_written),
+            );
+            total_physical_page_writes = total_physical_page_writes.saturating_add(
+                current_metrics
+                    .physical_page_writes
+                    .saturating_sub(handle_physical_page_writes),
+            );
+            total_syncs =
+                total_syncs.saturating_add(current_metrics.syncs.saturating_sub(handle_syncs));
+            db.close()?;
+            db = DB::open(&path, Options::default())?;
+            handle_page_bytes_written = 0;
+            handle_physical_page_writes = 0;
+            handle_syncs = 0;
+            db.verify()?;
+            check_range(&db, &model, &[], &[u8::MAX; 64])?;
+            reopen_runs = reopen_runs.saturating_add(1);
         }
     }
 
     let current_digest = digest(&model);
-    let before_maintenance = db.metrics()?;
     let mut retained = retained
         .take()
         .ok_or_else(|| invalid("retained snapshot was already released"))?;
@@ -268,10 +296,20 @@ fn main() -> AnyResult<()> {
     db.verify()?;
     check_range(&db, &model, &[], &[u8::MAX; 64])?;
     let after_maintenance = db.metrics()?;
-    let page_bytes_written = after_maintenance
-        .storage
-        .page_bytes_written
-        .saturating_sub(before_maintenance.storage.page_bytes_written);
+    total_page_bytes_written = total_page_bytes_written.saturating_add(
+        after_maintenance
+            .storage
+            .page_bytes_written
+            .saturating_sub(handle_page_bytes_written),
+    );
+    total_physical_page_writes = total_physical_page_writes.saturating_add(
+        after_maintenance
+            .storage
+            .physical_page_writes
+            .saturating_sub(handle_physical_page_writes),
+    );
+    total_syncs =
+        total_syncs.saturating_add(after_maintenance.storage.syncs.saturating_sub(handle_syncs));
     let final_space_bytes = after_maintenance
         .data_bytes
         .saturating_add(after_maintenance.blob_bytes)
@@ -318,12 +356,13 @@ fn main() -> AnyResult<()> {
         },
         "work": {
             "maintenance_runs": maintenance_runs,
+            "reopen_runs_during_workload": reopen_runs,
             "logical_write_bytes": logical_write_bytes,
-            "page_bytes_written_after_workload_start": page_bytes_written,
+            "page_bytes_written_after_workload_start": total_page_bytes_written,
             "page_write_amplification": if logical_write_bytes == 0 {
                 Value::Null
             } else {
-                json!(page_bytes_written as f64 / logical_write_bytes as f64)
+                json!(total_page_bytes_written as f64 / logical_write_bytes as f64)
             },
             "logical_live_bytes": logical_bytes,
             "final_space_bytes": final_space_bytes,
@@ -334,8 +373,8 @@ fn main() -> AnyResult<()> {
             },
             "reclaimable_pages": after_maintenance.reclaimable_pages,
             "physical_page_reads": after_maintenance.storage.physical_page_reads,
-            "physical_page_writes": after_maintenance.storage.physical_page_writes,
-            "syncs": after_maintenance.storage.syncs,
+            "physical_page_writes": total_physical_page_writes,
+            "syncs": total_syncs,
         },
     });
     let serialized = serde_json::to_string_pretty(&report)?;
