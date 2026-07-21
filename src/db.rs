@@ -13,7 +13,7 @@ use crate::btree::{BTree, BlobPointer, LookupResult, MAX_KEY_SIZE, PAGE_SIZE};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
-use crate::mvcc::PMT;
+use crate::mvcc::{PMT, PageMapping};
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions, preallocate_file, reserve_file};
 use crate::storage::format::{
@@ -66,6 +66,7 @@ const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
 const META_MAGIC: [u8; 8] = *b"SEERMET1";
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
+const PUBLICATION_CAPACITY_SAFETY_BYTES: u64 = 8 * PAGE_SIZE as u64;
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn retained_blob_path(path: &Path, snapshot_id: SnapshotId) -> PathBuf {
@@ -2225,6 +2226,87 @@ impl DB {
         atomic_write_without_fault_injection(&ledger_path, &bytes)
     }
 
+    /// Admit the complete candidate publication before the first page write.
+    ///
+    /// Individual atomic artifacts reserve their own temporary files later in
+    /// publication. A filesystem can therefore report ENOSPC after the data
+    /// page generation has already reached the device unless their aggregate
+    /// footprint is checked first. This is a conservative same-filesystem
+    /// guard; a concurrent external consumer can still force the final
+    /// write-time DiskFull/recovery path.
+    fn preflight_publication_capacity(&self) -> Result<()> {
+        let dirty_page_count = self
+            .engine
+            .btree()
+            .dirty_page_ids()
+            .into_iter()
+            .filter(|page_id| self.engine.btree().node(*page_id).is_some())
+            .count() as u64;
+        let reused_page_count = self.engine.pending_reuse_offsets().len() as u64;
+        let new_page_count = dirty_page_count.saturating_sub(reused_page_count);
+
+        let pmt_bytes = (self.engine.pmt().to_bytes().len() as u64)
+            .checked_add(
+                dirty_page_count
+                    .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .ok_or(Error::DiskFull)?;
+        let allocator_bytes = (self.engine.allocator().to_bytes().len() as u64)
+            .checked_add(dirty_page_count.checked_mul(8).ok_or(Error::DiskFull)?)
+            .ok_or(Error::DiskFull)?;
+        let meta_bytes = (META_MAGIC.len() as u64)
+            .checked_add(4 + 4 + 4 + 4)
+            .and_then(|size| size.checked_add(pmt_bytes))
+            .and_then(|size| size.checked_add(allocator_bytes))
+            .ok_or(Error::DiskFull)?;
+        let blob_bytes = self.blobs.to_bytes().len() as u64;
+        let ledger_bytes = self
+            .reuse_ledger
+            .to_bytes()
+            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?
+            .len() as u64;
+        let history_entry_bytes = ManifestHistory::entry_bytes(Manifest {
+            database_id: self.database_id,
+            history_id: self.history_id,
+            generation_id: GenerationId::new(0),
+            commit_id: CommitId::new(0),
+            page_size: PAGE_SIZE as u32,
+            root_page_id: 0,
+            pmt_checkpoint_id: PmtCheckpointId::new(0),
+            wal_segment: 0,
+            wal_offset: 0,
+            mutation_count: 0,
+            digest: 0,
+            format_version: FORMAT_VERSION,
+        })
+        .len() as u64;
+        let history_length = match fs::metadata(self.path.join(MANIFEST_HISTORY_FILE)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
+                .manifest_history
+                .to_bytes()
+                .map_or(0, |bytes| bytes.len() as u64),
+            Err(error) => return Err(error.into()),
+        };
+        let history_bytes = history_length
+            .checked_add(history_entry_bytes)
+            .ok_or(Error::DiskFull)?;
+        let required = new_page_count
+            .checked_mul(PAGE_SIZE as u64)
+            .and_then(|size| size.checked_add(meta_bytes.checked_mul(2)?))
+            .and_then(|size| size.checked_add(blob_bytes))
+            .and_then(|size| size.checked_add(ledger_bytes))
+            .and_then(|size| size.checked_add(history_bytes))
+            .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
+            .ok_or(Error::DiskFull)?;
+
+        if fs2::available_space(&self.path)? < required {
+            return Err(Error::CapacityPreflight);
+        }
+        Ok(())
+    }
+
     fn append_manifest_history(&self, manifest: Manifest) -> Result<()> {
         self.append_manifest_history_with_directory_sync(manifest, true)
     }
@@ -2293,6 +2375,10 @@ impl DB {
                 offsets: reuse_offsets,
             })
             .map_err(|message| Error::Corruption(format!("reuse ledger {message}")))?;
+        if let Err(error) = self.preflight_publication_capacity() {
+            self.reuse_ledger.remove_generation(commit.generation_id);
+            return Err(error);
+        }
         self.persist_reuse_ledger()?;
         if let Err(error) = self.engine.flush() {
             // Capacity preflight is guaranteed to issue no page I/O, so its

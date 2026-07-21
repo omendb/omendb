@@ -62,7 +62,12 @@ mod linux {
         db.put(b"pending", b"value-2").unwrap();
         let filler = fill_until_nearly_full(&root).unwrap();
 
-        assert!(matches!(db.flush(), Err(Error::CapacityPreflight)));
+        let flush_result = db.flush();
+        assert!(
+            matches!(&flush_result, Err(Error::CapacityPreflight)),
+            "expected retryable capacity preflight, got {flush_result:?}; metrics={:?}",
+            db.metrics()
+        );
         assert!(!db.durability_status().write_fenced);
         drop(filler);
         fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
