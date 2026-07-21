@@ -1087,6 +1087,50 @@ fn dbnext_r0_rejects_corrupt_wal_with_typed_diagnosis() {
 }
 
 #[test]
+fn dbnext_r0_rejects_corrupt_reuse_ledger_with_typed_diagnosis() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("corrupt-reuse-ledger.db");
+    let repair_path = root.path().join("corrupt-reuse-ledger-repair.db");
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"stable", b"one").unwrap();
+        db.flush().unwrap();
+        db.put(b"stable", b"two").unwrap();
+        db.flush().unwrap();
+        db.put(b"stable", b"three").unwrap();
+        db.inject_page_range_sync_failure();
+        assert!(matches!(db.flush(), Err(Error::Io(_))));
+    }
+
+    let ledger_path = path.join("seerdb.reuse-ledger");
+    let mut ledger = fs::read(&ledger_path).unwrap();
+    let last = ledger.len() - 1;
+    ledger[last] ^= 0xFF;
+    fs::write(&ledger_path, ledger).unwrap();
+
+    assert!(matches!(
+        DB::open(&path, Options::default()),
+        Err(Error::Corruption(message))
+            if message.to_ascii_lowercase().contains("reuse ledger")
+    ));
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Format,
+            ..
+        })
+    ));
+    assert!(matches!(
+        DB::repair(&path, &repair_path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Format,
+            ..
+        })
+    ));
+    assert!(!repair_path.exists());
+}
+
+#[test]
 fn dbnext_r0_capacity_limit_preserves_last_generation() {
     let root = tempdir().unwrap();
     let path = root.path().join("capacity.db");
