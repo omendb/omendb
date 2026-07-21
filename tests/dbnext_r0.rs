@@ -529,8 +529,10 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
 
     let report = db.prune_history().unwrap();
     assert_eq!(report.retained_generations, 2);
-    assert_eq!(report.removed_checkpoints, 1);
-    assert!(!second_checkpoint.exists());
+    // The current delta checkpoint still depends on its full and delta
+    // ancestors even though the middle logical manifest is unretained.
+    assert_eq!(report.removed_checkpoints, 0);
+    assert!(second_checkpoint.exists());
     assert!(first_checkpoint.is_file());
     assert!(third_checkpoint.is_file());
     assert_eq!(
@@ -547,7 +549,8 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     reopened.release_snapshot(snapshot_id).unwrap();
     let report = reopened.prune_history().unwrap();
     assert_eq!(report.retained_generations, 1);
-    assert!(!first_checkpoint.exists());
+    assert_eq!(report.removed_checkpoints, 0);
+    assert!(first_checkpoint.exists());
     assert!(third_checkpoint.is_file());
     assert!(matches!(
         reopened.get_at(snapshot_id, b"versioned"),
@@ -573,8 +576,8 @@ fn dbnext_r0_history_prune_rename_failure_preserves_old_sidecar() {
     assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
 
     let report = db.prune_history().unwrap();
-    assert_eq!(report.removed_checkpoints, 1);
-    assert!(!first_checkpoint.exists());
+    assert_eq!(report.removed_checkpoints, 0);
+    assert!(first_checkpoint.exists());
 }
 
 #[test]

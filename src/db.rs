@@ -17,9 +17,9 @@ use crate::mvcc::{PMT, PageMapping};
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
 use crate::space::{Device, DeviceOptions, preallocate_file, reserve_file};
 use crate::storage::format::{
-    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot, RetentionRegistry, ReuseAttempt,
-    ReuseLedger, SnapshotId,
+    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId,
+    MANIFEST_SLOT_SIZE, Manifest, ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot,
+    RetentionRegistry, ReuseAttempt, ReuseLedger, SnapshotId,
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
@@ -64,6 +64,11 @@ const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
 const META_MAGIC: [u8; 8] = *b"SEERMET1";
+const META_DELTA_MAGIC: [u8; 8] = *b"SEERMDL1";
+const META_DELTA_VERSION: u32 = 1;
+const META_DELTA_HEADER_SIZE: usize = 8 + 4 + 8 + 4 + 4 + 4;
+const META_DELTA_CHECKSUM_SIZE: usize = 4;
+const MAX_META_DELTA_CHAIN: usize = 64;
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 const PUBLICATION_CAPACITY_SAFETY_BYTES: u64 = 8 * PAGE_SIZE as u64;
@@ -861,6 +866,33 @@ pub struct DBMetrics {
     pub wal_reserved_bytes: u64,
     /// Physical pages currently safe for reuse.
     pub reclaimable_pages: u64,
+    /// Cumulative bytes written to publication artifacts by this handle.
+    pub publication: PublicationMetrics,
+}
+
+/// Cumulative bytes written to durable publication artifacts.
+///
+/// These counters measure successful bytes written by the current publication
+/// protocol. Metadata may be a full checkpoint or a bounded PMT delta;
+/// blob/image and manifest-history counters still describe their current
+/// whole-image/append-only artifacts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublicationMetrics {
+    /// Bytes written to PMT/allocator checkpoint images.
+    pub metadata_bytes_written: u64,
+    /// Bytes written to blob images.
+    pub blob_bytes_written: u64,
+    /// Bytes appended or rewritten in manifest history.
+    pub history_bytes_written: u64,
+    /// Bytes written to alternating manifest slots.
+    pub manifest_bytes_written: u64,
+}
+
+struct MetaDelta {
+    parent_checkpoint_id: u64,
+    updates: Vec<(u64, PageMapping)>,
+    removals: Vec<u64>,
+    allocator: PageAllocator,
 }
 
 /// A seerdb database instance.
@@ -931,6 +963,8 @@ pub struct DB {
     lock_file: Option<File>,
     /// Number of retryable WAL admission rejections for this handle.
     wal_admission_failures: u64,
+    /// Cumulative publication-artifact write counters.
+    publication: PublicationMetrics,
 }
 
 impl DB {
@@ -1435,6 +1469,7 @@ impl DB {
             check_only,
             lock_file,
             wal_admission_failures: 0,
+            publication: PublicationMetrics::default(),
         };
 
         if !check_only && current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
@@ -2068,14 +2103,14 @@ impl DB {
             .ok_or(Error::DiskFull)
     }
 
-    fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<()> {
+    fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<u64> {
         self.write_blob_image_with_directory_sync(path, data, true)
     }
 
     /// Write a blob image while deferring the containing-directory sync to the
     /// publication barrier. The caller must sync the directory before making
     /// a new manifest authoritative.
-    fn write_blob_image_without_directory_sync(&self, path: &Path, data: &[u8]) -> Result<()> {
+    fn write_blob_image_without_directory_sync(&self, path: &Path, data: &[u8]) -> Result<u64> {
         self.write_blob_image_with_directory_sync(path, data, false)
     }
 
@@ -2084,20 +2119,22 @@ impl DB {
         path: &Path,
         data: &[u8],
         sync_parent: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let reservation = self.path.join(BLOB_RESERVATION_FILE);
             if reservation.is_file() {
-                return atomic_write_reserved(path, &reservation, data, sync_parent);
+                atomic_write_reserved(path, &reservation, data, sync_parent)?;
+                return Ok(data.len() as u64);
             }
         }
 
         if sync_parent {
-            atomic_write(path, data)
+            atomic_write(path, data)?;
         } else {
-            atomic_write_without_directory_sync(path, data)
+            atomic_write_without_directory_sync(path, data)?;
         }
+        Ok(data.len() as u64)
     }
 
     /// Reconcile a blob image kept aside while a mixed-file rewrite crosses
@@ -2255,11 +2292,22 @@ impl DB {
         let allocator_bytes = (self.engine.allocator().to_bytes().len() as u64)
             .checked_add(dirty_page_count.checked_mul(8).ok_or(Error::DiskFull)?)
             .ok_or(Error::DiskFull)?;
-        let meta_bytes = (META_MAGIC.len() as u64)
+        let full_meta_bytes = (META_MAGIC.len() as u64)
             .checked_add(4 + 4 + 4 + 4)
             .and_then(|size| size.checked_add(pmt_bytes))
             .and_then(|size| size.checked_add(allocator_bytes))
             .ok_or(Error::DiskFull)?;
+        let parent = self
+            .manifest_history
+            .latest()
+            .unwrap_or_else(|| self.bootstrap_manifest());
+        let (checkpoint_meta_bytes, _) =
+            self.generation_meta_bytes(parent, dirty_page_count as usize)?;
+        let legacy_meta_bytes = if self.path.join(META_FILE).is_file() {
+            0
+        } else {
+            full_meta_bytes
+        };
         let blob_bytes = self.blobs.to_bytes().len() as u64;
         let ledger_bytes = self
             .reuse_ledger
@@ -2294,7 +2342,8 @@ impl DB {
             .ok_or(Error::DiskFull)?;
         let required = new_page_count
             .checked_mul(PAGE_SIZE as u64)
-            .and_then(|size| size.checked_add(meta_bytes.checked_mul(2)?))
+            .and_then(|size| size.checked_add(checkpoint_meta_bytes))
+            .and_then(|size| size.checked_add(legacy_meta_bytes))
             .and_then(|size| size.checked_add(blob_bytes))
             .and_then(|size| size.checked_add(ledger_bytes))
             .and_then(|size| size.checked_add(history_bytes))
@@ -2307,11 +2356,11 @@ impl DB {
         Ok(())
     }
 
-    fn append_manifest_history(&self, manifest: Manifest) -> Result<()> {
+    fn append_manifest_history(&self, manifest: Manifest) -> Result<u64> {
         self.append_manifest_history_with_directory_sync(manifest, true)
     }
 
-    fn append_manifest_history_without_directory_sync(&self, manifest: Manifest) -> Result<()> {
+    fn append_manifest_history_without_directory_sync(&self, manifest: Manifest) -> Result<u64> {
         self.append_manifest_history_with_directory_sync(manifest, false)
     }
 
@@ -2319,7 +2368,7 @@ impl DB {
         &self,
         manifest: Manifest,
         sync_parent: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let path = self.path.join(MANIFEST_HISTORY_FILE);
         let existing_len = fs::metadata(&path)?.len();
         let header_len = u64::try_from(ManifestHistory::header_bytes().len())
@@ -2333,6 +2382,7 @@ impl DB {
         // A crash may leave a partial final frame. Remove only that tail before
         // appending so recovery never has to scan through a misaligned frame.
         let complete_len = header_len + (existing_len - header_len) / entry_len * entry_len;
+        let mut bytes_written = 0u64;
         if complete_len != existing_len {
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(complete_len)?;
@@ -2343,14 +2393,17 @@ impl DB {
         }
 
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(&ManifestHistory::entry_bytes(manifest))?;
+        let entry = ManifestHistory::entry_bytes(manifest);
+        file.write_all(&entry)?;
+        bytes_written = bytes_written.saturating_add(entry.len() as u64);
         file.flush()?;
         file.sync_all()?;
         if sync_parent {
-            sync_directory(&self.path)
+            sync_directory(&self.path)?;
         } else {
-            Ok(())
+            // The caller owns the final publication-directory barrier.
         }
+        Ok(bytes_written)
     }
 
     /// Publish a generation after its pages and checkpoints are durable.
@@ -2360,6 +2413,10 @@ impl DB {
         append_commit: bool,
         recovered_wal_offset: u64,
     ) -> Result<()> {
+        let parent_manifest = self
+            .manifest_history
+            .latest()
+            .unwrap_or_else(|| self.bootstrap_manifest());
         // Retire the older manifest slot before page writes can reuse any
         // physical versions it names. If the new publication fails, both
         // slots still identify the same current generation and its pages.
@@ -2396,23 +2453,35 @@ impl DB {
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", commit.generation_id.get()));
-        Self::save_meta_without_directory_sync(
-            &checkpoint_path,
-            self.engine.pmt(),
-            self.engine.allocator(),
-        )?;
+        let checkpoint_bytes = self.save_generation_meta(&checkpoint_path, parent_manifest)?;
         // Keep the legacy filename as a compatibility/debug snapshot. It is
-        // never authoritative once a manifest selects a checkpoint.
+        // never authoritative once a manifest selects a checkpoint. Write it
+        // only once so it does not turn every delta publication back into a
+        // whole-image metadata write.
         let meta_path = self.path.join(META_FILE);
-        Self::save_meta_without_directory_sync(
-            &meta_path,
-            self.engine.pmt(),
-            self.engine.allocator(),
-        )?;
+        let legacy_meta_bytes = if meta_path.is_file() {
+            0
+        } else {
+            Self::save_meta_without_directory_sync(
+                &meta_path,
+                self.engine.pmt(),
+                self.engine.allocator(),
+            )?
+        };
+        self.publication.metadata_bytes_written = self
+            .publication
+            .metadata_bytes_written
+            .saturating_add(checkpoint_bytes)
+            .saturating_add(legacy_meta_bytes);
 
         let blob_path = self.path.join(BLOB_FILE);
         self.blobs.set_generation(commit.generation_id.get());
-        self.write_blob_image_without_directory_sync(&blob_path, &self.blobs.to_bytes())?;
+        let blob_image = self.blobs.to_bytes();
+        let blob_bytes = self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?;
+        self.publication.blob_bytes_written = self
+            .publication
+            .blob_bytes_written
+            .saturating_add(blob_bytes);
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
@@ -2444,11 +2513,19 @@ impl DB {
         manifest_history
             .push(manifest)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history_without_directory_sync(manifest)?;
+        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history_without_directory_sync(manifest)?
         } else {
+            let bytes = manifest_history
+                .to_bytes()
+                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
             self.persist_manifest_history_without_directory_sync(&manifest_history)?;
-        }
+            bytes.len() as u64
+        };
+        self.publication.history_bytes_written = self
+            .publication
+            .history_bytes_written
+            .saturating_add(history_bytes);
         // The candidate checkpoint, blob image, and manifest history have all
         // been file-synced. One final directory barrier makes their renamed or
         // created entries durable before the manifest can select the new
@@ -2457,6 +2534,10 @@ impl DB {
         sync_publication_directory(&self.path)?;
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
+        self.publication.manifest_bytes_written = self
+            .publication
+            .manifest_bytes_written
+            .saturating_add(MANIFEST_SLOT_SIZE as u64);
 
         let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
         let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
@@ -2612,9 +2693,16 @@ impl DB {
         let mut reclaimed = self.blobs.gc();
         if reclaimed > 0 {
             let blob_path = self.path.join(BLOB_FILE);
-            if let Err(error) = self.write_blob_image(&blob_path, &self.blobs.to_bytes()) {
-                self.write_fenced = true;
-                return Err(error);
+            let blob_image = self.blobs.to_bytes();
+            match self.write_blob_image(&blob_path, &blob_image) {
+                Ok(bytes) => {
+                    self.publication.blob_bytes_written =
+                        self.publication.blob_bytes_written.saturating_add(bytes);
+                }
+                Err(error) => {
+                    self.write_fenced = true;
+                    return Err(error);
+                }
             }
         }
         if !self.blobs.files_needing_gc().is_empty() {
@@ -2693,7 +2781,12 @@ impl DB {
             let reclaimed = self.blobs.gc();
             if reclaimed > 0 {
                 let blob_path = self.path.join(BLOB_FILE);
-                self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
+                let blob_image = self.blobs.to_bytes();
+                let blob_bytes = self.write_blob_image(&blob_path, &blob_image)?;
+                self.publication.blob_bytes_written = self
+                    .publication
+                    .blob_bytes_written
+                    .saturating_add(blob_bytes);
             }
             reclaimed
         } else {
@@ -2744,6 +2837,7 @@ impl DB {
             wal_bytes: artifact_size(WAL_FILE)?,
             wal_reserved_bytes: self.wal_reserved_extent,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
+            publication: self.publication,
         })
     }
 
@@ -3653,6 +3747,19 @@ impl DB {
         history
             .reconcile_current(current)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        let mut retained_checkpoints = BTreeSet::new();
+        for manifest in history
+            .manifests()
+            .iter()
+            .filter(|manifest| retained.contains(&manifest.generation_id))
+        {
+            if manifest.pmt_checkpoint_id.get() != 0 {
+                retained_checkpoints.extend(Self::load_meta_ancestors(
+                    &self.path,
+                    manifest.pmt_checkpoint_id.get(),
+                )?);
+            }
+        }
         let removed_manifests = history.prune_to_generations(&retained) as u64;
         if history != self.manifest_history {
             self.persist_manifest_history(&history)?;
@@ -3671,7 +3778,7 @@ impl DB {
             else {
                 continue;
             };
-            if retained.contains(&GenerationId::new(generation)) {
+            if retained_checkpoints.contains(&generation) {
                 continue;
             }
             let metadata = entry.metadata()?;
@@ -3708,12 +3815,18 @@ impl DB {
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", generation_id.get()));
-        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
-        Self::save_meta(
-            &self.path.join(META_FILE),
-            self.engine.pmt(),
-            self.engine.allocator(),
-        )?;
+        let checkpoint_bytes = self.save_generation_meta(&checkpoint_path, current)?;
+        let meta_path = self.path.join(META_FILE);
+        let legacy_meta_bytes = if meta_path.is_file() {
+            0
+        } else {
+            Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?
+        };
+        self.publication.metadata_bytes_written = self
+            .publication
+            .metadata_bytes_written
+            .saturating_add(checkpoint_bytes)
+            .saturating_add(legacy_meta_bytes);
 
         let manifest = Manifest {
             generation_id,
@@ -3725,13 +3838,25 @@ impl DB {
         manifest_history
             .push(manifest)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history(manifest)?;
+        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history(manifest)?
         } else {
+            let bytes = manifest_history
+                .to_bytes()
+                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
             self.persist_manifest_history(&manifest_history)?;
-        }
+            bytes.len() as u64
+        };
+        self.publication.history_bytes_written = self
+            .publication
+            .history_bytes_written
+            .saturating_add(history_bytes);
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
+        self.publication.manifest_bytes_written = self
+            .publication
+            .manifest_bytes_written
+            .saturating_add(MANIFEST_SLOT_SIZE as u64);
         self.engine.complete_generation();
         self.generation_id = generation_id;
         self.next_generation_id = GenerationId::new(
@@ -3755,12 +3880,18 @@ impl DB {
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", generation_id.get()));
-        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
-        Self::save_meta(
-            &self.path.join(META_FILE),
-            self.engine.pmt(),
-            self.engine.allocator(),
-        )?;
+        let checkpoint_bytes = self.save_generation_meta(&checkpoint_path, current)?;
+        let meta_path = self.path.join(META_FILE);
+        let legacy_meta_bytes = if meta_path.is_file() {
+            0
+        } else {
+            Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?
+        };
+        self.publication.metadata_bytes_written = self
+            .publication
+            .metadata_bytes_written
+            .saturating_add(checkpoint_bytes)
+            .saturating_add(legacy_meta_bytes);
 
         self.blobs.set_generation(generation_id.get());
         let blob_path = self.path.join(BLOB_FILE);
@@ -3773,7 +3904,12 @@ impl DB {
             fs::rename(&blob_path, &backup_path)?;
             sync_directory(&self.path)?;
         }
-        self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
+        let blob_image = self.blobs.to_bytes();
+        let blob_bytes = self.write_blob_image(&blob_path, &blob_image)?;
+        self.publication.blob_bytes_written = self
+            .publication
+            .blob_bytes_written
+            .saturating_add(blob_bytes);
 
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE.with(|failure| failure.replace(false)) {
@@ -3790,13 +3926,25 @@ impl DB {
         manifest_history
             .push(manifest)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history(manifest)?;
+        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
+            self.append_manifest_history(manifest)?
         } else {
+            let bytes = manifest_history
+                .to_bytes()
+                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
             self.persist_manifest_history(&manifest_history)?;
-        }
+            bytes.len() as u64
+        };
+        self.publication.history_bytes_written = self
+            .publication
+            .history_bytes_written
+            .saturating_add(history_bytes);
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
+        self.publication.manifest_bytes_written = self
+            .publication
+            .manifest_bytes_written
+            .saturating_add(MANIFEST_SLOT_SIZE as u64);
         self.engine.complete_generation();
         self.generation_id = generation_id;
         self.next_generation_id = GenerationId::new(
@@ -4112,13 +4260,217 @@ impl DB {
         DatabaseId::new(bytes)
     }
 
+    fn bootstrap_manifest(&self) -> Manifest {
+        Manifest {
+            database_id: self.database_id,
+            history_id: self.history_id,
+            generation_id: GenerationId::new(0),
+            commit_id: CommitId::new(0),
+            page_size: PAGE_SIZE as u32,
+            root_page_id: self.engine.btree().root_id() as u64,
+            pmt_checkpoint_id: PmtCheckpointId::new(0),
+            wal_segment: 0,
+            wal_offset: 0,
+            mutation_count: 0,
+            digest: 0,
+            format_version: FORMAT_VERSION,
+        }
+    }
+
     /// Load PMT and allocator from meta file.
     fn load_meta(path: &Path) -> Result<(PMT, PageAllocator)> {
-        let data = fs::read(path)?;
-        if data.len() >= META_MAGIC.len() && data[..META_MAGIC.len()] == META_MAGIC {
-            return Self::load_versioned_meta(&data);
+        Self::load_meta_with_depth(path).map(|(pmt, allocator, _)| (pmt, allocator))
+    }
+
+    /// Load a full checkpoint or a bounded metadata-delta chain.
+    fn load_meta_with_depth(path: &Path) -> Result<(PMT, PageAllocator, usize)> {
+        let mut current_path = path.to_path_buf();
+        let mut deltas = Vec::new();
+        let mut visited = HashSet::new();
+        let (mut pmt, mut allocator) = loop {
+            let data = fs::read(&current_path)?;
+            if data.len() >= META_DELTA_MAGIC.len()
+                && data[..META_DELTA_MAGIC.len()] == META_DELTA_MAGIC
+            {
+                let delta = Self::load_meta_delta(&data)?;
+                if delta.parent_checkpoint_id != 0 && !visited.insert(delta.parent_checkpoint_id) {
+                    return Err(Error::Corruption(
+                        "metadata delta chain contains a cycle".into(),
+                    ));
+                }
+                deltas.push(delta);
+                if deltas.len() > MAX_META_DELTA_CHAIN {
+                    return Err(Error::Corruption(format!(
+                        "metadata delta chain exceeds maximum length {MAX_META_DELTA_CHAIN}"
+                    )));
+                }
+                let parent = deltas
+                    .last()
+                    .map(|delta| delta.parent_checkpoint_id)
+                    .ok_or_else(|| Error::Corruption("metadata delta disappeared".into()))?;
+                if parent == 0 {
+                    break (PMT::new(), PageAllocator::new());
+                }
+                current_path = current_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(format!("seerdb.meta.{parent}"));
+                continue;
+            }
+
+            break if data.len() >= META_MAGIC.len() && data[..META_MAGIC.len()] == META_MAGIC {
+                Self::load_versioned_meta(&data)?
+            } else {
+                Self::load_legacy_meta(&data)?
+            };
+        };
+
+        for delta in deltas.iter().rev() {
+            for page_id in &delta.removals {
+                if pmt.remove(*page_id).is_none() {
+                    return Err(Error::Corruption(format!(
+                        "metadata delta removes unknown page {page_id}"
+                    )));
+                }
+            }
+            for (page_id, mapping) in &delta.updates {
+                pmt.insert_persisted(*page_id, *mapping);
+            }
+            allocator = delta.allocator.clone();
         }
-        Self::load_legacy_meta(&data)
+
+        Ok((pmt, allocator, deltas.len()))
+    }
+
+    fn load_meta_delta(data: &[u8]) -> Result<MetaDelta> {
+        if data.len() < META_DELTA_HEADER_SIZE + META_DELTA_CHECKSUM_SIZE {
+            return Err(Error::Corruption("metadata delta is truncated".into()));
+        }
+        let version = u32::from_le_bytes(
+            data[8..12]
+                .try_into()
+                .map_err(|_| Error::Corruption("metadata delta version is truncated".into()))?,
+        );
+        if version != META_DELTA_VERSION {
+            return Err(Error::Corruption(format!(
+                "unsupported metadata delta version {version}"
+            )));
+        }
+
+        let checksum_offset = data
+            .len()
+            .checked_sub(META_DELTA_CHECKSUM_SIZE)
+            .ok_or_else(|| Error::Corruption("metadata delta checksum is truncated".into()))?;
+        let expected = u32::from_le_bytes(
+            data[checksum_offset..]
+                .try_into()
+                .map_err(|_| Error::Corruption("metadata delta checksum is truncated".into()))?,
+        );
+        if crc32c::crc32c(&data[..checksum_offset]) != expected {
+            return Err(Error::Corruption("metadata delta checksum mismatch".into()));
+        }
+
+        let parent_checkpoint_id = u64::from_le_bytes(
+            data[12..20]
+                .try_into()
+                .map_err(|_| Error::Corruption("metadata delta parent is truncated".into()))?,
+        );
+        let update_count =
+            u32::from_le_bytes(data[20..24].try_into().map_err(|_| {
+                Error::Corruption("metadata delta update count is truncated".into())
+            })?) as usize;
+        let removal_count =
+            u32::from_le_bytes(data[24..28].try_into().map_err(|_| {
+                Error::Corruption("metadata delta removal count is truncated".into())
+            })?) as usize;
+        let allocator_len = u32::from_le_bytes(data[28..32].try_into().map_err(|_| {
+            Error::Corruption("metadata delta allocator length is truncated".into())
+        })?) as usize;
+
+        let update_bytes = update_count
+            .checked_mul(8 + PageMapping::SERIALIZED_SIZE)
+            .ok_or_else(|| Error::Corruption("metadata delta updates overflow".into()))?;
+        let removal_bytes = removal_count
+            .checked_mul(8)
+            .ok_or_else(|| Error::Corruption("metadata delta removals overflow".into()))?;
+        let allocator_start = META_DELTA_HEADER_SIZE
+            .checked_add(update_bytes)
+            .and_then(|offset| offset.checked_add(removal_bytes))
+            .ok_or_else(|| Error::Corruption("metadata delta layout overflows".into()))?;
+        let checksum_expected_end = allocator_start
+            .checked_add(allocator_len)
+            .and_then(|offset| offset.checked_add(META_DELTA_CHECKSUM_SIZE))
+            .ok_or_else(|| Error::Corruption("metadata delta layout overflows".into()))?;
+        if checksum_expected_end != data.len() {
+            return Err(Error::Corruption(
+                "metadata delta has trailing or truncated bytes".into(),
+            ));
+        }
+
+        let mut updates = Vec::with_capacity(update_count);
+        let mut offset = META_DELTA_HEADER_SIZE;
+        let mut previous_page = None;
+        for _ in 0..update_count {
+            let page_id =
+                u64::from_le_bytes(data[offset..offset + 8].try_into().map_err(|_| {
+                    Error::Corruption("metadata delta page ID is truncated".into())
+                })?);
+            if previous_page.is_some_and(|previous| page_id <= previous) {
+                return Err(Error::Corruption(
+                    "metadata delta updates are not strictly sorted".into(),
+                ));
+            }
+            previous_page = Some(page_id);
+            offset += 8;
+            let mapping_end = offset + PageMapping::SERIALIZED_SIZE;
+            let mapping =
+                PageMapping::from_bytes(data[offset..mapping_end].try_into().map_err(|_| {
+                    Error::Corruption("metadata delta mapping is truncated".into())
+                })?);
+            if mapping.version == u64::MAX {
+                return Err(Error::Corruption(
+                    "metadata delta mapping version is exhausted".into(),
+                ));
+            }
+            updates.push((page_id, mapping));
+            offset = mapping_end;
+        }
+
+        let mut removals = Vec::with_capacity(removal_count);
+        let mut previous_page = None;
+        for _ in 0..removal_count {
+            let page_id =
+                u64::from_le_bytes(data[offset..offset + 8].try_into().map_err(|_| {
+                    Error::Corruption("metadata delta removal is truncated".into())
+                })?);
+            if previous_page.is_some_and(|previous| page_id <= previous) {
+                return Err(Error::Corruption(
+                    "metadata delta removals are not strictly sorted".into(),
+                ));
+            }
+            previous_page = Some(page_id);
+            removals.push(page_id);
+            offset += 8;
+        }
+
+        if updates
+            .iter()
+            .any(|(page_id, _)| removals.binary_search(page_id).is_ok())
+        {
+            return Err(Error::Corruption(
+                "metadata delta updates and removals overlap".into(),
+            ));
+        }
+
+        let allocator =
+            PageAllocator::from_bytes(&data[allocator_start..allocator_start + allocator_len])
+                .ok_or_else(|| Error::Corruption("metadata delta allocator is invalid".into()))?;
+        Ok(MetaDelta {
+            parent_checkpoint_id,
+            updates,
+            removals,
+            allocator,
+        })
     }
 
     fn cleanup_orphaned_retained_blobs(
@@ -4345,7 +4697,7 @@ impl DB {
     }
 
     /// Save PMT and allocator to meta file.
-    fn save_meta(path: &Path, pmt: &PMT, allocator: &PageAllocator) -> Result<()> {
+    fn save_meta(path: &Path, pmt: &PMT, allocator: &PageAllocator) -> Result<u64> {
         Self::save_meta_with_directory_sync(path, pmt, allocator, true)
     }
 
@@ -4353,7 +4705,7 @@ impl DB {
         path: &Path,
         pmt: &PMT,
         allocator: &PageAllocator,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         Self::save_meta_with_directory_sync(path, pmt, allocator, false)
     }
 
@@ -4362,7 +4714,7 @@ impl DB {
         pmt: &PMT,
         allocator: &PageAllocator,
         sync_parent: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let pmt_bytes = pmt.to_bytes();
         let alloc_bytes = allocator.to_bytes();
 
@@ -4384,9 +4736,168 @@ impl DB {
         buf.extend_from_slice(&checksum.to_le_bytes());
 
         if sync_parent {
-            atomic_write(path, &buf)
+            atomic_write(path, &buf)?;
         } else {
-            atomic_write_without_directory_sync(path, &buf)
+            atomic_write_without_directory_sync(path, &buf)?;
+        }
+        Ok(buf.len() as u64)
+    }
+
+    fn save_meta_delta_without_directory_sync(
+        path: &Path,
+        parent_checkpoint_id: u64,
+        parent_pmt: &PMT,
+        pmt: &PMT,
+        allocator: &PageAllocator,
+    ) -> Result<u64> {
+        let mut updates = pmt
+            .iter()
+            .filter_map(|(page_id, mapping)| {
+                (parent_pmt.get(page_id) != Some(mapping)).then_some((page_id, *mapping))
+            })
+            .collect::<Vec<_>>();
+        updates.sort_unstable_by_key(|(page_id, _)| *page_id);
+        let mut removals = parent_pmt
+            .iter()
+            .filter_map(|(page_id, _)| (!pmt.contains(page_id)).then_some(page_id))
+            .collect::<Vec<_>>();
+        removals.sort_unstable();
+
+        let update_count = u32::try_from(updates.len())
+            .map_err(|_| Error::InvalidArgument("metadata delta has too many updates".into()))?;
+        let removal_count = u32::try_from(removals.len())
+            .map_err(|_| Error::InvalidArgument("metadata delta has too many removals".into()))?;
+        let allocator_bytes = allocator.to_bytes();
+        let allocator_len = u32::try_from(allocator_bytes.len())
+            .map_err(|_| Error::InvalidArgument("metadata delta allocator is too large".into()))?;
+
+        let total_len = META_DELTA_HEADER_SIZE
+            .checked_add(
+                updates
+                    .len()
+                    .checked_mul(8 + PageMapping::SERIALIZED_SIZE)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .and_then(|size| size.checked_add(removals.len().checked_mul(8)?))
+            .and_then(|size| size.checked_add(allocator_bytes.len()))
+            .and_then(|size| size.checked_add(META_DELTA_CHECKSUM_SIZE))
+            .ok_or(Error::DiskFull)?;
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(&META_DELTA_MAGIC);
+        buf.extend_from_slice(&META_DELTA_VERSION.to_le_bytes());
+        buf.extend_from_slice(&parent_checkpoint_id.to_le_bytes());
+        buf.extend_from_slice(&update_count.to_le_bytes());
+        buf.extend_from_slice(&removal_count.to_le_bytes());
+        buf.extend_from_slice(&allocator_len.to_le_bytes());
+        for (page_id, mapping) in updates {
+            buf.extend_from_slice(&page_id.to_le_bytes());
+            buf.extend_from_slice(&mapping.to_bytes());
+        }
+        for page_id in removals {
+            buf.extend_from_slice(&page_id.to_le_bytes());
+        }
+        buf.extend_from_slice(&allocator_bytes);
+        let checksum = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        atomic_write_without_directory_sync(path, &buf)?;
+        Ok(buf.len() as u64)
+    }
+
+    fn load_meta_ancestors(path: &Path, checkpoint_id: u64) -> Result<BTreeSet<u64>> {
+        let mut ancestors = BTreeSet::new();
+        let mut current_id = checkpoint_id;
+        for _ in 0..=MAX_META_DELTA_CHAIN {
+            if !ancestors.insert(current_id) {
+                return Err(Error::Corruption(
+                    "metadata delta chain contains a cycle".into(),
+                ));
+            }
+            let current_path = path.join(format!("seerdb.meta.{current_id}"));
+            let data = fs::read(&current_path)?;
+            if data.len() < META_DELTA_MAGIC.len()
+                || data[..META_DELTA_MAGIC.len()] != META_DELTA_MAGIC
+            {
+                return Ok(ancestors);
+            }
+            let delta = Self::load_meta_delta(&data)?;
+            if delta.parent_checkpoint_id == 0 {
+                return Ok(ancestors);
+            }
+            current_id = delta.parent_checkpoint_id;
+        }
+        Err(Error::Corruption(format!(
+            "metadata delta chain exceeds maximum length {MAX_META_DELTA_CHAIN}"
+        )))
+    }
+
+    fn generation_meta_bytes(
+        &self,
+        parent: Manifest,
+        dirty_page_count: usize,
+    ) -> Result<(u64, bool)> {
+        let pmt_bytes = (self.engine.pmt().to_bytes().len() as u64)
+            .checked_add(
+                (dirty_page_count as u64)
+                    .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .ok_or(Error::DiskFull)?;
+        let allocator_bytes = (self.engine.allocator().to_bytes().len() as u64)
+            .checked_add(
+                (dirty_page_count as u64)
+                    .checked_mul(8)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .ok_or(Error::DiskFull)?;
+        let full_bytes = (META_MAGIC.len() as u64)
+            .checked_add(4 + 4 + 4 + 4)
+            .and_then(|size| size.checked_add(pmt_bytes))
+            .and_then(|size| size.checked_add(allocator_bytes))
+            .ok_or(Error::DiskFull)?;
+        if parent.pmt_checkpoint_id.get() == 0 {
+            return Ok((full_bytes, true));
+        }
+
+        let checkpoint = self
+            .path
+            .join(format!("seerdb.meta.{}", parent.pmt_checkpoint_id.get()));
+        let (_, _, depth) = Self::load_meta_with_depth(&checkpoint)?;
+        if depth >= MAX_META_DELTA_CHAIN {
+            return Ok((full_bytes, true));
+        }
+        let delta_bytes = ((META_DELTA_HEADER_SIZE + META_DELTA_CHECKSUM_SIZE) as u64)
+            .checked_add(
+                (dirty_page_count as u64)
+                    .checked_mul((8 + PageMapping::SERIALIZED_SIZE + 8) as u64)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .and_then(|size| size.checked_add(self.engine.allocator().to_bytes().len() as u64))
+            .ok_or(Error::DiskFull)?;
+        Ok((delta_bytes, false))
+    }
+
+    fn save_generation_meta(&self, path: &Path, parent: Manifest) -> Result<u64> {
+        if parent.pmt_checkpoint_id.get() == 0 {
+            return Self::save_meta_without_directory_sync(
+                path,
+                self.engine.pmt(),
+                self.engine.allocator(),
+            );
+        }
+        let parent_path = self
+            .path
+            .join(format!("seerdb.meta.{}", parent.pmt_checkpoint_id.get()));
+        let (parent_pmt, _, depth) = Self::load_meta_with_depth(&parent_path)?;
+        if depth >= MAX_META_DELTA_CHAIN {
+            Self::save_meta_without_directory_sync(path, self.engine.pmt(), self.engine.allocator())
+        } else {
+            Self::save_meta_delta_without_directory_sync(
+                path,
+                parent.pmt_checkpoint_id.get(),
+                &parent_pmt,
+                self.engine.pmt(),
+                self.engine.allocator(),
+            )
         }
     }
 
@@ -5190,6 +5701,13 @@ mod tests {
             assert_eq!(metrics.storage.syncs, 1);
             assert_eq!(metrics.data_bytes, PAGE_SIZE as u64);
             assert_eq!(metrics.wal_bytes, 0);
+            assert!(metrics.publication.metadata_bytes_written > 0);
+            assert!(metrics.publication.blob_bytes_written > 0);
+            assert!(metrics.publication.history_bytes_written > 0);
+            assert_eq!(
+                metrics.publication.manifest_bytes_written,
+                MANIFEST_SLOT_SIZE as u64
+            );
         }
 
         let reopened = DB::open(&path, Options::default()).unwrap();
@@ -5202,6 +5720,113 @@ mod tests {
         assert_eq!(after.storage.physical_page_reads, 1);
         assert_eq!(after.storage.page_bytes_read, PAGE_SIZE as u64);
         assert_eq!(after.buffer.reads, 1);
+    }
+
+    #[test]
+    fn test_db_metadata_delta_reopens_and_preserves_parent_checkpoint() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata-delta.db");
+
+        let snapshot_id;
+        {
+            let mut db = DB::open(&path, Options::default()).unwrap();
+            for index in 0..200 {
+                db.put(
+                    format!("key-{index:04}").as_bytes(),
+                    format!("value-{index:04}").as_bytes(),
+                )
+                .unwrap();
+            }
+            db.flush().unwrap();
+            let first = db.durability_status();
+            snapshot_id = db.retain_commit(first.commit_id).unwrap();
+            db.put(b"key-0000", b"updated-value").unwrap();
+            db.flush().unwrap();
+            assert_eq!(
+                db.get(b"key-0000").unwrap(),
+                Some(b"updated-value".to_vec())
+            );
+            assert_eq!(
+                db.get_at(snapshot_id, b"key-0000").unwrap(),
+                Some(b"value-0000".to_vec())
+            );
+        }
+
+        let first_checkpoint = path.join("seerdb.meta.1");
+        let second_checkpoint = path.join("seerdb.meta.2");
+        let first_bytes = fs::read(&first_checkpoint).unwrap();
+        let second_bytes = fs::read(&second_checkpoint).unwrap();
+        assert!(first_bytes.starts_with(&META_MAGIC));
+        assert!(second_bytes.starts_with(&META_DELTA_MAGIC));
+        assert!(second_bytes.len() < first_bytes.len());
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(
+            reopened.get(b"key-0000").unwrap(),
+            Some(b"updated-value".to_vec())
+        );
+        assert_eq!(
+            reopened.get_at(snapshot_id, b"key-0000").unwrap(),
+            Some(b"value-0000".to_vec())
+        );
+        reopened.release_snapshot(snapshot_id).unwrap();
+        reopened.prune_history().unwrap();
+        assert!(first_checkpoint.is_file());
+        assert!(second_checkpoint.is_file());
+    }
+
+    #[test]
+    fn test_db_metadata_delta_corruption_fails_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("corrupt-metadata-delta.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let checkpoint = path.join("seerdb.meta.2");
+        let mut bytes = fs::read(&checkpoint).unwrap();
+        assert!(bytes.starts_with(&META_DELTA_MAGIC));
+        bytes.push(0xA5);
+        fs::write(checkpoint, bytes).unwrap();
+        assert!(matches!(
+            DB::open(&path, Options::default()),
+            Err(Error::Corruption(message)) if message.contains("metadata delta")
+        ));
+        assert!(matches!(
+            DB::check(&path, Options::default()),
+            Err(Error::Check {
+                kind: CheckFailureKind::Checkpoint,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_db_metadata_delta_chain_consolidates_at_hard_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata-delta-chain.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-0").unwrap();
+        db.flush().unwrap();
+
+        for revision in 1..=MAX_META_DELTA_CHAIN + 1 {
+            db.put(b"key", format!("value-{revision}").as_bytes())
+                .unwrap();
+            db.flush().unwrap();
+        }
+        let consolidation_generation = MAX_META_DELTA_CHAIN as u64 + 2;
+        let consolidated = path.join(format!("seerdb.meta.{consolidation_generation}"));
+        assert!(fs::read(&consolidated).unwrap().starts_with(&META_MAGIC));
+        let report = db.prune_history().unwrap();
+        assert_eq!(report.removed_checkpoints, MAX_META_DELTA_CHAIN as u64 + 1);
+        assert!(consolidated.is_file());
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value-65".to_vec()));
+        db.close().unwrap();
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-65".to_vec()));
     }
 
     #[test]

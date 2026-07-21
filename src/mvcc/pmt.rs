@@ -100,6 +100,17 @@ impl PMT {
         self.mappings.insert(page_id, mapping)
     }
 
+    /// Install a mapping from a durable checkpoint or delta without changing
+    /// its persisted version identity.
+    pub(crate) fn insert_persisted(
+        &mut self,
+        page_id: u64,
+        mapping: PageMapping,
+    ) -> Option<PageMapping> {
+        self.next_version = self.next_version.max(mapping.version.saturating_add(1));
+        self.mappings.insert(page_id, mapping)
+    }
+
     /// Remove a page mapping (page is being deleted/freed).
     ///
     /// Returns the old mapping if the page was previously mapped.

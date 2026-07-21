@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{BatchMutation, DB, Options, StorageMetrics};
+use seerdb::{BatchMutation, DB, Options, PublicationMetrics, StorageMetrics};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
@@ -26,6 +26,39 @@ struct CounterTotals {
     page_bytes_written: u64,
     physical_page_writes: u64,
     syncs: u64,
+}
+
+#[derive(Debug, Default)]
+struct PublicationTotals {
+    metadata_bytes_written: u64,
+    blob_bytes_written: u64,
+    history_bytes_written: u64,
+    manifest_bytes_written: u64,
+}
+
+impl PublicationTotals {
+    fn add_delta(&mut self, before: PublicationMetrics, after: PublicationMetrics) {
+        self.metadata_bytes_written = self.metadata_bytes_written.saturating_add(
+            after
+                .metadata_bytes_written
+                .saturating_sub(before.metadata_bytes_written),
+        );
+        self.blob_bytes_written = self.blob_bytes_written.saturating_add(
+            after
+                .blob_bytes_written
+                .saturating_sub(before.blob_bytes_written),
+        );
+        self.history_bytes_written = self.history_bytes_written.saturating_add(
+            after
+                .history_bytes_written
+                .saturating_sub(before.history_bytes_written),
+        );
+        self.manifest_bytes_written = self.manifest_bytes_written.saturating_add(
+            after
+                .manifest_bytes_written
+                .saturating_sub(before.manifest_bytes_written),
+        );
+    }
 }
 
 impl CounterTotals {
@@ -213,10 +246,13 @@ fn main() -> AnyResult<()> {
     let mut logical_write_bytes = 0u64;
     let mut maintenance_runs = 0u64;
     let mut reopen_runs = 0u64;
-    let initial_metrics = db.metrics()?.storage;
-    let mut handle_metrics = initial_metrics;
+    let initial_metrics = db.metrics()?;
+    let mut handle_metrics = initial_metrics.storage;
+    let mut handle_publication = initial_metrics.publication;
     let mut commit_counters = CounterTotals::default();
     let mut maintenance_counters = CounterTotals::default();
+    let mut commit_publication = PublicationTotals::default();
+    let mut maintenance_publication = PublicationTotals::default();
 
     for operation in 0..args.operations {
         let random = next_random(&mut state);
@@ -274,18 +310,24 @@ fn main() -> AnyResult<()> {
         }
 
         if (operation + 1) % (args.operations / 4).max(1) == 0 {
-            let before_maintenance = db.metrics()?.storage;
-            commit_counters.add_delta(handle_metrics, before_maintenance);
+            let before_maintenance = db.metrics()?;
+            commit_counters.add_delta(handle_metrics, before_maintenance.storage);
+            commit_publication.add_delta(handle_publication, before_maintenance.publication);
             let started = Instant::now();
             db.compact_with_limit(2)?;
             db.verify()?;
             maintenance_latency.push(started.elapsed().as_nanos());
             maintenance_runs = maintenance_runs.saturating_add(1);
-            let after_maintenance = db.metrics()?.storage;
-            maintenance_counters.add_delta(before_maintenance, after_maintenance);
+            let after_maintenance = db.metrics()?;
+            maintenance_counters.add_delta(before_maintenance.storage, after_maintenance.storage);
+            maintenance_publication.add_delta(
+                before_maintenance.publication,
+                after_maintenance.publication,
+            );
             db.close()?;
             db = DB::open(&path, Options::default())?;
             handle_metrics = StorageMetrics::default();
+            handle_publication = PublicationMetrics::default();
             db.verify()?;
             check_range(&db, &model, &[], &[u8::MAX; 64])?;
             reopen_runs = reopen_runs.saturating_add(1);
@@ -299,8 +341,9 @@ fn main() -> AnyResult<()> {
     retained.verify()?;
     retained.release()?;
 
-    let before_maintenance = db.metrics()?.storage;
-    commit_counters.add_delta(handle_metrics, before_maintenance);
+    let before_maintenance = db.metrics()?;
+    commit_counters.add_delta(handle_metrics, before_maintenance.storage);
+    commit_publication.add_delta(handle_publication, before_maintenance.publication);
     let started = Instant::now();
     let vacuum = db.vacuum()?;
     db.prune_history()?;
@@ -309,7 +352,11 @@ fn main() -> AnyResult<()> {
     db.verify()?;
     check_range(&db, &model, &[], &[u8::MAX; 64])?;
     let after_maintenance = db.metrics()?;
-    maintenance_counters.add_delta(before_maintenance, after_maintenance.storage);
+    maintenance_counters.add_delta(before_maintenance.storage, after_maintenance.storage);
+    maintenance_publication.add_delta(
+        before_maintenance.publication,
+        after_maintenance.publication,
+    );
     let total_page_bytes_written = commit_counters
         .page_bytes_written
         .saturating_add(maintenance_counters.page_bytes_written);
@@ -390,6 +437,16 @@ fn main() -> AnyResult<()> {
             "syncs": total_syncs,
             "syncs_by_commits": commit_counters.syncs,
             "syncs_by_maintenance": maintenance_counters.syncs,
+            "publication": {
+                "metadata_bytes_written_by_commits": commit_publication.metadata_bytes_written,
+                "metadata_bytes_written_by_maintenance": maintenance_publication.metadata_bytes_written,
+                "blob_bytes_written_by_commits": commit_publication.blob_bytes_written,
+                "blob_bytes_written_by_maintenance": maintenance_publication.blob_bytes_written,
+                "history_bytes_written_by_commits": commit_publication.history_bytes_written,
+                "history_bytes_written_by_maintenance": maintenance_publication.history_bytes_written,
+                "manifest_bytes_written_by_commits": commit_publication.manifest_bytes_written,
+                "manifest_bytes_written_by_maintenance": maintenance_publication.manifest_bytes_written,
+            },
         },
     });
     let serialized = serde_json::to_string_pretty(&report)?;
