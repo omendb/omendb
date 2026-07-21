@@ -62,11 +62,17 @@ mod linux {
         db.put(b"pending", b"value-2").unwrap();
         let filler = fill_until_nearly_full(&root).unwrap();
 
+        let before_flush = db.metrics().unwrap().storage;
         let flush_result = db.flush();
         assert!(
             matches!(&flush_result, Err(Error::CapacityPreflight)),
             "expected retryable capacity preflight, got {flush_result:?}; metrics={:?}",
             db.metrics()
+        );
+        let after_flush = db.metrics().unwrap().storage;
+        assert_eq!(
+            after_flush.physical_page_writes, before_flush.physical_page_writes,
+            "capacity preflight must not issue page writes"
         );
         assert!(!db.durability_status().write_fenced);
         drop(filler);
