@@ -911,6 +911,12 @@ fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
     );
     run_case(
         root.path(),
+        "grouped-publication-directory-sync.db",
+        DB::inject_publication_directory_sync_failure,
+        RecoveryOutcome::OldOrNew,
+    );
+    run_case(
+        root.path(),
         "grouped-after-manifest.db",
         DB::inject_after_manifest_failure,
         RecoveryOutcome::New,

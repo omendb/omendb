@@ -46,6 +46,7 @@ thread_local! {
     static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
@@ -2067,15 +2068,35 @@ impl DB {
     }
 
     fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<()> {
+        self.write_blob_image_with_directory_sync(path, data, true)
+    }
+
+    /// Write a blob image while deferring the containing-directory sync to the
+    /// publication barrier. The caller must sync the directory before making
+    /// a new manifest authoritative.
+    fn write_blob_image_without_directory_sync(&self, path: &Path, data: &[u8]) -> Result<()> {
+        self.write_blob_image_with_directory_sync(path, data, false)
+    }
+
+    fn write_blob_image_with_directory_sync(
+        &self,
+        path: &Path,
+        data: &[u8],
+        sync_parent: bool,
+    ) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let reservation = self.path.join(BLOB_RESERVATION_FILE);
             if reservation.is_file() {
-                return atomic_write_reserved(path, &reservation, data);
+                return atomic_write_reserved(path, &reservation, data, sync_parent);
             }
         }
 
-        atomic_write(path, data)
+        if sync_parent {
+            atomic_write(path, data)
+        } else {
+            atomic_write_without_directory_sync(path, data)
+        }
     }
 
     /// Reconcile a blob image kept aside while a mixed-file rewrite crosses
@@ -2160,10 +2181,29 @@ impl DB {
     }
 
     fn persist_manifest_history(&self, history: &ManifestHistory) -> Result<()> {
+        self.persist_manifest_history_with_directory_sync(history, true)
+    }
+
+    fn persist_manifest_history_without_directory_sync(
+        &self,
+        history: &ManifestHistory,
+    ) -> Result<()> {
+        self.persist_manifest_history_with_directory_sync(history, false)
+    }
+
+    fn persist_manifest_history_with_directory_sync(
+        &self,
+        history: &ManifestHistory,
+        sync_parent: bool,
+    ) -> Result<()> {
         let bytes = history
             .to_bytes()
             .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-        atomic_write(&self.path.join(MANIFEST_HISTORY_FILE), &bytes)
+        if sync_parent {
+            atomic_write(&self.path.join(MANIFEST_HISTORY_FILE), &bytes)
+        } else {
+            atomic_write_without_directory_sync(&self.path.join(MANIFEST_HISTORY_FILE), &bytes)
+        }
     }
 
     fn persist_reuse_ledger(&self) -> Result<()> {
@@ -2186,6 +2226,18 @@ impl DB {
     }
 
     fn append_manifest_history(&self, manifest: Manifest) -> Result<()> {
+        self.append_manifest_history_with_directory_sync(manifest, true)
+    }
+
+    fn append_manifest_history_without_directory_sync(&self, manifest: Manifest) -> Result<()> {
+        self.append_manifest_history_with_directory_sync(manifest, false)
+    }
+
+    fn append_manifest_history_with_directory_sync(
+        &self,
+        manifest: Manifest,
+        sync_parent: bool,
+    ) -> Result<()> {
         let path = self.path.join(MANIFEST_HISTORY_FILE);
         let existing_len = fs::metadata(&path)?.len();
         let header_len = u64::try_from(ManifestHistory::header_bytes().len())
@@ -2203,14 +2255,20 @@ impl DB {
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(complete_len)?;
             file.sync_all()?;
-            sync_directory(&self.path)?;
+            if sync_parent {
+                sync_directory(&self.path)?;
+            }
         }
 
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(&ManifestHistory::entry_bytes(manifest))?;
         file.flush()?;
         file.sync_all()?;
-        sync_directory(&self.path)
+        if sync_parent {
+            sync_directory(&self.path)
+        } else {
+            Ok(())
+        }
     }
 
     /// Publish a generation after its pages and checkpoints are durable.
@@ -2252,15 +2310,23 @@ impl DB {
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", commit.generation_id.get()));
-        Self::save_meta(&checkpoint_path, self.engine.pmt(), self.engine.allocator())?;
+        Self::save_meta_without_directory_sync(
+            &checkpoint_path,
+            self.engine.pmt(),
+            self.engine.allocator(),
+        )?;
         // Keep the legacy filename as a compatibility/debug snapshot. It is
         // never authoritative once a manifest selects a checkpoint.
         let meta_path = self.path.join(META_FILE);
-        Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?;
+        Self::save_meta_without_directory_sync(
+            &meta_path,
+            self.engine.pmt(),
+            self.engine.allocator(),
+        )?;
 
         let blob_path = self.path.join(BLOB_FILE);
         self.blobs.set_generation(commit.generation_id.get());
-        self.write_blob_image(&blob_path, &self.blobs.to_bytes())?;
+        self.write_blob_image_without_directory_sync(&blob_path, &self.blobs.to_bytes())?;
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
@@ -2293,10 +2359,16 @@ impl DB {
             .push(manifest)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history(manifest)?;
+            self.append_manifest_history_without_directory_sync(manifest)?;
         } else {
-            self.persist_manifest_history(&manifest_history)?;
+            self.persist_manifest_history_without_directory_sync(&manifest_history)?;
         }
+        // The candidate checkpoint, blob image, and manifest history have all
+        // been file-synced. One final directory barrier makes their renamed or
+        // created entries durable before the manifest can select the new
+        // generation. The safety mirror and reuse ledger were already synced
+        // before page reuse.
+        sync_publication_directory(&self.path)?;
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
 
@@ -3782,6 +3854,13 @@ impl DB {
         self.manifest.inject_mirror_sync_failure();
     }
 
+    /// Inject one failure at the coalesced artifact-directory barrier before
+    /// the next user manifest publication.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_publication_directory_sync_failure(&self) {
+        FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.set(true));
+    }
+
     /// Inject one failure after the next manifest becomes authoritative.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_after_manifest_failure(&self) {
@@ -4181,6 +4260,23 @@ impl DB {
 
     /// Save PMT and allocator to meta file.
     fn save_meta(path: &Path, pmt: &PMT, allocator: &PageAllocator) -> Result<()> {
+        Self::save_meta_with_directory_sync(path, pmt, allocator, true)
+    }
+
+    fn save_meta_without_directory_sync(
+        path: &Path,
+        pmt: &PMT,
+        allocator: &PageAllocator,
+    ) -> Result<()> {
+        Self::save_meta_with_directory_sync(path, pmt, allocator, false)
+    }
+
+    fn save_meta_with_directory_sync(
+        path: &Path,
+        pmt: &PMT,
+        allocator: &PageAllocator,
+        sync_parent: bool,
+    ) -> Result<()> {
         let pmt_bytes = pmt.to_bytes();
         let alloc_bytes = allocator.to_bytes();
 
@@ -4201,7 +4297,11 @@ impl DB {
         let checksum = crc32c::crc32c(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
 
-        atomic_write(path, &buf)
+        if sync_parent {
+            atomic_write(path, &buf)
+        } else {
+            atomic_write_without_directory_sync(path, &buf)
+        }
     }
 
     /// Recover a committed WAL prefix and reject corrupt complete records.
@@ -4488,6 +4588,19 @@ fn atomic_write_without_fault_injection(path: &Path, data: &[u8]) -> Result<()> 
 }
 
 fn atomic_write_with_fault_injection(path: &Path, data: &[u8], inject_faults: bool) -> Result<()> {
+    atomic_write_with_options(path, data, inject_faults, true)
+}
+
+fn atomic_write_without_directory_sync(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_with_options(path, data, true, false)
+}
+
+fn atomic_write_with_options(
+    path: &Path,
+    data: &[u8],
+    inject_faults: bool,
+    sync_parent: bool,
+) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let mut file = OpenOptions::new()
         .create(true)
@@ -4543,11 +4656,20 @@ fn atomic_write_with_fault_injection(path: &Path, data: &[u8], inject_faults: bo
         return Err(std::io::Error::other("injected atomic artifact write failure").into());
     }
 
-    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    if sync_parent {
+        sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn atomic_write_reserved(path: &Path, reservation: &Path, data: &[u8]) -> Result<()> {
+fn atomic_write_reserved(
+    path: &Path,
+    reservation: &Path,
+    data: &[u8],
+    sync_parent: bool,
+) -> Result<()> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4570,7 +4692,11 @@ fn atomic_write_reserved(path: &Path, reservation: &Path, data: &[u8]) -> Result
     }
 
     fs::rename(reservation, path)?;
-    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    if sync_parent {
+        sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -4585,6 +4711,14 @@ fn sync_directory(path: &Path) -> Result<()> {
         File::open(path)?.sync_all()?;
     }
     Ok(())
+}
+
+fn sync_publication_directory(path: &Path) -> Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+        return Err(std::io::Error::other("injected publication directory sync failure").into());
+    }
+    sync_directory(path)
 }
 
 /// Sync a newly created directory and each newly reachable parent directory.
