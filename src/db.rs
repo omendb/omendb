@@ -3085,6 +3085,30 @@ impl DB {
         self.register_retained_manifest(manifest, true)
     }
 
+    /// Pin the active root for a short-lived transaction without rewalking the
+    /// entire B-tree on every begin.
+    ///
+    /// The durable blob image and physical page offsets are still copied and
+    /// registered before this returns, so later reclamation cannot overwrite
+    /// the pinned root. Full graph and blob-target validation remains the
+    /// responsibility of [`DB::retain_commit`], [`DB::check`], and
+    /// [`DB::verify`]; reads through this pin validate pages and blob records
+    /// at their access boundaries and fail closed on corruption.
+    pub fn retain_current_commit(&mut self) -> Result<SnapshotId> {
+        self.check_writable()?;
+        self.flush()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        if manifest.commit_id != self.commit_id || manifest.generation_id != self.generation_id {
+            return Err(Error::Corruption(
+                "active manifest does not match the database frontier".into(),
+            ));
+        }
+        self.register_current_transaction_manifest(manifest)
+    }
+
     /// Return the active retention ID for a commit, if one exists.
     pub fn retained_snapshot_id(&self, commit_id: CommitId) -> Option<SnapshotId> {
         self.retention
@@ -3109,11 +3133,15 @@ impl DB {
         manifest: Manifest,
         deduplicate_commit: bool,
     ) -> Result<SnapshotId> {
-        self.register_manifest(manifest, deduplicate_commit, false)
+        self.register_manifest(manifest, deduplicate_commit, false, true)
+    }
+
+    fn register_current_transaction_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+        self.register_manifest(manifest, false, false, false)
     }
 
     fn register_ephemeral_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
-        self.register_manifest(manifest, false, true)
+        self.register_manifest(manifest, false, true, true)
     }
 
     fn register_manifest(
@@ -3121,6 +3149,7 @@ impl DB {
         manifest: Manifest,
         deduplicate_commit: bool,
         ephemeral: bool,
+        validate_tree: bool,
     ) -> Result<SnapshotId> {
         if deduplicate_commit
             && let Some(snapshot_id) = self.retained_snapshot_id(manifest.commit_id)
@@ -3172,22 +3201,24 @@ impl DB {
                 let _ = fs::remove_file(&retained_blob);
                 return Err(error);
             }
-            let pointers = match self.engine.verify_tree_at(manifest.root_page_id, &pmt) {
-                Ok(pointers) => pointers,
-                Err(error) => {
+            if validate_tree {
+                let pointers = match self.engine.verify_tree_at(manifest.root_page_id, &pmt) {
+                    Ok(pointers) => pointers,
+                    Err(error) => {
+                        let _ = fs::remove_file(&retained_blob);
+                        return Err(error);
+                    }
+                };
+                if pointers
+                    .iter()
+                    .any(|pointer| retained_blobs.read(pointer).is_none())
+                {
                     let _ = fs::remove_file(&retained_blob);
-                    return Err(error);
+                    return Err(Error::SnapshotUnavailable(format!(
+                        "commit {} has no complete historical blob image",
+                        manifest.commit_id.get()
+                    )));
                 }
-            };
-            if pointers
-                .iter()
-                .any(|pointer| retained_blobs.read(pointer).is_none())
-            {
-                let _ = fs::remove_file(&retained_blob);
-                return Err(Error::SnapshotUnavailable(format!(
-                    "commit {} has no complete historical blob image",
-                    manifest.commit_id.get()
-                )));
             }
         }
         let offsets = match Self::load_manifest_offsets(&self.path, manifest, snapshot_id) {
