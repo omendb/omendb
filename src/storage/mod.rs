@@ -503,21 +503,24 @@ impl StorageEngine {
             )));
         }
 
-        let device_size = self.device.size()?;
-        let end = mapping
-            .offset
-            .checked_add(PAGE_SIZE as u64)
-            .ok_or_else(|| Error::Corruption(format!("page {page_id} offset overflows")))?;
-        if end > device_size {
-            return Err(Error::Corruption(format!(
-                "page {page_id} at offset {} exceeds data file size {device_size}",
-                mapping.offset
-            )));
-        }
-
         let page_key = PageCacheKey::new(page_id, mapping.version);
         let mut buf = [0u8; PAGE_SIZE];
         if !self.buffer_lock()?.is_resident_key(page_key) {
+            // An immutable PMT-versioned page can be served from the cache
+            // without re-stat'ing the data file. Keep the extent check on the
+            // physical-miss path so an uncached truncated page still fails
+            // closed before Device::read_page.
+            let device_size = self.device.size()?;
+            let end = mapping
+                .offset
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| Error::Corruption(format!("page {page_id} offset overflows")))?;
+            if end > device_size {
+                return Err(Error::Corruption(format!(
+                    "page {page_id} at offset {} exceeds data file size {device_size}",
+                    mapping.offset
+                )));
+            }
             self.metrics
                 .physical_page_reads
                 .fetch_add(1, Ordering::Relaxed);
