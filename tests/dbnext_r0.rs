@@ -1814,6 +1814,108 @@ fn dbnext_r1_retained_root_reads_inline_and_blob_values() {
 }
 
 #[test]
+fn dbnext_r1_grouped_transaction_preserves_retained_root_through_maintenance() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("grouped-retained-maintenance.db");
+    let old_blob = vec![0x51u8; 2_048];
+    let new_blob = vec![0x52u8; 2_048];
+    let mut db = DB::open(&path, Options::default()).unwrap();
+
+    let initial = (0..32)
+        .map(|index| BatchMutation::Put {
+            key: format!("group-retained-{index:03}").into_bytes(),
+            value: format!("before-{index:03}").into_bytes(),
+        })
+        .chain(std::iter::once(BatchMutation::Put {
+            key: b"group-retained-blob".to_vec(),
+            value: old_blob.clone(),
+        }))
+        .collect::<Vec<_>>();
+    db.commit_batch(&initial).unwrap();
+
+    let retained = db.retain_current().unwrap();
+    let snapshot_id = retained.snapshot_id();
+    let mut transaction = db.begin_batch_transaction().unwrap();
+    for index in 0..32 {
+        let key = format!("group-retained-{index:03}");
+        let value = format!("after-{index:03}");
+        transaction.put(key.as_bytes(), value.as_bytes()).unwrap();
+    }
+    transaction.put(b"group-retained-blob", &new_blob).unwrap();
+    transaction
+        .put(b"group-retained-new", b"after-new")
+        .unwrap();
+    transaction.delete(b"group-retained-000").unwrap();
+    transaction.commit(&mut db).unwrap();
+
+    assert_eq!(
+        db.get(b"group-retained-001").unwrap(),
+        Some(b"after-001".to_vec())
+    );
+    assert_eq!(
+        db.get(b"group-retained-new").unwrap(),
+        Some(b"after-new".to_vec())
+    );
+    assert_eq!(db.get(b"group-retained-000").unwrap(), None);
+    assert_eq!(
+        retained.get(b"group-retained-001").unwrap(),
+        Some(b"before-001".to_vec())
+    );
+    assert_eq!(
+        retained.get(b"group-retained-blob").unwrap(),
+        Some(old_blob.clone())
+    );
+
+    drop(db);
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    for _ in 0..8 {
+        reopened.compact_with_limit(2).unwrap();
+    }
+    reopened.vacuum().unwrap();
+    reopened.verify().unwrap();
+    assert_eq!(
+        reopened.get(b"group-retained-001").unwrap(),
+        Some(b"after-001".to_vec())
+    );
+    assert_eq!(
+        reopened.get(b"group-retained-new").unwrap(),
+        Some(b"after-new".to_vec())
+    );
+    assert_eq!(reopened.get(b"group-retained-000").unwrap(), None);
+    assert_eq!(
+        reopened.get(b"group-retained-blob").unwrap(),
+        Some(new_blob)
+    );
+    assert_eq!(
+        reopened.get_at(snapshot_id, b"group-retained-001").unwrap(),
+        Some(b"before-001".to_vec())
+    );
+    assert_eq!(
+        retained.get(b"group-retained-blob").unwrap(),
+        Some(old_blob)
+    );
+    drop(reopened);
+
+    let mut after_reopen = DB::open(&path, Options::default()).unwrap();
+    after_reopen.verify().unwrap();
+    assert_eq!(
+        after_reopen
+            .get_at(snapshot_id, b"group-retained-001")
+            .unwrap(),
+        Some(b"before-001".to_vec())
+    );
+    retained.release().unwrap();
+    drop(after_reopen);
+
+    let final_db = DB::open(&path, Options::default()).unwrap();
+    assert!(matches!(
+        final_db.get_at(snapshot_id, b"group-retained-001"),
+        Err(Error::SnapshotUnavailable(_))
+    ));
+    assert!(!path.join("seerdb.retained").exists());
+}
+
+#[test]
 fn dbnext_r1_release_refreshes_reuse_without_reopen() {
     let root = tempdir().unwrap();
     let path = root.path().join("retained-release-refresh.db");
