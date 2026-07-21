@@ -388,6 +388,7 @@ fn dbnext_r0_ambiguous_new_page_reserves_commit_id() {
     reopened.flush().unwrap();
     assert_eq!(reopened.durability_status().commit_id.get(), 2);
     assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"two".to_vec()));
+    assert!(!path.join("seerdb.reuse-ledger").exists());
 }
 
 #[test]

@@ -620,14 +620,25 @@ impl ReuseLedger {
         before != self.attempts.len()
     }
 
-    /// Remove entries whose generation is present in authoritative history.
+    /// Remove entries reconciled by authoritative history.
+    ///
+    /// A non-empty attempt remains until its exact generation is published,
+    /// because its physical offsets may still overlap an older retained root.
+    /// An empty reservation has no physical liveness obligation and can be
+    /// removed once a later commit proves that its identity was skipped.
     pub fn prune_published(&mut self, history: &ManifestHistory) -> usize {
         let before = self.attempts.len();
         self.attempts.retain(|attempt| {
-            !history
+            let generation_published = history
                 .manifests()
                 .iter()
-                .any(|manifest| manifest.generation_id == attempt.generation_id)
+                .any(|manifest| manifest.generation_id == attempt.generation_id);
+            let empty_reservation_superseded = attempt.offsets.is_empty()
+                && history
+                    .manifests()
+                    .iter()
+                    .any(|manifest| manifest.commit_id > attempt.commit_id);
+            !(generation_published || empty_reservation_superseded)
         });
         before.saturating_sub(self.attempts.len())
     }
@@ -1239,6 +1250,22 @@ mod tests {
         history.push(manifest(2, 2)).unwrap();
         assert_eq!(ledger.prune_published(&history), 1);
         assert_eq!(ledger.attempts()[0].generation_id, GenerationId::new(4));
+    }
+
+    #[test]
+    fn reuse_ledger_prunes_superseded_empty_reservations() {
+        let mut ledger = ReuseLedger::new();
+        ledger
+            .push(ReuseAttempt {
+                commit_id: CommitId::new(1),
+                generation_id: GenerationId::new(1),
+                offsets: Vec::new(),
+            })
+            .unwrap();
+        let mut history = ManifestHistory::new();
+        history.push(manifest(2, 2)).unwrap();
+        assert_eq!(ledger.prune_published(&history), 1);
+        assert!(ledger.attempts().is_empty());
     }
 
     #[test]

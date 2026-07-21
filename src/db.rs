@@ -2300,7 +2300,9 @@ impl DB {
         self.manifest_history = manifest_history;
         self.manifest.publish(manifest)?;
 
-        if self.reuse_ledger.remove_generation(commit.generation_id) {
+        let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
+        let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
+        if removed_reuse_attempt || pruned_reuse_attempts > 0 {
             self.persist_reuse_ledger()?;
         }
 
