@@ -79,6 +79,108 @@ proptest! {
 #[cfg(feature = "fault-injection")]
 proptest! {
     #![proptest_config(ProptestConfig {
+        cases: 4,
+        max_shrink_iters: 1_000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn mixed_blob_gc_faults_preserve_retryable_catalog(
+        live_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
+        dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
+    ) {
+        for segmented in [false, true] {
+            for fault in 0u8..7 {
+                if !segmented && fault >= 3 {
+                    continue;
+                }
+
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("mixed-gc-fault-property.db");
+                let options = Options {
+                    blob_storage: if segmented {
+                        BlobStorageMode::Segmented
+                    } else {
+                        BlobStorageMode::WholeImage
+                    },
+                    ..Options::for_test()
+                };
+                let mut db = DB::create(&path, options).unwrap();
+                db.commit_batch(&[
+                    BatchMutation::Put {
+                        key: b"gc-live".to_vec(),
+                        value: live_value.clone(),
+                    },
+                    BatchMutation::Put {
+                        key: b"gc-dead-1".to_vec(),
+                        value: dead_value.clone(),
+                    },
+                    BatchMutation::Put {
+                        key: b"gc-dead-2".to_vec(),
+                        value: dead_value.clone(),
+                    },
+                ])
+                .unwrap();
+                db.commit_batch(&[
+                    BatchMutation::Delete {
+                        key: b"gc-dead-1".to_vec(),
+                    },
+                    BatchMutation::Delete {
+                        key: b"gc-dead-2".to_vec(),
+                    },
+                ])
+                .unwrap();
+
+                match fault {
+                    0 => db.inject_after_blob_rewrite_image_failure(),
+                    1 => db.inject_final_write_disk_full(),
+                    2 => db.inject_atomic_rename_failure(),
+                    3 => db.inject_blob_segment_after_write_failure(),
+                    4 => db.inject_blob_segment_catalog_rename_failure(),
+                    5 => db.inject_blob_segment_catalog_short_write_failure(),
+                    6 => db.inject_blob_segment_catalog_torn_write_failure(),
+                    _ => unreachable!(),
+                }
+                assert!(db.gc().is_err());
+                assert!(db.durability_status().write_fenced);
+                drop(db);
+
+                let mut reopened = DB::open(&path, Options::default()).unwrap();
+                assert_eq!(
+                    reopened.get(b"gc-live").unwrap(),
+                    Some(live_value.clone())
+                );
+                assert_eq!(reopened.get(b"gc-dead-1").unwrap(), None);
+                assert_eq!(reopened.get(b"gc-dead-2").unwrap(), None);
+                assert!(reopened.blob_stats().files_needing_gc > 0);
+                reopened.verify().unwrap();
+
+                assert!(reopened.gc().unwrap() > 0);
+                assert_eq!(
+                    reopened.get(b"gc-live").unwrap(),
+                    Some(live_value.clone())
+                );
+                assert_eq!(reopened.get(b"gc-dead-1").unwrap(), None);
+                assert_eq!(reopened.get(b"gc-dead-2").unwrap(), None);
+                reopened.verify().unwrap();
+                drop(reopened);
+
+                let mut reopened_again = DB::open(&path, Options::default()).unwrap();
+                assert_eq!(
+                    reopened_again.get(b"gc-live").unwrap(),
+                    Some(live_value.clone())
+                );
+                assert_eq!(reopened_again.get(b"gc-dead-1").unwrap(), None);
+                assert_eq!(reopened_again.get(b"gc-dead-2").unwrap(), None);
+                reopened_again.verify().unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+proptest! {
+    #![proptest_config(ProptestConfig {
         cases: 8,
         max_shrink_iters: 1_000,
         .. ProptestConfig::default()
