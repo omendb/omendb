@@ -2735,12 +2735,10 @@ impl DB {
     fn rewrite_mixed_blob_files(&mut self) -> Result<usize> {
         self.engine.ensure_materialized()?;
         let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
-        let entries = self
+        let scan = self
             .engine
             .btree()
             .range_scan(&[], &end)
-            .map_err(Error::from)?
-            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Error::from)?;
 
         let mut candidate_blobs = self.blobs.clone();
@@ -2750,7 +2748,8 @@ impl DB {
         candidate_blobs.mark_all_deleted();
         let mut candidate_tree = self.engine.btree().clone();
         let mut rewritten = 0usize;
-        for (key, result) in entries {
+        for entry in scan {
+            let (key, result) = entry.map_err(Error::from)?;
             let LookupResult::Blob(pointer) = result else {
                 continue;
             };
@@ -3691,16 +3690,42 @@ impl DB {
 
         let logical_pages_before = self.engine.pmt().len() as u64;
         let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
-        let entries = self.range(&[], &end)?;
+        // Stream the checked active-tree cursor into the candidate generation.
+        // Holding the complete live set here duplicated the candidate tree and
+        // blob image in memory, which made vacuum's peak memory scale with two
+        // copies of the database's logical contents.
+        self.engine.ensure_materialized()?;
+        let scan = self
+            .engine
+            .btree()
+            .range_scan(&[], &end)
+            .map_err(Error::from)?;
         let mut candidate_tree = BTree::new();
         let mut candidate_blobs = BlobManager::with_threshold(self.blobs.threshold());
-        for (key, value) in &entries {
+        let mut live_entries = 0u64;
+        for entry in scan {
+            let (key, result) = entry.map_err(Error::from)?;
+            let value = match result {
+                LookupResult::Found(value) => value,
+                LookupResult::Blob(pointer) => self
+                    .blobs
+                    .read(&pointer)
+                    .map(|value| value.to_vec())
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "active B-tree blob pointer {}:{}:{} is unavailable",
+                            pointer.file_id, pointer.offset, pointer.length
+                        ))
+                    })?,
+                LookupResult::Deleted | LookupResult::NotFound => continue,
+            };
             if candidate_blobs.should_separate(value.len()) {
-                let pointer = candidate_blobs.append(key, value.clone());
-                candidate_tree.upsert_blob(key, pointer)?;
+                let pointer = candidate_blobs.append(&key, value);
+                candidate_tree.upsert_blob(&key, pointer)?;
             } else {
-                candidate_tree.upsert(key, value)?;
+                candidate_tree.upsert(&key, &value)?;
             }
+            live_entries = live_entries.saturating_add(1);
         }
 
         let candidate_blob_bytes = candidate_blobs.to_bytes();
@@ -3715,7 +3740,7 @@ impl DB {
             self.publish_blob_rewrite_generation()?;
             Ok(VacuumReport {
                 durability: self.durability_status(),
-                live_entries: entries.len() as u64,
+                live_entries,
                 logical_pages_before,
                 logical_pages_after: self.engine.pmt().len() as u64,
             })
