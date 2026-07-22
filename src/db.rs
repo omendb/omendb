@@ -6220,6 +6220,26 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_final_write_disk_full_reopens_old_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compaction-final-disk-full.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+
+        db.inject_final_write_disk_full();
+        assert!(matches!(db.compact(), Err(Error::DiskFull)));
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+        reopened.verify().unwrap();
+    }
+
+    #[test]
     fn test_db_wal_admission_rejects_before_blob_or_tree_mutation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal-admission.db");
@@ -7326,6 +7346,24 @@ mod tests {
     }
 
     #[test]
+    fn test_db_vacuum_final_write_disk_full_reopens_old_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vacuum-final-disk-full.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+
+        db.inject_final_write_disk_full();
+        assert!(matches!(db.vacuum(), Err(Error::DiskFull)));
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+        reopened.verify().unwrap();
+    }
+
+    #[test]
     fn test_db_concurrent_transactions() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -7483,5 +7521,33 @@ mod tests {
         assert!(db.gc().unwrap() > 0);
         assert_eq!(db.get(b"live").unwrap(), Some(value));
         db.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_mixed_gc_final_write_disk_full_reopens_old_root() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed-gc-final-disk-full.db");
+        let value = vec![0xEF; 2_000];
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        for key in [b"live".as_slice(), b"dead-1", b"dead-2"] {
+            db.put(key, &value).unwrap();
+        }
+        db.flush().unwrap();
+        db.delete(b"dead-1").unwrap();
+        db.delete(b"dead-2").unwrap();
+        db.flush().unwrap();
+
+        db.inject_final_write_disk_full();
+        assert!(matches!(db.gc(), Err(Error::DiskFull)));
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"live").unwrap(), Some(value.clone()));
+        assert_eq!(reopened.get(b"dead-1").unwrap(), None);
+        assert_eq!(reopened.get(b"dead-2").unwrap(), None);
+        assert!(reopened.blob_stats().files_needing_gc > 0);
+        assert!(reopened.gc().unwrap() > 0);
+        reopened.verify().unwrap();
     }
 }
