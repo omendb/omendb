@@ -47,6 +47,7 @@ thread_local! {
     static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -4676,6 +4677,13 @@ impl DB {
         FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.set(true));
     }
 
+    /// Inject one failure after a segmented blob catalog temp file is synced
+    /// but before it replaces the previous catalog.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_catalog_rename_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME.with(|failure| failure.set(true));
+    }
+
     /// Begin a root-bound byte transaction.
     ///
     /// The transaction captures the current published commit and retains its
@@ -5798,6 +5806,15 @@ fn atomic_write_with_options(
     file.flush()?;
     file.sync_all()?;
     drop(file);
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    let blob_catalog_rename_failure = inject_faults
+        && path.file_name().is_some_and(|name| name == BLOB_FILE)
+        && FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME.with(|failure| failure.replace(false));
+    #[cfg(any(test, feature = "fault-injection"))]
+    if blob_catalog_rename_failure {
+        return Err(std::io::Error::other("injected blob catalog rename failure").into());
+    }
 
     #[cfg(any(test, feature = "fault-injection"))]
     let injected = inject_faults && FAIL_NEXT_ATOMIC_RENAME.with(|failure| failure.replace(false));
@@ -7904,6 +7921,40 @@ mod tests {
         assert!(db.durability_status().write_fenced);
         assert!(fs::metadata(&segment).unwrap().len() > segment_len_before);
         assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), catalog_before);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        reopened.verify().unwrap();
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_catalog_rename_failure_preserves_old_catalog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-catalog-rename-failure.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xF1; 2_000];
+        let pending = vec![0xF2; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+        let catalog = path.join(BLOB_FILE);
+        let catalog_before = fs::read(&catalog).unwrap();
+
+        db.put(b"pending", &pending).unwrap();
+        db.inject_blob_segment_catalog_rename_failure();
+        assert!(db.flush().is_err());
+        assert!(db.durability_status().write_fenced);
+        assert_eq!(fs::read(&catalog).unwrap(), catalog_before);
         drop(db);
 
         let mut reopened = DB::open(&path, Options::default()).unwrap();
