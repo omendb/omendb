@@ -15,6 +15,7 @@ const BLOB_FORMAT_MAGIC: [u8; 8] = *b"SEERBLB1";
 const BLOB_FORMAT_VERSION: u32 = 1;
 pub(crate) const SEGMENT_CATALOG_MAGIC: [u8; 8] = *b"SEERBLC1";
 const SEGMENT_CATALOG_VERSION: u32 = 1;
+const DEFAULT_SEGMENT_TARGET_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Manages blob files for KV separation.
 ///
@@ -39,6 +40,9 @@ pub struct BlobManager {
     /// may leave an ignored suffix in a segment, so the next catalog always
     /// appends from this frontier rather than trusting physical file length.
     persisted_lengths: HashMap<u32, u64>,
+    /// Target size for the active segmented blob file. A record larger than
+    /// this target is kept intact in its own segment.
+    segment_target_size: u64,
 }
 
 impl BlobManager {
@@ -56,6 +60,7 @@ impl BlobManager {
             generation_id: 0,
             segmented: false,
             persisted_lengths: HashMap::new(),
+            segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         }
     }
 
@@ -63,6 +68,17 @@ impl BlobManager {
     pub(crate) fn with_threshold_and_mode(threshold: usize, segmented: bool) -> Self {
         let mut manager = Self::with_threshold(threshold);
         manager.segmented = segmented;
+        manager
+    }
+
+    #[cfg(test)]
+    fn with_threshold_and_mode_and_segment_size(
+        threshold: usize,
+        segmented: bool,
+        segment_target_size: u64,
+    ) -> Self {
+        let mut manager = Self::with_threshold_and_mode(threshold, segmented);
+        manager.segment_target_size = segment_target_size;
         manager
     }
 
@@ -122,7 +138,7 @@ impl BlobManager {
     /// Append a value to the active blob file and return a pointer.
     pub fn append(&mut self, key: &[u8], value: Vec<u8>) -> BlobPointer {
         // Get or create the active blob file.
-        if self.files.is_empty() {
+        if self.files.is_empty() || self.should_rollover(value.len()) {
             self.create_new_file();
         }
 
@@ -217,6 +233,30 @@ impl BlobManager {
             .iter()
             .find(|file| file.file_id() == pointer.file_id)
             .is_some_and(|file| file.can_mark_deleted(pointer.offset))
+    }
+
+    fn should_rollover(&self, value_len: usize) -> bool {
+        if !self.segmented {
+            return false;
+        }
+
+        let Some(file) = self.files.last() else {
+            return false;
+        };
+        let Some(current_size) = file.serialized_size() else {
+            return false;
+        };
+        let Some(record_size) = BlobRecord::OVERHEAD_SIZE
+            .checked_add(value_len)
+            .and_then(|size| u64::try_from(size).ok())
+        else {
+            return true;
+        };
+
+        current_size > 0
+            && current_size
+                .checked_add(record_size)
+                .is_none_or(|size| size > self.segment_target_size)
     }
 
     /// Read a value from a blob file.
@@ -421,7 +461,7 @@ impl BlobManager {
         }
         if let Some(value_len) = appended_value_len {
             let record_size = BlobRecord::OVERHEAD_SIZE.checked_add(value_len)?;
-            if self.files.is_empty() {
+            if self.files.is_empty() || self.should_rollover(value_len) {
                 size = size.checked_add(4 + 8 + 4)?;
             }
             size = size.checked_add(u64::try_from(record_size).ok()?)?;
@@ -509,6 +549,7 @@ impl BlobManager {
             generation_id,
             segmented: true,
             persisted_lengths,
+            segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }
 
@@ -591,6 +632,7 @@ impl BlobManager {
             generation_id,
             segmented: false,
             persisted_lengths: HashMap::new(),
+            segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }
 
@@ -628,6 +670,7 @@ impl BlobManager {
             generation_id: 0,
             segmented: false,
             persisted_lengths: HashMap::new(),
+            segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }
 }
@@ -816,6 +859,24 @@ mod tests {
         assert!(bm.mark_deleted(&pointer));
         assert_eq!(projected_delete, bm.to_bytes().len() as u64);
         assert_eq!(bm.serialized_size(), Some(projected_delete));
+    }
+
+    #[test]
+    fn test_segmented_append_rolls_over_at_target_and_accounts_for_header() {
+        let mut manager = BlobManager::with_threshold_and_mode_and_segment_size(1024, true, 64);
+        let first = manager.append(b"first", vec![1; 40]);
+        manager.mark_segments_persisted();
+        let projected = manager
+            .projected_segment_write_size(None, Some(40))
+            .expect("segmented projection should fit");
+
+        let second = manager.append(b"second", vec![2; 40]);
+        assert_eq!(first.file_id, 1);
+        assert_eq!(first.offset, 0);
+        assert_eq!(second.file_id, 2);
+        assert_eq!(second.offset, 0);
+        assert_eq!(manager.segment_file_ids(), vec![1, 2]);
+        assert_eq!(projected, manager.segment_write_size().unwrap());
     }
 
     #[test]
