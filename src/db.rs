@@ -6087,6 +6087,7 @@ impl Drop for DB {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::io::{Seek, SeekFrom, Write};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7941,6 +7942,95 @@ mod tests {
         );
         assert!(!reopened.blob_stats().catalog_needs_consolidation);
         reopened.verify().unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 8,
+            max_shrink_iters: 1_000,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn segmented_rollover_preserves_catalog_and_records(
+            target_delta in 0u16..768,
+            values in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 1..65),
+                1..17
+            )
+        ) {
+            let target = 256 + u64::from(target_delta);
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("segmented-rollover-property.db");
+            let options = Options {
+                blob_storage: BlobStorageMode::Segmented,
+                blob_threshold: 0,
+                ..Options::for_test()
+            };
+            let mut db = DB::create(&path, options).unwrap();
+            db.blobs.set_segment_target_size_for_test(target);
+
+            let mut mutations = Vec::with_capacity(values.len() + 2);
+            for (index, value) in values.into_iter().enumerate() {
+                mutations.push(BatchMutation::Put {
+                    key: format!("rollover-{index:04}").into_bytes(),
+                    value,
+                });
+            }
+
+            // Two records that each fit in one segment but cannot fit
+            // together guarantee that the generated run exercises rollover.
+            let forced_value = vec![0xD7; target as usize / 2];
+            mutations.push(BatchMutation::Put {
+                key: b"rollover-forced-a".to_vec(),
+                value: forced_value.clone(),
+            });
+            mutations.push(BatchMutation::Put {
+                key: b"rollover-forced-b".to_vec(),
+                value: forced_value,
+            });
+
+            let expected = mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    BatchMutation::Put { key, value } => Some((key.clone(), value.clone())),
+                    BatchMutation::Delete { .. } => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            db.commit_batch(&mutations).unwrap();
+            let segment_ids = db.blobs.segment_file_ids();
+            assert!(segment_ids.len() >= 2);
+            for file_id in &segment_ids {
+                assert!(
+                    db.blobs.segment_bytes(*file_id).unwrap().len() <= target as usize,
+                    "segment {file_id} exceeded target {target}"
+                );
+            }
+
+            let deletes = expected
+                .keys()
+                .enumerate()
+                .filter(|(index, _)| index % 4 == 0)
+                .map(|(_, key)| BatchMutation::Delete { key: key.clone() })
+                .collect::<Vec<_>>();
+            db.commit_batch(&deletes).unwrap();
+            let mut expected = expected;
+            for mutation in &deletes {
+                if let BatchMutation::Delete { key } = mutation {
+                    expected.remove(key);
+                }
+            }
+            db.verify().unwrap();
+            assert_eq!(db.blob_stats().total_deleted, deletes.len());
+            drop(db);
+
+            let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+            for (key, value) in &expected {
+                assert_eq!(reopened.get(key).unwrap(), Some(value.clone()));
+            }
+            assert_eq!(reopened.blob_stats().total_deleted, deletes.len());
+            reopened.verify().unwrap();
+        }
     }
 
     #[test]
