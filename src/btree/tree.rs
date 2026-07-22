@@ -594,7 +594,58 @@ impl BTree {
 
     /// Find the leaf immediately to the right of `target`, validating the
     /// route and returning corruption instead of silently stopping a scan.
-    fn next_leaf_checked(&self, target: PageId) -> Result<Option<PageId>, BTreeError> {
+    fn next_leaf_from_parent_hint(
+        &self,
+        target: PageId,
+        parent_hint: u32,
+    ) -> Option<Option<PageId>> {
+        let mut current = target;
+        let mut visited = HashSet::new();
+
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+
+            let parent_id = if current == target {
+                parent_hint
+            } else {
+                self.node(current)?.parent_id()
+            };
+            if parent_id == 0 {
+                return (current == self.root).then_some(None);
+            }
+
+            let parent = self.node(parent_id as PageId)?;
+            if !parent.is_internal() {
+                return None;
+            }
+            let child_position = if parent.leftmost_child() == current as u64 {
+                0
+            } else {
+                (0..parent.count())
+                    .find(|&index| parent.child_id(index) == Some(current as u64))
+                    .map(|index| index + 1)?
+            };
+
+            if child_position < parent.count() {
+                let next_child = parent.child_id(child_position)?;
+                let next_child = u32::try_from(next_child).ok()? as PageId;
+                return self.leftmost_leaf_checked(next_child).ok();
+            }
+            current = parent_id as PageId;
+        }
+    }
+
+    fn next_leaf_checked(
+        &self,
+        target: PageId,
+        parent_hint: u32,
+    ) -> Result<Option<PageId>, BTreeError> {
+        if let Some(next_leaf) = self.next_leaf_from_parent_hint(target, parent_hint) {
+            return Ok(next_leaf);
+        }
+
         let mut path = Vec::new();
         let mut active = HashSet::new();
         if !self.find_path_to_leaf_checked(self.root, target, &mut path, &mut active)? {
@@ -1046,7 +1097,8 @@ impl RangeCursor {
                 continue;
             }
 
-            let next_leaf = match tree.next_leaf_checked(self.current_node) {
+            let parent_hint = node.parent_id();
+            let next_leaf = match tree.next_leaf_checked(self.current_node, parent_hint) {
                 Ok(next_leaf) => next_leaf,
                 Err(error) => {
                     self.done = true;
@@ -1424,6 +1476,27 @@ mod tests {
             let value = format!("value_{i:06}");
             tree.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
+
+        let results: Vec<_> = tree
+            .range_scan(b"key_000050", b"key_000450")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(results.len(), 400);
+        assert_eq!(results.first().unwrap().0, b"key_000050");
+        assert_eq!(results.last().unwrap().0, b"key_000449");
+    }
+
+    #[test]
+    fn test_btree_range_scan_falls_back_from_stale_parent_hint() {
+        let mut tree = BTree::new();
+        for i in 0..500 {
+            let key = format!("key_{i:06}");
+            tree.insert(key.as_bytes(), b"value").unwrap();
+        }
+
+        let leaf_id = tree.find_leaf(b"key_000050").unwrap();
+        tree.node_mut(leaf_id).unwrap().set_parent_id(u32::MAX);
 
         let results: Vec<_> = tree
             .range_scan(b"key_000050", b"key_000450")

@@ -1175,7 +1175,8 @@ impl StorageEngine {
                 }
             }
 
-            let Some(next) = self.next_leaf_page(pmt, root_page_id, current)? else {
+            let parent_hint = node.parent_id();
+            let Some(next) = self.next_leaf_page(pmt, root_page_id, current, parent_hint)? else {
                 return Ok(results);
             };
             current = next;
@@ -1275,7 +1276,66 @@ impl StorageEngine {
         }
     }
 
-    fn next_leaf_page(&self, pmt: &PMT, root_page_id: u32, target: u32) -> Result<Option<u32>> {
+    fn next_leaf_from_parent_hint(
+        &self,
+        pmt: &PMT,
+        root_page_id: u32,
+        target: u32,
+        parent_hint: u32,
+    ) -> Option<Option<u32>> {
+        let mut current = target;
+        let mut visited = HashSet::new();
+
+        loop {
+            if !visited.insert(current) {
+                return None;
+            }
+
+            let parent_id = if current == target {
+                parent_hint
+            } else {
+                self.read_node_from_pmt(pmt, current as u64)
+                    .ok()?
+                    .parent_id()
+            };
+            if parent_id == 0 {
+                return (current == root_page_id).then_some(None);
+            }
+
+            let parent = self.read_node_from_pmt(pmt, parent_id as u64).ok()?;
+            if !parent.is_internal() {
+                return None;
+            }
+            let child_position = if parent.leftmost_child() == current as u64 {
+                0
+            } else {
+                (0..parent.count())
+                    .find(|&index| parent.child_id(index) == Some(current as u64))
+                    .map(|index| index + 1)?
+            };
+
+            if child_position < parent.count() {
+                let next_child = parent.child_id(child_position)?;
+                let next_child = u32::try_from(next_child).ok()?;
+                return self.leftmost_leaf_page(pmt, next_child).ok();
+            }
+            current = parent_id;
+        }
+    }
+
+    fn next_leaf_page(
+        &self,
+        pmt: &PMT,
+        root_page_id: u32,
+        target: u32,
+        parent_hint: u32,
+    ) -> Result<Option<u32>> {
+        if let Some(next_leaf) =
+            self.next_leaf_from_parent_hint(pmt, root_page_id, target, parent_hint)
+        {
+            return Ok(next_leaf);
+        }
+
         let mut path = Vec::new();
         let mut active = HashSet::new();
         if !self.find_path_to_leaf_page(pmt, root_page_id, target, &mut path, &mut active)? {
