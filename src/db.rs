@@ -2450,6 +2450,28 @@ impl DB {
             .ok_or(Error::DiskFull)
     }
 
+    /// Bound a metadata delta that may update every current mapping.
+    ///
+    /// Interior relocation changes existing PMT mappings after the normal
+    /// dirty-page admission point. Passing zero dirty pages to
+    /// `generation_meta_bytes` would therefore under-account the sidecar that
+    /// is written after the relocation. The relocation path does not change
+    /// the logical page set, so the current PMT count bounds both its mapping
+    /// updates and any conservative removal allowance.
+    fn max_metadata_delta_bytes(page_count: usize, allocator: &PageAllocator) -> Result<u64> {
+        let page_count = u64::try_from(page_count).map_err(|_| Error::DiskFull)?;
+        let update_bytes = page_count
+            .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
+            .ok_or(Error::DiskFull)?;
+        let removal_bytes = page_count.checked_mul(8).ok_or(Error::DiskFull)?;
+        (META_DELTA_HEADER_SIZE as u64)
+            .checked_add(update_bytes)
+            .and_then(|size| size.checked_add(removal_bytes))
+            .and_then(|size| size.checked_add(allocator.to_bytes().len() as u64))
+            .and_then(|size| size.checked_add(META_DELTA_CHECKSUM_SIZE as u64))
+            .ok_or(Error::DiskFull)
+    }
+
     fn append_manifest_history(&self, manifest: Manifest) -> Result<u64> {
         self.append_manifest_history_with_directory_sync(manifest, true)
     }
@@ -2809,6 +2831,7 @@ impl DB {
         if !self.blobs.files_needing_gc().is_empty() {
             let rewritten = match self.rewrite_mixed_blob_files() {
                 Ok(reclaimed) => reclaimed,
+                Err(error) if matches!(&error, Error::CapacityPreflight) => return Err(error),
                 Err(error) => {
                     self.write_fenced = true;
                     return Err(error);
@@ -2866,8 +2889,27 @@ impl DB {
         }
 
         let blob_bytes = candidate_blobs.to_bytes();
+        let candidate_page_count = candidate_tree
+            .dirty_page_ids()
+            .into_iter()
+            .filter(|page_id| candidate_tree.node(*page_id).is_some())
+            .count();
+        let candidate_data_bytes = u64::try_from(candidate_page_count)
+            .map_err(|_| Error::DiskFull)?
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(Error::DiskFull)?;
+        let metadata_bytes = Self::max_metadata_delta_bytes(
+            candidate_tree.node_count(),
+            candidate_tree.page_allocator(),
+        )?;
+        self.preflight_maintenance_capacity(
+            candidate_data_bytes,
+            metadata_bytes,
+            blob_bytes.len() as u64,
+        )?;
         self.engine
             .check_artifact_capacity(blob_bytes.len() as u64)?;
+        self.engine.preflight_rebuild_capacity(&candidate_tree)?;
         self.reserve_blob_image(blob_bytes.len() as u64)?;
         *self.engine.btree_mut() = candidate_tree;
         self.blobs = candidate_blobs;
@@ -4248,11 +4290,10 @@ impl DB {
             let will_relocate =
                 max_relocated_pages != Some(0) && self.engine.has_relocatable_interior_page()?;
             if will_relocate {
-                let parent = self
-                    .manifest
-                    .load_latest()?
-                    .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
-                let (metadata_bytes, _) = self.generation_meta_bytes(parent, 0)?;
+                let metadata_bytes = Self::max_metadata_delta_bytes(
+                    self.engine.pmt().len(),
+                    self.engine.allocator(),
+                )?;
                 self.preflight_maintenance_capacity(0, metadata_bytes, 0)?;
             }
             // Both slots must continue to name the old PMT until all moved
@@ -6148,6 +6189,37 @@ mod tests {
     }
 
     #[test]
+    fn test_compaction_after_metadata_delta_admits_relocation_sidecar() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metadata-delta-compaction.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        db.put(b"key", b"value-1").unwrap();
+        db.flush().unwrap();
+        db.put(b"key", b"value-2").unwrap();
+        db.flush().unwrap();
+        assert!(
+            fs::read(path.join("seerdb.meta.2"))
+                .unwrap()
+                .starts_with(&META_DELTA_MAGIC)
+        );
+
+        let report = db.compact().unwrap();
+        assert_eq!(report.relocated_pages, 1);
+        assert!(
+            fs::read(path.join("seerdb.meta.3"))
+                .unwrap()
+                .starts_with(&META_DELTA_MAGIC)
+        );
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
+        reopened.verify().unwrap();
+    }
+
+    #[test]
     fn test_db_wal_admission_rejects_before_blob_or_tree_mutation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal-admission.db");
@@ -7378,5 +7450,38 @@ mod tests {
         db.inject_capacity_limit(u64::MAX);
         assert_eq!(db.gc().unwrap(), 1);
         assert_eq!(db.blob_stats().files_needing_gc, 0);
+    }
+
+    #[test]
+    fn test_db_mixed_gc_capacity_refusal_is_retryable_before_candidate_install() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed-gc-admission.db");
+        let value = vec![0xCD; 2_000];
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        for key in [b"live".as_slice(), b"dead-1", b"dead-2"] {
+            db.put(key, &value).unwrap();
+        }
+        db.flush().unwrap();
+        db.delete(b"dead-1").unwrap();
+        db.delete(b"dead-2").unwrap();
+        db.flush().unwrap();
+        let before = db.blob_stats();
+        assert_eq!(before.total_valid, 1);
+        assert_eq!(before.total_deleted, 2);
+        assert_eq!(before.files_needing_gc, 1);
+
+        let data_capacity = fs::metadata(path.join(DATA_FILE)).unwrap().len();
+        db.inject_capacity_limit(data_capacity);
+        assert!(matches!(db.gc(), Err(Error::CapacityPreflight)));
+        assert!(!db.durability_status().write_fenced);
+        assert_eq!(db.blob_stats().total_valid, before.total_valid);
+        assert_eq!(db.blob_stats().total_deleted, before.total_deleted);
+        assert_eq!(db.get(b"live").unwrap(), Some(value.clone()));
+
+        db.inject_capacity_limit(u64::MAX);
+        assert!(db.gc().unwrap() > 0);
+        assert_eq!(db.get(b"live").unwrap(), Some(value));
+        db.verify().unwrap();
     }
 }

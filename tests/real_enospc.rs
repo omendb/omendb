@@ -102,10 +102,39 @@ mod linux {
 
         db.vacuum().unwrap();
         assert_eq!(db.get(b"pending").unwrap(), None);
+
+        let large = vec![0xAB; 2_000];
+        for key in [b"gc-live".as_slice(), b"gc-dead-1", b"gc-dead-2"] {
+            db.put(key, &large).unwrap();
+        }
+        db.flush().unwrap();
+        db.delete(b"gc-dead-1").unwrap();
+        db.delete(b"gc-dead-2").unwrap();
+        db.flush().unwrap();
+        let filler = fill_until_nearly_full(&root).unwrap();
+        let before_gc = db.metrics().unwrap().storage;
+        let gc_result = db.gc();
+        assert!(
+            matches!(&gc_result, Err(Error::CapacityPreflight)),
+            "expected maintenance capacity preflight for mixed blob GC, got {gc_result:?}; metrics={:?}",
+            db.metrics()
+        );
+        let after_gc = db.metrics().unwrap().storage;
+        assert_eq!(
+            after_gc.physical_page_writes, before_gc.physical_page_writes,
+            "mixed blob GC capacity preflight must not issue page writes"
+        );
+        assert!(!db.durability_status().write_fenced);
+        drop(filler);
+        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+
+        assert!(db.gc().unwrap() > 0);
+        assert_eq!(db.get(b"gc-live").unwrap(), Some(large));
         drop(db);
 
         let reopened = DB::open(&path, Options::for_test()).unwrap();
         assert_eq!(reopened.get(b"base").unwrap(), Some(b"value-1".to_vec()));
         assert_eq!(reopened.get(b"pending").unwrap(), None);
+        assert_eq!(reopened.get(b"gc-live").unwrap(), Some(vec![0xAB; 2_000]));
     }
 }
