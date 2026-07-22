@@ -102,6 +102,38 @@ fn view_reads_segmented_blob_records_without_a_sidecar() {
 }
 
 #[test]
+fn view_protects_old_pages_during_reclamation() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("db");
+    let mut db = DB::create(&path, Options::for_test()).unwrap();
+    let old_value = vec![b'o'; 4096];
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"stable-key".to_vec(),
+        value: old_value.clone(),
+    }])
+    .unwrap();
+    db.flush().unwrap();
+
+    let view = db.begin_read_view().unwrap();
+    for revision in 0..4 {
+        db.commit_batch(&[BatchMutation::Put {
+            key: b"stable-key".to_vec(),
+            value: format!("new-{revision}").into_bytes(),
+        }])
+        .unwrap();
+        db.flush().unwrap();
+    }
+
+    db.compact_with_limit(usize::MAX).unwrap();
+    assert_eq!(view.get(b"stable-key").unwrap(), Some(old_value));
+    assert_eq!(db.get(b"stable-key").unwrap(), Some(b"new-3".to_vec()));
+
+    drop(view);
+    db.compact_with_limit(usize::MAX).unwrap();
+    db.verify().unwrap();
+}
+
+#[test]
 fn view_begin_does_not_flush_unpublished_mutations() {
     let root = tempdir().unwrap();
     let path = root.path().join("db");
