@@ -48,6 +48,8 @@ thread_local! {
     static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -2235,7 +2237,45 @@ impl DB {
     /// atomically publish its small catalog. A failed append can leave an
     /// ignored suffix; the catalog length is the recovery frontier and the
     /// next publication truncates that suffix before appending.
+    fn prepare_segment_catalog_backup(&self) -> Result<()> {
+        let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
+        if backup_path.exists() {
+            return Ok(());
+        }
+
+        let catalog_path = self.path.join(BLOB_FILE);
+        if catalog_path.exists() {
+            fs::rename(&catalog_path, &backup_path)?;
+            sync_directory(&self.path)?;
+            return Ok(());
+        }
+
+        // A first segmented publication has no catalog to rename. Keep a
+        // valid empty catalog for the generation selected by the current
+        // manifest so a failed first catalog publication can recover to the
+        // empty database just like later publications recover to their old
+        // catalog.
+        let generation_id = self
+            .manifest_history
+            .latest()
+            .map_or(0, |manifest| manifest.generation_id.get());
+        let mut empty = BlobManager::with_threshold_and_mode(self.blobs.threshold(), true);
+        empty.set_generation(generation_id);
+        let bytes = empty.to_segment_catalog_bytes();
+        atomic_write_without_fault_injection(&backup_path, &bytes)
+    }
+
+    fn finish_segment_catalog_backup(&self) -> Result<()> {
+        let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
+        if backup_path.exists() {
+            fs::remove_file(backup_path)?;
+            sync_directory(&self.path)?;
+        }
+        Ok(())
+    }
+
     fn write_blob_segments(&mut self) -> Result<u64> {
+        self.prepare_segment_catalog_backup()?;
         let mut bytes_written = 0u64;
         for file_id in self.blobs.segment_file_ids() {
             let data = self
@@ -2353,12 +2393,12 @@ impl DB {
         Ok(data.len() as u64)
     }
 
-    /// Reconcile a blob image kept aside while a mixed-file rewrite crosses
-    /// the blob-image/manifest publication boundary.
+    /// Reconcile a blob image or segmented catalog kept aside while a blob
+    /// publication crosses the blob-image/manifest boundary.
     ///
-    /// The backup has the generation selected by the current manifest. If
-    /// that generation is still authoritative, the rewrite did not publish and
-    /// the backup must be restored. If the manifest advanced, publication
+    /// The backup has the generation selected by the prior manifest. If that
+    /// generation is still authoritative, the publication did not complete
+    /// and the backup must be restored. If the manifest advanced, publication
     /// completed and the backup is only stale cleanup state.
     fn recover_blob_rewrite_backup(
         path: &Path,
@@ -2843,6 +2883,7 @@ impl DB {
 
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
+            self.finish_segment_catalog_backup()?;
         }
 
         let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
@@ -3018,6 +3059,7 @@ impl DB {
                         self.publication.blob_bytes_written.saturating_add(bytes);
                     if self.blobs.is_segmented() {
                         self.prune_unreferenced_blob_segments()?;
+                        self.finish_segment_catalog_backup()?;
                     }
                 }
                 Err(error) => {
@@ -3130,6 +3172,7 @@ impl DB {
                     .saturating_add(blob_bytes);
                 if self.blobs.is_segmented() {
                     self.prune_unreferenced_blob_segments()?;
+                    self.finish_segment_catalog_backup()?;
                 }
             }
             reclaimed
@@ -4478,6 +4521,7 @@ impl DB {
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
+            self.finish_segment_catalog_backup()?;
         }
         self.engine.complete_generation();
         self.generation_id = generation_id;
@@ -4487,7 +4531,7 @@ impl DB {
                 .checked_add(1)
                 .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
         );
-        if had_blob_image {
+        if !self.blobs.is_segmented() && had_blob_image {
             fs::remove_file(&backup_path)?;
             sync_directory(&self.path)?;
         }
@@ -4682,6 +4726,20 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_blob_segment_catalog_rename_failure(&self) {
         FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME.with(|failure| failure.set(true));
+    }
+
+    /// Inject one truncated segmented blob catalog image before manifest
+    /// publication.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_catalog_short_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one checksum-corrupted segmented blob catalog image before
+    /// manifest publication.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_catalog_torn_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE.with(|failure| failure.set(true));
     }
 
     /// Begin a root-bound byte transaction.
@@ -5778,15 +5836,19 @@ fn atomic_write_with_options(
         return Err(error.into());
     }
     #[cfg(any(test, feature = "fault-injection"))]
-    let short_write =
-        inject_faults && FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.replace(false));
+    let short_write = inject_faults
+        && ((path.file_name().is_some_and(|name| name == BLOB_FILE)
+            && FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE.with(|failure| failure.replace(false)))
+            || FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.replace(false)));
     #[cfg(not(any(test, feature = "fault-injection")))]
     let short_write = false;
     #[cfg(not(any(test, feature = "fault-injection")))]
     let _ = inject_faults;
     #[cfg(any(test, feature = "fault-injection"))]
-    let torn_write =
-        inject_faults && FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.replace(false));
+    let torn_write = inject_faults
+        && ((path.file_name().is_some_and(|name| name == BLOB_FILE)
+            && FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE.with(|failure| failure.replace(false)))
+            || FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.replace(false)));
     #[cfg(not(any(test, feature = "fault-injection")))]
     let torn_write = false;
 
@@ -7920,7 +7982,10 @@ mod tests {
         assert!(db.flush().is_err());
         assert!(db.durability_status().write_fenced);
         assert!(fs::metadata(&segment).unwrap().len() > segment_len_before);
-        assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), catalog_before);
+        assert_eq!(
+            fs::read(path.join(BLOB_REWRITE_BACKUP_FILE)).unwrap(),
+            catalog_before
+        );
         drop(db);
 
         let mut reopened = DB::open(&path, Options::default()).unwrap();
@@ -7954,7 +8019,9 @@ mod tests {
         db.inject_blob_segment_catalog_rename_failure();
         assert!(db.flush().is_err());
         assert!(db.durability_status().write_fenced);
-        assert_eq!(fs::read(&catalog).unwrap(), catalog_before);
+        let backup = path.join(BLOB_REWRITE_BACKUP_FILE);
+        assert!(!catalog.exists());
+        assert_eq!(fs::read(&backup).unwrap(), catalog_before);
         drop(db);
 
         let mut reopened = DB::open(&path, Options::default()).unwrap();
@@ -7964,6 +8031,120 @@ mod tests {
         reopened.put(b"pending", &pending).unwrap();
         reopened.flush().unwrap();
         assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        assert!(!backup.exists());
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_catalog_write_failures_restore_old_catalog() {
+        let failures = [
+            (
+                "short",
+                DB::inject_blob_segment_catalog_short_write_failure as fn(&DB),
+            ),
+            (
+                "torn",
+                DB::inject_blob_segment_catalog_torn_write_failure as fn(&DB),
+            ),
+        ];
+
+        for (name, inject_failure) in failures {
+            let dir = tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(format!("segmented-catalog-{name}-failure.db"));
+            let options = Options {
+                blob_storage: BlobStorageMode::Segmented,
+                blob_threshold: 4,
+                ..Options::default()
+            };
+            let base = vec![0xF3; 2_000];
+            let pending = vec![0xF4; 2_100];
+            let mut db = DB::create(&path, options).unwrap();
+            db.put(b"base", &base).unwrap();
+            db.flush().unwrap();
+
+            db.put(b"pending", &pending).unwrap();
+            inject_failure(&db);
+            assert!(db.flush().is_err(), "{name} catalog write should fail");
+            assert!(db.durability_status().write_fenced);
+            assert!(path.join(BLOB_REWRITE_BACKUP_FILE).is_file());
+            drop(db);
+
+            let mut reopened = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+            assert_eq!(reopened.get(b"pending").unwrap(), None);
+            assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+            reopened.verify().unwrap();
+            reopened.put(b"pending", &pending).unwrap();
+            reopened.flush().unwrap();
+            assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+            assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+            reopened.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_db_segmented_first_catalog_write_failure_restores_empty_catalog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-first-catalog-failure.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let pending = vec![0xF7; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"pending", &pending).unwrap();
+        db.inject_blob_segment_catalog_short_write_failure();
+        assert!(db.flush().is_err());
+        assert!(db.durability_status().write_fenced);
+        assert!(path.join(BLOB_REWRITE_BACKUP_FILE).is_file());
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        reopened.verify().unwrap();
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_publication_directory_failure_restores_old_catalog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-directory-failure.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xF5; 2_000];
+        let pending = vec![0xF6; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+
+        db.put(b"pending", &pending).unwrap();
+        db.inject_publication_directory_sync_failure();
+        assert!(db.flush().is_err());
+        assert!(db.durability_status().write_fenced);
+        assert!(path.join(BLOB_REWRITE_BACKUP_FILE).is_file());
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        reopened.verify().unwrap();
+        if reopened.get(b"pending").unwrap().is_none() {
+            reopened.put(b"pending", &pending).unwrap();
+            reopened.flush().unwrap();
+        }
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
         reopened.verify().unwrap();
     }
 }
