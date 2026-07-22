@@ -82,6 +82,11 @@ impl BlobManager {
         manager
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_segment_target_size_for_test(&mut self, segment_target_size: u64) {
+        self.segment_target_size = segment_target_size;
+    }
+
     /// Whether this manager uses the separate segment/catalog layout.
     pub(crate) fn is_segmented(&self) -> bool {
         self.segmented

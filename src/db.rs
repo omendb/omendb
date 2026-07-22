@@ -74,6 +74,9 @@ const META_DELTA_VERSION: u32 = 1;
 const META_DELTA_HEADER_SIZE: usize = 8 + 4 + 8 + 4 + 4 + 4;
 const META_DELTA_CHECKSUM_SIZE: usize = 4;
 const MAX_META_DELTA_CHAIN: usize = 64;
+/// Maximum accumulated deletion offsets before explicit segmented catalog
+/// consolidation is requested by `DB::gc()`.
+const MAX_SEGMENTED_CATALOG_DELETED_ENTRIES: usize = 4096;
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 const PUBLICATION_CAPACITY_SAFETY_BYTES: u64 = 8 * PAGE_SIZE as u64;
@@ -145,6 +148,10 @@ fn blob_storage_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+fn segmented_catalog_needs_consolidation(blobs: &BlobManager) -> bool {
+    blobs.is_segmented() && blobs.total_deleted_entries() > MAX_SEGMENTED_CATALOG_DELETED_ENTRIES
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     Normal,
@@ -182,6 +189,9 @@ pub struct BlobStats {
     pub total_valid: usize,
     /// Total deleted entries across all files.
     pub total_deleted: usize,
+    /// Whether segmented catalog deletion metadata has crossed its maintenance
+    /// bound and explicit `DB::gc()` should consolidate it.
+    pub catalog_needs_consolidation: bool,
 }
 
 /// One mutation in an atomic multi-record commit.
@@ -3074,7 +3084,9 @@ impl DB {
                 }
             }
         }
-        if !self.blobs.files_needing_gc().is_empty() {
+        if !self.blobs.files_needing_gc().is_empty()
+            || segmented_catalog_needs_consolidation(&self.blobs)
+        {
             let rewritten = match self.rewrite_mixed_blob_files() {
                 Ok(reclaimed) => reclaimed,
                 Err(error) if matches!(&error, Error::CapacityPreflight) => return Err(error),
@@ -3194,6 +3206,7 @@ impl DB {
             files_needing_gc: self.blobs.files_needing_gc().len(),
             total_valid: self.blobs.total_valid_entries(),
             total_deleted: self.blobs.total_deleted_entries(),
+            catalog_needs_consolidation: segmented_catalog_needs_consolidation(&self.blobs),
         }
     }
 
@@ -7857,6 +7870,76 @@ mod tests {
         assert_eq!(reopened.get(b"dead-2").unwrap(), None);
         assert!(reopened.blob_stats().files_needing_gc > 0);
         assert!(reopened.gc().unwrap() > 0);
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn segmented_catalog_consolidation_bound_is_explicit() {
+        let mut blobs = BlobManager::with_threshold_and_mode(1, true);
+        let mut pointers = Vec::with_capacity(MAX_SEGMENTED_CATALOG_DELETED_ENTRIES + 1);
+        for index in 0..=MAX_SEGMENTED_CATALOG_DELETED_ENTRIES {
+            pointers.push(blobs.append(&index.to_le_bytes(), vec![index as u8; 2]));
+        }
+
+        for pointer in pointers.iter().take(MAX_SEGMENTED_CATALOG_DELETED_ENTRIES) {
+            assert!(blobs.mark_deleted(pointer));
+        }
+        assert!(!segmented_catalog_needs_consolidation(&blobs));
+        assert!(blobs.mark_deleted(&pointers[MAX_SEGMENTED_CATALOG_DELETED_ENTRIES]));
+        assert!(segmented_catalog_needs_consolidation(&blobs));
+    }
+
+    #[test]
+    fn segmented_catalog_consolidation_runs_as_explicit_maintenance() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-catalog-consolidation.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 1,
+            ..Options::default()
+        };
+        let mut db = DB::open(&path, options).unwrap();
+        db.blobs.set_segment_target_size_for_test(1_250);
+
+        let groups = (MAX_SEGMENTED_CATALOG_DELETED_ENTRIES / 4) + 1;
+        let total = groups * 10;
+        let puts = (0..total)
+            .map(|index| BatchMutation::Put {
+                key: index.to_le_bytes().to_vec(),
+                value: vec![index as u8; 100],
+            })
+            .collect::<Vec<_>>();
+        db.commit_batch(&puts).unwrap();
+
+        let deletes = (0..total)
+            .filter(|index| index % 10 < 4)
+            .map(|index| BatchMutation::Delete {
+                key: index.to_le_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        db.commit_batch(&deletes).unwrap();
+
+        let before = db.blob_stats();
+        assert_eq!(before.files_needing_gc, 0);
+        assert_eq!(before.total_deleted, deletes.len());
+        assert!(before.catalog_needs_consolidation);
+        assert!(db.gc().unwrap() > 0);
+
+        let after = db.blob_stats();
+        assert_eq!(after.total_deleted, 0);
+        assert!(!after.catalog_needs_consolidation);
+        assert_eq!(db.get(&0usize.to_le_bytes()).unwrap(), None);
+        assert_eq!(db.get(&4usize.to_le_bytes()).unwrap(), Some(vec![4; 100]));
+        db.verify().unwrap();
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(&0usize.to_le_bytes()).unwrap(), None);
+        assert_eq!(
+            reopened.get(&4usize.to_le_bytes()).unwrap(),
+            Some(vec![4; 100])
+        );
+        assert!(!reopened.blob_stats().catalog_needs_consolidation);
         reopened.verify().unwrap();
     }
 
