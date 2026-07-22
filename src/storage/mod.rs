@@ -627,6 +627,31 @@ impl StorageEngine {
         self.device.check_capacity(length).map_err(Error::from)
     }
 
+    /// Admit the new data extent required by a logical rebuild before the
+    /// active PMT is replaced. The candidate contains only newly allocated
+    /// pages, so its flush starts at the current data-file end.
+    pub fn preflight_rebuild_capacity(&self, candidate: &BTree) -> Result<()> {
+        let page_count = candidate
+            .dirty_page_ids()
+            .into_iter()
+            .filter(|page_id| candidate.node(*page_id).is_some())
+            .count() as u64;
+        if page_count == 0 {
+            return Ok(());
+        }
+        let start = self.device.size()?;
+        let required_end = start
+            .checked_add(page_count.saturating_mul(PAGE_SIZE as u64))
+            .ok_or(Error::DiskFull)?;
+        self.device
+            .check_write_capacity(required_end - PAGE_SIZE as u64)
+            .map_err(capacity_preflight_error)?;
+        self.device
+            .reserve(required_end)
+            .map_err(capacity_preflight_error)?;
+        Ok(())
+    }
+
     /// Flush all dirty pages to disk.
     ///
     /// Small generations keep staging images resident until the device sync,

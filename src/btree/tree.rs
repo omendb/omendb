@@ -454,6 +454,11 @@ impl BTree {
         RangeScan::new(self, start.to_vec(), end.to_vec())
     }
 
+    /// Create a resumable forward range cursor for bounded maintenance.
+    pub(crate) fn range_cursor(&self, start: &[u8], end: &[u8]) -> Result<RangeCursor, BTreeError> {
+        RangeCursor::new(self, start.to_vec(), end.to_vec())
+    }
+
     // -- Internal helpers --
 
     /// Find the leaf node where `key` should reside.
@@ -935,6 +940,15 @@ pub enum BTreeError {
 /// Cursor for range scanning the B-tree.
 pub struct RangeScan<'a> {
     tree: &'a BTree,
+    cursor: RangeCursor,
+}
+
+/// Owned position for a checked forward range scan.
+///
+/// The cursor does not borrow the tree, so a maintenance operation can keep
+/// its position between bounded calls while the source tree remains fixed.
+#[derive(Debug, Clone)]
+pub(crate) struct RangeCursor {
     start: Vec<u8>,
     end: Vec<u8>,
     current_node: PageId,
@@ -944,6 +958,15 @@ pub struct RangeScan<'a> {
 
 impl<'a> RangeScan<'a> {
     fn new(tree: &'a BTree, start: Vec<u8>, end: Vec<u8>) -> Result<Self, BTreeError> {
+        Ok(Self {
+            tree,
+            cursor: RangeCursor::new(tree, start, end)?,
+        })
+    }
+}
+
+impl RangeCursor {
+    fn new(tree: &BTree, start: Vec<u8>, end: Vec<u8>) -> Result<Self, BTreeError> {
         let leaf_id = tree.find_leaf(&start)?;
         let node = tree
             .node(leaf_id)
@@ -955,7 +978,6 @@ impl<'a> RangeScan<'a> {
         };
 
         Ok(Self {
-            tree,
             start,
             end,
             current_node: leaf_id,
@@ -963,18 +985,17 @@ impl<'a> RangeScan<'a> {
             done: false,
         })
     }
-}
 
-impl<'a> Iterator for RangeScan<'a> {
-    type Item = Result<(Vec<u8>, LookupResult), BTreeError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub(crate) fn next(
+        &mut self,
+        tree: &BTree,
+    ) -> Option<Result<(Vec<u8>, LookupResult), BTreeError>> {
         if self.done {
             return None;
         }
 
         loop {
-            let Some(node) = self.tree.node(self.current_node) else {
+            let Some(node) = tree.node(self.current_node) else {
                 self.done = true;
                 return Some(Err(BTreeError::Corruption("range page is missing".into())));
             };
@@ -1025,7 +1046,7 @@ impl<'a> Iterator for RangeScan<'a> {
                 continue;
             }
 
-            let next_leaf = match self.tree.next_leaf_checked(self.current_node) {
+            let next_leaf = match tree.next_leaf_checked(self.current_node) {
                 Ok(next_leaf) => next_leaf,
                 Err(error) => {
                     self.done = true;
@@ -1039,6 +1060,14 @@ impl<'a> Iterator for RangeScan<'a> {
             self.current_node = next_leaf;
             self.current_index = 0;
         }
+    }
+}
+
+impl<'a> Iterator for RangeScan<'a> {
+    type Item = Result<(Vec<u8>, LookupResult), BTreeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.cursor.next(self.tree)
     }
 }
 

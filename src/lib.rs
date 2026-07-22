@@ -55,8 +55,8 @@ pub mod storage;
 pub use db::{
     BatchMutation, BatchTransaction, BatchTransactionState, CheckReport, CompactionReport, DB,
     DBMetrics, DurabilityStatus, HistoryPruneReport, Options, PublicationMetrics, RepairAction,
-    RepairReport, RestoreReport, RetainedSnapshot, Snapshot, SnapshotReport, VacuumReport,
-    VerificationReport, WalCheckStatus,
+    RepairReport, RestoreReport, RetainedSnapshot, Snapshot, SnapshotReport, VacuumProgress,
+    VacuumReport, VerificationReport, WalCheckStatus,
 };
 pub use error::{CheckFailureKind, Error, Result};
 pub use storage::StorageMetrics;

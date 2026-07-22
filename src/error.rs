@@ -112,6 +112,10 @@ pub enum Error {
         current: CommitId,
     },
 
+    /// A bounded maintenance operation owns the serialized writer lane.
+    #[error("maintenance is in progress: {0}")]
+    MaintenanceInProgress(&'static str),
+
     /// A batch commit is durable, but releasing its temporary root lease
     /// failed. The transaction is committed; the caller may retry cleanup or
     /// drop the transaction so its lease drop guard can retry it.

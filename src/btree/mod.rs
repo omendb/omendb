@@ -13,4 +13,5 @@ pub use node::{
     BLOB_POINTER_SIZE, BlobPointer, InsertError, MAX_KEY_SIZE, Node, NodeHeader, PAGE_SIZE,
     PageType, SplitError, Tombstone, ValueRef, ValueType,
 };
+pub(crate) use tree::RangeCursor;
 pub use tree::{BTree, BTreeError, LookupResult, RangeScan};

@@ -9,7 +9,7 @@ pub use options::Options;
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
-use crate::btree::{BTree, BlobPointer, LookupResult, MAX_KEY_SIZE, PAGE_SIZE};
+use crate::btree::{BTree, BlobPointer, LookupResult, MAX_KEY_SIZE, PAGE_SIZE, RangeCursor};
 use crate::buffer::{BufferManager, BufferStats};
 use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
@@ -834,6 +834,23 @@ pub struct VacuumReport {
     pub logical_pages_after: u64,
 }
 
+/// Progress from one bounded logical vacuum step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumProgress {
+    /// Durable identity. It changes only when the final step publishes.
+    pub durability: DurabilityStatus,
+    /// Number of logical entries consumed by the source cursor.
+    pub scanned_entries: u64,
+    /// Number of live entries copied into the candidate tree.
+    pub live_entries: u64,
+    /// Active logical page count before rebuilding.
+    pub logical_pages_before: u64,
+    /// Candidate page count after publication, or `None` while incomplete.
+    pub logical_pages_after: Option<u64>,
+    /// Whether this step published the rebuilt generation.
+    pub complete: bool,
+}
+
 /// Results from pruning superseded manifests and checkpoint files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryPruneReport {
@@ -895,6 +912,17 @@ struct MetaDelta {
     allocator: PageAllocator,
 }
 
+struct VacuumState {
+    source_generation: GenerationId,
+    source_commit: CommitId,
+    cursor: RangeCursor,
+    candidate_tree: BTree,
+    candidate_blobs: BlobManager,
+    scanned_entries: u64,
+    live_entries: u64,
+    logical_pages_before: u64,
+}
+
 /// A seerdb database instance.
 ///
 /// Provides key-value storage with:
@@ -913,6 +941,8 @@ pub struct DB {
     wal: WalManager,
     /// Blob manager.
     blobs: BlobManager,
+    /// In-memory candidate for a resumable logical vacuum.
+    vacuum: Option<VacuumState>,
     /// Durable retained-root registry shared with retained snapshot handles.
     retention: Arc<Mutex<RetentionState>>,
     /// Transaction manager for MVCC.
@@ -1448,6 +1478,7 @@ impl DB {
             engine,
             wal,
             blobs,
+            vacuum: None,
             retention,
             txn_manager: TransactionManager::new(),
             manifest,
@@ -1511,6 +1542,7 @@ impl DB {
     /// the next published root generation.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         validate_wal_put_lengths(key, value)?;
         let record = WalRecord::put(key, value);
         self.admit_wal_record(&record)?;
@@ -1575,6 +1607,7 @@ impl DB {
         mutations: &[BatchMutation],
     ) -> Result<DurabilityStatus> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         if self.commit_id != expected_commit {
             return Err(Error::SerializationConflict {
                 expected: expected_commit,
@@ -1770,6 +1803,7 @@ impl DB {
     /// the next published root generation.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         validate_wal_key_length(key)?;
         let record = WalRecord::delete(key);
         self.admit_wal_record(&record)?;
@@ -2611,6 +2645,7 @@ impl DB {
     /// Flush all pending writes as one durable root generation.
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         if self.pending_mutations == 0 {
             return Ok(());
         }
@@ -2672,6 +2707,7 @@ impl DB {
     /// Returns the number of entries reclaimed.
     pub fn gc(&mut self) -> Result<usize> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         self.flush()?;
         if !self
             .retention
@@ -3649,6 +3685,7 @@ impl DB {
     /// truncation. Retained-root pages are never overwritten or reclaimed.
     pub fn compact(&mut self) -> Result<CompactionReport> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         let result = self.compact_inner(None);
         if result.is_err() {
             // A maintenance failure can occur after the manifest barrier or
@@ -3668,6 +3705,7 @@ impl DB {
     /// bounded without weakening the manifest publication barrier.
     pub fn compact_with_limit(&mut self, max_relocated_pages: usize) -> Result<CompactionReport> {
         self.check_writable()?;
+        self.check_maintenance_idle()?;
         let result = self.compact_inner(Some(max_relocated_pages));
         if result.is_err() {
             self.write_fenced = true;
@@ -3681,30 +3719,65 @@ impl DB {
     /// This is the first complete logical reclamation primitive: tombstones
     /// and obsolete versions are omitted from the rebuilt tree, while the
     /// old PMT and blob image remain protected until the new manifest is
-    /// authoritative. The rebuild is intentionally whole-database for now;
-    /// bounded scheduling can be layered on the same publication protocol.
+    /// authoritative. The unbounded convenience method drains the same
+    /// resumable cursor used by [`DB::vacuum_step`].
     pub fn vacuum(&mut self) -> Result<VacuumReport> {
         self.check_writable()?;
-        self.flush()?;
-        self.mirror_current_manifest()?;
+        loop {
+            let progress = self.vacuum_step(usize::MAX)?;
+            if progress.complete {
+                return Ok(VacuumReport {
+                    durability: progress.durability,
+                    live_entries: progress.live_entries,
+                    logical_pages_before: progress.logical_pages_before,
+                    logical_pages_after: progress.logical_pages_after.ok_or_else(|| {
+                        Error::Corruption("completed vacuum has no page count".into())
+                    })?,
+                });
+            }
+        }
+    }
 
-        let logical_pages_before = self.engine.pmt().len() as u64;
-        let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
-        // Stream the checked active-tree cursor into the candidate generation.
-        // Holding the complete live set here duplicated the candidate tree and
-        // blob image in memory, which made vacuum's peak memory scale with two
-        // copies of the database's logical contents.
-        self.engine.ensure_materialized()?;
-        let scan = self
-            .engine
-            .btree()
-            .range_scan(&[], &end)
-            .map_err(Error::from)?;
-        let mut candidate_tree = BTree::new();
-        let mut candidate_blobs = BlobManager::with_threshold(self.blobs.threshold());
-        let mut live_entries = 0u64;
-        for entry in scan {
-            let (key, result) = entry.map_err(Error::from)?;
+    /// Advance logical reclamation in a bounded call.
+    ///
+    /// The candidate tree remains private to this handle and is published
+    /// only on the final step. A crash or explicit cancellation therefore
+    /// leaves the previous manifest and blob image authoritative. The writer
+    /// lane remains reserved while a step is pending, so mutations and other
+    /// maintenance calls are rejected until completion or cancellation.
+    pub fn vacuum_step(&mut self, max_entries: usize) -> Result<VacuumProgress> {
+        self.check_writable()?;
+        if max_entries == 0 {
+            return Err(Error::InvalidArgument(
+                "vacuum step must process at least one entry".into(),
+            ));
+        }
+        if self.vacuum.is_none() {
+            self.start_vacuum()?;
+        }
+
+        let mut state = self.vacuum.take().ok_or_else(|| {
+            Error::Corruption("vacuum state disappeared after initialization".into())
+        })?;
+        if state.source_generation != self.generation_id || state.source_commit != self.commit_id {
+            return Err(Error::NeedsRecovery(
+                "vacuum source generation changed before publication".into(),
+            ));
+        }
+
+        let mut complete = false;
+        for _ in 0..max_entries {
+            let next = state.cursor.next(self.engine.btree());
+            let Some(entry) = next else {
+                complete = true;
+                break;
+            };
+            let (key, result) = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return Err(error.into());
+                }
+            };
             let value = match result {
                 LookupResult::Found(value) => value,
                 LookupResult::Blob(pointer) => self
@@ -3719,36 +3792,115 @@ impl DB {
                     })?,
                 LookupResult::Deleted | LookupResult::NotFound => continue,
             };
-            if candidate_blobs.should_separate(value.len()) {
-                let pointer = candidate_blobs.append(&key, value);
-                candidate_tree.upsert_blob(&key, pointer)?;
+            if state.candidate_blobs.should_separate(value.len()) {
+                let pointer = state.candidate_blobs.append(&key, value);
+                state.candidate_tree.upsert_blob(&key, pointer)?;
             } else {
-                candidate_tree.upsert(&key, &value)?;
+                state.candidate_tree.upsert(&key, &value)?;
             }
-            live_entries = live_entries.saturating_add(1);
+            state.scanned_entries = state.scanned_entries.saturating_add(1);
+            state.live_entries = state.live_entries.saturating_add(1);
         }
 
-        let candidate_blob_bytes = candidate_blobs.to_bytes();
-        self.engine
-            .check_artifact_capacity(candidate_blob_bytes.len() as u64)?;
-        self.reserve_blob_image(candidate_blob_bytes.len() as u64)?;
+        if !complete {
+            let progress = self.vacuum_progress(&state, false);
+            self.vacuum = Some(state);
+            return Ok(progress);
+        }
 
-        let result = (|| {
-            self.engine.prepare_logical_rebuild(candidate_tree)?;
-            self.blobs = candidate_blobs;
-            self.engine.flush()?;
-            self.publish_blob_rewrite_generation()?;
-            Ok(VacuumReport {
-                durability: self.durability_status(),
-                live_entries,
-                logical_pages_before,
-                logical_pages_after: self.engine.pmt().len() as u64,
-            })
-        })();
+        let candidate_blob_bytes = state.candidate_blobs.to_bytes();
+        if let Err(error) = self
+            .engine
+            .check_artifact_capacity(candidate_blob_bytes.len() as u64)
+        {
+            self.vacuum = Some(state);
+            return Err(error);
+        }
+        if let Err(error) = self.reserve_blob_image(candidate_blob_bytes.len() as u64) {
+            self.vacuum = Some(state);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .engine
+            .preflight_rebuild_capacity(&state.candidate_tree)
+        {
+            self.vacuum = Some(state);
+            return Err(error);
+        }
+
+        let result = self.finish_vacuum(state);
         if result.is_err() {
             self.write_fenced = true;
         }
-        result
+        let report = result?;
+        Ok(VacuumProgress {
+            durability: report.durability,
+            scanned_entries: report.live_entries,
+            live_entries: report.live_entries,
+            logical_pages_before: report.logical_pages_before,
+            logical_pages_after: Some(report.logical_pages_after),
+            complete: true,
+        })
+    }
+
+    /// Cancel an in-memory vacuum candidate without changing the durable root.
+    pub fn cancel_vacuum(&mut self) -> Result<bool> {
+        self.check_writable()?;
+        Ok(self.vacuum.take().is_some())
+    }
+
+    fn start_vacuum(&mut self) -> Result<()> {
+        self.flush()?;
+        self.mirror_current_manifest()?;
+        self.engine.ensure_materialized()?;
+        let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
+        let cursor = self
+            .engine
+            .btree()
+            .range_cursor(&[], &end)
+            .map_err(Error::from)?;
+        self.vacuum = Some(VacuumState {
+            source_generation: self.generation_id,
+            source_commit: self.commit_id,
+            cursor,
+            candidate_tree: BTree::new(),
+            candidate_blobs: BlobManager::with_threshold(self.blobs.threshold()),
+            scanned_entries: 0,
+            live_entries: 0,
+            logical_pages_before: self.engine.pmt().len() as u64,
+        });
+        Ok(())
+    }
+
+    fn vacuum_progress(&self, state: &VacuumState, complete: bool) -> VacuumProgress {
+        VacuumProgress {
+            durability: self.durability_status(),
+            scanned_entries: state.scanned_entries,
+            live_entries: state.live_entries,
+            logical_pages_before: state.logical_pages_before,
+            logical_pages_after: None,
+            complete,
+        }
+    }
+
+    fn finish_vacuum(&mut self, state: VacuumState) -> Result<VacuumReport> {
+        let VacuumState {
+            candidate_tree,
+            candidate_blobs,
+            live_entries,
+            logical_pages_before,
+            ..
+        } = state;
+        self.engine.prepare_logical_rebuild(candidate_tree)?;
+        self.blobs = candidate_blobs;
+        self.engine.flush()?;
+        self.publish_blob_rewrite_generation()?;
+        Ok(VacuumReport {
+            durability: self.durability_status(),
+            live_entries,
+            logical_pages_before,
+            logical_pages_after: self.engine.pmt().len() as u64,
+        })
     }
 
     /// Remove historical manifests and PMT checkpoints that are not needed
@@ -4259,6 +4411,13 @@ impl DB {
             return Err(Error::NeedsRecovery(
                 "writer fenced after a failed durable publication; reopen required".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn check_maintenance_idle(&self) -> Result<()> {
+        if self.vacuum.is_some() {
+            return Err(Error::MaintenanceInProgress("logical vacuum"));
         }
         Ok(())
     }
@@ -6938,6 +7097,75 @@ mod tests {
         db.abort_transaction(&mut txn2);
         assert!(!txn2.is_active());
         assert_eq!(db.latest_committed_txn(), 1); // Still 1
+    }
+
+    #[test]
+    fn test_db_vacuum_step_is_bounded_and_crash_safe() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bounded-vacuum.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        for index in 0..12 {
+            let key = format!("key-{index:02}");
+            db.put(key.as_bytes(), b"value").unwrap();
+        }
+        db.flush().unwrap();
+        let before = db.durability_status();
+
+        let progress = db.vacuum_step(3).unwrap();
+        assert!(!progress.complete);
+        assert_eq!(progress.scanned_entries, 3);
+        assert_eq!(progress.live_entries, 3);
+        assert_eq!(progress.logical_pages_after, None);
+        assert_eq!(db.durability_status(), before);
+        assert!(matches!(
+            db.put(b"blocked", b"write"),
+            Err(Error::MaintenanceInProgress("logical vacuum"))
+        ));
+
+        // Dropping an incomplete candidate must not publish or fence the old
+        // generation. The drop path also exercises the close-time retry.
+        drop(db);
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key-00").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(reopened.durability_status(), before);
+
+        let mut completed = false;
+        while !completed {
+            let progress = reopened.vacuum_step(2).unwrap();
+            completed = progress.complete;
+            if completed {
+                assert_eq!(progress.live_entries, 12);
+                assert_eq!(progress.logical_pages_after, Some(1));
+            } else {
+                assert_eq!(progress.logical_pages_after, None);
+            }
+        }
+        assert_eq!(reopened.range(b"key-00", b"key-99").unwrap().len(), 12);
+        reopened.close().unwrap();
+
+        let verified = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(verified.range(b"key-00", b"key-99").unwrap().len(), 12);
+    }
+
+    #[test]
+    fn test_db_vacuum_can_be_cancelled_without_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cancel-vacuum.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        for index in 0..4 {
+            let key = format!("key-{index}");
+            db.put(key.as_bytes(), b"value").unwrap();
+        }
+        db.flush().unwrap();
+        let before = db.durability_status();
+
+        assert!(!db.vacuum_step(1).unwrap().complete);
+        assert!(db.cancel_vacuum().unwrap());
+        assert!(!db.cancel_vacuum().unwrap());
+        assert_eq!(db.durability_status(), before);
+        db.put(b"after-cancel", b"value").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"after-cancel").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]
