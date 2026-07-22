@@ -86,7 +86,6 @@ losetup -d "$data_loop"
 data_loop=
 
 cp --reflink=auto --sparse=always "$data_image" "$baseline_image"
-cp --reflink=auto --sparse=always "$baseline_image" "$replay_image"
 
 data_loop=$(losetup --find --show "$data_image")
 log_loop=$(losetup --find --show "$log_image")
