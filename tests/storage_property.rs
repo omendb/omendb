@@ -90,7 +90,7 @@ proptest! {
         dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
     ) {
         for segmented in [false, true] {
-            for fault in 0u8..7 {
+            for fault in 0u8..9 {
                 if !segmented && fault >= 3 {
                     continue;
                 }
@@ -139,6 +139,8 @@ proptest! {
                     4 => db.inject_blob_segment_catalog_rename_failure(),
                     5 => db.inject_blob_segment_catalog_short_write_failure(),
                     6 => db.inject_blob_segment_catalog_torn_write_failure(),
+                    7 => db.inject_blob_segment_sync_failure(),
+                    8 => db.inject_blob_segment_catalog_sync_failure(),
                     _ => unreachable!(),
                 }
                 assert!(db.gc().is_err());
@@ -146,6 +148,13 @@ proptest! {
                 drop(db);
 
                 let mut reopened = DB::open(&path, Options::default()).unwrap();
+                assert!(
+                    fs::read_dir(&path)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")),
+                    "reopen must clean non-authoritative publication temporary files"
+                );
                 assert_eq!(
                     reopened.get(b"gc-live").unwrap(),
                     Some(live_value.clone())

@@ -46,7 +46,9 @@ thread_local! {
     static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
@@ -1222,6 +1224,7 @@ impl DB {
             Some(Self::acquire_writer_lock(&path.join(LOCK_FILE))?)
         };
         if !read_only {
+            cleanup_orphaned_temporary_artifacts(&path)?;
             clear_blob_reservation(&path)?;
             clear_wal_reservation(&path)?;
         }
@@ -2332,6 +2335,11 @@ impl DB {
             file.seek(SeekFrom::Start(persisted))?;
             file.write_all(&data[persisted_usize..])?;
             file.flush()?;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            if FAIL_NEXT_BLOB_SEGMENT_SYNC.with(|failure| failure.replace(false)) {
+                return Err(std::io::Error::other("injected blob segment sync failure").into());
+            }
             file.sync_all()?;
             bytes_written = bytes_written.saturating_add(new_len - persisted);
 
@@ -4740,6 +4748,18 @@ impl DB {
         FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.set(true));
     }
 
+    /// Inject one failure while syncing a segmented blob suffix.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_sync_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure while syncing a segmented blob catalog temp file.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_catalog_sync_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC.with(|failure| failure.set(true));
+    }
+
     /// Inject one failure after a segmented blob catalog temp file is synced
     /// but before it replaces the previous catalog.
     #[cfg(any(test, feature = "fault-injection"))]
@@ -5885,6 +5905,14 @@ fn atomic_write_with_options(
         }
     }
     file.flush()?;
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    if inject_faults
+        && path.file_name().is_some_and(|name| name == BLOB_FILE)
+        && FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC.with(|failure| failure.replace(false))
+    {
+        return Err(std::io::Error::other("injected blob catalog sync failure").into());
+    }
     file.sync_all()?;
     drop(file);
 
@@ -6002,6 +6030,25 @@ fn sync_directory_chain(path: &Path) -> Result<()> {
             break;
         }
         current = parent;
+    }
+    Ok(())
+}
+
+/// Remove non-authoritative atomic-publication temporary files left by an
+/// interrupted write. They are safe to discard because every authoritative
+/// artifact is selected by the manifest or its catalog, never by a `.tmp`
+/// name. Read-only/check handles deliberately leave them untouched.
+fn cleanup_orphaned_temporary_artifacts(path: &Path) -> Result<()> {
+    let mut removed = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.file_name().to_string_lossy().ends_with(".tmp") {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(path)?;
     }
     Ok(())
 }
