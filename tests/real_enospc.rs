@@ -80,10 +80,32 @@ mod linux {
 
         db.flush().unwrap();
         assert_eq!(db.get(b"pending").unwrap(), Some(b"value-2".to_vec()));
+
+        db.delete(b"pending").unwrap();
+        db.flush().unwrap();
+        let filler = fill_until_nearly_full(&root).unwrap();
+        let before_vacuum = db.metrics().unwrap().storage;
+        let vacuum_result = db.vacuum();
+        assert!(
+            matches!(&vacuum_result, Err(Error::CapacityPreflight)),
+            "expected maintenance capacity preflight, got {vacuum_result:?}; metrics={:?}",
+            db.metrics()
+        );
+        let after_vacuum = db.metrics().unwrap().storage;
+        assert_eq!(
+            after_vacuum.physical_page_writes, before_vacuum.physical_page_writes,
+            "maintenance capacity preflight must not issue page writes"
+        );
+        assert!(!db.durability_status().write_fenced);
+        drop(filler);
+        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+
+        db.vacuum().unwrap();
+        assert_eq!(db.get(b"pending").unwrap(), None);
         drop(db);
 
         let reopened = DB::open(&path, Options::for_test()).unwrap();
         assert_eq!(reopened.get(b"base").unwrap(), Some(b"value-1".to_vec()));
-        assert_eq!(reopened.get(b"pending").unwrap(), Some(b"value-2".to_vec()));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
     }
 }

@@ -2390,6 +2390,66 @@ impl DB {
         Ok(())
     }
 
+    /// Admit a maintenance generation before it writes new data pages.
+    ///
+    /// Maintenance publications do not carry a WAL reservation, so account
+    /// for their new data extent and all atomic sidecar artifacts directly.
+    /// This is conservative: the metadata argument may be a full checkpoint
+    /// even when the selected generation will use a smaller delta.
+    fn preflight_maintenance_capacity(
+        &self,
+        data_bytes: u64,
+        metadata_bytes: u64,
+        blob_bytes: u64,
+    ) -> Result<()> {
+        let ledger_bytes = self
+            .reuse_ledger
+            .to_bytes()
+            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?
+            .len() as u64;
+        let history_entry_bytes =
+            ManifestHistory::entry_bytes(self.bootstrap_manifest()).len() as u64;
+        let history_length = match fs::metadata(self.path.join(MANIFEST_HISTORY_FILE)) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
+                .manifest_history
+                .to_bytes()
+                .map_or(0, |bytes| bytes.len() as u64),
+            Err(error) => return Err(error.into()),
+        };
+        let history_bytes = history_length
+            .checked_add(history_entry_bytes)
+            .ok_or(Error::DiskFull)?;
+        let required = data_bytes
+            .checked_add(metadata_bytes)
+            .and_then(|size| size.checked_add(blob_bytes))
+            .and_then(|size| size.checked_add(ledger_bytes))
+            .and_then(|size| size.checked_add(history_bytes))
+            .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
+            .ok_or(Error::DiskFull)?;
+        if fs2::available_space(&self.path)? < required {
+            return Err(Error::CapacityPreflight);
+        }
+        Ok(())
+    }
+
+    fn full_metadata_bytes_for_candidate(candidate: &BTree) -> Result<u64> {
+        let page_count = u64::try_from(candidate.node_count()).map_err(|_| Error::DiskFull)?;
+        let pmt_bytes = 4u64
+            .checked_add(
+                page_count
+                    .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
+                    .ok_or(Error::DiskFull)?,
+            )
+            .ok_or(Error::DiskFull)?;
+        let allocator_bytes = candidate.page_allocator().to_bytes().len() as u64;
+        (META_MAGIC.len() as u64)
+            .checked_add(4 + 4 + 4 + 4)
+            .and_then(|size| size.checked_add(pmt_bytes))
+            .and_then(|size| size.checked_add(allocator_bytes))
+            .ok_or(Error::DiskFull)
+    }
+
     fn append_manifest_history(&self, manifest: Manifest) -> Result<u64> {
         self.append_manifest_history_with_directory_sync(manifest, true)
     }
@@ -3687,7 +3747,7 @@ impl DB {
         self.check_writable()?;
         self.check_maintenance_idle()?;
         let result = self.compact_inner(None);
-        if result.is_err() {
+        if result.is_err() && !matches!(&result, Err(Error::CapacityPreflight)) {
             // A maintenance failure can occur after the manifest barrier or
             // after the file length changed. Reopen is the only universally
             // safe way to reconstruct the active generation and allocator.
@@ -3707,7 +3767,7 @@ impl DB {
         self.check_writable()?;
         self.check_maintenance_idle()?;
         let result = self.compact_inner(Some(max_relocated_pages));
-        if result.is_err() {
+        if result.is_err() && !matches!(&result, Err(Error::CapacityPreflight)) {
             self.write_fenced = true;
         }
         result
@@ -3809,6 +3869,21 @@ impl DB {
         }
 
         let candidate_blob_bytes = state.candidate_blobs.to_bytes();
+        let candidate_page_count =
+            u64::try_from(state.candidate_tree.node_count()).map_err(|_| Error::DiskFull)?;
+        let candidate_data_bytes = candidate_page_count
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or(Error::DiskFull)?;
+        let candidate_metadata_bytes =
+            Self::full_metadata_bytes_for_candidate(&state.candidate_tree)?;
+        if let Err(error) = self.preflight_maintenance_capacity(
+            candidate_data_bytes,
+            candidate_metadata_bytes,
+            candidate_blob_bytes.len() as u64,
+        ) {
+            self.vacuum = Some(state);
+            return Err(error);
+        }
         if let Err(error) = self
             .engine
             .check_artifact_capacity(candidate_blob_bytes.len() as u64)
@@ -4170,6 +4245,16 @@ impl DB {
         let mut manifest_replicated = false;
         let mut relocated_pages = 0;
         if has_reclaimable_pages {
+            let will_relocate =
+                max_relocated_pages != Some(0) && self.engine.has_relocatable_interior_page()?;
+            if will_relocate {
+                let parent = self
+                    .manifest
+                    .load_latest()?
+                    .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
+                let (metadata_bytes, _) = self.generation_meta_bytes(parent, 0)?;
+                self.preflight_maintenance_capacity(0, metadata_bytes, 0)?;
+            }
             // Both slots must continue to name the old PMT until all moved
             // copies are durable. This is the maintenance equivalent of the
             // normal generation reuse barrier.

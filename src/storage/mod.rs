@@ -342,6 +342,45 @@ impl StorageEngine {
         self.relocate_interior_pages_with_limit(usize::MAX)
     }
 
+    /// Report whether at least one active page can move into a lower hole.
+    ///
+    /// This planning-only check performs no page reads or writes. Maintenance
+    /// uses it to avoid demanding publication-sidecar capacity when a compact
+    /// call can only trim an already-free tail.
+    pub fn has_relocatable_interior_page(&self) -> Result<bool> {
+        if !self.pending_reclaimed_offsets.is_empty() {
+            return Err(Error::NeedsRecovery(
+                "cannot plan relocation before generation publication".into(),
+            ));
+        }
+
+        let protected_offsets = self
+            .protected_offsets
+            .lock()
+            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+            .clone();
+        let mut free_offsets = self.free_offsets.clone();
+        free_offsets.sort_unstable();
+        let mut active_pages: Vec<_> = self
+            .pmt
+            .iter()
+            .filter(|(_, mapping)| !protected_offsets.contains(&mapping.offset))
+            .map(|(_, mapping)| mapping.offset)
+            .collect();
+        active_pages.sort_unstable_by_key(|offset| std::cmp::Reverse(*offset));
+
+        let mut free_index = 0;
+        for source in active_pages {
+            while free_index < free_offsets.len() && free_offsets[free_index] >= source {
+                free_index += 1;
+            }
+            if free_index < free_offsets.len() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Relocate at most `max_pages` active pages into lower unprotected holes.
     ///
     /// The limit bounds the write set and temporary page-image memory for one
