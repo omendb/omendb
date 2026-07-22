@@ -42,6 +42,33 @@ enum WorkloadKind {
     RangeRead,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurabilityMode {
+    Durable,
+    Buffered,
+}
+
+impl DurabilityMode {
+    fn parse(value: &str) -> BenchResult<Self> {
+        match value {
+            "durable" => Ok(Self::Durable),
+            "buffered" => Ok(Self::Buffered),
+            _ => Err(format!("unknown durability {value:?}; expected durable or buffered").into()),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Buffered => "buffered",
+        }
+    }
+
+    fn sync_writes(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+}
+
 impl WorkloadKind {
     fn parse(value: &str) -> BenchResult<Self> {
         match value {
@@ -77,7 +104,7 @@ struct Config {
     value_bytes: usize,
     range_width: usize,
     seed: u64,
-    sync: bool,
+    durability: DurabilityMode,
 }
 
 impl Config {
@@ -97,13 +124,13 @@ impl Config {
         let mut value_bytes = 128;
         let mut range_width = 32;
         let mut seed = 7;
-        let mut sync = false;
+        let mut durability = DurabilityMode::Durable;
 
         let mut index = 0;
         while index < args.len() {
             let flag = &args[index];
             if flag == "--sync" {
-                sync = true;
+                durability = DurabilityMode::Durable;
                 index += 1;
                 continue;
             }
@@ -124,6 +151,7 @@ impl Config {
                         .parse()
                         .map_err(|_| format!("invalid {flag}: {value}"))?
                 }
+                "--durability" => durability = DurabilityMode::parse(value)?,
                 _ => return Err(format!("unknown argument {flag:?}; use --help").into()),
             }
             index += 2;
@@ -154,7 +182,7 @@ impl Config {
             value_bytes,
             range_width,
             seed,
-            sync,
+            durability,
         })
     }
 }
@@ -177,9 +205,13 @@ fn print_help() {
          --value-bytes N          Value size (default 128)\n\
          --range-width N          Range width in keys (default 32)\n\
          --seed N                 Deterministic trace seed (default 7)\n\
-         --sync                   Request a sync durability boundary\n\n\
+         --durability durable|buffered\n\
+                                  Durability mode (default durable)\n\
+         --sync                   Alias for --durability durable\n\n\
          Workloads use the same generated trace for every engine. Each run\n\
-         verifies the oracle, closes, reopens, and verifies the final digest."
+         verifies the oracle, closes, reopens, and verifies the final digest.\n\
+         SeerDB common-KV runs support durable mode only; buffered mode is\n\
+         useful for peer-only diagnostics and is not a matched SeerDB run."
     );
 }
 
@@ -295,13 +327,13 @@ struct SeerCounters {
 struct FjallEngine {
     db: fjall::Database,
     keyspace: fjall::Keyspace,
-    sync: bool,
+    durable: bool,
 }
 
 #[cfg(feature = "rocksdb")]
 struct RocksDbEngine {
     db: rocksdb::DB,
-    sync: bool,
+    durable: bool,
 }
 
 enum Engine {
@@ -315,11 +347,20 @@ enum Engine {
 }
 
 impl Engine {
-    fn create(kind: EngineKind, path: &Path, sync: bool) -> BenchResult<Self> {
+    fn create(kind: EngineKind, path: &Path, durability: DurabilityMode) -> BenchResult<Self> {
         match kind {
             EngineKind::SeerDb => {
+                if durability != DurabilityMode::Durable {
+                    return Err(
+                        "SeerDB common-KV comparison supports durable mode only; buffered mode is not equivalent"
+                            .into(),
+                    );
+                }
                 let options = seerdb::Options {
-                    sync_writes: sync,
+                    // `DB::commit_batch` always forces the generation
+                    // publication barrier. Enabling this option would add a
+                    // sync per page and compare an extra durability policy.
+                    sync_writes: false,
                     blob_threshold: usize::MAX,
                     ..seerdb::Options::default()
                 };
@@ -332,7 +373,11 @@ impl Engine {
                 {
                     let db = fjall::Database::builder(path).open()?;
                     let keyspace = db.keyspace("default", fjall::KeyspaceCreateOptions::default)?;
-                    Ok(Self::Fjall(FjallEngine { db, keyspace, sync }))
+                    Ok(Self::Fjall(FjallEngine {
+                        db,
+                        keyspace,
+                        durable: durability.sync_writes(),
+                    }))
                 }
                 #[cfg(not(feature = "fjall"))]
                 {
@@ -345,7 +390,10 @@ impl Engine {
                     let mut options = rocksdb::Options::default();
                     options.create_if_missing(true);
                     let db = rocksdb::DB::open(&options, path)?;
-                    return Ok(Self::RocksDb(RocksDbEngine { db, sync }));
+                    return Ok(Self::RocksDb(RocksDbEngine {
+                        db,
+                        durable: durability.sync_writes(),
+                    }));
                 }
                 #[cfg(not(feature = "rocksdb"))]
                 {
@@ -355,11 +403,23 @@ impl Engine {
         }
     }
 
-    fn open_existing(kind: EngineKind, path: &Path, sync: bool) -> BenchResult<Self> {
+    fn open_existing(
+        kind: EngineKind,
+        path: &Path,
+        durability: DurabilityMode,
+    ) -> BenchResult<Self> {
         match kind {
             EngineKind::SeerDb => {
+                if durability != DurabilityMode::Durable {
+                    return Err(
+                        "SeerDB common-KV comparison supports durable mode only; buffered mode is not equivalent"
+                            .into(),
+                    );
+                }
                 let options = seerdb::Options {
-                    sync_writes: sync,
+                    // See the create path: commit_batch's publication barrier
+                    // is the matched durable boundary for this adapter.
+                    sync_writes: false,
                     blob_threshold: usize::MAX,
                     ..seerdb::Options::default()
                 };
@@ -372,7 +432,11 @@ impl Engine {
                 {
                     let db = fjall::Database::builder(path).open()?;
                     let keyspace = db.keyspace("default", fjall::KeyspaceCreateOptions::default)?;
-                    Ok(Self::Fjall(FjallEngine { db, keyspace, sync }))
+                    Ok(Self::Fjall(FjallEngine {
+                        db,
+                        keyspace,
+                        durable: durability.sync_writes(),
+                    }))
                 }
                 #[cfg(not(feature = "fjall"))]
                 {
@@ -385,7 +449,10 @@ impl Engine {
                     let mut options = rocksdb::Options::default();
                     options.create_if_missing(false);
                     let db = rocksdb::DB::open(&options, path)?;
-                    return Ok(Self::RocksDb(RocksDbEngine { db, sync }));
+                    return Ok(Self::RocksDb(RocksDbEngine {
+                        db,
+                        durable: durability.sync_writes(),
+                    }));
                 }
                 #[cfg(not(feature = "rocksdb"))]
                 {
@@ -430,7 +497,7 @@ impl Engine {
                     }
                 }
                 batch.commit()?;
-                if engine.sync {
+                if engine.durable {
                     engine.db.persist(fjall::PersistMode::SyncAll)?;
                 }
             }
@@ -447,7 +514,7 @@ impl Engine {
                     }
                 }
                 let mut write_options = rocksdb::WriteOptions::default();
-                write_options.set_sync(engine.sync);
+                write_options.set_sync(engine.durable);
                 engine.db.write_opt(batch, &write_options)?;
             }
         }
@@ -764,10 +831,10 @@ fn print_result(result: &RunResult) {
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
     println!(
-        "{{\n  \"format\": \"seerdb-common-kv-v1\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"sync\": {},\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+        "{{\n  \"format\": \"seerdb-common-kv-v2\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
-        config.sync,
+        config.durability.name(),
         config.keys,
         config.operations,
         config.batch_size,
@@ -819,7 +886,7 @@ fn main() -> BenchResult<()> {
 
     let initial = initial_state(&config);
     let operations = generate_operations(&config);
-    let mut engine = Engine::create(config.engine, &config.path, config.sync)?;
+    let mut engine = Engine::create(config.engine, &config.path, config.durability)?;
     let mut oracle = BTreeMap::new();
 
     let preload_started = Instant::now();
@@ -838,7 +905,7 @@ fn main() -> BenchResult<()> {
     engine.close()?;
 
     let disk_bytes = disk_bytes(&config.path)?;
-    let reopened = Engine::open_existing(config.engine, &config.path, config.sync)?;
+    let reopened = Engine::open_existing(config.engine, &config.path, config.durability)?;
     let reopened_entries = reopened.range(&[], &[0xff])?;
     if reopened_entries != expected_entries {
         return Err("reopen verification failed: final entries differ from oracle".into());

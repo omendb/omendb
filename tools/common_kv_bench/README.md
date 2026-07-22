@@ -22,18 +22,24 @@ matched tuning.
 From this directory:
 
 ```bash
-# SeerDB and Fjall (Fjall is the default feature)
-cargo run --release -- --engine seerdb --workload batch-put --path /tmp/seerdb-bench
-cargo run --release -- --engine fjall --workload mixed --sync --path /tmp/fjall-bench
+# SeerDB and Fjall (Fjall is the default feature; both runs are durable)
+cargo run --release -- --engine seerdb --workload batch-put \
+  --durability durable --path /tmp/seerdb-bench
+cargo run --release -- --engine fjall --workload mixed \
+  --durability durable --path /tmp/fjall-bench
 
 # RocksDB uses an optional native dependency and disables the Fjall default
 cargo run --release --no-default-features --features rocksdb -- \
-  --engine rocksdb --workload mixed --sync --path /tmp/rocksdb-bench
+  --engine rocksdb --workload mixed --durability durable \
+  --path /tmp/rocksdb-bench
 ```
 
 The path must not already exist. The default run size is intentionally small;
 increase `--keys`, `--operations`, and `--value-bytes` for a real comparison.
-Use `--help` for all workload controls.
+The default is durable mode. `--durability buffered` is available for
+peer-only diagnostics; SeerDB rejects it because its common-KV adapter always
+publishes a durable generation per commit. `--sync` remains an alias for
+`--durability durable`. Use `--help` for all workload controls.
 
 The RocksDB adapter requires a working native RocksDB build toolchain. On
 macOS that currently includes `libclang` for the published `rocksdb 0.24.0`
