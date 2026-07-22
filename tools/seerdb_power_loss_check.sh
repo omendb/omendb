@@ -11,6 +11,10 @@ mount_point=$2
 oracle_file=$3
 verify_binary=$4
 
+# The device is a disposable copy of the baseline plus one replay prefix.
+# Verification may perform normal SeerDB recovery and cleanup on it; the
+# baseline image and immutable log remain outside this mount and are never
+# passed to the checker.
 mounted=0
 cleanup() {
     if (( mounted )); then
@@ -19,6 +23,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mount "$replay_device" "$mount_point"
+mount -o rw "$replay_device" "$mount_point"
 mounted=1
 "$verify_binary" verify "$mount_point/db" "$oracle_file"

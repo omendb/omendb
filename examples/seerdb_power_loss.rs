@@ -5,7 +5,7 @@
 //! interrupted publication itself.
 
 use seerdb::storage::format::SnapshotId;
-use seerdb::{DB, Options};
+use seerdb::{BlobStorageMode, DB, Options};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -55,7 +55,7 @@ fn run() -> Result<(), String> {
 }
 
 fn seed(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
-    let mut db = DB::create(db_path, Options::default()).map_err(error)?;
+    let mut db = DB::create(db_path, power_loss_options()?).map_err(error)?;
     db.put(INLINE_KEY, INLINE_OLD).map_err(error)?;
     db.put(BLOB_KEY, &vec![BLOB_OLD; BLOB_LEN]).map_err(error)?;
     db.flush().map_err(error)?;
@@ -76,7 +76,7 @@ fn seed(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
 
 fn mutate(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
     let oracle = read_oracle(oracle_path)?;
-    let mut db = DB::open(db_path, Options::default()).map_err(error)?;
+    let mut db = DB::open(db_path, power_loss_options()?).map_err(error)?;
     if db.get(INLINE_KEY).map_err(error)?.as_deref() != Some(INLINE_OLD) {
         return Err("seed generation is not active before mutation".into());
     }
@@ -105,7 +105,7 @@ fn verify(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
         .new_commit
         .ok_or_else(|| "oracle has no completed mutation commit".to_string())?;
     for pass in 0..2 {
-        let mut db = DB::open(db_path, Options::default()).map_err(error)?;
+        let mut db = DB::open(db_path, power_loss_options()?).map_err(error)?;
         let status = db.durability_status();
         let (expected_inline, expected_blob) = match status.commit_id.get() {
             commit if commit == oracle.old_commit => (INLINE_OLD, BLOB_OLD),
@@ -141,6 +141,25 @@ fn verify(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
         db.verify().map_err(error)?;
     }
     Ok(())
+}
+
+fn power_loss_options() -> Result<Options, String> {
+    let blob_storage = match env::var("SEERDB_POWERLOSS_BLOB_STORAGE")
+        .unwrap_or_else(|_| "whole".to_string())
+        .as_str()
+    {
+        "whole" => BlobStorageMode::WholeImage,
+        "segmented" => BlobStorageMode::Segmented,
+        value => {
+            return Err(format!(
+                "SEERDB_POWERLOSS_BLOB_STORAGE must be whole or segmented, got {value}"
+            ));
+        }
+    };
+    Ok(Options {
+        blob_storage,
+        ..Options::default()
+    })
 }
 
 fn read_oracle(path: &Path) -> Result<Oracle, String> {
