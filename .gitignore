@@ -1,4 +1,5 @@
 /target
+/tools/common_kv_bench/target/
 Cargo.lock
 
 # Coverage reports

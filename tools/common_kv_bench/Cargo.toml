@@ -1,0 +1,15 @@
+[package]
+name = "seerdb-common-kv-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["fjall"]
+fjall = ["dep:fjall"]
+rocksdb = ["dep:rocksdb"]
+
+[dependencies]
+seerdb = { path = "../.." }
+fjall = { version = "3.1.8", optional = true }
+rocksdb = { version = "0.24.0", optional = true, default-features = false, features = ["lz4"] }
