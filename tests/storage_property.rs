@@ -85,6 +85,83 @@ proptest! {
     })]
 
     #[test]
+    fn vacuum_capacity_refusal_preserves_retryable_candidate(
+        live_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
+        dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
+    ) {
+        for segmented in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("vacuum-capacity-property.db");
+            let options = Options {
+                blob_storage: if segmented {
+                    BlobStorageMode::Segmented
+                } else {
+                    BlobStorageMode::WholeImage
+                },
+                ..Options::for_test()
+            };
+            let mut db = DB::create(&path, options).unwrap();
+            db.commit_batch(&[
+                BatchMutation::Put {
+                    key: b"vacuum-live".to_vec(),
+                    value: live_value.clone(),
+                },
+                BatchMutation::Put {
+                    key: b"vacuum-dead".to_vec(),
+                    value: dead_value.clone(),
+                },
+            ])
+            .unwrap();
+            db.commit_batch(&[BatchMutation::Delete {
+                key: b"vacuum-dead".to_vec(),
+            }])
+            .unwrap();
+            let before_commit = db.durability_status().commit_id;
+            let before_generation = db.durability_status().generation_id;
+            let before_page_writes = db.metrics().unwrap().storage.physical_page_writes;
+
+            db.inject_capacity_limit(0);
+            let refusal = db.vacuum();
+            assert!(matches!(
+                refusal,
+                Err(Error::DiskFull | Error::CapacityPreflight)
+            ));
+            let after_page_writes = db.metrics().unwrap().storage.physical_page_writes;
+            assert_eq!(after_page_writes, before_page_writes);
+            assert_eq!(db.durability_status().commit_id, before_commit);
+            assert_eq!(db.durability_status().generation_id, before_generation);
+            assert!(!db.durability_status().write_fenced);
+            assert_eq!(db.get(b"vacuum-live").unwrap(), Some(live_value.clone()));
+            assert_eq!(db.get(b"vacuum-dead").unwrap(), None);
+
+            db.inject_capacity_limit(u64::MAX);
+            let report = db.vacuum().unwrap();
+            assert_eq!(report.live_entries, 1);
+            assert_eq!(db.get(b"vacuum-live").unwrap(), Some(live_value.clone()));
+            assert_eq!(db.get(b"vacuum-dead").unwrap(), None);
+            db.verify().unwrap();
+            drop(db);
+
+            let mut reopened = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(
+                reopened.get(b"vacuum-live").unwrap(),
+                Some(live_value.clone())
+            );
+            assert_eq!(reopened.get(b"vacuum-dead").unwrap(), None);
+            reopened.verify().unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 8,
+        max_shrink_iters: 1_000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
     fn publication_faults_reopen_old_or_complete_new(
         new_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
         fault in 0u8..4
