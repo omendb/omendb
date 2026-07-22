@@ -88,6 +88,33 @@ impl Device {
         Self::open_with_mode(path, options, false)
     }
 
+    /// Clone the underlying descriptor for an independent read handle.
+    ///
+    /// The handle shares the file's inode with the writer, so an atomic
+    /// publication cannot invalidate reads already in progress. It has its
+    /// own offset/fault state and never participates in writer admission.
+    pub(crate) fn clone_for_read(&self) -> io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            use_odirect: self.use_odirect,
+            sync_writes: false,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_sync: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_write: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_after_write: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_page_range_sync: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_final_write_disk_full: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_disk_full: AtomicBool::new(false),
+            #[cfg(any(test, feature = "fault-injection"))]
+            capacity_limit: AtomicU64::new(u64::MAX),
+        })
+    }
+
     fn open_with_mode<P: AsRef<Path>>(
         path: P,
         options: &DeviceOptions,

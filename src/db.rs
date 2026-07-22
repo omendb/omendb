@@ -21,11 +21,15 @@ use crate::storage::format::{
     MANIFEST_SLOT_SIZE, Manifest, ManifestHistory, ManifestStore, PmtCheckpointId, RetainedRoot,
     RetentionRegistry, ReuseAttempt, ReuseLedger, SnapshotId,
 };
-use crate::storage::{StorageEngine, StorageMetrics};
+use crate::storage::{StorageEngine, StorageMetrics, StorageReadView};
 use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as PositionalFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as PositionalFileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -591,6 +595,279 @@ struct RetentionLease {
     state: Arc<Mutex<RetentionState>>,
     snapshot_id: SnapshotId,
     released: bool,
+}
+
+/// A cheap immutable read handle bound to one published SeerDB generation.
+///
+/// The handle owns a process-local retention lease and independent page/blob
+/// descriptors. It does not copy the PMT, serialize blob bytes, or write a
+/// sidecar at creation time. Writers continue to publish newer generations;
+/// this view remains on the root and physical files it captured.
+pub struct ReadView {
+    storage: StorageReadView,
+    blobs: BlobReadView,
+    lease: Option<RetentionLease>,
+    durability: DurabilityStatus,
+}
+
+struct BlobReadView {
+    files: HashMap<u32, File>,
+    bases: HashMap<u32, u64>,
+}
+
+impl BlobReadView {
+    fn open(path: &Path, blobs: &BlobManager) -> Result<Self> {
+        if blobs.is_segmented() {
+            let mut files = HashMap::new();
+            let mut bases = HashMap::new();
+            for file_id in blobs.segment_file_ids() {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(blob_segment_path(path, file_id))?;
+                files.insert(file_id, file);
+                bases.insert(file_id, 0);
+            }
+            return Ok(Self { files, bases });
+        }
+
+        let file_ids = blobs.segment_file_ids();
+        if file_ids.is_empty() {
+            return Ok(Self {
+                files: HashMap::new(),
+                bases: HashMap::new(),
+            });
+        }
+        let file = OpenOptions::new().read(true).open(path.join(BLOB_FILE))?;
+        let file_len = file.metadata()?.len();
+        let mut files = HashMap::new();
+        let mut bases = HashMap::new();
+        let mut cursor;
+        let mut header = [0u8; 32];
+        if file_len >= header.len() as u64 {
+            read_exact_at(&file, 0, &mut header)?;
+        }
+
+        if header[..8] == *b"SEERBLB1" {
+            if decode_u32(&header[8..12])? != 1 {
+                return Err(Error::Corruption("unsupported blob image version".into()));
+            }
+            let count = decode_u32(&header[28..32])? as usize;
+            cursor = 32;
+            for _ in 0..count {
+                let mut descriptor = [0u8; 12];
+                read_exact_at(&file, cursor, &mut descriptor)?;
+                let file_id = decode_u32(&descriptor[..4])?;
+                let data_len = decode_u64(&descriptor[4..12])?;
+                let base = cursor
+                    .checked_add(12)
+                    .ok_or_else(|| Error::Corruption("blob image offset overflow".into()))?;
+                let data_end = base
+                    .checked_add(data_len)
+                    .ok_or_else(|| Error::Corruption("blob image length overflow".into()))?;
+                if file_id == 0 || data_end > file_len || files.contains_key(&file_id) {
+                    return Err(Error::Corruption("invalid blob image descriptor".into()));
+                }
+                files.insert(file_id, file.try_clone()?);
+                bases.insert(file_id, base);
+                cursor = data_end;
+                let mut deleted_count = [0u8; 4];
+                read_exact_at(&file, cursor, &mut deleted_count)?;
+                let deleted_bytes = u64::from(decode_u32(&deleted_count)?)
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::Corruption("blob deletion metadata overflow".into()))?;
+                cursor = cursor
+                    .checked_add(4)
+                    .and_then(|offset| offset.checked_add(deleted_bytes))
+                    .ok_or_else(|| Error::Corruption("blob image offset overflow".into()))?;
+            }
+        } else {
+            let mut count_bytes = [0u8; 4];
+            read_exact_at(&file, 0, &mut count_bytes)?;
+            let count = decode_u32(&count_bytes)? as usize;
+            cursor = 4;
+            for _ in 0..count {
+                let mut descriptor = [0u8; 8];
+                read_exact_at(&file, cursor, &mut descriptor)?;
+                let file_id = decode_u32(&descriptor[..4])?;
+                let data_len = u64::from(decode_u32(&descriptor[4..8])?);
+                let base = cursor
+                    .checked_add(8)
+                    .ok_or_else(|| Error::Corruption("blob image offset overflow".into()))?;
+                let data_end = base
+                    .checked_add(data_len)
+                    .ok_or_else(|| Error::Corruption("blob image length overflow".into()))?;
+                if file_id == 0 || data_end > file_len || files.contains_key(&file_id) {
+                    return Err(Error::Corruption("invalid legacy blob descriptor".into()));
+                }
+                files.insert(file_id, file.try_clone()?);
+                bases.insert(file_id, base);
+                cursor = data_end;
+            }
+        }
+
+        for file_id in file_ids {
+            if !files.contains_key(&file_id) {
+                return Err(Error::Corruption(format!(
+                    "blob image is missing file {file_id}"
+                )));
+            }
+        }
+        Ok(Self { files, bases })
+    }
+
+    fn read(&self, pointer: &BlobPointer) -> Result<Vec<u8>> {
+        let file = self.files.get(&pointer.file_id).ok_or_else(|| {
+            Error::Corruption(format!(
+                "blob pointer names missing file {}",
+                pointer.file_id
+            ))
+        })?;
+        let base = *self.bases.get(&pointer.file_id).ok_or_else(|| {
+            Error::Corruption(format!(
+                "blob pointer has no base for file {}",
+                pointer.file_id
+            ))
+        })?;
+        let offset = base
+            .checked_add(pointer.offset)
+            .ok_or_else(|| Error::Corruption("blob pointer offset overflow".into()))?;
+        let mut header = [0u8; 12];
+        read_exact_at(file, offset, &mut header)?;
+        let length = decode_u32(&header[8..12])?;
+        if length != pointer.length {
+            return Err(Error::Corruption(
+                "blob pointer length does not match record".into(),
+            ));
+        }
+        let value_len = usize::try_from(length)
+            .map_err(|_| Error::Corruption("blob value length overflows memory".into()))?;
+        let record_len = 12usize
+            .checked_add(value_len)
+            .ok_or_else(|| Error::Corruption("blob record length overflow".into()))?;
+        let mut record = vec![0u8; record_len];
+        read_exact_at(file, offset, &mut record)?;
+        let mut crc_bytes = [0u8; 4];
+        read_exact_at(
+            file,
+            offset
+                .checked_add(record_len as u64)
+                .ok_or_else(|| Error::Corruption("blob record offset overflow".into()))?,
+            &mut crc_bytes,
+        )?;
+        let stored_crc = u32::from_le_bytes(crc_bytes);
+        if stored_crc != crc32c::crc32c(&record) {
+            return Err(Error::Corruption("blob record checksum mismatch".into()));
+        }
+        Ok(record[12..].to_vec())
+    }
+}
+
+fn read_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let count = file.read_at(&mut buffer[filled..], offset + filled as u64)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file read reached end of file",
+                ));
+            }
+            filled += count;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let count = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "file read reached end of file",
+                ));
+            }
+            filled += count;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut cloned = file.try_clone()?;
+        cloned.seek(SeekFrom::Start(offset))?;
+        cloned.read_exact(buffer)
+    }
+}
+
+fn decode_u32(bytes: &[u8]) -> Result<u32> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| Error::Corruption("truncated blob integer".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::Corruption("truncated blob integer".into()))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+impl ReadView {
+    /// Return the generation captured by this view.
+    #[must_use]
+    pub fn commit_id(&self) -> CommitId {
+        self.durability.commit_id
+    }
+
+    /// Return the durability state captured by this view.
+    #[must_use]
+    pub fn durability_status(&self) -> DurabilityStatus {
+        self.durability
+    }
+
+    /// Read a key from the captured generation.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.storage.lookup(key)? {
+            LookupResult::Found(value) => Ok(Some(value)),
+            LookupResult::Blob(pointer) => self.blobs.read(&pointer).map(Some),
+            LookupResult::Deleted | LookupResult::NotFound => Ok(None),
+        }
+    }
+
+    /// Read a range from the captured generation.
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.storage
+            .range(start, end)?
+            .into_iter()
+            .filter_map(|(key, result)| match result {
+                LookupResult::Found(value) => Some(Ok((key, value))),
+                LookupResult::Blob(pointer) => {
+                    Some(self.blobs.read(&pointer).map(|value| (key, value)))
+                }
+                LookupResult::Deleted | LookupResult::NotFound => None,
+            })
+            .collect()
+    }
+
+    /// Release the view's root lease before dropping the handle.
+    pub fn release(mut self) -> Result<()> {
+        if let Some(mut lease) = self.lease.take() {
+            lease.release()?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ReadView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadView")
+            .field("durability", &self.durability)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Snapshot {
@@ -3778,6 +4055,54 @@ impl DB {
         self.register_current_transaction_manifest(manifest)
     }
 
+    /// Begin a cheap immutable view over the active published generation.
+    ///
+    /// Unlike historical retention, this path does not serialize a blob
+    /// sidecar or copy the PMT. The view pins the immutable PMT and opens the
+    /// current page/blob files before returning; the process-local lease keeps
+    /// reclamation from reusing pages or deleting old blob segments while it
+    /// is live.
+    pub fn begin_read_view(&mut self) -> Result<ReadView> {
+        self.check_readable()?;
+        self.check_maintenance_idle()?;
+        let manifest = self
+            .manifest
+            .load_latest()?
+            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        if manifest.commit_id != self.commit_id || manifest.generation_id != self.generation_id {
+            return Err(Error::Corruption(
+                "active manifest does not match the database frontier".into(),
+            ));
+        }
+
+        let snapshot_id = self.register_read_view_manifest(manifest)?;
+        let mut lease = RetentionLease {
+            state: Arc::clone(&self.retention),
+            snapshot_id,
+            released: false,
+        };
+        let storage = match self.engine.read_view(manifest.root_page_id) {
+            Ok(storage) => storage,
+            Err(error) => {
+                let _ = lease.release();
+                return Err(error);
+            }
+        };
+        let blobs = match BlobReadView::open(&self.path, &self.blobs) {
+            Ok(blobs) => blobs,
+            Err(error) => {
+                let _ = lease.release();
+                return Err(error);
+            }
+        };
+        Ok(ReadView {
+            storage,
+            blobs,
+            lease: Some(lease),
+            durability: self.durability_status(),
+        })
+    }
+
     /// Return the active retention ID for a commit, if one exists.
     pub fn retained_snapshot_id(&self, commit_id: CommitId) -> Option<SnapshotId> {
         self.retention
@@ -3806,7 +4131,31 @@ impl DB {
     }
 
     fn register_current_transaction_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
-        self.register_manifest(manifest, false, false, false)
+        self.register_manifest(manifest, false, true, false)
+    }
+
+    fn register_read_view_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {
+        let snapshot_id = {
+            let state = self
+                .retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            state.next_ephemeral_snapshot_id()
+        };
+        {
+            let mut state = self
+                .retention
+                .lock()
+                .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?;
+            state.insert_ephemeral(manifest, HashSet::new())?;
+            let protected = state
+                .protected_offsets
+                .lock()
+                .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
+                .clone();
+            self.engine.set_protected_offsets(protected)?;
+        }
+        Ok(snapshot_id)
     }
 
     fn register_ephemeral_manifest(&mut self, manifest: Manifest) -> Result<SnapshotId> {

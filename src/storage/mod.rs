@@ -99,7 +99,7 @@ pub struct StorageEngine {
     /// Buffer manager (page cache).
     buffer: Mutex<BufferManager>,
     /// Page mapping table (page locations).
-    pmt: PMT,
+    pmt: Arc<PMT>,
     /// Device (file I/O).
     device: Device,
     /// Next offset for page allocation.
@@ -115,6 +115,10 @@ pub struct StorageEngine {
     /// pages remain unavailable for reuse until the corresponding retention
     /// lease is released and the allocator refreshes its reclamation view.
     protected_offsets: Arc<Mutex<HashSet<u64>>>,
+    /// Immutable PMTs held by live read views. Keeping the PMT itself here
+    /// avoids copying every page offset when a view begins; reclamation walks
+    /// these roots only when it refreshes its reuse plan.
+    protected_pmts: Arc<Mutex<Vec<Arc<PMT>>>>,
     /// Active-generation offsets held aside while a logical rebuild is being
     /// published. Resetting the PMT before the new root is authoritative must
     /// not make the old root's pages reusable after a crash.
@@ -124,6 +128,17 @@ pub struct StorageEngine {
     lazy_root: Option<u32>,
     /// Cumulative physical work counters for diagnostics and benchmarks.
     metrics: StorageCounters,
+}
+
+/// An immutable, generation-bound read handle.
+///
+/// The PMT is shared copy-on-write with the writer and the device descriptor
+/// is cloned for independent positioned reads. Creating this handle therefore
+/// does not copy the PMT or acquire the writer's buffer-pool mutex during any
+/// subsequent lookup.
+pub(crate) struct StorageReadView {
+    engine: StorageEngine,
+    root_page_id: u64,
 }
 
 impl StorageEngine {
@@ -158,17 +173,48 @@ impl StorageEngine {
         Self {
             btree: btree.with_page_allocator(allocator),
             buffer: Mutex::new(buffer),
-            pmt,
+            pmt: Arc::new(pmt),
             device,
             next_offset: 0,
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
             protected_offsets,
+            protected_pmts: Arc::new(Mutex::new(Vec::new())),
             rebuild_reserved_offsets: HashSet::new(),
             lazy_root: None,
             metrics: StorageCounters::default(),
         }
+    }
+
+    /// Create a read-only handle pinned to the current PMT and root.
+    pub(crate) fn read_view(&self, root_page_id: u64) -> Result<StorageReadView> {
+        let buffer_capacity = self.buffer_stats().total_frames * PAGE_SIZE;
+        let pmt = Arc::clone(&self.pmt);
+        let device = self.device.clone_for_read()?;
+        self.protected_pmts
+            .lock()
+            .map_err(|_| Error::Corruption("storage PMT lease mutex is poisoned".into()))?
+            .push(Arc::clone(&pmt));
+        let engine = Self {
+            btree: BTree::new().with_page_allocator(PageAllocator::new()),
+            buffer: Mutex::new(BufferManager::new(buffer_capacity)),
+            pmt,
+            device,
+            next_offset: 0,
+            free_offsets: Vec::new(),
+            pending_reclaimed_offsets: Vec::new(),
+            pending_reclaimed_cache_keys: Vec::new(),
+            protected_offsets: Arc::clone(&self.protected_offsets),
+            protected_pmts: Arc::clone(&self.protected_pmts),
+            rebuild_reserved_offsets: HashSet::new(),
+            lazy_root: Some(root_page_id as u32),
+            metrics: StorageCounters::default(),
+        };
+        Ok(StorageReadView {
+            engine,
+            root_page_id,
+        })
     }
 
     /// Get a reference to the B-tree.
@@ -183,7 +229,7 @@ impl StorageEngine {
 
     /// Get a reference to the PMT.
     pub fn pmt(&self) -> &PMT {
-        &self.pmt
+        self.pmt.as_ref()
     }
 
     /// Get a reference to the allocator.
@@ -270,6 +316,15 @@ impl StorageEngine {
             .lock()
             .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
             .clone();
+        let protected_pmts = self
+            .protected_pmts
+            .lock()
+            .map_err(|_| Error::Corruption("storage PMT lease mutex is poisoned".into()))?
+            .clone();
+        let mut protected_offsets = protected_offsets;
+        for pmt in protected_pmts {
+            protected_offsets.extend(pmt.iter().map(|(_, mapping)| mapping.offset));
+        }
         let rebuild_reserved_offsets = &self.rebuild_reserved_offsets;
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
@@ -453,7 +508,7 @@ impl StorageEngine {
         for (page_id, mapping, target, _) in moves {
             retired_offsets.push(mapping.offset);
             retired_cache_keys.push(PageCacheKey::new(page_id, mapping.version));
-            self.pmt.insert(page_id, mapping.file_id, target);
+            Arc::make_mut(&mut self.pmt).insert(page_id, mapping.file_id, target);
         }
         self.free_offsets.retain(|offset| !targets.contains(offset));
         self.pending_reclaimed_offsets = retired_offsets;
@@ -588,7 +643,7 @@ impl StorageEngine {
 
     /// Get mutable access to the page mapping table for recovery.
     pub fn pmt_mut(&mut self) -> &mut PMT {
-        &mut self.pmt
+        Arc::make_mut(&mut self.pmt)
     }
 
     /// Replace the active logical tree as part of a full mark-and-rebuild
@@ -610,7 +665,7 @@ impl StorageEngine {
 
         self.rebuild_reserved_offsets =
             self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
-        self.pmt.clear();
+        Arc::make_mut(&mut self.pmt).clear();
         self.btree = btree;
         self.lazy_root = None;
         self.free_offsets.clear();
@@ -771,7 +826,7 @@ impl StorageEngine {
                 } else {
                     self.next_offset += PAGE_SIZE as u64;
                 }
-                self.pmt.insert(page_id as u64, 0, offset);
+                Arc::make_mut(&mut self.pmt).insert(page_id as u64, 0, offset);
                 let version = self
                     .pmt
                     .get(page_id as u64)
@@ -1579,7 +1634,7 @@ impl StorageEngine {
             self.btree.add_node(node, page_id as u32);
 
             // Update PMT.
-            self.pmt.insert(page_id, 0, offset);
+            Arc::make_mut(&mut self.pmt).insert(page_id, 0, offset);
             let version = self
                 .pmt
                 .get(page_id)
@@ -1603,6 +1658,30 @@ impl StorageEngine {
         self.pending_reclaimed_cache_keys.clear();
 
         Ok(())
+    }
+}
+
+impl StorageReadView {
+    pub(crate) fn lookup(&self, key: &[u8]) -> Result<LookupResult> {
+        self.engine
+            .lookup_at(self.root_page_id, self.engine.pmt(), key)
+    }
+
+    pub(crate) fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, LookupResult)>> {
+        self.engine
+            .range_at(self.root_page_id, self.engine.pmt(), start, end)
+    }
+}
+
+impl Drop for StorageReadView {
+    fn drop(&mut self) {
+        if let Ok(mut leases) = self.engine.protected_pmts.lock()
+            && let Some(index) = leases
+                .iter()
+                .position(|pmt| Arc::ptr_eq(pmt, &self.engine.pmt))
+        {
+            leases.swap_remove(index);
+        }
     }
 }
 
