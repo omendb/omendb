@@ -8,7 +8,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use seerdb::{BatchMutation, DB, Options, PublicationMetrics, StorageMetrics};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error as StdError;
@@ -90,6 +90,7 @@ struct Args {
     seed: u64,
     db: Option<PathBuf>,
     output: Option<PathBuf>,
+    trace_output: Option<PathBuf>,
 }
 
 fn invalid(message: impl Into<String>) -> Box<dyn StdError> {
@@ -116,6 +117,7 @@ fn parse_args() -> AnyResult<Args> {
         seed: DEFAULT_SEED,
         db: None,
         output: None,
+        trace_output: None,
     };
 
     while let Some(flag) = args.next() {
@@ -128,9 +130,10 @@ fn parse_args() -> AnyResult<Args> {
             "--seed" => parsed.seed = parse_u64(&value, &flag)?,
             "--db" => parsed.db = Some(PathBuf::from(value)),
             "--output" => parsed.output = Some(PathBuf::from(value)),
+            "--trace-output" => parsed.trace_output = Some(PathBuf::from(value)),
             "--help" | "-h" => {
                 println!(
-                    "usage: seerdb_qualification [--keys N] [--operations N] [--seed N] [--db PATH] [--output PATH]"
+                    "usage: seerdb_qualification [--keys N] [--operations N] [--seed N] [--db PATH] [--output PATH] [--trace-output PATH]"
                 );
                 std::process::exit(0);
             }
@@ -157,6 +160,41 @@ fn workload_key(index: usize) -> Vec<u8> {
 
 fn workload_value(index: usize, revision: usize) -> Vec<u8> {
     format!("qualification-value-{index:08}-revision-{revision:08}").into_bytes()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn trace_event(events: &mut Vec<Value>, next_seq: &mut u64, kind: &str, payload: Value) {
+    let mut event = Map::new();
+    event.insert("seq".to_owned(), json!(*next_seq));
+    event.insert("kind".to_owned(), json!(kind));
+    if let Value::Object(payload) = payload {
+        event.extend(payload);
+    }
+    events.push(Value::Object(event));
+    *next_seq = next_seq.saturating_add(1);
+}
+
+fn trace_pairs(pairs: &[(Vec<u8>, Vec<u8>)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| {
+                json!({
+                    "key_hex": hex_encode(key),
+                    "value_hex": hex_encode(value),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn digest(model: &Model) -> String {
@@ -233,10 +271,42 @@ fn main() -> AnyResult<()> {
             value: value.clone(),
         })
         .collect();
+    let mut trace_events = Vec::with_capacity(args.operations.saturating_add(args.keys) + 16);
+    let mut next_trace_seq = 0;
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "header",
+        json!({
+            "schema": "seerdb-storage-conformance-v1",
+            "keys": args.keys,
+            "operations": args.operations,
+            "seed": args.seed,
+        }),
+    );
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "batch",
+        json!({
+            "atomic": true,
+            "mutations": initial.iter().map(|(key, value)| json!({
+                "op": "put",
+                "key_hex": hex_encode(key),
+                "value_hex": hex_encode(value),
+            })).collect::<Vec<_>>(),
+        }),
+    );
     db.commit_batch(&initial_batch)?;
     let mut model = initial;
     let mut retained = Some(db.retain_current()?);
     let retained_model = model.clone();
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "retain",
+        json!({"snapshot": "initial"}),
+    );
     let mut state = args.seed;
     let mut revisions = vec![0usize; args.keys + args.operations];
     let mut commit_latency = Vec::new();
@@ -260,6 +330,15 @@ fn main() -> AnyResult<()> {
         let key = workload_key(key_index);
         match random % 100 {
             0..=44 => {
+                trace_event(
+                    &mut trace_events,
+                    &mut next_trace_seq,
+                    "get",
+                    json!({
+                        "key_hex": hex_encode(&key),
+                        "expected_value_hex": model.get(&key).map(|value| hex_encode(value)),
+                    }),
+                );
                 let started = Instant::now();
                 let actual = db.get(&key)?;
                 get_latency.push(started.elapsed().as_nanos());
@@ -270,6 +349,19 @@ fn main() -> AnyResult<()> {
             45..=69 => {
                 revisions[key_index] = revisions[key_index].saturating_add(1);
                 let value = workload_value(key_index, revisions[key_index]);
+                trace_event(
+                    &mut trace_events,
+                    &mut next_trace_seq,
+                    "batch",
+                    json!({
+                        "atomic": true,
+                        "mutations": [{
+                            "op": "put",
+                            "key_hex": hex_encode(&key),
+                            "value_hex": hex_encode(&value),
+                        }],
+                    }),
+                );
                 let started = Instant::now();
                 db.commit_batch(&[BatchMutation::Put {
                     key: key.clone(),
@@ -281,6 +373,18 @@ fn main() -> AnyResult<()> {
                 model.insert(key, value);
             }
             70..=84 => {
+                trace_event(
+                    &mut trace_events,
+                    &mut next_trace_seq,
+                    "batch",
+                    json!({
+                        "atomic": true,
+                        "mutations": [{
+                            "op": "delete",
+                            "key_hex": hex_encode(&key),
+                        }],
+                    }),
+                );
                 let started = Instant::now();
                 db.commit_batch(&[BatchMutation::Delete { key: key.clone() }])?;
                 commit_latency.push(started.elapsed().as_nanos());
@@ -292,6 +396,17 @@ fn main() -> AnyResult<()> {
                 let end_index = (start_index + 16).min(args.keys + args.operations);
                 let start = workload_key(start_index);
                 let end = workload_key(end_index);
+                let expected = model_range(&model, &start, &end);
+                trace_event(
+                    &mut trace_events,
+                    &mut next_trace_seq,
+                    "range",
+                    json!({
+                        "start_hex": hex_encode(&start),
+                        "end_hex": hex_encode(&end),
+                        "expected": trace_pairs(&expected),
+                    }),
+                );
                 let started = Instant::now();
                 check_range(&db, &model, &start, &end)?;
                 range_latency.push(started.elapsed().as_nanos());
@@ -303,6 +418,16 @@ fn main() -> AnyResult<()> {
                 .as_ref()
                 .ok_or_else(|| invalid("retained snapshot disappeared"))?;
             for (key, value) in retained_model.iter().take(8) {
+                trace_event(
+                    &mut trace_events,
+                    &mut next_trace_seq,
+                    "snapshot_get",
+                    json!({
+                        "snapshot": "initial",
+                        "key_hex": hex_encode(key),
+                        "expected_value_hex": hex_encode(value),
+                    }),
+                );
                 if snapshot.get(key)?.as_deref() != Some(value.as_slice()) {
                     return Err(invalid("retained snapshot changed after later commits"));
                 }
@@ -310,6 +435,12 @@ fn main() -> AnyResult<()> {
         }
 
         if (operation + 1) % (args.operations / 4).max(1) == 0 {
+            trace_event(
+                &mut trace_events,
+                &mut next_trace_seq,
+                "maintenance",
+                json!({"action": "compact", "limit": 2}),
+            );
             let before_maintenance = db.metrics()?;
             commit_counters.add_delta(handle_metrics, before_maintenance.storage);
             commit_publication.add_delta(handle_publication, before_maintenance.publication);
@@ -324,7 +455,19 @@ fn main() -> AnyResult<()> {
                 before_maintenance.publication,
                 after_maintenance.publication,
             );
+            trace_event(
+                &mut trace_events,
+                &mut next_trace_seq,
+                "verify",
+                json!({"boundary": "maintenance"}),
+            );
             db.close()?;
+            trace_event(
+                &mut trace_events,
+                &mut next_trace_seq,
+                "reopen",
+                json!({"boundary": "maintenance"}),
+            );
             db = DB::open(&path, Options::default())?;
             handle_metrics = StorageMetrics::default();
             handle_publication = PublicationMetrics::default();
@@ -338,12 +481,24 @@ fn main() -> AnyResult<()> {
     let mut retained = retained
         .take()
         .ok_or_else(|| invalid("retained snapshot was already released"))?;
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "snapshot_release",
+        json!({"snapshot": "initial"}),
+    );
     retained.verify()?;
     retained.release()?;
 
     let before_maintenance = db.metrics()?;
     commit_counters.add_delta(handle_metrics, before_maintenance.storage);
     commit_publication.add_delta(handle_publication, before_maintenance.publication);
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "maintenance",
+        json!({"action": "vacuum_prune"}),
+    );
     let started = Instant::now();
     let vacuum = db.vacuum()?;
     db.prune_history()?;
@@ -372,7 +527,19 @@ fn main() -> AnyResult<()> {
         .saturating_add(after_maintenance.wal_bytes);
     let logical_bytes = logical_bytes(&model);
 
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "check",
+        json!({"boundary": "pre-close"}),
+    );
     let check_before_close = DB::check(&path, Options::default())?;
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "reopen",
+        json!({"boundary": "final"}),
+    );
     db.close()?;
     drop(db);
     let mut reopened = DB::open(&path, Options::default())?;
@@ -383,9 +550,29 @@ fn main() -> AnyResult<()> {
         return Err(invalid("reopen digest changed"));
     }
     let status = reopened.durability_status();
+    trace_event(
+        &mut trace_events,
+        &mut next_trace_seq,
+        "expect_final",
+        json!({
+            "digest": current_digest,
+            "commit_id": status.commit_id.get(),
+        }),
+    );
     reopened.close()?;
     drop(reopened);
     drop(temporary);
+
+    let trace_text = trace_events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n")
+        + "\n";
+    let trace_crc32c = format!("{:08x}", crc32c::crc32c(trace_text.as_bytes()));
+    if let Some(trace_output) = args.trace_output {
+        fs::write(&trace_output, &trace_text)?;
+    }
 
     let report = json!({
         "schema": "seerdb-qualification-v1",
@@ -394,6 +581,12 @@ fn main() -> AnyResult<()> {
             "operations": args.operations,
             "seed": args.seed,
             "path": path,
+        },
+        "trace": {
+            "schema": "seerdb-storage-conformance-v1",
+            "events": trace_events.len(),
+            "bytes": trace_text.len(),
+            "crc32c": trace_crc32c,
         },
         "correctness": {
             "digest": current_digest,
