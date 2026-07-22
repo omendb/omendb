@@ -962,6 +962,8 @@ pub struct DBMetrics {
 /// whole-image/append-only artifacts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PublicationMetrics {
+    /// Bytes appended to the durable WAL by this open handle.
+    pub wal_bytes_written: u64,
     /// Bytes written to PMT/allocator checkpoint images.
     pub metadata_bytes_written: u64,
     /// Bytes written to blob images.
@@ -2029,6 +2031,10 @@ impl DB {
                 }
                 use std::io::Write;
                 file.write_all(&wal_buf)?;
+                self.publication.wal_bytes_written = self
+                    .publication
+                    .wal_bytes_written
+                    .saturating_add(wal_buf.len() as u64);
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_AFTER_WRITE.with(|failure| failure.replace(false)) {
                     return Err(std::io::Error::other("injected post-append WAL failure").into());
@@ -6341,6 +6347,7 @@ mod tests {
             assert_eq!(metrics.storage.syncs, 1);
             assert_eq!(metrics.data_bytes, PAGE_SIZE as u64);
             assert_eq!(metrics.wal_bytes, 0);
+            assert!(metrics.publication.wal_bytes_written > 0);
             assert!(metrics.publication.metadata_bytes_written > 0);
             assert!(metrics.publication.blob_bytes_written > 0);
             assert!(metrics.publication.history_bytes_written > 0);

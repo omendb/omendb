@@ -30,6 +30,7 @@ struct CounterTotals {
 
 #[derive(Debug, Default)]
 struct PublicationTotals {
+    wal_bytes_written: u64,
     metadata_bytes_written: u64,
     blob_bytes_written: u64,
     history_bytes_written: u64,
@@ -38,6 +39,11 @@ struct PublicationTotals {
 
 impl PublicationTotals {
     fn add_delta(&mut self, before: PublicationMetrics, after: PublicationMetrics) {
+        self.wal_bytes_written = self.wal_bytes_written.saturating_add(
+            after
+                .wal_bytes_written
+                .saturating_sub(before.wal_bytes_written),
+        );
         self.metadata_bytes_written = self.metadata_bytes_written.saturating_add(
             after
                 .metadata_bytes_written
@@ -631,6 +637,8 @@ fn main() -> AnyResult<()> {
             "syncs_by_commits": commit_counters.syncs,
             "syncs_by_maintenance": maintenance_counters.syncs,
             "publication": {
+                "wal_bytes_written_by_commits": commit_publication.wal_bytes_written,
+                "wal_bytes_written_by_maintenance": maintenance_publication.wal_bytes_written,
                 "metadata_bytes_written_by_commits": commit_publication.metadata_bytes_written,
                 "metadata_bytes_written_by_maintenance": maintenance_publication.metadata_bytes_written,
                 "blob_bytes_written_by_commits": commit_publication.blob_bytes_written,

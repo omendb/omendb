@@ -89,6 +89,9 @@ fn value(index: usize, round: usize, length: usize) -> Vec<u8> {
 
 fn delta(before: PublicationMetrics, after: PublicationMetrics) -> PublicationMetrics {
     PublicationMetrics {
+        wal_bytes_written: after
+            .wal_bytes_written
+            .saturating_sub(before.wal_bytes_written),
         metadata_bytes_written: after
             .metadata_bytes_written
             .saturating_sub(before.metadata_bytes_written),
@@ -105,6 +108,9 @@ fn delta(before: PublicationMetrics, after: PublicationMetrics) -> PublicationMe
 }
 
 fn add(total: &mut PublicationMetrics, increment: PublicationMetrics) {
+    total.wal_bytes_written = total
+        .wal_bytes_written
+        .saturating_add(increment.wal_bytes_written);
     total.metadata_bytes_written = total
         .metadata_bytes_written
         .saturating_add(increment.metadata_bytes_written);
@@ -121,6 +127,7 @@ fn add(total: &mut PublicationMetrics, increment: PublicationMetrics) {
 
 fn json_publication(metrics: PublicationMetrics) -> serde_json::Value {
     json!({
+        "wal_bytes_written": metrics.wal_bytes_written,
         "metadata_bytes_written": metrics.metadata_bytes_written,
         "blob_bytes_written": metrics.blob_bytes_written,
         "history_bytes_written": metrics.history_bytes_written,
