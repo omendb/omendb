@@ -57,6 +57,7 @@ thread_local! {
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// File names for the database.
@@ -4733,7 +4734,7 @@ impl DB {
             reclaimed_checkpoint_bytes = reclaimed_checkpoint_bytes.saturating_add(metadata.len());
         }
         if removed_checkpoints > 0 {
-            sync_directory(&self.path)?;
+            sync_history_prune_directory(&self.path)?;
         }
 
         Ok(HistoryPruneReport {
@@ -5056,6 +5057,14 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_publication_directory_sync_failure(&self) {
         FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one final directory-sync failure after history pruning removes
+    /// obsolete checkpoint files. The active manifest remains authoritative;
+    /// reopen should accept the pruned or unpruned directory state.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_history_prune_directory_sync_failure(&self) {
+        FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC.with(|failure| failure.set(true));
     }
 
     /// Inject one failure after the next manifest becomes authoritative.
@@ -6349,6 +6358,14 @@ fn sync_publication_directory(path: &Path) -> Result<()> {
     #[cfg(any(test, feature = "fault-injection"))]
     if FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
         return Err(std::io::Error::other("injected publication directory sync failure").into());
+    }
+    sync_directory(path)
+}
+
+fn sync_history_prune_directory(path: &Path) -> Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+        return Err(std::io::Error::other("injected history-prune directory sync failure").into());
     }
     sync_directory(path)
 }
@@ -7737,6 +7754,39 @@ mod tests {
 
         let reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    }
+
+    #[test]
+    fn test_db_history_prune_directory_failure_reopens_and_retries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prune-directory-failure.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value-0").unwrap();
+        db.flush().unwrap();
+        for revision in 1..=MAX_META_DELTA_CHAIN + 1 {
+            db.put(b"key", format!("value-{revision}").as_bytes())
+                .unwrap();
+            db.flush().unwrap();
+        }
+        db.put(b"key", b"value-final").unwrap();
+        db.flush().unwrap();
+        let obsolete_checkpoint = path.join("seerdb.meta.1");
+        assert!(obsolete_checkpoint.is_file());
+
+        db.inject_history_prune_directory_sync_failure();
+        assert!(matches!(db.prune_history(), Err(Error::Io(_))));
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-final".to_vec()));
+        reopened.verify().unwrap();
+        let report = reopened.prune_history().unwrap();
+        assert_eq!(report.removed_checkpoints, 0);
+        reopened.close().unwrap();
+
+        let reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-final".to_vec()));
+        assert!(!obsolete_checkpoint.is_file());
     }
 
     #[test]
