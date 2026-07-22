@@ -5,7 +5,7 @@
 
 use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Default threshold for blob separation (1KB).
@@ -13,6 +13,8 @@ pub const DEFAULT_BLOB_THRESHOLD: usize = 1024;
 
 const BLOB_FORMAT_MAGIC: [u8; 8] = *b"SEERBLB1";
 const BLOB_FORMAT_VERSION: u32 = 1;
+pub(crate) const SEGMENT_CATALOG_MAGIC: [u8; 8] = *b"SEERBLC1";
+const SEGMENT_CATALOG_VERSION: u32 = 1;
 
 /// Manages blob files for KV separation.
 ///
@@ -31,6 +33,12 @@ pub struct BlobManager {
     threshold: usize,
     /// Generation whose blob metadata was last durably serialized.
     generation_id: u64,
+    /// Whether records live in separate append-only segment files.
+    segmented: bool,
+    /// Catalog length already durable for each segment. A failed publication
+    /// may leave an ignored suffix in a segment, so the next catalog always
+    /// appends from this frontier rather than trusting physical file length.
+    persisted_lengths: HashMap<u32, u64>,
 }
 
 impl BlobManager {
@@ -46,7 +54,25 @@ impl BlobManager {
             next_file_id: 1,
             threshold,
             generation_id: 0,
+            segmented: false,
+            persisted_lengths: HashMap::new(),
         }
+    }
+
+    /// Create a manager for a newly created database with an explicit layout.
+    pub(crate) fn with_threshold_and_mode(threshold: usize, segmented: bool) -> Self {
+        let mut manager = Self::with_threshold(threshold);
+        manager.segmented = segmented;
+        manager
+    }
+
+    /// Whether this manager uses the separate segment/catalog layout.
+    pub(crate) fn is_segmented(&self) -> bool {
+        self.segmented
+    }
+
+    pub(crate) fn is_segment_catalog(buf: &[u8]) -> bool {
+        buf.starts_with(&SEGMENT_CATALOG_MAGIC)
     }
 
     /// Get the blob threshold.
@@ -119,6 +145,7 @@ impl BlobManager {
         }
         self.next_file_id = file_id.checked_add(1)?;
         self.files.push(Arc::new(BlobFile::new(file_id)));
+        self.persisted_lengths.entry(file_id).or_insert(0);
         Some(file_id)
     }
 
@@ -319,6 +346,172 @@ impl BlobManager {
         buf
     }
 
+    /// Return the checksummed catalog for the segmented layout. Record bytes
+    /// are deliberately absent: the catalog names a prefix of each segment
+    /// and stores only deletion metadata needed by the active root.
+    pub(crate) fn to_segment_catalog_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&SEGMENT_CATALOG_MAGIC);
+        buf.extend_from_slice(&SEGMENT_CATALOG_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.threshold as u64).to_le_bytes());
+        buf.extend_from_slice(&self.generation_id.to_le_bytes());
+        buf.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
+        for file in &self.files {
+            buf.extend_from_slice(&file.file_id().to_le_bytes());
+            buf.extend_from_slice(&(file.to_bytes().len() as u64).to_le_bytes());
+            let deleted_offsets: Vec<_> = file.deleted_offsets().collect();
+            buf.extend_from_slice(&(deleted_offsets.len() as u32).to_le_bytes());
+            for offset in deleted_offsets {
+                buf.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        let total_length = buf.len().saturating_add(12) as u64;
+        buf.extend_from_slice(&total_length.to_le_bytes());
+        let checksum = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    /// Return the current serialized bytes for one segment. The caller can
+    /// compare its length with [`Self::persisted_segment_length`] and append
+    /// only the new suffix.
+    pub(crate) fn segment_bytes(&self, file_id: u32) -> Option<Vec<u8>> {
+        self.files
+            .iter()
+            .find(|file| file.file_id() == file_id)
+            .map(|file| file.to_bytes())
+    }
+
+    pub(crate) fn persisted_segment_length(&self, file_id: u32) -> u64 {
+        self.persisted_lengths.get(&file_id).copied().unwrap_or(0)
+    }
+
+    /// Bytes that the next segmented publication will write: the catalog plus
+    /// any record suffixes not yet covered by a durable catalog frontier.
+    pub(crate) fn segment_write_size(&self) -> Option<u64> {
+        let mut size = 32u64.checked_add(12)?;
+        for file in &self.files {
+            size = size.checked_add(4 + 8 + 4)?;
+            size = size.checked_add(
+                u64::try_from(file.deleted_count())
+                    .ok()?
+                    .checked_mul(std::mem::size_of::<u64>() as u64)?,
+            )?;
+            let current = file.serialized_size()?;
+            let persisted = self.persisted_segment_length(file.file_id());
+            if current < persisted {
+                return None;
+            }
+            size = size.checked_add(current - persisted)?;
+        }
+        Some(size)
+    }
+
+    /// Conservative bytes admitted before one append/deletion mutation.
+    pub(crate) fn projected_segment_write_size(
+        &self,
+        retired: Option<&BlobPointer>,
+        appended_value_len: Option<usize>,
+    ) -> Option<u64> {
+        let mut size = self.segment_write_size()?;
+        if let Some(pointer) = retired
+            && self.can_mark_deleted(pointer)
+        {
+            size = size.checked_add(std::mem::size_of::<u64>() as u64)?;
+        }
+        if let Some(value_len) = appended_value_len {
+            let record_size = BlobRecord::OVERHEAD_SIZE.checked_add(value_len)?;
+            if self.files.is_empty() {
+                size = size.checked_add(4 + 8 + 4)?;
+            }
+            size = size.checked_add(u64::try_from(record_size).ok()?)?;
+        }
+        Some(size)
+    }
+
+    pub(crate) fn mark_segments_persisted(&mut self) {
+        for file in &self.files {
+            self.persisted_lengths
+                .insert(file.file_id(), file.to_bytes().len() as u64);
+        }
+    }
+
+    pub(crate) fn segment_file_ids(&self) -> Vec<u32> {
+        self.files.iter().map(|file| file.file_id()).collect()
+    }
+
+    /// Load a segmented catalog using the caller-provided segment bytes. The
+    /// bytes may contain an ignored suffix from an interrupted append, but the
+    /// catalog length must be fully present and parseable.
+    pub(crate) fn from_segment_catalog(
+        buf: &[u8],
+        segments: &HashMap<u32, Vec<u8>>,
+    ) -> Option<Self> {
+        if buf.len() < 12 {
+            return None;
+        }
+        let total_length = u64::from_le_bytes(buf[buf.len() - 12..buf.len() - 4].try_into().ok()?);
+        if total_length != u64::try_from(buf.len()).ok()? {
+            return None;
+        }
+        let stored_checksum = u32::from_le_bytes(buf[buf.len() - 4..].try_into().ok()?);
+        if stored_checksum != crc32c::crc32c(&buf[..buf.len() - 4]) {
+            return None;
+        }
+
+        let payload = &buf[..buf.len() - 12];
+        let mut cursor = Cursor::new(payload);
+        if cursor.take(SEGMENT_CATALOG_MAGIC.len())? != SEGMENT_CATALOG_MAGIC
+            || cursor.u32()? != SEGMENT_CATALOG_VERSION
+        {
+            return None;
+        }
+        let threshold = usize::try_from(cursor.u64()?).ok()?;
+        let generation_id = cursor.u64()?;
+        let num_files = usize::try_from(cursor.u32()?).ok()?;
+        if num_files > cursor.remaining() / 16 {
+            return None;
+        }
+
+        let mut files = Vec::with_capacity(num_files);
+        let mut next_file_id = 1u32;
+        let mut file_ids = HashSet::with_capacity(num_files);
+        let mut persisted_lengths = HashMap::with_capacity(num_files);
+        for _ in 0..num_files {
+            let file_id = cursor.u32()?;
+            if file_id == 0 || file_id == u32::MAX || !file_ids.insert(file_id) {
+                return None;
+            }
+            let data_len = usize::try_from(cursor.u64()?).ok()?;
+            let segment = segments.get(&file_id)?;
+            let data = segment.get(..data_len)?;
+            let mut file = BlobFile::from_bytes(file_id, data)?;
+            let deleted_count = usize::try_from(cursor.u32()?).ok()?;
+            if deleted_count > file.record_count()
+                || deleted_count > cursor.remaining() / std::mem::size_of::<u64>()
+            {
+                return None;
+            }
+            let mut deleted_offsets = Vec::with_capacity(deleted_count);
+            for _ in 0..deleted_count {
+                deleted_offsets.push(cursor.u64()?);
+            }
+            file.restore_deleted(&deleted_offsets)?;
+            next_file_id = next_file_id.max(file_id.checked_add(1)?);
+            persisted_lengths.insert(file_id, data_len as u64);
+            files.push(Arc::new(file));
+        }
+        cursor.finish()?;
+        Some(Self {
+            files,
+            next_file_id,
+            threshold,
+            generation_id,
+            segmented: true,
+            persisted_lengths,
+        })
+    }
+
     /// Deserialize from bytes.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.starts_with(&BLOB_FORMAT_MAGIC) {
@@ -396,6 +589,8 @@ impl BlobManager {
             next_file_id,
             threshold,
             generation_id,
+            segmented: false,
+            persisted_lengths: HashMap::new(),
         })
     }
 
@@ -431,6 +626,8 @@ impl BlobManager {
             next_file_id,
             threshold: DEFAULT_BLOB_THRESHOLD,
             generation_id: 0,
+            segmented: false,
+            persisted_lengths: HashMap::new(),
         })
     }
 }
@@ -650,6 +847,23 @@ mod tests {
         let restored = BlobManager::from_bytes(&legacy).unwrap();
         assert_eq!(restored.file_count(), 1);
         assert_eq!(restored.total_valid_entries(), 1);
+    }
+
+    #[test]
+    fn test_segment_catalog_roundtrip_ignores_unpublished_suffix() {
+        let mut manager = BlobManager::with_threshold_and_mode(1024, true);
+        let pointer = manager.append(b"key", vec![7; 1500]);
+        manager.set_generation(9);
+        let catalog = manager.to_segment_catalog_bytes();
+        let mut segment = manager.segment_bytes(pointer.file_id).unwrap();
+        segment.extend_from_slice(b"unpublished suffix");
+        let segments = HashMap::from([(pointer.file_id, segment)]);
+
+        let restored = BlobManager::from_segment_catalog(&catalog, &segments).unwrap();
+        assert!(restored.is_segmented());
+        assert_eq!(restored.generation_id(), 9);
+        assert_eq!(restored.read(&pointer), Some(&vec![7; 1500][..]));
+        assert_eq!(restored.persisted_segment_length(pointer.file_id), 1516);
     }
 
     #[test]

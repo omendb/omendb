@@ -5,7 +5,7 @@
 
 mod options;
 
-pub use options::Options;
+pub use options::{BlobStorageMode, Options};
 
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
@@ -23,7 +23,7 @@ use crate::storage::format::{
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,7 @@ thread_local! {
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
+const BLOB_SEGMENT_PREFIX: &str = "seerdb.blob.segment.";
 const BLOB_RESERVATION_FILE: &str = "seerdb.blob.reserve";
 const BLOB_REWRITE_BACKUP_FILE: &str = "seerdb.blob.rewrite-old";
 const WAL_FILE: &str = "seerdb.wal";
@@ -76,6 +77,68 @@ static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn retained_blob_path(path: &Path, snapshot_id: SnapshotId) -> PathBuf {
     path.join(format!("{BLOB_FILE}.retained.{}", snapshot_id.get()))
+}
+
+fn blob_segment_path(path: &Path, file_id: u32) -> PathBuf {
+    path.join(format!("{BLOB_SEGMENT_PREFIX}{file_id:010}"))
+}
+
+fn read_blob_segments(path: &Path) -> Result<HashMap<u32, Vec<u8>>> {
+    let mut segments = HashMap::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(BLOB_SEGMENT_PREFIX))
+        else {
+            continue;
+        };
+        let file_id = suffix
+            .parse::<u32>()
+            .map_err(|_| Error::Corruption("blob segment has an invalid file ID".into()))?;
+        if file_id == 0
+            || file_id == u32::MAX
+            || segments.insert(file_id, fs::read(entry.path())?).is_some()
+        {
+            return Err(Error::Corruption(
+                "blob segment IDs are invalid or duplicated".into(),
+            ));
+        }
+    }
+    Ok(segments)
+}
+
+fn parse_blob_catalog(path: &Path, bytes: &[u8]) -> Result<Option<BlobManager>> {
+    if BlobManager::is_segment_catalog(bytes) {
+        let segments = read_blob_segments(path)?;
+        Ok(BlobManager::from_segment_catalog(bytes, &segments))
+    } else {
+        Ok(BlobManager::from_bytes(bytes))
+    }
+}
+
+fn blob_storage_size(path: &Path) -> Result<u64> {
+    let mut total = match fs::metadata(path.join(BLOB_FILE)) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BLOB_SEGMENT_PREFIX)
+        {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1376,22 +1439,25 @@ impl DB {
             let blob_data = recovered_blob_bytes
                 .as_deref()
                 .map_or_else(|| fs::read(&blob_path), |bytes| Ok(bytes.to_vec()))?;
-            match BlobManager::from_bytes(&blob_data) {
+            match parse_blob_catalog(&path, &blob_data)? {
                 Some(blobs) => blobs,
                 None if check_only => {
                     return Err(Error::Check {
                         kind: CheckFailureKind::Blob,
-                        message: "blob file is truncated or has an invalid checksum".into(),
+                        message: "blob catalog or segment is invalid".into(),
                     });
                 }
                 None => {
                     return Err(Error::Corruption(
-                        "blob file is truncated or has an invalid checksum".into(),
+                        "blob catalog or segment is invalid".into(),
                     ));
                 }
             }
         } else {
-            BlobManager::with_threshold(options.blob_threshold)
+            BlobManager::with_threshold_and_mode(
+                options.blob_threshold,
+                options.blob_storage == BlobStorageMode::Segmented,
+            )
         };
         if current_manifest
             .is_some_and(|current| blobs.generation_id() != current.generation_id.get())
@@ -1713,17 +1779,13 @@ impl DB {
         }
 
         if blob_changed {
-            let projected = candidate_blobs
-                .serialized_size()
-                .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+            let projected = Self::blob_publication_size(&candidate_blobs)?;
             self.engine.check_artifact_capacity(projected)?;
         }
 
         self.ensure_wal_reservation()?;
-        if blob_changed {
-            let projected = candidate_blobs
-                .serialized_size()
-                .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+        if blob_changed && !candidate_blobs.is_segmented() {
+            let projected = Self::blob_publication_size(&candidate_blobs)?;
             self.reserve_blob_image(projected)?;
         }
 
@@ -2039,12 +2101,31 @@ impl DB {
         retired: Option<&BlobPointer>,
         appended_value_len: Option<usize>,
     ) -> Result<()> {
-        let required = self
-            .blobs
-            .projected_serialized_size(retired, appended_value_len)
-            .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
+        let required = if self.blobs.is_segmented() {
+            self.blobs
+                .projected_segment_write_size(retired, appended_value_len)
+        } else {
+            self.blobs
+                .projected_serialized_size(retired, appended_value_len)
+        }
+        .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))?;
         self.engine.check_artifact_capacity(required)?;
+        if self.blobs.is_segmented() {
+            return Ok(());
+        }
         self.reserve_blob_image(required)
+    }
+
+    fn blob_publication_size(blobs: &BlobManager) -> Result<u64> {
+        if blobs.is_segmented() {
+            blobs
+                .segment_write_size()
+                .ok_or_else(|| Error::InvalidArgument("blob catalog size overflows".into()))
+        } else {
+            blobs
+                .serialized_size()
+                .ok_or_else(|| Error::InvalidArgument("blob image size overflows".into()))
+        }
     }
 
     fn reserve_blob_image(&self, required: u64) -> Result<()> {
@@ -2148,6 +2229,98 @@ impl DB {
         self.write_blob_image_with_directory_sync(path, data, false)
     }
 
+    /// Append only new record bytes for the segmented blob layout, then
+    /// atomically publish its small catalog. A failed append can leave an
+    /// ignored suffix; the catalog length is the recovery frontier and the
+    /// next publication truncates that suffix before appending.
+    fn write_blob_segments(&mut self) -> Result<u64> {
+        let mut bytes_written = 0u64;
+        for file_id in self.blobs.segment_file_ids() {
+            let data = self
+                .blobs
+                .segment_bytes(file_id)
+                .ok_or_else(|| Error::Corruption("blob segment disappeared from catalog".into()))?;
+            let persisted = self.blobs.persisted_segment_length(file_id);
+            let persisted_usize = usize::try_from(persisted)
+                .map_err(|_| Error::Corruption("blob segment length overflows usize".into()))?;
+            if data.len() < persisted_usize {
+                return Err(Error::Corruption(
+                    "blob segment shrank below its catalog frontier".into(),
+                ));
+            }
+            if data.len() == persisted_usize {
+                continue;
+            }
+
+            let segment_path = blob_segment_path(&self.path, file_id);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&segment_path)?;
+            let physical_len = file.metadata()?.len();
+            if physical_len < persisted {
+                return Err(Error::Corruption(
+                    "blob segment is shorter than its catalog frontier".into(),
+                ));
+            }
+            if physical_len != persisted {
+                file.set_len(persisted)?;
+            }
+            let new_len = data.len() as u64;
+            reserve_file(&file, new_len)?;
+            file.set_len(new_len)?;
+            file.seek(SeekFrom::Start(persisted))?;
+            file.write_all(&data[persisted_usize..])?;
+            file.flush()?;
+            file.sync_all()?;
+            bytes_written = bytes_written.saturating_add(new_len - persisted);
+        }
+
+        let catalog = self.blobs.to_segment_catalog_bytes();
+        let catalog_path = self.path.join(BLOB_FILE);
+        atomic_write_without_directory_sync(&catalog_path, &catalog)?;
+        bytes_written = bytes_written.saturating_add(catalog.len() as u64);
+        self.blobs.mark_segments_persisted();
+        Ok(bytes_written)
+    }
+
+    /// Remove segment files no longer named by the authoritative active
+    /// catalog. This runs only after the manifest publication barrier, so an
+    /// interrupted rewrite leaves the old segments available for catalog
+    /// recovery.
+    fn prune_unreferenced_blob_segments(&self) -> Result<()> {
+        let live = self
+            .blobs
+            .segment_file_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut removed = false;
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(file_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(BLOB_SEGMENT_PREFIX))
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if !live.contains(&file_id) {
+                fs::remove_file(entry.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_directory(&self.path)?;
+        }
+        Ok(())
+    }
+
     fn write_blob_image_with_directory_sync(
         &self,
         path: &Path,
@@ -2189,7 +2362,7 @@ impl DB {
         }
 
         let backup_bytes = fs::read(&backup_path)?;
-        let backup_blobs = BlobManager::from_bytes(&backup_bytes).ok_or_else(|| {
+        let backup_blobs = parse_blob_catalog(path, &backup_bytes)?.ok_or_else(|| {
             Error::Corruption("interrupted blob rewrite backup is invalid".into())
         })?;
         let Some(manifest_generation) =
@@ -2226,7 +2399,7 @@ impl DB {
         let current_blobs = if blob_path.is_file() {
             fs::read(&blob_path)
                 .ok()
-                .and_then(|bytes| BlobManager::from_bytes(&bytes))
+                .and_then(|bytes| parse_blob_catalog(path, &bytes).ok().flatten())
         } else {
             None
         };
@@ -2342,7 +2515,7 @@ impl DB {
         } else {
             full_meta_bytes
         };
-        let blob_bytes = self.blobs.to_bytes().len() as u64;
+        let blob_bytes = Self::blob_publication_size(&self.blobs)?;
         let ledger_bytes = self
             .reuse_ledger
             .to_bytes()
@@ -2590,10 +2763,14 @@ impl DB {
             .saturating_add(checkpoint_bytes)
             .saturating_add(legacy_meta_bytes);
 
-        let blob_path = self.path.join(BLOB_FILE);
         self.blobs.set_generation(commit.generation_id.get());
-        let blob_image = self.blobs.to_bytes();
-        let blob_bytes = self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?;
+        let blob_bytes = if self.blobs.is_segmented() {
+            self.write_blob_segments()?
+        } else {
+            let blob_path = self.path.join(BLOB_FILE);
+            let blob_image = self.blobs.to_bytes();
+            self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?
+        };
         self.publication.blob_bytes_written = self
             .publication
             .blob_bytes_written
@@ -2654,6 +2831,10 @@ impl DB {
             .publication
             .manifest_bytes_written
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
+
+        if self.blobs.is_segmented() {
+            self.prune_unreferenced_blob_segments()?;
+        }
 
         let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
         let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
@@ -2815,12 +2996,20 @@ impl DB {
         }
         let mut reclaimed = self.blobs.gc();
         if reclaimed > 0 {
-            let blob_path = self.path.join(BLOB_FILE);
-            let blob_image = self.blobs.to_bytes();
-            match self.write_blob_image(&blob_path, &blob_image) {
+            let write_result = if self.blobs.is_segmented() {
+                self.write_blob_segments()
+            } else {
+                let blob_path = self.path.join(BLOB_FILE);
+                let blob_image = self.blobs.to_bytes();
+                self.write_blob_image(&blob_path, &blob_image)
+            };
+            match write_result {
                 Ok(bytes) => {
                     self.publication.blob_bytes_written =
                         self.publication.blob_bytes_written.saturating_add(bytes);
+                    if self.blobs.is_segmented() {
+                        self.prune_unreferenced_blob_segments()?;
+                    }
                 }
                 Err(error) => {
                     self.write_fenced = true;
@@ -2888,7 +3077,7 @@ impl DB {
             return Ok(0);
         }
 
-        let blob_bytes = candidate_blobs.to_bytes();
+        let blob_bytes = Self::blob_publication_size(&candidate_blobs)?;
         let candidate_page_count = candidate_tree
             .dirty_page_ids()
             .into_iter()
@@ -2902,15 +3091,12 @@ impl DB {
             candidate_tree.node_count(),
             candidate_tree.page_allocator(),
         )?;
-        self.preflight_maintenance_capacity(
-            candidate_data_bytes,
-            metadata_bytes,
-            blob_bytes.len() as u64,
-        )?;
-        self.engine
-            .check_artifact_capacity(blob_bytes.len() as u64)?;
+        self.preflight_maintenance_capacity(candidate_data_bytes, metadata_bytes, blob_bytes)?;
+        self.engine.check_artifact_capacity(blob_bytes)?;
         self.engine.preflight_rebuild_capacity(&candidate_tree)?;
-        self.reserve_blob_image(blob_bytes.len() as u64)?;
+        if !candidate_blobs.is_segmented() {
+            self.reserve_blob_image(blob_bytes)?;
+        }
         *self.engine.btree_mut() = candidate_tree;
         self.blobs = candidate_blobs;
 
@@ -2922,13 +3108,20 @@ impl DB {
             self.admit_blob_image(None, None)?;
             let reclaimed = self.blobs.gc();
             if reclaimed > 0 {
-                let blob_path = self.path.join(BLOB_FILE);
-                let blob_image = self.blobs.to_bytes();
-                let blob_bytes = self.write_blob_image(&blob_path, &blob_image)?;
+                let blob_bytes = if self.blobs.is_segmented() {
+                    self.write_blob_segments()?
+                } else {
+                    let blob_path = self.path.join(BLOB_FILE);
+                    let blob_image = self.blobs.to_bytes();
+                    self.write_blob_image(&blob_path, &blob_image)?
+                };
                 self.publication.blob_bytes_written = self
                     .publication
                     .blob_bytes_written
                     .saturating_add(blob_bytes);
+                if self.blobs.is_segmented() {
+                    self.prune_unreferenced_blob_segments()?;
+                }
             }
             reclaimed
         } else {
@@ -2975,7 +3168,7 @@ impl DB {
             wal_admission_failures: self.wal_admission_failures,
             buffer: self.engine.buffer_stats(),
             data_bytes: artifact_size(DATA_FILE)?,
-            blob_bytes: artifact_size(BLOB_FILE)?,
+            blob_bytes: blob_storage_size(&self.path)?,
             wal_bytes: artifact_size(WAL_FILE)?,
             wal_reserved_bytes: self.wal_reserved_extent,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
@@ -3056,11 +3249,14 @@ impl DB {
             let bytes = fs::read(&blob_path).map_err(|error| {
                 VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
             })?;
-            BlobManager::from_bytes(&bytes).ok_or_else(|| VerificationFailure {
-                kind: CheckFailureKind::Blob,
-                message: "blob file failed integrity verification".into(),
-            })?;
-            bytes.len() as u64
+            parse_blob_catalog(&self.path, &bytes)
+                .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
+                .ok_or_else(|| VerificationFailure {
+                    kind: CheckFailureKind::Blob,
+                    message: "blob catalog failed integrity verification".into(),
+                })?;
+            blob_storage_size(&self.path)
+                .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
         } else {
             0
         };
@@ -3562,14 +3758,11 @@ impl DB {
             }
         };
         let retained_blob = retained_blob_path(&self.path, snapshot_id);
-        let blob_bytes = if self.path.join(BLOB_FILE).is_file() {
-            fs::read(self.path.join(BLOB_FILE))?
-        } else {
-            self.blobs.to_bytes()
-        };
-        let mut retained_blobs = BlobManager::from_bytes(&blob_bytes).ok_or_else(|| {
-            Error::Corruption("current blob image is invalid while retaining a commit".into())
-        })?;
+        // Build the immutable retention sidecar from the verified in-memory
+        // manager. Segmented stores use whole-image sidecars for now; this
+        // keeps historical reads independent of active segment cleanup while
+        // the active publication path avoids rewriting those segments.
+        let mut retained_blobs = self.blobs.clone();
         // Deletion markers describe the active root. An older retained root
         // may still legitimately reference a value that a later commit
         // replaced, so its immutable sidecar must preserve the append-only
@@ -3910,7 +4103,7 @@ impl DB {
             return Ok(progress);
         }
 
-        let candidate_blob_bytes = state.candidate_blobs.to_bytes();
+        let candidate_blob_bytes = Self::blob_publication_size(&state.candidate_blobs)?;
         let candidate_page_count =
             u64::try_from(state.candidate_tree.node_count()).map_err(|_| Error::DiskFull)?;
         let candidate_data_bytes = candidate_page_count
@@ -3921,19 +4114,20 @@ impl DB {
         if let Err(error) = self.preflight_maintenance_capacity(
             candidate_data_bytes,
             candidate_metadata_bytes,
-            candidate_blob_bytes.len() as u64,
+            candidate_blob_bytes,
         ) {
             self.vacuum = Some(state);
             return Err(error);
         }
-        if let Err(error) = self
-            .engine
-            .check_artifact_capacity(candidate_blob_bytes.len() as u64)
-        {
+        if let Err(error) = self.engine.check_artifact_capacity(candidate_blob_bytes) {
             self.vacuum = Some(state);
             return Err(error);
         }
-        if let Err(error) = self.reserve_blob_image(candidate_blob_bytes.len() as u64) {
+        if let Err(error) = if state.candidate_blobs.is_segmented() {
+            Ok(())
+        } else {
+            self.reserve_blob_image(candidate_blob_bytes)
+        } {
             self.vacuum = Some(state);
             return Err(error);
         }
@@ -3981,7 +4175,10 @@ impl DB {
             source_commit: self.commit_id,
             cursor,
             candidate_tree: BTree::new(),
-            candidate_blobs: BlobManager::with_threshold(self.blobs.threshold()),
+            candidate_blobs: BlobManager::with_threshold_and_mode(
+                self.blobs.threshold(),
+                self.blobs.is_segmented(),
+            ),
             scanned_entries: 0,
             live_entries: 0,
             logical_pages_before: self.engine.pmt().len() as u64,
@@ -4175,6 +4372,9 @@ impl DB {
             .publication
             .manifest_bytes_written
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
+        if self.blobs.is_segmented() {
+            self.prune_unreferenced_blob_segments()?;
+        }
         self.engine.complete_generation();
         self.generation_id = generation_id;
         self.next_generation_id = GenerationId::new(
@@ -4222,8 +4422,12 @@ impl DB {
             fs::rename(&blob_path, &backup_path)?;
             sync_directory(&self.path)?;
         }
-        let blob_image = self.blobs.to_bytes();
-        let blob_bytes = self.write_blob_image(&blob_path, &blob_image)?;
+        let blob_bytes = if self.blobs.is_segmented() {
+            self.write_blob_segments()?
+        } else {
+            let blob_image = self.blobs.to_bytes();
+            self.write_blob_image(&blob_path, &blob_image)?
+        };
         self.publication.blob_bytes_written = self
             .publication
             .blob_bytes_written
@@ -4263,6 +4467,9 @@ impl DB {
             .publication
             .manifest_bytes_written
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
+        if self.blobs.is_segmented() {
+            self.prune_unreferenced_blob_segments()?;
+        }
         self.engine.complete_generation();
         self.generation_id = generation_id;
         self.next_generation_id = GenerationId::new(
@@ -5730,6 +5937,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
                 || name == REUSE_LEDGER_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
+                || name.starts_with(BLOB_SEGMENT_PREFIX)
                 || name == META_FILE
                 || name.starts_with("seerdb.meta.")
                 || (include_wal && name == WAL_FILE))
@@ -7546,6 +7754,78 @@ mod tests {
         assert_eq!(reopened.get(b"live").unwrap(), Some(value.clone()));
         assert_eq!(reopened.get(b"dead-1").unwrap(), None);
         assert_eq!(reopened.get(b"dead-2").unwrap(), None);
+        assert!(reopened.blob_stats().files_needing_gc > 0);
+        assert!(reopened.gc().unwrap() > 0);
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_blob_layout_reopens_and_verifies() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let value = vec![0xA7; 2_000];
+
+        let mut db = DB::create(&path, options.clone()).unwrap();
+        db.put(b"key", &value).unwrap();
+        db.close().unwrap();
+        assert!(path.join(BLOB_FILE).is_file());
+        assert!(blob_segment_path(&path, 1).is_file());
+
+        let catalog = fs::read(path.join(BLOB_FILE)).unwrap();
+        assert!(BlobManager::is_segment_catalog(&catalog));
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(value.clone()));
+        reopened.verify().unwrap();
+
+        let retained = reopened.retain_current().unwrap();
+        assert_eq!(retained.get(b"key").unwrap(), Some(value.clone()));
+        let replacement = vec![0xB8; 2_100];
+        reopened.put(b"key", &replacement).unwrap();
+        reopened.close().unwrap();
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"key").unwrap(), Some(replacement));
+        reopened.verify().unwrap();
+
+        let archive = dir.path().join("segmented-archive");
+        reopened.snapshot(&archive).unwrap();
+        reopened.close().unwrap();
+        let mut archived = DB::open(&archive, Options::default()).unwrap();
+        assert_eq!(archived.get(b"key").unwrap(), Some(vec![0xB8; 2_100]));
+        archived.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_blob_rewrite_failure_restores_catalog() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-gc.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let value = vec![0xC1; 2_000];
+        let mut db = DB::create(&path, options).unwrap();
+        for key in [b"live".as_slice(), b"dead-1", b"dead-2"] {
+            db.put(key, &value).unwrap();
+        }
+        db.flush().unwrap();
+        db.delete(b"dead-1").unwrap();
+        db.delete(b"dead-2").unwrap();
+        db.flush().unwrap();
+
+        db.inject_after_blob_rewrite_image_failure();
+        assert!(db.gc().is_err());
+        assert!(db.durability_status().write_fenced);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"live").unwrap(), Some(value.clone()));
+        assert_eq!(reopened.get(b"dead-1").unwrap(), None);
         assert!(reopened.blob_stats().files_needing_gc > 0);
         assert!(reopened.gc().unwrap() > 0);
         reopened.verify().unwrap();

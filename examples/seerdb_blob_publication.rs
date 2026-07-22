@@ -3,12 +3,12 @@
 //! This is a bounded qualification harness, not a throughput benchmark. It
 //! makes the current whole-image blob publication cost visible while checking
 //! replacement, reopen, and retained-root behavior. The result is useful for
-//! deciding when the separately gated immutable-segment/catalog design is
-//! justified.
+//! deciding whether the opt-in immutable-segment/catalog design is justified
+//! for a workload.
 
 #![allow(clippy::disallowed_methods)]
 
-use seerdb::{BatchMutation, DB, Options, PublicationMetrics};
+use seerdb::{BatchMutation, BlobStorageMode, DB, Options, PublicationMetrics};
 use serde_json::json;
 use std::env;
 use std::error::Error;
@@ -27,6 +27,7 @@ struct Args {
     value_bytes: usize,
     rounds: usize,
     batch: usize,
+    segmented: bool,
     output: Option<PathBuf>,
 }
 
@@ -45,9 +46,14 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         value_bytes: DEFAULT_VALUE_BYTES,
         rounds: DEFAULT_ROUNDS,
         batch: DEFAULT_BATCH,
+        segmented: false,
         output: None,
     };
     while let Some(flag) = args.next() {
+        if flag == "--segmented" {
+            parsed.segmented = true;
+            continue;
+        }
         let value = args
             .next()
             .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -59,7 +65,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--output" => parsed.output = Some(PathBuf::from(value)),
             "--help" | "-h" => {
                 println!(
-                    "usage: seerdb_blob_publication [--records N] [--value-bytes N] [--rounds N] [--batch N] [--output PATH]"
+                    "usage: seerdb_blob_publication [--records N] [--value-bytes N] [--rounds N] [--batch N] [--segmented] [--output PATH]"
                 );
                 std::process::exit(0);
             }
@@ -122,11 +128,35 @@ fn json_publication(metrics: PublicationMetrics) -> serde_json::Value {
     })
 }
 
+fn segment_bytes(path: &std::path::Path) -> Result<u64, Box<dyn Error>> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("seerdb.blob.segment.")
+        {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
     let directory = tempdir()?;
     let path = directory.path().join("blob-qualification.db");
-    let mut db = DB::open(&path, Options::default())?;
+    let options = Options {
+        blob_storage: if args.segmented {
+            BlobStorageMode::Segmented
+        } else {
+            BlobStorageMode::WholeImage
+        },
+        ..Options::default()
+    };
+    let mut db = DB::open(&path, options)?;
     let mut publication = PublicationMetrics::default();
     let mut round_reports = Vec::with_capacity(args.rounds);
 
@@ -177,10 +207,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             "value_bytes": args.value_bytes,
             "rounds": args.rounds,
             "batch": args.batch,
+            "segmented": args.segmented,
         },
         "publication": json_publication(publication),
         "rounds": round_reports,
         "final_blob_file_bytes": fs::metadata(path.join("seerdb.blob"))?.len(),
+        "final_blob_segment_bytes": segment_bytes(&path)?,
         "final_commit": final_commit.get(),
         "retained_snapshot": snapshot.get(),
     });
