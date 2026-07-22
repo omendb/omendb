@@ -7,7 +7,7 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use seerdb::{DB, Error, Options};
+    use seerdb::{BlobStorageMode, DB, Error, Options};
     use std::cmp::min;
     use std::env;
     use std::fs::{self, File, OpenOptions};
@@ -129,12 +129,46 @@ mod linux {
         fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
 
         assert!(db.gc().unwrap() > 0);
-        assert_eq!(db.get(b"gc-live").unwrap(), Some(large));
+        assert_eq!(db.get(b"gc-live").unwrap(), Some(large.clone()));
         drop(db);
 
         let reopened = DB::open(&path, Options::for_test()).unwrap();
         assert_eq!(reopened.get(b"base").unwrap(), Some(b"value-1".to_vec()));
         assert_eq!(reopened.get(b"pending").unwrap(), None);
         assert_eq!(reopened.get(b"gc-live").unwrap(), Some(vec![0xAB; 2_000]));
+
+        let segmented_path = root.join("segmented-db");
+        let segmented_options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            max_wal_bytes: 1024 * 1024,
+            ..Options::for_test()
+        };
+        let mut segmented = DB::create(&segmented_path, segmented_options).unwrap();
+        segmented.put(b"base", &large).unwrap();
+        segmented.flush().unwrap();
+        segmented.put(b"pending", &large).unwrap();
+        let filler = fill_until_nearly_full(&root).unwrap();
+        let before_segmented_flush = segmented.metrics().unwrap().storage;
+        let segmented_flush = segmented.flush();
+        assert!(
+            matches!(segmented_flush, Err(Error::CapacityPreflight)),
+            "expected segmented append capacity preflight, got {segmented_flush:?}; metrics={:?}",
+            segmented.metrics()
+        );
+        let after_segmented_flush = segmented.metrics().unwrap().storage;
+        assert_eq!(
+            after_segmented_flush.physical_page_writes, before_segmented_flush.physical_page_writes,
+            "segmented append refusal must not issue page writes"
+        );
+        assert!(!segmented.durability_status().write_fenced);
+        drop(filler);
+        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+
+        segmented.flush().unwrap();
+        assert_eq!(segmented.get(b"pending").unwrap(), Some(large.clone()));
+        drop(segmented);
+        let segmented_reopened = DB::open(&segmented_path, Options::for_test()).unwrap();
+        assert_eq!(segmented_reopened.get(b"pending").unwrap(), Some(large));
     }
 }
