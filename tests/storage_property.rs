@@ -3,14 +3,77 @@
 #![allow(clippy::disallowed_methods)]
 
 use proptest::prelude::*;
+#[cfg(feature = "fault-injection")]
+use seerdb::Error;
 use seerdb::{BatchMutation, BlobStorageMode, DB, Options};
 use std::collections::BTreeMap;
+#[cfg(feature = "fault-injection")]
+use std::fs;
 use tempfile::tempdir;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn key(key_id: u8) -> Vec<u8> {
     format!("property-key-{key_id:03}").into_bytes()
+}
+
+#[cfg(feature = "fault-injection")]
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 8,
+        max_shrink_iters: 1_000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn capacity_refusal_preserves_retryable_blob_layouts(
+        key_id in 1u8..32,
+        value in prop::collection::vec(any::<u8>(), 0..512)
+    ) {
+        for segmented in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("capacity-property.db");
+            let options = Options {
+                blob_storage: if segmented {
+                    BlobStorageMode::Segmented
+                } else {
+                    BlobStorageMode::WholeImage
+                },
+                ..Options::for_test()
+            };
+            let mut db = DB::create(&path, options).unwrap();
+            let blob_key = key(0);
+            let blob_value = vec![0xC7; 2_048];
+            db.commit_batch(&[BatchMutation::Put {
+                key: blob_key.clone(),
+                value: blob_value.clone(),
+            }])
+            .unwrap();
+            db.verify().unwrap();
+
+            let pending_key = key(key_id);
+            db.put(&pending_key, &value).unwrap();
+            let data_capacity = fs::metadata(path.join("seerdb.data")).unwrap().len();
+            let before = db.metrics().unwrap().storage.physical_page_writes;
+            db.inject_capacity_limit(data_capacity);
+            assert!(matches!(db.flush(), Err(Error::CapacityPreflight)));
+            let after = db.metrics().unwrap().storage.physical_page_writes;
+            assert_eq!(after, before, "capacity refusal must not write pages");
+            assert!(!db.durability_status().write_fenced);
+            assert_eq!(db.get(&pending_key).unwrap(), Some(value.clone()));
+
+            db.inject_capacity_limit(u64::MAX);
+            db.flush().unwrap();
+            assert_eq!(db.get(&pending_key).unwrap(), Some(value.clone()));
+            db.verify().unwrap();
+            drop(db);
+
+            let mut reopened = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(reopened.get(&blob_key).unwrap(), Some(blob_value));
+            assert_eq!(reopened.get(&pending_key).unwrap(), Some(value.clone()));
+            reopened.verify().unwrap();
+        }
+    }
 }
 
 fn model_range(model: &Model, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
