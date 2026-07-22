@@ -85,6 +85,102 @@ proptest! {
     })]
 
     #[test]
+    fn mixed_blob_gc_capacity_refusal_preserves_catalog(
+        live_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
+        dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
+    ) {
+        for segmented in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("mixed-gc-capacity-property.db");
+            let options = Options {
+                blob_storage: if segmented {
+                    BlobStorageMode::Segmented
+                } else {
+                    BlobStorageMode::WholeImage
+                },
+                ..Options::for_test()
+            };
+            let mut db = DB::create(&path, options).unwrap();
+            db.commit_batch(&[
+                BatchMutation::Put {
+                    key: b"gc-live".to_vec(),
+                    value: live_value.clone(),
+                },
+                BatchMutation::Put {
+                    key: b"gc-dead-1".to_vec(),
+                    value: dead_value.clone(),
+                },
+                BatchMutation::Put {
+                    key: b"gc-dead-2".to_vec(),
+                    value: dead_value.clone(),
+                },
+            ])
+            .unwrap();
+            db.commit_batch(&[
+                BatchMutation::Delete {
+                    key: b"gc-dead-1".to_vec(),
+                },
+                BatchMutation::Delete {
+                    key: b"gc-dead-2".to_vec(),
+                },
+            ])
+            .unwrap();
+            let before_stats = db.blob_stats();
+            let before_page_writes = db.metrics().unwrap().storage.physical_page_writes;
+            let data_capacity = fs::metadata(path.join("seerdb.data")).unwrap().len();
+
+            db.inject_capacity_limit(data_capacity);
+            let refusal = db.gc();
+            assert!(
+                matches!(refusal, Err(Error::CapacityPreflight)),
+                "unexpected mixed-GC result: segmented={segmented}, data_capacity={data_capacity}, valid={}, deleted={}, files={}, result={refusal:?}",
+                before_stats.total_valid,
+                before_stats.total_deleted,
+                before_stats.files_needing_gc
+            );
+            let after_stats = db.blob_stats();
+            assert_eq!(after_stats.total_valid, before_stats.total_valid);
+            assert_eq!(after_stats.total_deleted, before_stats.total_deleted);
+            assert_eq!(
+                after_stats.files_needing_gc,
+                before_stats.files_needing_gc
+            );
+            assert_eq!(
+                db.metrics().unwrap().storage.physical_page_writes,
+                before_page_writes
+            );
+            assert!(!db.durability_status().write_fenced);
+            assert_eq!(db.get(b"gc-live").unwrap(), Some(live_value.clone()));
+
+            db.inject_capacity_limit(u64::MAX);
+            assert!(db.gc().unwrap() > 0);
+            assert_eq!(db.get(b"gc-live").unwrap(), Some(live_value.clone()));
+            assert_eq!(db.get(b"gc-dead-1").unwrap(), None);
+            assert_eq!(db.get(b"gc-dead-2").unwrap(), None);
+            db.verify().unwrap();
+            drop(db);
+
+            let mut reopened = DB::open(&path, Options::default()).unwrap();
+            assert_eq!(
+                reopened.get(b"gc-live").unwrap(),
+                Some(live_value.clone())
+            );
+            assert_eq!(reopened.get(b"gc-dead-1").unwrap(), None);
+            assert_eq!(reopened.get(b"gc-dead-2").unwrap(), None);
+            reopened.verify().unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 8,
+        max_shrink_iters: 1_000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
     fn vacuum_capacity_refusal_preserves_retryable_candidate(
         live_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
         dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
