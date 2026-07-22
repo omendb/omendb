@@ -46,6 +46,7 @@ thread_local! {
     static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
     static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -2276,6 +2277,13 @@ impl DB {
             file.flush()?;
             file.sync_all()?;
             bytes_written = bytes_written.saturating_add(new_len - persisted);
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            if FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.replace(false)) {
+                return Err(
+                    std::io::Error::other("injected failure after blob segment write").into(),
+                );
+            }
         }
 
         let catalog = self.blobs.to_segment_catalog_bytes();
@@ -4659,6 +4667,13 @@ impl DB {
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn inject_after_blob_rewrite_image_failure(&self) {
         FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after a segmented blob suffix is durable but before
+    /// its catalog is published.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn inject_blob_segment_after_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.set(true));
     }
 
     /// Begin a root-bound byte transaction.
@@ -7828,6 +7843,76 @@ mod tests {
         assert_eq!(reopened.get(b"dead-1").unwrap(), None);
         assert!(reopened.blob_stats().files_needing_gc > 0);
         assert!(reopened.gc().unwrap() > 0);
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_gc_prunes_unreferenced_segments() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-gc-prune.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let value = vec![0xD2; 2_000];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"live", &value).unwrap();
+        db.put(b"dead-1", &value).unwrap();
+        db.put(b"dead-2", &value).unwrap();
+        db.flush().unwrap();
+        let old_segment = blob_segment_path(&path, 1);
+        assert!(old_segment.is_file());
+
+        db.delete(b"dead-1").unwrap();
+        db.delete(b"dead-2").unwrap();
+        db.flush().unwrap();
+        assert!(db.gc().unwrap() > 0);
+        assert!(blob_segment_path(&path, 2).is_file());
+        assert!(!old_segment.exists());
+        assert_eq!(db.get(b"live").unwrap(), Some(value.clone()));
+        db.verify().unwrap();
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert!(!old_segment.exists());
+        assert_eq!(reopened.get(b"live").unwrap(), Some(value));
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_append_failure_ignores_orphan_suffix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-append-failure.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xE3; 2_000];
+        let pending = vec![0xE4; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+        let segment = blob_segment_path(&path, 1);
+        let catalog_before = fs::read(path.join(BLOB_FILE)).unwrap();
+        let segment_len_before = fs::metadata(&segment).unwrap().len();
+
+        db.put(b"pending", &pending).unwrap();
+        db.inject_blob_segment_after_write_failure();
+        assert!(db.flush().is_err());
+        assert!(db.durability_status().write_fenced);
+        assert!(fs::metadata(&segment).unwrap().len() > segment_len_before);
+        assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), catalog_before);
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        reopened.verify().unwrap();
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
         reopened.verify().unwrap();
     }
 }
