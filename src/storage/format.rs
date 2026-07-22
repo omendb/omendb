@@ -557,11 +557,12 @@ pub struct ReuseAttempt {
 /// indeterminate after a process or filesystem failure.
 ///
 /// Entries are written before any candidate page reaches the device. A
-/// successful publication is removed after its manifest is durable; reopening
-/// reconciles entries that were left behind after that final cleanup step by
-/// checking the authoritative manifest history. An entry absent from history
-/// is retained so its reserved identity is never reused; non-empty entries
-/// also cause historical reads to fail closed for their offsets.
+/// successful publication is removed from the in-memory ledger after its
+/// manifest is durable. For reused slots, on-disk cleanup may be deferred until
+/// the next publication or reopen; both reconcile entries against authoritative
+/// manifest history. An entry absent from history is retained so its reserved
+/// identity is never reused; non-empty entries also cause historical reads to
+/// fail closed for their offsets.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReuseLedger {
     attempts: Vec<ReuseAttempt>,

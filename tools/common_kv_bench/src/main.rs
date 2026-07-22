@@ -316,10 +316,15 @@ fn generate_operations(config: &Config) -> Vec<Operation> {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct SeerCounters {
+    physical_page_writes: u64,
     page_bytes_written: u64,
+    generation_flushes: u64,
+    data_syncs: u64,
     wal_bytes_written: u64,
     metadata_bytes_written: u64,
     blob_bytes_written: u64,
+    history_bytes_written: u64,
+    manifest_bytes_written: u64,
     reclaimed_bytes: u64,
 }
 
@@ -565,10 +570,15 @@ impl Engine {
     fn seer_counters(&self) -> Option<SeerCounters> {
         match self {
             Self::SeerDb { db, .. } => db.metrics().ok().map(|metrics| SeerCounters {
+                physical_page_writes: metrics.storage.physical_page_writes,
                 page_bytes_written: metrics.storage.page_bytes_written,
+                generation_flushes: metrics.storage.generation_flushes,
+                data_syncs: metrics.storage.syncs,
                 wal_bytes_written: metrics.publication.wal_bytes_written,
                 metadata_bytes_written: metrics.publication.metadata_bytes_written,
                 blob_bytes_written: metrics.publication.blob_bytes_written,
+                history_bytes_written: metrics.publication.history_bytes_written,
+                manifest_bytes_written: metrics.publication.manifest_bytes_written,
                 reclaimed_bytes: metrics.storage.reclaimed_bytes,
             }),
             #[cfg(feature = "fjall")]
@@ -831,7 +841,7 @@ fn print_result(result: &RunResult) {
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
     println!(
-        "{{\n  \"format\": \"seerdb-common-kv-v2\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+        "{{\n  \"format\": \"seerdb-common-kv-v3\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
         config.durability.name(),
@@ -863,7 +873,16 @@ fn print_result(result: &RunResult) {
         result.disk_bytes,
         result
             .seer_counters
+            .map_or(0, |counters| counters.physical_page_writes),
+        result
+            .seer_counters
             .map_or(0, |counters| counters.page_bytes_written),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.generation_flushes),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.data_syncs),
         result
             .seer_counters
             .map_or(0, |counters| counters.wal_bytes_written),
@@ -873,6 +892,12 @@ fn print_result(result: &RunResult) {
         result
             .seer_counters
             .map_or(0, |counters| counters.blob_bytes_written),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.history_bytes_written),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.manifest_bytes_written),
         result
             .seer_counters
             .map_or(0, |counters| counters.reclaimed_bytes),

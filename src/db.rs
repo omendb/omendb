@@ -3065,6 +3065,7 @@ impl DB {
         // the commit envelope is always forced at the publication boundary.
         self.write_wal_to_disk(true)?;
         let reuse_offsets = self.engine.pending_reuse_offsets();
+        let reused_slots = !reuse_offsets.is_empty();
         self.reuse_ledger
             .push(ReuseAttempt {
                 commit_id: commit.commit_id,
@@ -3190,7 +3191,14 @@ impl DB {
 
         let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
         let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
-        if removed_reuse_attempt || pruned_reuse_attempts > 0 {
+        // Once the manifest is durable, a successful reuse attempt is no
+        // longer authoritative. Keep its on-disk ledger entry until the next
+        // publication or reopen when this generation actually reused slots;
+        // both paths reconcile it against manifest history. This avoids one
+        // non-authoritative delete plus directory sync per reused generation.
+        // Keep eager cleanup for empty reservations so a normal append-only
+        // first publication does not leave a misleading ledger artifact.
+        if (removed_reuse_attempt || pruned_reuse_attempts > 0) && !reused_slots {
             self.persist_reuse_ledger()?;
         }
 

@@ -392,6 +392,31 @@ fn dbnext_r0_ambiguous_new_page_reserves_commit_id() {
 }
 
 #[test]
+fn dbnext_r0_defers_successful_reuse_ledger_cleanup_until_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("deferred-reuse-ledger-cleanup.db");
+    let mut db = DB::open(&path, Options::for_test()).unwrap();
+
+    db.put(b"versioned", b"one").unwrap();
+    db.flush().unwrap();
+    db.put(b"versioned", b"two").unwrap();
+    db.flush().unwrap();
+    db.put(b"versioned", b"three").unwrap();
+    db.flush().unwrap();
+
+    // The third generation reused the first generation's retired root page.
+    // The ledger remains as a conservative on-disk recovery hint, but the
+    // in-memory ledger is already reconciled after manifest publication.
+    assert!(path.join("seerdb.reuse-ledger").is_file());
+    assert_eq!(db.get(b"versioned").unwrap(), Some(b"three".to_vec()));
+
+    drop(db);
+    let reopened = DB::open(&path, Options::for_test()).unwrap();
+    assert!(!path.join("seerdb.reuse-ledger").exists());
+    assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"three".to_vec()));
+}
+
+#[test]
 fn dbnext_r0_vacuum_rebuilds_live_tree_and_preserves_retained_root() {
     let root = tempdir().unwrap();
     let path = root.path().join("vacuum.db");
