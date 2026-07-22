@@ -259,66 +259,77 @@ proptest! {
 
     #[test]
     fn publication_faults_reopen_old_or_complete_new(
-        new_value in prop::collection::vec(any::<u8>(), 1_025..2_049),
-        fault in 0u8..4
+        new_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
     ) {
         for segmented in [false, true] {
-            let directory = tempdir().unwrap();
-            let path = directory.path().join("publication-property.db");
-            let options = Options {
-                blob_storage: if segmented {
-                    BlobStorageMode::Segmented
-                } else {
-                    BlobStorageMode::WholeImage
-                },
-                ..Options::for_test()
-            };
-            let old_value = vec![0xD8; 2_048];
-            let retained;
-            {
-                let mut db = DB::create(&path, options).unwrap();
-                db.commit_batch(&[BatchMutation::Put {
-                    key: b"fault-key".to_vec(),
-                    value: old_value.clone(),
-                }])
-                .unwrap();
-                let old_commit = db.durability_status().commit_id;
-                retained = db.retain_commit(old_commit).unwrap();
-                db.put(b"fault-key", &new_value).unwrap();
-                match fault {
-                    0 => db.inject_sync_failure(),
-                    1 => db.inject_write_failure(),
-                    2 => db.inject_atomic_rename_failure(),
-                    3 => db.inject_after_manifest_failure(),
-                    _ => unreachable!(),
+            for fault in 0u8..14 {
+                let directory = tempdir().unwrap();
+                let path = directory.path().join("publication-property.db");
+                let options = Options {
+                    blob_storage: if segmented {
+                        BlobStorageMode::Segmented
+                    } else {
+                        BlobStorageMode::WholeImage
+                    },
+                    ..Options::for_test()
+                };
+                let old_value = vec![0xD8; 2_048];
+                let retained;
+                {
+                    let mut db = DB::create(&path, options).unwrap();
+                    db.commit_batch(&[BatchMutation::Put {
+                        key: b"fault-key".to_vec(),
+                        value: old_value.clone(),
+                    }])
+                    .unwrap();
+                    let old_commit = db.durability_status().commit_id;
+                    retained = db.retain_commit(old_commit).unwrap();
+                    db.put(b"fault-key", &new_value).unwrap();
+                    match fault {
+                        0 => db.inject_sync_failure(),
+                        1 => db.inject_write_failure(),
+                        2 => db.inject_atomic_rename_failure(),
+                        3 => db.inject_after_manifest_failure(),
+                        4 => db.inject_page_range_sync_failure(),
+                        5 => db.inject_after_write_failure(),
+                        6 => db.inject_manifest_sync_failure(),
+                        7 => db.inject_publication_directory_sync_failure(),
+                        8 => db.inject_manifest_mirror_sync_failure(),
+                        9 => db.inject_wal_write_failure(),
+                        10 => db.inject_wal_after_write_failure(),
+                        11 => db.inject_wal_sync_failure(),
+                        12 => db.inject_wal_after_sync_failure(),
+                        13 => db.inject_wal_truncate_failure(),
+                        _ => unreachable!(),
+                    }
+                    assert!(db.flush().is_err());
                 }
-                assert!(db.flush().is_err());
-            }
 
-            let mut reopened = DB::open(&path, Options::default()).unwrap();
-            let recovered = reopened.get(b"fault-key").unwrap().unwrap();
-            assert!(
-                recovered.as_slice() == old_value.as_slice()
-                    || recovered.as_slice() == new_value.as_slice(),
-                "recovery exposed a partial value"
-            );
-            if fault == 3 {
-                assert_eq!(recovered.as_slice(), new_value.as_slice());
-            }
-            assert_eq!(
-                reopened.get_at(retained, b"fault-key").unwrap(),
-                Some(old_value.clone())
-            );
-            reopened.verify().unwrap();
-            reopened.release_snapshot(retained).unwrap();
-            reopened.close().unwrap();
+                let mut reopened = DB::open(&path, Options::default()).unwrap();
+                let recovered = reopened.get(b"fault-key").unwrap().unwrap();
+                assert!(
+                    recovered.as_slice() == old_value.as_slice()
+                        || recovered.as_slice() == new_value.as_slice(),
+                    "recovery exposed a partial value for fault {fault}"
+                );
+                if matches!(fault, 3 | 13) {
+                    assert_eq!(recovered.as_slice(), new_value.as_slice());
+                }
+                assert_eq!(
+                    reopened.get_at(retained, b"fault-key").unwrap(),
+                    Some(old_value.clone())
+                );
+                reopened.verify().unwrap();
+                reopened.release_snapshot(retained).unwrap();
+                reopened.close().unwrap();
 
-            let mut reopened_again = DB::open(&path, Options::default()).unwrap();
-            assert_eq!(
-                reopened_again.get(b"fault-key").unwrap(),
-                Some(recovered)
-            );
-            reopened_again.verify().unwrap();
+                let mut reopened_again = DB::open(&path, Options::default()).unwrap();
+                assert_eq!(
+                    reopened_again.get(b"fault-key").unwrap(),
+                    Some(recovered)
+                );
+                reopened_again.verify().unwrap();
+            }
         }
     }
 }
