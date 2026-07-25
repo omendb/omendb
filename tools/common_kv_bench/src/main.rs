@@ -98,6 +98,7 @@ struct Config {
     engine: EngineKind,
     workload: WorkloadKind,
     path: PathBuf,
+    output: Option<PathBuf>,
     keys: usize,
     operations: usize,
     batch_size: usize,
@@ -118,6 +119,7 @@ impl Config {
         let mut engine = EngineKind::SeerDb;
         let mut workload = WorkloadKind::Mixed;
         let mut path = None;
+        let mut output = None;
         let mut keys = 1_000;
         let mut operations = 4_000;
         let mut batch_size = 16;
@@ -141,6 +143,7 @@ impl Config {
                 "--engine" => engine = EngineKind::parse(value)?,
                 "--workload" => workload = WorkloadKind::parse(value)?,
                 "--path" => path = Some(PathBuf::from(value)),
+                "--output" => output = Some(PathBuf::from(value)),
                 "--keys" => keys = parse_usize(flag, value)?,
                 "--operations" => operations = parse_usize(flag, value)?,
                 "--batch-size" => batch_size = parse_usize(flag, value)?,
@@ -176,6 +179,7 @@ impl Config {
             engine,
             workload,
             path,
+            output,
             keys,
             operations,
             batch_size,
@@ -199,6 +203,7 @@ fn print_help() {
          --engine seerdb|fjall|rocksdb\n\
          --workload batch-put|mixed|point-read|range-read\n\
          --path PATH             Fresh or empty database directory\n\
+         --output PATH            Also write the versioned JSON result artifact\n\
          --keys N                 Initial/key-space size (default 1000)\n\
          --operations N           Measured operation count (default 4000)\n\
          --batch-size N           Write batch size (default 16)\n\
@@ -326,6 +331,60 @@ struct SeerCounters {
     history_bytes_written: u64,
     manifest_bytes_written: u64,
     reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ResourceMetrics {
+    user_cpu_ns: u128,
+    system_cpu_ns: u128,
+    max_rss_bytes: Option<u64>,
+}
+
+#[cfg(unix)]
+fn timeval_to_ns(value: libc::timeval) -> u128 {
+    let seconds = u128::try_from(value.tv_sec).unwrap_or(0);
+    let micros = u128::try_from(value.tv_usec).unwrap_or(0);
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(micros.saturating_mul(1_000))
+}
+
+#[cfg(unix)]
+fn process_resource_metrics() -> ResourceMetrics {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `getrusage` writes the complete `rusage` structure for the
+    // requested process and the pointer refers to valid writable storage.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return ResourceMetrics::default();
+    }
+    // SAFETY: A successful `getrusage` call initialized every field.
+    let usage = unsafe { usage.assume_init() };
+    let max_rss = u64::try_from(usage.ru_maxrss).ok().and_then(|rss| {
+        if cfg!(target_os = "linux") {
+            rss.checked_mul(1024)
+        } else {
+            Some(rss)
+        }
+    });
+    ResourceMetrics {
+        user_cpu_ns: timeval_to_ns(usage.ru_utime),
+        system_cpu_ns: timeval_to_ns(usage.ru_stime),
+        max_rss_bytes: max_rss,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_resource_metrics() -> ResourceMetrics {
+    ResourceMetrics::default()
+}
+
+fn resource_delta(before: ResourceMetrics, after: ResourceMetrics) -> ResourceMetrics {
+    ResourceMetrics {
+        user_cpu_ns: after.user_cpu_ns.saturating_sub(before.user_cpu_ns),
+        system_cpu_ns: after.system_cpu_ns.saturating_sub(before.system_cpu_ns),
+        max_rss_bytes: after.max_rss_bytes,
+    }
 }
 
 #[cfg(feature = "fjall")]
@@ -641,6 +700,8 @@ struct RunResult {
     config: Config,
     preload_ns: u128,
     workload_ns: u128,
+    reopen_ns: u128,
+    resources: ResourceMetrics,
     latency: LatencyStats,
     counters: RunCounters,
     logical_bytes: u64,
@@ -829,7 +890,7 @@ fn prepare_path(path: &Path) -> BenchResult<()> {
     Ok(())
 }
 
-fn print_result(result: &RunResult) {
+fn render_result(result: &RunResult) -> String {
     let config = &result.config;
     let throughput =
         result.counters.measured_operations as f64 / (result.workload_ns as f64 / 1_000_000_000.0);
@@ -840,11 +901,13 @@ fn print_result(result: &RunResult) {
             .seer_counters
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
-    println!(
-        "{{\n  \"format\": \"seerdb-common-kv-v3\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+    format!(
+        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
         config.durability.name(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         config.keys,
         config.operations,
         config.batch_size,
@@ -853,6 +916,7 @@ fn print_result(result: &RunResult) {
         config.seed,
         result.preload_ns,
         result.workload_ns,
+        result.reopen_ns,
         throughput,
         if config.workload == WorkloadKind::BatchPut {
             "batch"
@@ -871,6 +935,12 @@ fn print_result(result: &RunResult) {
         result.final_keys,
         result.digest,
         result.disk_bytes,
+        result.resources.user_cpu_ns,
+        result.resources.system_cpu_ns,
+        result
+            .resources
+            .max_rss_bytes
+            .map_or_else(|| "null".to_string(), |value| value.to_string()),
         result
             .seer_counters
             .map_or(0, |counters| counters.physical_page_writes),
@@ -902,7 +972,7 @@ fn print_result(result: &RunResult) {
             .seer_counters
             .map_or(0, |counters| counters.reclaimed_bytes),
         amplification.map_or_else(|| "null".to_string(), |value| format!("{value:.3}")),
-    );
+    )
 }
 
 fn main() -> BenchResult<()> {
@@ -911,6 +981,7 @@ fn main() -> BenchResult<()> {
 
     let initial = initial_state(&config);
     let operations = generate_operations(&config);
+    let resource_before = process_resource_metrics();
     let mut engine = Engine::create(config.engine, &config.path, config.durability)?;
     let mut oracle = BTreeMap::new();
 
@@ -930,6 +1001,7 @@ fn main() -> BenchResult<()> {
     engine.close()?;
 
     let disk_bytes = disk_bytes(&config.path)?;
+    let reopen_started = Instant::now();
     let reopened = Engine::open_existing(config.engine, &config.path, config.durability)?;
     let reopened_entries = reopened.range(&[], &[0xff])?;
     if reopened_entries != expected_entries {
@@ -939,11 +1011,15 @@ fn main() -> BenchResult<()> {
         return Err("reopen verification failed: digest differs from oracle".into());
     }
     reopened.close()?;
+    let reopen_ns = reopen_started.elapsed().as_nanos();
+    let resources = resource_delta(resource_before, process_resource_metrics());
 
-    print_result(&RunResult {
+    let result = RunResult {
         config,
         preload_ns,
         workload_ns,
+        reopen_ns,
+        resources,
         latency,
         counters,
         logical_bytes,
@@ -951,6 +1027,17 @@ fn main() -> BenchResult<()> {
         digest: expected_digest,
         disk_bytes,
         seer_counters,
-    });
+    };
+    let output = render_result(&result);
+    println!("{output}");
+    if let Some(path) = result.config.output.as_deref() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("{output}\n"))?;
+    }
     Ok(())
 }
