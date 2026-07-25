@@ -21,14 +21,45 @@ mod runner {
     use std::fs;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use tempfile::tempdir;
 
     const DEFAULT_SCHEDULE: &str = "../monorepo-dbnext/experiments/dbnext/ai/workloads/r0-integrity-recovery/failure-schedule.jsonl";
 
     type AnyResult<T> = Result<T, Box<dyn StdError>>;
 
+    struct RunArgs {
+        schedule: PathBuf,
+        output: Option<PathBuf>,
+        manifest: Option<PathBuf>,
+    }
+
     fn invalid(message: impl Into<String>) -> Box<dyn StdError> {
         Box::new(IoError::new(ErrorKind::InvalidData, message.into()))
+    }
+
+    fn absolute_path_string(path: &Path) -> String {
+        if path.is_absolute() {
+            return path.to_string_lossy().into_owned();
+        }
+        std::env::current_dir()
+            .map(|current| current.join(path).to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    }
+
+    fn canonical_path_string(path: &Path) -> String {
+        fs::canonicalize(path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| absolute_path_string(path))
+    }
+
+    fn command_output(program: &str, arguments: &[&str]) -> Value {
+        match Command::new(program).args(arguments).output() {
+            Ok(output) if output.status.success() => {
+                Value::String(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            }
+            _ => Value::Null,
+        }
     }
 
     fn string_field<'a>(object: &'a Map<String, Value>, name: &str) -> AnyResult<&'a str> {
@@ -175,18 +206,32 @@ mod runner {
         let commit_id = reopened.durability_status().commit_id.get();
         let expected_prior = matches!(
             inject,
-            "DataSync" | "PackedPageSync" | "ManifestSync" | "ShortWrite" | "TornWrite"
+            "DataSync" | "PackedPageSync" | "ShortWrite" | "TornWrite"
         );
         let expected_new = matches!(inject, "AfterManifestPublish" | "WalTruncate");
         let prior = value == Some(b"one".to_vec()) && commit_id == 1;
         let new = value == Some(b"two".to_vec()) && commit_id == 2;
-        let accepted = (expected_prior && prior) || (expected_new && new);
+        // A candidate manifest sync can fail after the inactive slot has
+        // become a complete, valid generation. Both recovery frontiers are
+        // safe; partial visibility is not. This is also the policy used by
+        // the typed DBNext adapter's external fault matrix.
+        let manifest_sync_old_or_new = inject == "ManifestSync" && (prior || new);
+        let accepted =
+            (expected_prior && prior) || (expected_new && new) || manifest_sync_old_or_new;
+        let recovery_frontier = if prior {
+            "prior"
+        } else if new {
+            "complete-new"
+        } else {
+            "invalid"
+        };
         Ok(json!({
             "case": case,
             "inject": inject,
             "native_seam": seam,
             "recovered_commit_id": commit_id,
             "recovered_value": value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            "recovery_frontier": recovery_frontier,
             "writer_fenced_before_reopen": fenced,
             "accepted": accepted,
         }))
@@ -262,12 +307,49 @@ mod runner {
         }))
     }
 
-    pub fn run() -> AnyResult<()> {
-        let schedule = std::env::args()
-            .nth(1)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_SCHEDULE));
-        let bytes = fs::read(&schedule)?;
+    fn parse_args() -> AnyResult<RunArgs> {
+        let mut arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        let schedule = match arguments.first() {
+            Some(argument) if !argument.to_string_lossy().starts_with("--") => {
+                PathBuf::from(arguments.remove(0))
+            }
+            _ => PathBuf::from(DEFAULT_SCHEDULE),
+        };
+        let mut arguments = arguments.into_iter();
+        let mut output = None;
+        let mut manifest = None;
+        while let Some(argument) = arguments.next() {
+            match argument.to_str() {
+                Some("--output") => {
+                    output = Some(PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| invalid("--output requires a path"))?,
+                    ));
+                }
+                Some("--manifest") => {
+                    manifest = Some(PathBuf::from(
+                        arguments
+                            .next()
+                            .ok_or_else(|| invalid("--manifest requires a path"))?,
+                    ));
+                }
+                Some(other) => return Err(invalid(format!("unknown argument: {other}"))),
+                None => return Err(invalid("arguments must be valid UTF-8")),
+            }
+        }
+        if output.as_deref() == manifest.as_deref() && output.is_some() {
+            return Err(invalid("--output and --manifest must be different paths"));
+        }
+        Ok(RunArgs {
+            schedule,
+            output,
+            manifest,
+        })
+    }
+
+    fn execute_schedule(schedule: &Path) -> AnyResult<Value> {
+        let bytes = fs::read(schedule)?;
         let mut results = Vec::new();
         for (line, raw) in String::from_utf8(bytes.clone())?.lines().enumerate() {
             if raw.trim().is_empty() {
@@ -283,16 +365,90 @@ mod runner {
         let accepted = results
             .iter()
             .all(|result| result["result"]["accepted"].as_bool() == Some(true));
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schedule": schedule,
-                "case_count": results.len(),
-                "accepted": accepted,
-                "cases": results,
-            }))?
-        );
-        if !accepted {
+        Ok(json!({
+            "adapter": "seerdb-r0-faults-v1",
+            "schedule": {
+                "path": canonical_path_string(schedule),
+                "bytes": bytes.len(),
+                "crc32c": format!("{:08x}", crc32c::crc32c(&bytes)),
+                "bundle": "r0-integrity-recovery-v0",
+            },
+            "case_count": results.len(),
+            "accepted": accepted,
+            "cases": results,
+        }))
+    }
+
+    fn run_manifest(
+        schedule: &Path,
+        output: Option<&Path>,
+        manifest: Option<&Path>,
+        result: &Value,
+    ) -> Value {
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .ok();
+        json!({
+            "manifest_version": "dbnext-fault-manifest-v1",
+            "target": "seerdb-rust",
+            "adapter": result["adapter"],
+            "schedule": result["schedule"],
+            "paths": {
+                "schedule": canonical_path_string(schedule),
+                "result": output.map(canonical_path_string),
+                "manifest": manifest.map(canonical_path_string),
+            },
+            "host": {
+                "os": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "logical_cpus": parallelism,
+            },
+            "software": {
+                "package": env!("CARGO_PKG_NAME"),
+                "version": env!("CARGO_PKG_VERSION"),
+                "git_head": command_output("git", &["rev-parse", "HEAD"]),
+                "rustc": command_output("rustc", &["--version"]),
+                "cargo": command_output("cargo", &["--version"]),
+            },
+            "correctness": {
+                "accepted": result["accepted"],
+                "case_count": result["case_count"],
+                "cases": result["cases"],
+            },
+            "unsupported": [
+                "SeerDB's native fault seams are analogues, not DBNext packed-range byte identities",
+                "Linux block-layer power-loss and external filesystem races require the privileged runner",
+            ],
+        })
+    }
+
+    pub fn run() -> AnyResult<()> {
+        let RunArgs {
+            schedule,
+            output,
+            manifest,
+        } = parse_args()?;
+        let mut result = execute_schedule(&schedule)?;
+        let manifest_value =
+            run_manifest(&schedule, output.as_deref(), manifest.as_deref(), &result);
+        result["run_manifest"] = manifest_value.clone();
+        let encoded = serde_json::to_string_pretty(&result)? + "\n";
+        if let Some(output) = output.as_deref() {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(output, encoded)?;
+        } else {
+            print!("{encoded}");
+        }
+        if let Some(manifest) = manifest.as_deref() {
+            if let Some(parent) = manifest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let encoded_manifest = serde_json::to_string_pretty(&manifest_value)? + "\n";
+            fs::write(manifest, encoded_manifest)?;
+        }
+        if !result["accepted"].as_bool().unwrap_or(false) {
             return Err(invalid("one or more shared R0 fault cases failed"));
         }
         Ok(())
