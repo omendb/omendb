@@ -63,6 +63,7 @@ thread_local! {
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
+const BLOB_DELTA_FILE: &str = "seerdb.blob.delta";
 const BLOB_SEGMENT_PREFIX: &str = "seerdb.blob.segment.";
 const BLOB_RESERVATION_FILE: &str = "seerdb.blob.reserve";
 const BLOB_REWRITE_BACKUP_FILE: &str = "seerdb.blob.rewrite-old";
@@ -126,10 +127,25 @@ fn read_blob_segments(path: &Path) -> Result<HashMap<u32, Vec<u8>>> {
     Ok(segments)
 }
 
-fn parse_blob_catalog(path: &Path, bytes: &[u8]) -> Result<Option<BlobManager>> {
+fn parse_blob_catalog(
+    path: &Path,
+    bytes: &[u8],
+    target_generation: Option<u64>,
+) -> Result<Option<BlobManager>> {
     if BlobManager::is_segment_catalog(bytes) {
         let segments = read_blob_segments(path)?;
-        Ok(BlobManager::from_segment_catalog(bytes, &segments))
+        let delta_log = match fs::read(path.join(BLOB_DELTA_FILE)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let parsed = BlobManager::from_segment_catalog_with_delta_log(
+            bytes,
+            &segments,
+            &delta_log,
+            target_generation,
+        );
+        Ok(parsed)
     } else {
         Ok(BlobManager::from_bytes(bytes))
     }
@@ -152,11 +168,16 @@ fn blob_storage_size(path: &Path) -> Result<u64> {
             total = total.saturating_add(entry.metadata()?.len());
         }
     }
+    if let Ok(metadata) = fs::metadata(path.join(BLOB_DELTA_FILE)) {
+        total = total.saturating_add(metadata.len());
+    }
     Ok(total)
 }
 
 fn segmented_catalog_needs_consolidation(blobs: &BlobManager) -> bool {
-    blobs.is_segmented() && blobs.total_deleted_entries() > MAX_SEGMENTED_CATALOG_DELETED_ENTRIES
+    blobs.is_segmented()
+        && (blobs.total_deleted_entries() > MAX_SEGMENTED_CATALOG_DELETED_ENTRIES
+            || blobs.catalog_needs_consolidation())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1736,7 +1757,11 @@ impl DB {
             let blob_data = recovered_blob_bytes
                 .as_deref()
                 .map_or_else(|| fs::read(&blob_path), |bytes| Ok(bytes.to_vec()))?;
-            match parse_blob_catalog(&path, &blob_data)? {
+            match parse_blob_catalog(
+                &path,
+                &blob_data,
+                current_manifest.map(|manifest| manifest.generation_id.get()),
+            )? {
                 Some(blobs) => blobs,
                 None if check_only => {
                     return Err(Error::Check {
@@ -2534,7 +2559,10 @@ impl DB {
     /// atomically publish its small catalog. A failed append can leave an
     /// ignored suffix; the catalog length is the recovery frontier and the
     /// next publication truncates that suffix before appending.
-    fn prepare_segment_catalog_backup(&self) -> Result<()> {
+    fn prepare_segment_catalog_backup(&self, consolidate: bool) -> Result<()> {
+        if !consolidate {
+            return Ok(());
+        }
         let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
         if backup_path.exists() {
             return Ok(());
@@ -2564,15 +2592,57 @@ impl DB {
 
     fn finish_segment_catalog_backup(&self) -> Result<()> {
         let backup_path = self.path.join(BLOB_REWRITE_BACKUP_FILE);
-        if backup_path.exists() {
+        let consolidated = backup_path.exists();
+        if consolidated {
             fs::remove_file(backup_path)?;
+            let delta_path = self.path.join(BLOB_DELTA_FILE);
+            if delta_path.exists() {
+                fs::remove_file(delta_path)?;
+            }
             sync_directory(&self.path)?;
         }
         Ok(())
     }
 
+    fn append_segment_catalog_delta(&self, delta: &[u8]) -> Result<u64> {
+        let delta_path = self.path.join(BLOB_DELTA_FILE);
+        let existing = match fs::read(&delta_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let prefix = BlobManager::segment_catalog_delta_prefix_len_through_generation(
+            &existing,
+            self.blobs.persisted_segment_catalog_generation(),
+        )
+        .ok_or_else(|| Error::Corruption("segmented catalog delta log is invalid".into()))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&delta_path)?;
+        if u64::try_from(prefix).map_err(|_| Error::DiskFull)? != file.metadata()?.len() {
+            file.set_len(u64::try_from(prefix).map_err(|_| Error::DiskFull)?)?;
+        }
+        file.seek(SeekFrom::Start(
+            u64::try_from(prefix).map_err(|_| Error::DiskFull)?,
+        ))?;
+        file.write_all(delta)?;
+        file.flush()?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected blob catalog sync failure").into());
+        }
+        file.sync_all()?;
+        Ok(delta.len() as u64)
+    }
+
     fn write_blob_segments(&mut self) -> Result<u64> {
-        self.prepare_segment_catalog_backup()?;
+        let catalog_path = self.path.join(BLOB_FILE);
+        let consolidate = !catalog_path.exists() || self.blobs.catalog_needs_consolidation();
+        self.prepare_segment_catalog_backup(consolidate)?;
         let mut bytes_written = 0u64;
         for file_id in self.blobs.segment_file_ids() {
             let data = self
@@ -2629,11 +2699,20 @@ impl DB {
             }
         }
 
-        let catalog = self.blobs.to_segment_catalog_bytes();
-        let catalog_path = self.path.join(BLOB_FILE);
-        atomic_write_without_directory_sync(&catalog_path, &catalog)?;
-        bytes_written = bytes_written.saturating_add(catalog.len() as u64);
-        self.blobs.mark_segments_persisted();
+        if consolidate {
+            let catalog = self.blobs.to_segment_catalog_bytes();
+            atomic_write_without_directory_sync(&catalog_path, &catalog)?;
+            bytes_written = bytes_written.saturating_add(catalog.len() as u64);
+            self.blobs.mark_segment_catalog_consolidated();
+        } else {
+            let delta = self
+                .blobs
+                .to_segment_catalog_delta_bytes()
+                .ok_or_else(|| Error::Corruption("segmented catalog delta overflows".into()))?;
+            bytes_written =
+                bytes_written.saturating_add(self.append_segment_catalog_delta(&delta)?);
+            self.blobs.mark_segment_delta_persisted();
+        }
         Ok(bytes_written)
     }
 
@@ -2712,17 +2791,39 @@ impl DB {
             return Ok(None);
         }
 
+        let manifest_generation = current_manifest.map(|manifest| manifest.generation_id.get());
+        let blob_path = path.join(BLOB_FILE);
+        if let Some(manifest_generation) = manifest_generation
+            && blob_path.is_file()
+            && let Some(blobs) = fs::read(&blob_path).ok().and_then(|bytes| {
+                parse_blob_catalog(path, &bytes, Some(manifest_generation))
+                    .ok()
+                    .flatten()
+            })
+            && blobs.generation_id() == manifest_generation
+        {
+            if !read_only {
+                fs::remove_file(&backup_path)?;
+                if blobs.is_segmented() {
+                    let delta_path = path.join(BLOB_DELTA_FILE);
+                    if delta_path.exists() {
+                        fs::remove_file(delta_path)?;
+                    }
+                }
+                sync_directory(path)?;
+            }
+            return Ok(None);
+        }
+
         let backup_bytes = fs::read(&backup_path)?;
-        let backup_blobs = parse_blob_catalog(path, &backup_bytes)?.ok_or_else(|| {
-            Error::Corruption("interrupted blob rewrite backup is invalid".into())
-        })?;
-        let Some(manifest_generation) =
-            current_manifest.map(|manifest| manifest.generation_id.get())
-        else {
+        let backup_blobs = parse_blob_catalog(path, &backup_bytes, manifest_generation)?
+            .ok_or_else(|| {
+                Error::Corruption("interrupted blob rewrite backup is invalid".into())
+            })?;
+        let Some(manifest_generation) = manifest_generation else {
             if read_only {
                 return Ok(Some(backup_bytes));
             }
-            let blob_path = path.join(BLOB_FILE);
             if blob_path.exists() {
                 fs::remove_file(&blob_path)?;
             }
@@ -2746,11 +2847,10 @@ impl DB {
             return Ok(None);
         }
 
-        let blob_path = path.join(BLOB_FILE);
         let current_blobs = if blob_path.is_file() {
             fs::read(&blob_path)
                 .ok()
-                .and_then(|bytes| parse_blob_catalog(path, &bytes).ok().flatten())
+                .and_then(|bytes| parse_blob_catalog(path, &bytes, None).ok().flatten())
         } else {
             None
         };
@@ -3184,6 +3284,11 @@ impl DB {
             .manifest_bytes_written
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected post-manifest failure").into());
+        }
+
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
             self.finish_segment_catalog_backup()?;
@@ -3200,11 +3305,6 @@ impl DB {
         // first publication does not leave a misleading ledger artifact.
         if (removed_reuse_attempt || pruned_reuse_attempts > 0) && !reused_slots {
             self.persist_reuse_ledger()?;
-        }
-
-        #[cfg(any(test, feature = "fault-injection"))]
-        if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
-            return Err(std::io::Error::other("injected post-manifest failure").into());
         }
 
         self.engine.complete_generation();
@@ -3357,7 +3457,7 @@ impl DB {
         let mut reclaimed = self.blobs.gc();
         if reclaimed > 0 {
             let write_result = if self.blobs.is_segmented() {
-                self.write_blob_segments()
+                self.publish_blob_rewrite_generation().map(|()| 0)
             } else {
                 let blob_path = self.path.join(BLOB_FILE);
                 let blob_image = self.blobs.to_bytes();
@@ -3367,10 +3467,6 @@ impl DB {
                 Ok(bytes) => {
                     self.publication.blob_bytes_written =
                         self.publication.blob_bytes_written.saturating_add(bytes);
-                    if self.blobs.is_segmented() {
-                        self.prune_unreferenced_blob_segments()?;
-                        self.finish_segment_catalog_backup()?;
-                    }
                 }
                 Err(error) => {
                     self.write_fenced = true;
@@ -3472,7 +3568,8 @@ impl DB {
             let reclaimed = self.blobs.gc();
             if reclaimed > 0 {
                 let blob_bytes = if self.blobs.is_segmented() {
-                    self.write_blob_segments()?
+                    self.publish_blob_rewrite_generation()?;
+                    0
                 } else {
                     let blob_path = self.path.join(BLOB_FILE);
                     let blob_image = self.blobs.to_bytes();
@@ -3482,10 +3579,6 @@ impl DB {
                     .publication
                     .blob_bytes_written
                     .saturating_add(blob_bytes);
-                if self.blobs.is_segmented() {
-                    self.prune_unreferenced_blob_segments()?;
-                    self.finish_segment_catalog_backup()?;
-                }
             }
             reclaimed
         } else {
@@ -3614,7 +3707,7 @@ impl DB {
             let bytes = fs::read(&blob_path).map_err(|error| {
                 VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
             })?;
-            parse_blob_catalog(&self.path, &bytes)
+            parse_blob_catalog(&self.path, &bytes, Some(self.generation_id.get()))
                 .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
                 .ok_or_else(|| VerificationFailure {
                     kind: CheckFailureKind::Blob,
@@ -4809,6 +4902,12 @@ impl DB {
             .publication
             .manifest_bytes_written
             .saturating_add(MANIFEST_SLOT_SIZE as u64);
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected post-manifest failure").into());
+        }
+
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
         }
@@ -6471,6 +6570,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
                 || name == REUSE_LEDGER_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
+                || name == BLOB_DELTA_FILE
                 || name.starts_with(BLOB_SEGMENT_PREFIX)
                 || name == META_FILE
                 || name.starts_with("seerdb.meta.")
@@ -6517,6 +6617,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::storage::format::MANIFEST_SLOT_SIZE;
+
+    const TEST_SEGMENT_CATALOG_DELTA_LIMIT: u32 = 64;
 
     #[test]
     fn test_db_open() {
@@ -8616,10 +8718,84 @@ mod tests {
         assert!(db.flush().is_err());
         assert!(db.durability_status().write_fenced);
         assert!(fs::metadata(&segment).unwrap().len() > segment_len_before);
+        assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), catalog_before);
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(!path.join(BLOB_DELTA_FILE).exists());
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        reopened.verify().unwrap();
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        assert!(path.join(BLOB_DELTA_FILE).is_file());
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_catalog_delta_chain_reopens_and_preserves_anchor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-catalog-delta-chain.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xE5; 2_000];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+        let anchor = fs::read(path.join(BLOB_FILE)).unwrap();
+
+        for index in 0..3 {
+            let key = format!("delta-{index}");
+            db.put(key.as_bytes(), &vec![0xE6 + index as u8; 2_000])
+                .unwrap();
+            db.flush().unwrap();
+        }
+        assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), anchor);
+        let delta = fs::read(path.join(BLOB_DELTA_FILE)).unwrap();
+        assert!(!delta.is_empty());
         assert_eq!(
-            fs::read(path.join(BLOB_REWRITE_BACKUP_FILE)).unwrap(),
-            catalog_before
+            BlobManager::segment_catalog_delta_prefix_len(&delta),
+            Some(delta.len())
         );
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        for index in 0..3 {
+            let key = format!("delta-{index}");
+            assert_eq!(
+                reopened.get(key.as_bytes()).unwrap(),
+                Some(vec![0xE6 + index as u8; 2_000])
+            );
+        }
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_catalog_delta_sync_failure_discards_future_frame() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmented-catalog-delta-sync-failure.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xE7; 2_000];
+        let pending = vec![0xE8; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+        db.put(b"pending", &pending).unwrap();
+        db.inject_blob_segment_catalog_sync_failure();
+        assert!(db.flush().is_err());
+        assert!(db.durability_status().write_fenced);
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(path.join(BLOB_DELTA_FILE).is_file());
         drop(db);
 
         let mut reopened = DB::open(&path, Options::default()).unwrap();
@@ -8633,7 +8809,15 @@ mod tests {
     }
 
     #[test]
-    fn test_db_segmented_catalog_rename_failure_preserves_old_catalog() {
+    fn test_db_segmented_catalog_consolidation_rename_failure_preserves_old_catalog() {
+        fn fill_delta_chain(db: &mut DB) {
+            for index in 0..TEST_SEGMENT_CATALOG_DELTA_LIMIT {
+                let key = format!("delta-{index}");
+                db.put(key.as_bytes(), &vec![0xF0; 2_000]).unwrap();
+                db.flush().unwrap();
+            }
+        }
+
         let dir = tempdir().unwrap();
         let path = dir.path().join("segmented-catalog-rename-failure.db");
         let options = Options {
@@ -8648,6 +8832,7 @@ mod tests {
         db.flush().unwrap();
         let catalog = path.join(BLOB_FILE);
         let catalog_before = fs::read(&catalog).unwrap();
+        fill_delta_chain(&mut db);
 
         db.put(b"pending", &pending).unwrap();
         db.inject_blob_segment_catalog_rename_failure();
@@ -8663,9 +8848,14 @@ mod tests {
         assert_eq!(reopened.get(b"pending").unwrap(), None);
         reopened.verify().unwrap();
         reopened.put(b"pending", &pending).unwrap();
-        reopened.flush().unwrap();
+        reopened.inject_after_manifest_failure();
+        assert!(reopened.flush().is_err());
+        drop(reopened);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
         assert!(!backup.exists());
+        assert!(!path.join(BLOB_DELTA_FILE).exists());
         reopened.verify().unwrap();
     }
 
@@ -8697,6 +8887,11 @@ mod tests {
             let mut db = DB::create(&path, options).unwrap();
             db.put(b"base", &base).unwrap();
             db.flush().unwrap();
+            for index in 0..TEST_SEGMENT_CATALOG_DELTA_LIMIT {
+                let key = format!("delta-{index}");
+                db.put(key.as_bytes(), &vec![0xF0; 2_000]).unwrap();
+                db.flush().unwrap();
+            }
 
             db.put(b"pending", &pending).unwrap();
             inject_failure(&db);
@@ -8714,6 +8909,7 @@ mod tests {
             reopened.flush().unwrap();
             assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
             assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+            assert!(!path.join(BLOB_DELTA_FILE).exists());
             reopened.verify().unwrap();
         }
     }
@@ -8766,7 +8962,8 @@ mod tests {
         db.inject_publication_directory_sync_failure();
         assert!(db.flush().is_err());
         assert!(db.durability_status().write_fenced);
-        assert!(path.join(BLOB_REWRITE_BACKUP_FILE).is_file());
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(path.join(BLOB_DELTA_FILE).is_file());
         drop(db);
 
         let mut reopened = DB::open(&path, Options::default()).unwrap();
@@ -8779,6 +8976,7 @@ mod tests {
         }
         assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
         assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(path.join(BLOB_DELTA_FILE).is_file());
         reopened.verify().unwrap();
     }
 }
