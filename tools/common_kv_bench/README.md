@@ -20,6 +20,23 @@ filesystem when comparing engines. These numbers are diagnostic until they
 are repeated on a documented Linux/NVMe matrix with warm-up, repetitions, and
 matched tuning.
 
+For a repeatable Linux baseline with raw runs and an aggregate manifest, use
+`tools/common_kv_qualification.sh`. It defaults to three durable repetitions
+and one discarded warm-up for `batch-put` and `mixed` across all three engines:
+
+```bash
+tools/common_kv_qualification.sh --output-dir /tmp/seerdb-common-kv-qualification
+```
+
+The script preserves each `seerdb-common-kv-v4` result and writes a
+`seerdb-common-kv-qualification-v1` manifest with median latency/throughput,
+reopen time, disk bytes, resource metadata, the exact trace parameters, and
+the final-state digest. It leaves the filesystem cache intact and records that
+policy; use a controlled Linux/NVMe host and an explicit CPU set through
+`SEERDB_BENCH_CPUSET` when a qualification result needs tighter resource
+control. The script refuses non-Linux hosts unless
+`SEERDB_COMMON_KV_ALLOW_NONLINUX=1` is set for a diagnostic run.
+
 ## Examples
 
 From this directory:
