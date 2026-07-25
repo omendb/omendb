@@ -4873,6 +4873,20 @@ impl DB {
             .saturating_add(checkpoint_bytes)
             .saturating_add(legacy_meta_bytes);
 
+        if self.blobs.is_segmented() {
+            // A compaction generation changes the manifest-selected physical
+            // root even when the blob pointers do not change. Advance the
+            // segmented catalog frontier with an empty delta (or a bounded
+            // consolidation) so the catalog can be validated against the
+            // same root generation after reopen.
+            self.blobs.set_generation(generation_id.get());
+            let blob_bytes = self.write_blob_segments()?;
+            self.publication.blob_bytes_written = self
+                .publication
+                .blob_bytes_written
+                .saturating_add(blob_bytes);
+        }
+
         let manifest = Manifest {
             generation_id,
             pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
@@ -4910,6 +4924,7 @@ impl DB {
 
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
+            self.finish_segment_catalog_backup()?;
         }
         self.engine.complete_generation();
         self.generation_id = generation_id;
@@ -5038,7 +5053,12 @@ impl DB {
                     self.engine.pmt().len(),
                     self.engine.allocator(),
                 )?;
-                self.preflight_maintenance_capacity(0, metadata_bytes, 0)?;
+                let blob_bytes = if self.blobs.is_segmented() {
+                    Self::blob_publication_size(&self.blobs)?
+                } else {
+                    0
+                };
+                self.preflight_maintenance_capacity(0, metadata_bytes, blob_bytes)?;
             }
             // Both slots must continue to name the old PMT until all moved
             // copies are durable. This is the maintenance equivalent of the
@@ -8773,6 +8793,47 @@ mod tests {
                 Some(vec![0xE6 + index as u8; 2_000])
             );
         }
+        reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_segmented_compaction_advances_catalog_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("segmented-compaction-catalog-generation.db");
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 64,
+            ..Options::for_test()
+        };
+        let blob = vec![0xD5; 2_000];
+        let mut db = DB::create(&path, options).unwrap();
+        let initial = (0..256)
+            .map(|index| BatchMutation::Put {
+                key: format!("key-{index:04}").into_bytes(),
+                value: vec![index as u8; 128],
+            })
+            .chain(std::iter::once(BatchMutation::Put {
+                key: b"segmented-blob".to_vec(),
+                value: blob.clone(),
+            }))
+            .collect::<Vec<_>>();
+        db.commit_batch(&initial).unwrap();
+
+        db.put(b"key-0128", &[0xE6; 128]).unwrap();
+        db.flush().unwrap();
+        let report = db.compact().unwrap();
+        assert!(
+            report.relocated_pages > 0,
+            "expected an interior relocation"
+        );
+        assert_eq!(db.get(b"segmented-blob").unwrap(), Some(blob.clone()));
+        db.verify().unwrap();
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::for_test()).unwrap();
+        assert_eq!(reopened.get(b"segmented-blob").unwrap(), Some(blob));
         reopened.verify().unwrap();
     }
 
