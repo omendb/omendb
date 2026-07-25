@@ -41,6 +41,15 @@ mod linux {
         Ok(filler)
     }
 
+    fn release_filler(root: &PathBuf, filler: File) -> io::Result<()> {
+        drop(filler);
+        fs::remove_file(root.join("seerdb-enospc.filler"))?;
+        // XFS can defer free-space accounting for an unlink until the
+        // directory inode is synchronized; the retry must observe released
+        // capacity on every supported filesystem.
+        File::open(root)?.sync_all()
+    }
+
     #[test]
     #[ignore = "requires SEERDB_ENOSPC_ROOT on a dedicated size-limited Linux filesystem"]
     fn real_filesystem_enospc_preflight_is_retryable() {
@@ -75,8 +84,7 @@ mod linux {
             "capacity preflight must not issue page writes"
         );
         assert!(!db.durability_status().write_fenced);
-        drop(filler);
-        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+        release_filler(&root, filler).unwrap();
 
         db.flush().unwrap();
         assert_eq!(db.get(b"pending").unwrap(), Some(b"value-2".to_vec()));
@@ -97,8 +105,7 @@ mod linux {
             "maintenance capacity preflight must not issue page writes"
         );
         assert!(!db.durability_status().write_fenced);
-        drop(filler);
-        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+        release_filler(&root, filler).unwrap();
 
         db.vacuum().unwrap();
         assert_eq!(db.get(b"pending").unwrap(), None);
@@ -125,8 +132,7 @@ mod linux {
             "mixed blob GC capacity preflight must not issue page writes"
         );
         assert!(!db.durability_status().write_fenced);
-        drop(filler);
-        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+        release_filler(&root, filler).unwrap();
 
         assert!(db.gc().unwrap() > 0);
         assert_eq!(db.get(b"gc-live").unwrap(), Some(large.clone()));
@@ -162,8 +168,7 @@ mod linux {
             "segmented append refusal must not issue page writes"
         );
         assert!(!segmented.durability_status().write_fenced);
-        drop(filler);
-        fs::remove_file(root.join("seerdb-enospc.filler")).unwrap();
+        release_filler(&root, filler).unwrap();
 
         segmented.flush().unwrap();
         assert_eq!(segmented.get(b"pending").unwrap(), Some(large.clone()));
