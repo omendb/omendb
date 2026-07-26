@@ -110,6 +110,20 @@ oracle, close/reopen verification, latency quantiles, process resources, and
 SeerDB publication counters. It leaves the filesystem cache intact and does
 not substitute for external recovery testing or NVMe measurements.
 
+For the portable process-termination recovery gate, run the independent
+ordered-KV adapters through deterministic old-state and complete-new-state
+batch boundaries:
+
+```bash
+tools/common_kv_faults.sh \
+  --output-dir /tmp/seerdb-common-kv-faults
+```
+
+This writes a `seerdb-common-kv-process-crash-manifest-v1` with six Linux
+cases, SIGKILL status, two reopen checks, and the accepted prefix digest for
+SeerDB, Fjall, and RocksDB. It does not claim recovery from a kill during
+fsync/page write or from block-layer power loss; those remain separate gates.
+
 ## Verification
 
 ```bash

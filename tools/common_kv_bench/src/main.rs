@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
@@ -106,6 +106,10 @@ struct Config {
     range_width: usize,
     seed: u64,
     durability: DurabilityMode,
+    progress: Option<PathBuf>,
+    progress_hold: Option<PathBuf>,
+    progress_hold_index: Option<usize>,
+    verify_prefix: Option<usize>,
 }
 
 impl Config {
@@ -127,6 +131,10 @@ impl Config {
         let mut range_width = 32;
         let mut seed = 7;
         let mut durability = DurabilityMode::Durable;
+        let mut progress = None;
+        let mut progress_hold = None;
+        let mut progress_hold_index = None;
+        let mut verify_prefix = None;
 
         let mut index = 0;
         while index < args.len() {
@@ -155,6 +163,10 @@ impl Config {
                         .map_err(|_| format!("invalid {flag}: {value}"))?
                 }
                 "--durability" => durability = DurabilityMode::parse(value)?,
+                "--progress" => progress = Some(PathBuf::from(value)),
+                "--progress-hold" => progress_hold = Some(PathBuf::from(value)),
+                "--progress-hold-index" => progress_hold_index = Some(parse_usize(flag, value)?),
+                "--verify-prefix" => verify_prefix = Some(parse_usize(flag, value)?),
                 _ => return Err(format!("unknown argument {flag:?}; use --help").into()),
             }
             index += 2;
@@ -165,6 +177,28 @@ impl Config {
                 "keys, operations, batch-size, value-bytes, and range-width must be non-zero"
                     .into(),
             );
+        }
+
+        if progress_hold.is_some() != progress_hold_index.is_some() {
+            return Err(
+                "--progress-hold and --progress-hold-index must be provided together".into(),
+            );
+        }
+        if progress_hold.is_some() && progress.is_none() {
+            return Err("--progress is required when a progress hold is configured".into());
+        }
+        if verify_prefix.is_some() && (progress.is_some() || progress_hold.is_some()) {
+            return Err("--verify-prefix cannot be combined with progress controls".into());
+        }
+        if let Some(prefix) = verify_prefix {
+            if workload != WorkloadKind::BatchPut {
+                return Err("--verify-prefix requires --workload batch-put".into());
+            }
+            if prefix > operations || prefix % batch_size != 0 {
+                return Err(
+                    "--verify-prefix must be a batch boundary between zero and operations".into(),
+                );
+            }
         }
 
         let path = path.unwrap_or_else(|| {
@@ -187,6 +221,10 @@ impl Config {
             range_width,
             seed,
             durability,
+            progress,
+            progress_hold,
+            progress_hold_index,
+            verify_prefix,
         })
     }
 }
@@ -213,6 +251,10 @@ fn print_help() {
          --durability durable|buffered\n\
                                   Durability mode (default durable)\n\
          --sync                   Alias for --durability durable\n\n\
+         --progress PATH          Write the next batch/operation boundary here\n\
+         --progress-hold PATH     Wait for this path at --progress-hold-index\n\
+         --progress-hold-index N  Hold before publishing boundary N\n\
+         --verify-prefix N        Open an existing batch-put DB and verify prefix N\n\n\
          Workloads use the same generated trace for every engine. Each run\n\
          verifies the oracle, closes, reopens, and verifies the final digest.\n\
          SeerDB common-KV runs support durable mode only; buffered mode is\n\
@@ -778,11 +820,39 @@ fn logical_bytes_for_initial_state(initial: &[(Vec<u8>, Vec<u8>)]) -> u64 {
         .sum()
 }
 
+fn publish_progress_boundary(
+    progress: Option<&Path>,
+    progress_hold: Option<&Path>,
+    progress_hold_index: Option<usize>,
+    index: usize,
+) -> BenchResult<()> {
+    let Some(progress) = progress else {
+        return Ok(());
+    };
+    if let Some(parent) = progress
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(progress, format!("{index}\n"))?;
+    if progress_hold_index == Some(index) {
+        let hold = progress_hold.ok_or("progress hold index configured without hold path")?;
+        while !hold.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    Ok(())
+}
+
 fn run_workload(
     engine: &mut Engine,
     oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     operations: &[Operation],
     batch_size: usize,
+    progress: Option<&Path>,
+    progress_hold: Option<&Path>,
+    progress_hold_index: Option<usize>,
 ) -> BenchResult<(u128, LatencyStats, RunCounters, u64)> {
     let mut latencies = Vec::new();
     let mut counters = RunCounters::default();
@@ -793,7 +863,13 @@ fn run_workload(
         .iter()
         .all(|operation| matches!(operation, Operation::Put { .. }))
     {
-        for chunk in operations.chunks(batch_size) {
+        for (chunk_index, chunk) in operations.chunks(batch_size).enumerate() {
+            publish_progress_boundary(
+                progress,
+                progress_hold,
+                progress_hold_index,
+                chunk_index.saturating_mul(batch_size),
+            )?;
             let batch_started = Instant::now();
             engine.write_batch(chunk)?;
             latencies.push(batch_started.elapsed().as_nanos());
@@ -807,7 +883,13 @@ fn run_workload(
         }
         counters.measured_operations = operations.len();
     } else {
-        for operation in operations {
+        for (operation_index, operation) in operations.iter().enumerate() {
+            publish_progress_boundary(
+                progress,
+                progress_hold,
+                progress_hold_index,
+                operation_index,
+            )?;
             let operation_started = Instant::now();
             match operation {
                 Operation::Put { key, value } => {
@@ -975,8 +1057,87 @@ fn render_result(result: &RunResult) -> String {
     )
 }
 
+fn render_prefix_verification(
+    config: &Config,
+    prefix: usize,
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> String {
+    format!(
+        "{{\n  \"format\": \"seerdb-common-kv-process-crash-verification-v1\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"operations\": {},\n  \"batch_size\": {},\n  \"expected_prefix\": {},\n  \"reopen_passes\": 2,\n  \"accepted\": true,\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\"\n}}",
+        config.engine.name(),
+        config.workload.name(),
+        config.durability.name(),
+        config.operations,
+        config.batch_size,
+        prefix,
+        entries.len(),
+        digest(entries),
+    )
+}
+
+fn verify_existing_prefix(config: &Config, prefix: usize) -> BenchResult<String> {
+    let initial = initial_state(config);
+    let operations = generate_operations(config);
+    let mut oracle = BTreeMap::new();
+    for (key, value) in &initial {
+        oracle.insert(key.clone(), value.clone());
+    }
+    for operation in operations.iter().take(prefix) {
+        apply_oracle(&mut oracle, operation);
+    }
+    let expected_entries = oracle
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let expected_digest = digest(&expected_entries);
+
+    for pass in 0..2 {
+        let reopened = Engine::open_existing(config.engine, &config.path, config.durability)?;
+        let actual_entries = reopened.range(&[], &[0xff])?;
+        if actual_entries != expected_entries {
+            return Err(format!(
+                "prefix verification reopen pass {} failed: entries differ from expected prefix",
+                pass + 1
+            )
+            .into());
+        }
+        if digest(&actual_entries) != expected_digest {
+            return Err(format!(
+                "prefix verification reopen pass {} failed: digest differs from expected prefix",
+                pass + 1
+            )
+            .into());
+        }
+        reopened.close()?;
+    }
+
+    Ok(render_prefix_verification(
+        config,
+        prefix,
+        &expected_entries,
+    ))
+}
+
+fn emit_output(output: &str, path: Option<&Path>) -> BenchResult<()> {
+    println!("{output}");
+    if let Some(path) = path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("{output}\n"))?;
+    }
+    Ok(())
+}
+
 fn main() -> BenchResult<()> {
     let config = Config::parse()?;
+    if let Some(prefix) = config.verify_prefix {
+        let output = verify_existing_prefix(&config, prefix)?;
+        return emit_output(&output, config.output.as_deref());
+    }
     prepare_path(&config.path)?;
 
     let initial = initial_state(&config);
@@ -989,8 +1150,15 @@ fn main() -> BenchResult<()> {
     apply_initial_state(&mut engine, &mut oracle, &initial, config.batch_size)?;
     let preload_ns = preload_started.elapsed().as_nanos();
 
-    let (workload_ns, latency, counters, workload_logical_bytes) =
-        run_workload(&mut engine, &mut oracle, &operations, config.batch_size)?;
+    let (workload_ns, latency, counters, workload_logical_bytes) = run_workload(
+        &mut engine,
+        &mut oracle,
+        &operations,
+        config.batch_size,
+        config.progress.as_deref(),
+        config.progress_hold.as_deref(),
+        config.progress_hold_index,
+    )?;
     let logical_bytes = logical_bytes_for_initial_state(&initial) + workload_logical_bytes;
     let expected_entries = oracle
         .iter()
@@ -1029,15 +1197,5 @@ fn main() -> BenchResult<()> {
         seer_counters,
     };
     let output = render_result(&result);
-    println!("{output}");
-    if let Some(path) = result.config.output.as_deref() {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, format!("{output}\n"))?;
-    }
-    Ok(())
+    emit_output(&output, result.config.output.as_deref())
 }
