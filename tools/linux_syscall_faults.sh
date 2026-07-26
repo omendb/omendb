@@ -2,17 +2,18 @@
 set -Eeuo pipefail
 
 # Run external libc-boundary fault injection against a real durable mutation.
-# This is intentionally narrower than dm-log-writes: it tests returned EIO at
-# fsync/fdatasync/rename, not torn writes, block reordering, or power loss.
+# This is intentionally narrower than dm-log-writes: it tests returned EIO
+# before or after fsync/fdatasync/rename/write completion, not torn writes,
+# block reordering, or power loss.
 
 usage() {
     cat >&2 <<'EOF'
 usage: tools/linux_syscall_faults.sh [--output-dir PATH]
 
 The default output is /tmp/seerdb-linux-syscall-faults-TIMESTAMP. Each
-observed fsync, fdatasync, rename, and write call is failed once in fresh
-whole-image and segmented databases. Every case must reopen as the old or
-complete-new root and pass verification twice.
+observed fsync, fdatasync, rename, and write call is failed once before and
+after completion in fresh whole-image and segmented databases. Every case
+must reopen as the old or complete-new root and pass verification twice.
 EOF
 }
 
@@ -82,34 +83,37 @@ for layout in whole segmented; do
             continue
         fi
 
-        for ((fault_after = 1; fault_after <= call_count; fault_after++)); do
-            case_name="$layout.$syscall.$fault_after"
-            case_dir="$output_dir/runs/$case_name"
-            mkdir -p "$case_dir"
-            cp -a "$baseline/db" "$case_dir/db"
-            cp "$baseline/oracle" "$case_dir/oracle"
+        for mode in before after; do
+            for ((fault_after = 1; fault_after <= call_count; fault_after++)); do
+                case_name="$layout.$mode.$syscall.$fault_after"
+                case_dir="$output_dir/runs/$case_name"
+                mkdir -p "$case_dir"
+                cp -a "$baseline/db" "$case_dir/db"
+                cp "$baseline/oracle" "$case_dir/oracle"
 
-            set +e
-            LD_PRELOAD="$injector" \
-            SEERDB_POWERLOSS_BLOB_STORAGE="$layout" \
-            SEERDB_FAULT_SYSCALL="$syscall" \
-            SEERDB_FAULT_AFTER="$fault_after" \
-                "$verify_binary" mutate "$case_dir/db" "$case_dir/oracle" \
-                >"$case_dir/mutate.stdout" 2>"$case_dir/mutate.stderr"
-            child_status=$?
-            set -e
-            printf '%s\n' "$child_status" >"$case_dir/child.status"
+                set +e
+                LD_PRELOAD="$injector" \
+                SEERDB_POWERLOSS_BLOB_STORAGE="$layout" \
+                SEERDB_FAULT_SYSCALL="$syscall" \
+                SEERDB_FAULT_AFTER="$fault_after" \
+                SEERDB_FAULT_MODE="$mode" \
+                    "$verify_binary" mutate "$case_dir/db" "$case_dir/oracle" \
+                    >"$case_dir/mutate.stdout" 2>"$case_dir/mutate.stderr"
+                child_status=$?
+                set -e
+                printf '%s\n' "$child_status" >"$case_dir/child.status"
 
-            if ! SEERDB_POWERLOSS_BLOB_STORAGE="$layout" \
-                "$verify_binary" verify-fault "$case_dir/db" "$baseline/oracle" \
-                >"$case_dir/verify.stdout" 2>"$case_dir/verify.stderr"; then
-                echo "linux_syscall_faults: verifier failed for $case_name" >&2
-                sed -n '1,120p' "$case_dir/verify.stderr" >&2 || true
-                exit 1
-            fi
-            printf '%s\t%s\t%s\t%s\t%s\n' \
-                "$layout" "$syscall" "$fault_after" "$call_count" "$child_status" \
-                >>"$output_dir/cases.tsv"
+                if ! SEERDB_POWERLOSS_BLOB_STORAGE="$layout" \
+                    "$verify_binary" verify-fault "$case_dir/db" "$baseline/oracle" \
+                    >"$case_dir/verify.stdout" 2>"$case_dir/verify.stderr"; then
+                    echo "linux_syscall_faults: verifier failed for $case_name" >&2
+                    sed -n '1,120p' "$case_dir/verify.stderr" >&2 || true
+                    exit 1
+                fi
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$layout" "$mode" "$syscall" "$fault_after" "$call_count" "$child_status" \
+                    >>"$output_dir/cases.tsv"
+            done
         done
     done
 done
@@ -137,9 +141,10 @@ for line in (output_dir / "observed.tsv").read_text().splitlines():
 
 cases = []
 for line in (output_dir / "cases.tsv").read_text().splitlines():
-    layout, syscall, fault_after, observed_calls, child_status = line.split("\t")
+    layout, mode, syscall, fault_after, observed_calls, child_status = line.split("\t")
     cases.append({
         "layout": layout,
+        "mode": mode,
         "syscall": syscall,
         "failed_call": int(fault_after),
         "observed_calls": int(observed_calls),
@@ -160,10 +165,11 @@ manifest = {
     "host_os": platform.system(),
     "host_arch": platform.machine(),
     "kernel": command_output("uname", "-r"),
-    "fault_domain": "libc boundary; one selected fsync/fdatasync/rename/write call returns EIO",
+    "fault_domain": "libc boundary; one selected fsync/fdatasync/rename/write call returns EIO before or after completion",
     "oracle": "baseline seed oracle remains outside the faulted child and is used by the verifier",
     "accepted_states": "old seeded root or complete-new mutation root",
     "verification": "fresh process opens each case twice, checks active and retained values, and runs DB verify",
+    "modes": ["before", "after"],
     "not_exercised": [
         "Rust positional page writes that bypass the interposed libc pwrite symbol",
         "torn or short block writes",

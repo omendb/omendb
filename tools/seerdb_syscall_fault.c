@@ -1,8 +1,9 @@
 #define _GNU_SOURCE
 
 // Deliberately small Linux-only LD_PRELOAD helper for the external syscall
-// boundary gate. It returns EIO at one selected libc call and otherwise calls
-// through to libc. This does not emulate torn sectors or a power cut.
+// boundary gate. It returns EIO at one selected libc call, either before or
+// after calling through to libc. This does not emulate torn sectors or a
+// power cut.
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -55,6 +56,11 @@ static int should_fail(const char *name, unsigned long count) {
     return end != after && *end == '\0' && selected > 0 && count == selected;
 }
 
+static int fail_after_completion(void) {
+    const char *mode = getenv("SEERDB_FAULT_MODE");
+    return mode != NULL && strcmp(mode, "after") == 0;
+}
+
 static fsync_fn real_fsync(void) {
     static fsync_fn function;
     if (function == NULL) {
@@ -98,7 +104,8 @@ static write_fn real_write(void) {
 int fsync(int fd) {
     unsigned long count = atomic_fetch_add_explicit(&fsync_count, 1, memory_order_relaxed) + 1;
     trace_call("fsync", count, fd);
-    if (should_fail("fsync", count)) {
+    int selected = should_fail("fsync", count);
+    if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
     }
@@ -107,14 +114,20 @@ int fsync(int fd) {
         errno = ENOSYS;
         return -1;
     }
-    return function(fd);
+    int result = function(fd);
+    if (selected && fail_after_completion() && result == 0) {
+        errno = EIO;
+        return -1;
+    }
+    return result;
 }
 
 int fdatasync(int fd) {
     unsigned long count =
         atomic_fetch_add_explicit(&fdatasync_count, 1, memory_order_relaxed) + 1;
     trace_call("fdatasync", count, fd);
-    if (should_fail("fdatasync", count)) {
+    int selected = should_fail("fdatasync", count);
+    if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
     }
@@ -123,13 +136,19 @@ int fdatasync(int fd) {
         errno = ENOSYS;
         return -1;
     }
-    return function(fd);
+    int result = function(fd);
+    if (selected && fail_after_completion() && result == 0) {
+        errno = EIO;
+        return -1;
+    }
+    return result;
 }
 
 int rename(const char *old_path, const char *new_path) {
     unsigned long count = atomic_fetch_add_explicit(&rename_count, 1, memory_order_relaxed) + 1;
     trace_call("rename", count, -1);
-    if (should_fail("rename", count)) {
+    int selected = should_fail("rename", count);
+    if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
     }
@@ -138,13 +157,19 @@ int rename(const char *old_path, const char *new_path) {
         errno = ENOSYS;
         return -1;
     }
-    return function(old_path, new_path);
+    int result = function(old_path, new_path);
+    if (selected && fail_after_completion() && result == 0) {
+        errno = EIO;
+        return -1;
+    }
+    return result;
 }
 
 int renameat(int old_directory, const char *old_path, int new_directory, const char *new_path) {
     unsigned long count = atomic_fetch_add_explicit(&rename_count, 1, memory_order_relaxed) + 1;
     trace_call("rename", count, -1);
-    if (should_fail("rename", count)) {
+    int selected = should_fail("rename", count);
+    if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
     }
@@ -153,13 +178,19 @@ int renameat(int old_directory, const char *old_path, int new_directory, const c
         errno = ENOSYS;
         return -1;
     }
-    return function(old_directory, old_path, new_directory, new_path);
+    int result = function(old_directory, old_path, new_directory, new_path);
+    if (selected && fail_after_completion() && result == 0) {
+        errno = EIO;
+        return -1;
+    }
+    return result;
 }
 
 ssize_t write(int fd, const void *buffer, size_t length) {
     unsigned long count = atomic_fetch_add_explicit(&write_count, 1, memory_order_relaxed) + 1;
     trace_call("write", count, fd);
-    if (should_fail("write", count)) {
+    int selected = should_fail("write", count);
+    if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
     }
@@ -168,5 +199,10 @@ ssize_t write(int fd, const void *buffer, size_t length) {
         errno = ENOSYS;
         return -1;
     }
-    return function(fd, buffer, length);
+    ssize_t result = function(fd, buffer, length);
+    if (selected && fail_after_completion() && result >= 0) {
+        errno = EIO;
+        return -1;
+    }
+    return result;
 }
