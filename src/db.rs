@@ -3161,9 +3161,15 @@ impl DB {
         // physical versions it names. If the new publication fails, both
         // slots still identify the same current generation and its pages.
         self.mirror_current_manifest()?;
-        // A non-syncing mutation path is still ordered before page writes and
-        // the commit envelope is always forced at the publication boundary.
-        self.write_wal_to_disk(true)?;
+        // Mutation records have already been written to the WAL by the
+        // mutation or batch admission path. The commit envelope is appended
+        // and forced only after the new out-of-place pages are durable below.
+        // The manifest remains the visibility barrier, so forcing the
+        // uncommitted mutation prefix before page write-back adds a sync
+        // without strengthening recovery: an incomplete publication still
+        // reopens the old root, while a durable commit record is enough to
+        // replay the complete generation.
+        self.write_wal_to_disk(false)?;
         let reuse_offsets = self.engine.pending_reuse_offsets();
         let reused_slots = !reuse_offsets.is_empty();
         self.reuse_ledger
