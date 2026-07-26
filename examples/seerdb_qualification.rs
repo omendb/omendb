@@ -372,7 +372,8 @@ fn main() -> AnyResult<()> {
                 db.commit_batch(&[BatchMutation::Put {
                     key: key.clone(),
                     value: value.clone(),
-                }])?;
+                }])
+                .map_err(|error| invalid(format!("operation {operation} put: {error}")))?;
                 commit_latency.push(started.elapsed().as_nanos());
                 logical_write_bytes =
                     logical_write_bytes.saturating_add((key.len() + value.len()) as u64);
@@ -392,7 +393,8 @@ fn main() -> AnyResult<()> {
                     }),
                 );
                 let started = Instant::now();
-                db.commit_batch(&[BatchMutation::Delete { key: key.clone() }])?;
+                db.commit_batch(&[BatchMutation::Delete { key: key.clone() }])
+                    .map_err(|error| invalid(format!("operation {operation} delete: {error}")))?;
                 commit_latency.push(started.elapsed().as_nanos());
                 logical_write_bytes = logical_write_bytes.saturating_add(key.len() as u64);
                 model.remove(&key);

@@ -1150,41 +1150,27 @@ impl Node {
             }
             *self = left;
         } else {
-            // Internal nodes retain their child-routing metadata and use the
-            // cheaper slot truncation path.
-            self.truncate(mid);
+            // Internal entries can be physically interleaved with the half
+            // being removed when separators arrived out of order. Rebuilding
+            // the retained left half is required to reclaim those holes;
+            // merely truncating the slot array can leave two logical entries
+            // with almost no reported free space and make the next split
+            // fail with PageFull.
+            let parent_id = self.parent_id();
+            let leftmost_child = self.leftmost_child();
+            let mut left = Node::new_internal();
+            left.set_parent_id(parent_id);
+            left.set_leftmost_child(leftmost_child);
+            for index in 0..mid {
+                let key = self.key(index).ok_or(SplitError::Corruption)?;
+                let child = self.child_id(index).ok_or(SplitError::Corruption)?;
+                left.insert_child(&key, child)
+                    .map_err(|_| SplitError::InsertFailed)?;
+            }
+            *self = left;
         }
 
         Ok((median_key, right))
-    }
-
-    /// Truncate the node to keep only the first `new_count` entries.
-    fn truncate(&mut self, new_count: usize) {
-        let old_count = self.count();
-        if new_count >= old_count {
-            return;
-        }
-
-        // Zero out slots beyond new_count.
-        let slot_start = Self::slot_array_start() + new_count * SLOT_SIZE;
-        let slot_end = Self::slot_array_start() + old_count * SLOT_SIZE;
-        self.data[slot_start..slot_end].fill(0);
-
-        // Update header.
-        let mut header = self.header();
-        header.count = new_count as u32;
-        // Recalculate free space.
-        let slot_array_end = Self::slot_array_start() + new_count * SLOT_SIZE;
-        let min_entry = if new_count > 0 {
-            (0..new_count)
-                .map(|i| self.slot_offset(i))
-                .min()
-                .unwrap_or(PAGE_SIZE)
-        } else {
-            PAGE_SIZE
-        };
-        header.free_space = (min_entry - slot_array_end) as u32;
-        self.set_header(&header);
     }
 }
 

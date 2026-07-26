@@ -1279,6 +1279,62 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_out_of_order_internal_split_rebuilds_left_half() {
+        let keys = 8_192;
+        let operations = 38_205;
+        let mut tree = BTree::new();
+        let mut reference = BTreeMap::new();
+        let mut revisions = vec![0usize; keys + 524_288];
+
+        for index in 0..keys {
+            let key = format!("qualification-key-{index:08}");
+            let value = format!("qualification-value-{index:08}-revision-{:08}", 0);
+            tree.upsert(key.as_bytes(), value.as_bytes()).unwrap();
+            reference.insert(key.into_bytes(), value.into_bytes());
+        }
+
+        let mut state = 20_260_727_u64;
+        for operation in 0..operations {
+            let random = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state = random;
+            let key_index = (random as usize) % (keys + 524_288);
+            let key = format!("qualification-key-{key_index:08}");
+            match random % 100 {
+                0..=44 => {}
+                45..=69 => {
+                    revisions[key_index] = revisions[key_index].saturating_add(1);
+                    let value = format!(
+                        "qualification-value-{key_index:08}-revision-{:08}",
+                        revisions[key_index]
+                    );
+                    tree.upsert(key.as_bytes(), value.as_bytes())
+                        .unwrap_or_else(|error| panic!("operation {operation}: {error:?}"));
+                    reference.insert(key.into_bytes(), value.into_bytes());
+                }
+                70..=84 => {
+                    tree.delete(key.as_bytes())
+                        .unwrap_or_else(|error| panic!("operation {operation}: {error:?}"));
+                    reference.remove(key.as_bytes());
+                }
+                _ => {}
+            }
+        }
+
+        let actual = tree
+            .range_scan(b"qualification-key-", b"qualification-key-\xFF")
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let expected: Vec<_> = reference
+            .into_iter()
+            .map(|(key, value)| (key, LookupResult::Found(value)))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_btree_range_scan() {
         let mut tree = BTree::new();
 
