@@ -77,11 +77,13 @@ fault races remain open. See [ai/STATUS.md](ai/STATUS.md) for the evidence and
 remaining gates.
 
 On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
-it fails each observed `fsync`, `fdatasync`, and rename call once during a
-whole-image and segmented durable mutation, then requires the old or
+it fails each observed `fsync`, `fdatasync`, rename, and `write` call once
+during a whole-image and segmented durable mutation, then requires the old or
 complete-new root after two fresh reopens. This does not emulate torn writes,
 block-layer cache loss, or machine power loss; the privileged
 `tools/linux_power_loss.sh` gate remains separate.
+The Rust positional page-write path is still covered by SeerDB's in-process
+write-fault seams rather than this libc preload.
 
 ## Portable qualification
 

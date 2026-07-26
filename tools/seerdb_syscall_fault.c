@@ -17,10 +17,12 @@
 typedef int (*fsync_fn)(int);
 typedef int (*rename_fn)(const char *, const char *);
 typedef int (*renameat_fn)(int, const char *, int, const char *);
+typedef ssize_t (*write_fn)(int, const void *, size_t);
 
 static _Atomic unsigned long fsync_count;
 static _Atomic unsigned long fdatasync_count;
 static _Atomic unsigned long rename_count;
+static _Atomic unsigned long write_count;
 
 static void trace_call(const char *name, unsigned long count, int fd) {
     const char *path = getenv("SEERDB_FAULT_TRACE");
@@ -85,6 +87,14 @@ static renameat_fn real_renameat(void) {
     return function;
 }
 
+static write_fn real_write(void) {
+    static write_fn function;
+    if (function == NULL) {
+        function = (write_fn)dlsym(RTLD_NEXT, "write");
+    }
+    return function;
+}
+
 int fsync(int fd) {
     unsigned long count = atomic_fetch_add_explicit(&fsync_count, 1, memory_order_relaxed) + 1;
     trace_call("fsync", count, fd);
@@ -144,4 +154,19 @@ int renameat(int old_directory, const char *old_path, int new_directory, const c
         return -1;
     }
     return function(old_directory, old_path, new_directory, new_path);
+}
+
+ssize_t write(int fd, const void *buffer, size_t length) {
+    unsigned long count = atomic_fetch_add_explicit(&write_count, 1, memory_order_relaxed) + 1;
+    trace_call("write", count, fd);
+    if (should_fail("write", count)) {
+        errno = EIO;
+        return -1;
+    }
+    write_fn function = real_write();
+    if (function == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return function(fd, buffer, length);
 }

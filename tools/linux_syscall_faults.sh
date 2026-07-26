@@ -10,9 +10,9 @@ usage() {
 usage: tools/linux_syscall_faults.sh [--output-dir PATH]
 
 The default output is /tmp/seerdb-linux-syscall-faults-TIMESTAMP. Each
-observed fsync, fdatasync, and rename call is failed once in fresh whole-image
-and segmented databases. Every case must reopen as the old or complete-new
-root and pass verification twice.
+observed fsync, fdatasync, rename, and write call is failed once in fresh
+whole-image and segmented databases. Every case must reopen as the old or
+complete-new root and pass verification twice.
 EOF
 }
 
@@ -74,7 +74,7 @@ for layout in whole segmented; do
         "$verify_binary" mutate "$trace_run/db" "$trace_run/oracle" \
         >"$trace_run/mutate.stdout" 2>"$trace_run/mutate.stderr"
 
-    for syscall in fsync fdatasync rename; do
+    for syscall in fsync fdatasync rename write; do
         call_count=$(awk -v method="$syscall" '$1 == method { count = $2 } END { print count + 0 }' \
             "$trace_run/syscalls.log")
         printf '%s\t%s\t%s\n' "$layout" "$syscall" "$call_count" >>"$output_dir/observed.tsv"
@@ -101,7 +101,7 @@ for layout in whole segmented; do
             printf '%s\n' "$child_status" >"$case_dir/child.status"
 
             if ! SEERDB_POWERLOSS_BLOB_STORAGE="$layout" \
-                "$verify_binary" verify-fault "$case_dir/db" "$case_dir/oracle" \
+                "$verify_binary" verify-fault "$case_dir/db" "$baseline/oracle" \
                 >"$case_dir/verify.stdout" 2>"$case_dir/verify.stderr"; then
                 echo "linux_syscall_faults: verifier failed for $case_name" >&2
                 sed -n '1,120p' "$case_dir/verify.stderr" >&2 || true
@@ -151,7 +151,7 @@ for line in (output_dir / "cases.tsv").read_text().splitlines():
 if not cases:
     raise SystemExit("no external syscall cases executed")
 for item in observed:
-    if item["syscall"] in {"fsync", "rename"} and item["observed_calls"] == 0:
+    if item["syscall"] in {"fsync", "rename", "write"} and item["observed_calls"] == 0:
         raise SystemExit(f"required syscall was not observed: {item}")
 
 manifest = {
@@ -160,10 +160,12 @@ manifest = {
     "host_os": platform.system(),
     "host_arch": platform.machine(),
     "kernel": command_output("uname", "-r"),
-    "fault_domain": "libc boundary; one selected fsync/fdatasync/rename call returns EIO",
+    "fault_domain": "libc boundary; one selected fsync/fdatasync/rename/write call returns EIO",
+    "oracle": "baseline seed oracle remains outside the faulted child and is used by the verifier",
     "accepted_states": "old seeded root or complete-new mutation root",
     "verification": "fresh process opens each case twice, checks active and retained values, and runs DB verify",
     "not_exercised": [
+        "Rust positional page writes that bypass the interposed libc pwrite symbol",
         "torn or short block writes",
         "block-layer reordering or cache loss",
         "machine power loss",
