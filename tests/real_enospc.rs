@@ -5,6 +5,8 @@
 //! explicitly so the result cannot be confused with the deterministic fault
 //! seam.
 
+#![allow(clippy::disallowed_methods)]
+
 #[cfg(target_os = "linux")]
 mod linux {
     use seerdb::{BlobStorageMode, DB, Error, Options};
