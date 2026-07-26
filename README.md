@@ -1,16 +1,56 @@
 # seerdb
 
-High-performance, general-purpose embedded storage engine for modern SSDs. Written in Rust.
+Embedded durable ordered byte-KV storage engine for Rust consumers. Written in Rust.
 
 ## What
 
-An embedded key-value storage engine designed from scratch for modern hardware:
+SeerDB provides a small durable kernel for applications that need ordered byte
+keys and values without a separate database server:
 
-- **Out-of-place writes** (LeanStore-inspired): immutable page versions reduce rewrite amplification; SeerDB performance claims remain to be benchmarked
-- **KV separation** (WiscKey-inspired): large values stored separately for lower write amplification
-- **SSD-native**: designed for NVMe, with optional FDP/ZNS support
-- **Snapshots**: immutable root generations with explicit retained historical
-  reads; durable data-version MVCC remains a future extension
+- **Durable generations**: pages, checkpoints, commit metadata, manifests, and
+  WAL cleanup publish in a checked order. Two independently valid manifest slots
+  provide a fallback root when the newest publication is damaged.
+- **Out-of-place pages**: immutable page versions support generation-aware
+  reclamation, compaction, vacuum, and retained historical reads.
+- **WAL recovery**: committed-prefix replay, torn-tail handling, corruption
+  refusal, offline checks, and destination-only repair are part of the baseline.
+- **KV separation**: large values use the compatibility whole-image blob format;
+  the segmented catalog layout is available as an opt-in format under separate
+  qualification.
+- **Reader/writer contract**: one serialized writer with concurrent reads,
+  root-bound read views, retained snapshots, and expected-base conflict refusal.
+- **Capacity handling**: typed ENOSPC refusal and preflight admission cover
+  ordinary commits and maintenance, with same-handle retry and reopen tests.
+- **SSD-aware paths**: Linux O_DIRECT, page-aligned buffers, and optional FDP/ZNS
+  feature flags exist, but device-specific optimization is not required by the
+  baseline contract.
+
+SeerDB does not claim durable per-record MVCC, parallel writers, SQL, HA, or
+cross-device performance parity. Those are later DBNext or post-v0.1 concerns.
+
+## Basic use
+
+Create a database once, then reopen the same directory on later process starts:
+
+```rust
+use seerdb::{DB, Options};
+
+let mut db = DB::create("./my_db", Options::default())?;
+db.put(b"key", b"value")?;
+db.flush()?;
+assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
+db.close()?;
+
+let mut db = DB::open("./my_db", Options::default())?;
+assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
+db.close()?;
+```
+
+Use `commit_batch` for an atomic group of byte-oriented puts and deletes. Use
+`begin_read_view`, `retain_commit`, or `begin_snapshot` when a read must stay
+bound to a published historical generation. Call `verify`, `check`, and
+`durability_status` in operational tooling rather than treating a successful
+open as a complete integrity audit.
 
 ## Direction
 
@@ -24,9 +64,17 @@ current design and staged optimization plan.
 ## Status
 
 The current Rust lane is a single-writer durable kernel with concurrent reads,
-root-generation retention, WAL recovery, and crash-safe reclamation baselines.
-It is still under production qualification; see [ai/STATUS.md](ai/STATUS.md)
-for the open ENOSPC, soak, MVCC, migration, and performance gates.
+root-generation retention, WAL recovery, crash-safe reclamation, and retryable
+capacity refusal. The current release suite passes 223 unit tests, 74 DBNext R0
+tests, storage properties, all-target Clippy, and warnings-as-errors docs. A
+524,288-operation ARM64 Linux workload/recovery soak passed with digest/reopen
+parity, and the DBNext R0 integrity gate accepts its replay and 13 fault cases.
+
+It is not yet a v0.1 release: the local environments lack the Linux
+`dm-log-writes` target for external power-loss qualification, and controlled
+device-backed comparison, broader DBNext R1/R2 semantics, and final filesystem
+fault races remain open. See [ai/STATUS.md](ai/STATUS.md) for the evidence and
+remaining gates.
 
 ## Portable qualification
 
@@ -45,6 +93,34 @@ observations, separates user-commit work from maintenance/restart work in its
 physical counters, and records the final digest. These are portable
 qualification measurements, not cross-engine or device-backed performance
 claims; the ext4/XFS power-loss runner remains a separate privileged gate.
+
+For the matched ordered-KV comparison harness, use Linux and retain the raw
+runs plus aggregate manifest:
+
+```bash
+tools/common_kv_qualification.sh \
+  --output-dir /tmp/seerdb-common-kv-qualification \
+  --engines seerdb,fjall,rocksdb \
+  --workloads batch-put,mixed,point-read,range-read \
+  --repetitions 2 --warmups 1
+```
+
+The comparison uses durable mode, a shared deterministic trace, an in-memory
+oracle, close/reopen verification, latency quantiles, process resources, and
+SeerDB publication counters. It leaves the filesystem cache intact and does
+not substitute for external recovery testing or NVMe measurements.
+
+## Verification
+
+```bash
+cargo test --release --all-features --tests
+cargo clippy --all-features --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+```
+
+The privileged `tools/linux_power_loss.sh` runner is separate and requires a
+Linux host with loop devices, `dm-log-writes`, and `replay-log`. It records an
+explicit `not-run` manifest when those prerequisites are unavailable.
 
 ## References
 
