@@ -4,7 +4,10 @@
 use seerdb::blob::BlobManager;
 use seerdb::recovery::WalRecord;
 use seerdb::storage::format::{CommitId, CommitRecord, FORMAT_VERSION, GenerationId, Manifest};
-use seerdb::{BatchMutation, CheckFailureKind, DB, Error, Options, RepairAction, WalCheckStatus};
+use seerdb::{
+    BatchMutation, BlobStorageMode, CheckFailureKind, DB, Error, Options, RepairAction,
+    WalCheckStatus,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -2847,6 +2850,113 @@ fn dbnext_r0_sustained_reclamation_preserves_retained_root_and_recovers_space() 
         assert_eq!(reopened.get(key).unwrap(), Some(value.clone()));
     }
     assert!(reopened.verify().is_ok());
+}
+
+#[test]
+fn dbnext_r0_sustained_segmented_blob_reclamation_preserves_retained_root() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("sustained-segmented-reclamation.db");
+    let options = Options {
+        blob_storage: BlobStorageMode::Segmented,
+        ..Options::default()
+    };
+    let mut db = DB::create(&path, options).unwrap();
+    let key_count = 24usize;
+    let rounds = 12usize;
+    let blob_bytes = || {
+        fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("seerdb.blob.segment.")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>()
+    };
+    let value = |round: usize, key_id: usize| {
+        vec![(0x40 + ((round + key_id) % 32)) as u8; 2_048 + ((round + key_id) % 4) * 256]
+    };
+    let mut model = BTreeMap::new();
+
+    for key_id in 0..key_count {
+        let key = format!("key-{key_id:02}").into_bytes();
+        let value = value(0, key_id);
+        db.put(&key, &value).unwrap();
+        model.insert(key, value);
+    }
+    db.flush().unwrap();
+    let retained_commit = db.durability_status().commit_id;
+    let retained = db.retain_commit(retained_commit).unwrap();
+    let retained_value = db.get_at(retained, b"key-00").unwrap().unwrap();
+    let initial_segment_bytes = blob_bytes();
+    let mut peak_segment_bytes = initial_segment_bytes;
+
+    for round in 1..=rounds {
+        for key_id in 0..key_count {
+            let key = format!("key-{key_id:02}").into_bytes();
+            if (round + key_id).is_multiple_of(11) {
+                db.delete(&key).unwrap();
+                model.remove(&key);
+            } else {
+                let next_value = value(round, key_id);
+                db.put(&key, &next_value).unwrap();
+                model.insert(key, next_value);
+            }
+        }
+        db.flush().unwrap();
+
+        for _ in 0..8 {
+            let report = db.compact_with_limit(2).unwrap();
+            assert!(report.relocated_pages <= 2);
+            db.verify().unwrap();
+            if report.relocated_pages == 0 && report.data_bytes_before == report.data_bytes_after {
+                break;
+            }
+        }
+
+        peak_segment_bytes = peak_segment_bytes.max(blob_bytes());
+        assert_model(&db, &model);
+        assert_eq!(
+            db.get_at(retained, b"key-00").unwrap(),
+            Some(retained_value.clone())
+        );
+        if round.is_multiple_of(3) {
+            db.close().unwrap();
+            db = DB::open(&path, Options::default()).unwrap();
+            db.verify().unwrap();
+            assert_model(&db, &model);
+            assert_eq!(
+                db.get_at(retained, b"key-00").unwrap(),
+                Some(retained_value.clone())
+            );
+        }
+    }
+
+    assert!(peak_segment_bytes > initial_segment_bytes);
+    assert_eq!(
+        db.gc().unwrap(),
+        0,
+        "retained root must block blob reclamation"
+    );
+    db.release_snapshot(retained).unwrap();
+    assert!(db.gc().unwrap() > 0);
+    assert_eq!(db.blob_stats().files_needing_gc, 0);
+    assert_eq!(db.blob_stats().total_deleted, 0);
+    db.vacuum().unwrap();
+    db.compact().unwrap();
+    assert!(blob_bytes() < peak_segment_bytes);
+    assert_model(&db, &model);
+    db.verify().unwrap();
+
+    db.close().unwrap();
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    reopened.verify().unwrap();
+    assert_model(&reopened, &model);
+    assert_eq!(reopened.blob_stats().files_needing_gc, 0);
+    assert_eq!(reopened.blob_stats().total_deleted, 0);
 }
 
 #[test]
