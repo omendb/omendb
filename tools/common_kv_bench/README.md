@@ -70,11 +70,12 @@ reopens. This mode is used by `tools/common_kv_syscall_faults.sh` to keep
 database creation faults separate from mutation recovery.
 
 On Linux, `tools/common_kv_syscall_faults.sh` builds all three adapters, fails
-each observed `fsync`, `fdatasync`, and rename call once during that seeded
-mutation, and writes a `seerdb-common-kv-syscall-fault-manifest-v1` artifact.
-The manifest records accepted prefixes and host/toolchain metadata. Install a
-native `libclang` package when building the optional RocksDB adapter. This is
-external libc-boundary evidence, not torn-write, block-layer, or power-loss
+each observed `fsync`, `fdatasync`, and rename call once both before and after
+completion during that seeded mutation, and writes a
+`seerdb-common-kv-syscall-fault-manifest-v1` artifact. The manifest records
+accepted prefixes and host/toolchain metadata. Install a native `libclang`
+package when building the optional RocksDB adapter. This is external
+libc-boundary evidence, not torn-write, block-layer, or power-loss
 equivalence.
 
 The RocksDB adapter requires a working native RocksDB build toolchain. On

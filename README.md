@@ -87,11 +87,19 @@ The current page-write path uses `write` after seeking, so it is included in
 this matrix; a future positional `pwrite` path would need a separate external
 interposer.
 
+`tools/linux_syscall_crashes.sh` uses the same interposer to hold a selected
+libc call and lets the parent send `SIGKILL` either before the call or after
+the real call succeeds but before it returns. The ARM64 Linux matrix covers
+138 whole-image/segmented cases with two-reopen old-or-complete-new checks.
+This is process-termination evidence at the libc boundary, not block-layer
+power-loss, torn-write, or general filesystem-race evidence.
+
 The same seeded mutation contract is available for the common-KV comparison:
-`tools/common_kv_syscall_faults.sh` passed 105 external sync/rename cases over
-SeerDB, Fjall, and RocksDB on ARM64 Linux, with complete batch-prefix and
-two-reopen verification. Its manifest is diagnostic recovery evidence, not
-incumbent performance or block-layer power-loss equivalence.
+`tools/common_kv_syscall_faults.sh` passed 210 external sync/rename cases over
+SeerDB, Fjall, and RocksDB on ARM64 Linux: every observed call was tested both
+before and after completion, with complete batch-prefix and two-reopen
+verification. Its manifest is diagnostic recovery evidence, not incumbent
+performance or block-layer power-loss equivalence.
 
 ## Portable qualification
 

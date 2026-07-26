@@ -20,8 +20,9 @@ Options:
   --seed N                Deterministic trace seed (default: 7)
 
 The harness runs seerdb, fjall, and rocksdb. It traces each engine's seeded
-mutation, fails every observed fsync, fdatasync, and rename call once, and
-accepts only a complete batch prefix after two fresh reopens.
+mutation, fails every observed fsync, fdatasync, and rename call once both
+before and after completion, and accepts only a complete batch prefix after
+two fresh reopens.
 EOF
 }
 
@@ -174,58 +175,61 @@ for engine in seerdb fjall rocksdb; do
             continue
         fi
 
-        for ((fault_after = 1; fault_after <= call_count; fault_after++)); do
-            case_name="$engine.$syscall.$fault_after"
-            case_dir="$output_dir/runs/$case_name"
-            mkdir -p "$case_dir"
-            cp -a "$baseline/db" "$case_dir/db"
-            set_mutation_args "$engine" "$case_dir/db"
-            set +e
-            LD_PRELOAD="$injector" \
-            SEERDB_FAULT_SYSCALL="$syscall" \
-            SEERDB_FAULT_AFTER="$fault_after" \
-                "$binary" "${mutation_args[@]}" \
-                >"$case_dir/mutate.stdout" 2>"$case_dir/mutate.stderr"
-            child_status=$?
-            set -e
-            printf '%s\n' "$child_status" >"$case_dir/child.status"
-
-            accepted_prefix=
-            for ((prefix = 0; prefix <= operations; prefix += batch_size)); do
-                verify_args=(
-                    --engine "$engine"
-                    --workload batch-put
-                    --durability durable
-                    --open-existing
-                    --base-operations "$base_operations"
-                    --path "$case_dir/db"
-                    --keys "$keys"
-                    --operations "$operations"
-                    --batch-size "$batch_size"
-                    --value-bytes "$value_bytes"
-                    --range-width 1
-                    --seed "$seed"
-                    --verify-prefix "$prefix"
-                )
+        for mode in before after; do
+            for ((fault_after = 1; fault_after <= call_count; fault_after++)); do
+                case_name="$engine.$mode.$syscall.$fault_after"
+                case_dir="$output_dir/runs/$case_name"
+                mkdir -p "$case_dir"
+                cp -a "$baseline/db" "$case_dir/db"
+                set_mutation_args "$engine" "$case_dir/db"
                 set +e
-                "$binary" "${verify_args[@]}" \
-                    >"$case_dir/verify-$prefix.stdout" \
-                    2>"$case_dir/verify-$prefix.stderr"
-                verify_status=$?
+                LD_PRELOAD="$injector" \
+                SEERDB_FAULT_SYSCALL="$syscall" \
+                SEERDB_FAULT_AFTER="$fault_after" \
+                SEERDB_FAULT_MODE="$mode" \
+                    "$binary" "${mutation_args[@]}" \
+                    >"$case_dir/mutate.stdout" 2>"$case_dir/mutate.stderr"
+                child_status=$?
                 set -e
-                if ((verify_status == 0)); then
-                    accepted_prefix=$prefix
-                    break
+                printf '%s\n' "$child_status" >"$case_dir/child.status"
+
+                accepted_prefix=
+                for ((prefix = 0; prefix <= operations; prefix += batch_size)); do
+                    verify_args=(
+                        --engine "$engine"
+                        --workload batch-put
+                        --durability durable
+                        --open-existing
+                        --base-operations "$base_operations"
+                        --path "$case_dir/db"
+                        --keys "$keys"
+                        --operations "$operations"
+                        --batch-size "$batch_size"
+                        --value-bytes "$value_bytes"
+                        --range-width 1
+                        --seed "$seed"
+                        --verify-prefix "$prefix"
+                    )
+                    set +e
+                    "$binary" "${verify_args[@]}" \
+                        >"$case_dir/verify-$prefix.stdout" \
+                        2>"$case_dir/verify-$prefix.stderr"
+                    verify_status=$?
+                    set -e
+                    if ((verify_status == 0)); then
+                        accepted_prefix=$prefix
+                        break
+                    fi
+                done
+                if [[ -z "$accepted_prefix" ]]; then
+                    echo "common_kv_syscall_faults: no accepted batch prefix for $case_name" >&2
+                    sed -n '1,120p' "$case_dir/mutate.stderr" >&2 || true
+                    exit 1
                 fi
+                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$engine" "$mode" "$syscall" "$fault_after" "$call_count" "$child_status" "$accepted_prefix" \
+                    >>"$output_dir/cases.tsv"
             done
-            if [[ -z "$accepted_prefix" ]]; then
-                echo "common_kv_syscall_faults: no accepted batch prefix for $case_name" >&2
-                sed -n '1,120p' "$case_dir/mutate.stderr" >&2 || true
-                exit 1
-            fi
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$engine" "$syscall" "$fault_after" "$call_count" "$child_status" "$accepted_prefix" \
-                >>"$output_dir/cases.tsv"
         done
     done
 done
@@ -254,9 +258,10 @@ for line in (output_dir / "observed.tsv").read_text().splitlines():
 
 cases = []
 for line in (output_dir / "cases.tsv").read_text().splitlines():
-    engine, syscall, failed_call, observed_calls, child_status, prefix = line.split("\t")
+    engine, mode, syscall, failed_call, observed_calls, child_status, prefix = line.split("\t")
     cases.append({
         "engine": engine,
+        "mode": mode,
         "syscall": syscall,
         "failed_call": int(failed_call),
         "observed_calls": int(observed_calls),
@@ -283,8 +288,9 @@ manifest = {
     "batch_size": batch_size,
     "value_bytes": value_bytes,
     "seed": seed,
-    "fault_domain": "external libc boundary; one observed fsync/fdatasync/rename call returns EIO",
+    "fault_domain": "external libc boundary; one observed fsync/fdatasync/rename call returns EIO before or after completion",
     "accepted_states": "a complete batch prefix after the durable baseline, verified across two fresh reopens",
+    "modes": ["before", "after"],
     "not_exercised": [
         "torn or short block writes",
         "block-layer reordering or cache loss",

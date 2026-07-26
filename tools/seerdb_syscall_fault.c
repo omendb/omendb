@@ -61,6 +61,30 @@ static int fail_after_completion(void) {
     return mode != NULL && strcmp(mode, "after") == 0;
 }
 
+static int hold_selected_call(void) {
+    const char *marker = getenv("SEERDB_FAULT_HOLD");
+    return marker != NULL && *marker != '\0';
+}
+
+static void notify_and_hold(const char *name, unsigned long count) {
+    const char *marker = getenv("SEERDB_FAULT_HOLD");
+    if (marker != NULL && *marker != '\0') {
+        int marker_fd = open(marker, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (marker_fd >= 0) {
+            char line[96];
+            int length = snprintf(line, sizeof(line), "%s %lu\n", name, count);
+            if (length > 0 && (size_t)length < sizeof(line)) {
+                (void)syscall(SYS_write, marker_fd, line, (size_t)length);
+            }
+            (void)close(marker_fd);
+        }
+    }
+
+    for (;;) {
+        (void)pause();
+    }
+}
+
 static fsync_fn real_fsync(void) {
     static fsync_fn function;
     if (function == NULL) {
@@ -105,6 +129,10 @@ int fsync(int fd) {
     unsigned long count = atomic_fetch_add_explicit(&fsync_count, 1, memory_order_relaxed) + 1;
     trace_call("fsync", count, fd);
     int selected = should_fail("fsync", count);
+    int hold = selected && hold_selected_call();
+    if (hold && !fail_after_completion()) {
+        notify_and_hold("fsync", count);
+    }
     if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
@@ -115,6 +143,9 @@ int fsync(int fd) {
         return -1;
     }
     int result = function(fd);
+    if (hold && fail_after_completion() && result == 0) {
+        notify_and_hold("fsync", count);
+    }
     if (selected && fail_after_completion() && result == 0) {
         errno = EIO;
         return -1;
@@ -127,6 +158,10 @@ int fdatasync(int fd) {
         atomic_fetch_add_explicit(&fdatasync_count, 1, memory_order_relaxed) + 1;
     trace_call("fdatasync", count, fd);
     int selected = should_fail("fdatasync", count);
+    int hold = selected && hold_selected_call();
+    if (hold && !fail_after_completion()) {
+        notify_and_hold("fdatasync", count);
+    }
     if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
@@ -137,6 +172,9 @@ int fdatasync(int fd) {
         return -1;
     }
     int result = function(fd);
+    if (hold && fail_after_completion() && result == 0) {
+        notify_and_hold("fdatasync", count);
+    }
     if (selected && fail_after_completion() && result == 0) {
         errno = EIO;
         return -1;
@@ -148,6 +186,10 @@ int rename(const char *old_path, const char *new_path) {
     unsigned long count = atomic_fetch_add_explicit(&rename_count, 1, memory_order_relaxed) + 1;
     trace_call("rename", count, -1);
     int selected = should_fail("rename", count);
+    int hold = selected && hold_selected_call();
+    if (hold && !fail_after_completion()) {
+        notify_and_hold("rename", count);
+    }
     if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
@@ -158,6 +200,9 @@ int rename(const char *old_path, const char *new_path) {
         return -1;
     }
     int result = function(old_path, new_path);
+    if (hold && fail_after_completion() && result == 0) {
+        notify_and_hold("rename", count);
+    }
     if (selected && fail_after_completion() && result == 0) {
         errno = EIO;
         return -1;
@@ -169,6 +214,10 @@ int renameat(int old_directory, const char *old_path, int new_directory, const c
     unsigned long count = atomic_fetch_add_explicit(&rename_count, 1, memory_order_relaxed) + 1;
     trace_call("rename", count, -1);
     int selected = should_fail("rename", count);
+    int hold = selected && hold_selected_call();
+    if (hold && !fail_after_completion()) {
+        notify_and_hold("rename", count);
+    }
     if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
@@ -179,6 +228,9 @@ int renameat(int old_directory, const char *old_path, int new_directory, const c
         return -1;
     }
     int result = function(old_directory, old_path, new_directory, new_path);
+    if (hold && fail_after_completion() && result == 0) {
+        notify_and_hold("rename", count);
+    }
     if (selected && fail_after_completion() && result == 0) {
         errno = EIO;
         return -1;
@@ -190,6 +242,10 @@ ssize_t write(int fd, const void *buffer, size_t length) {
     unsigned long count = atomic_fetch_add_explicit(&write_count, 1, memory_order_relaxed) + 1;
     trace_call("write", count, fd);
     int selected = should_fail("write", count);
+    int hold = selected && hold_selected_call();
+    if (hold && !fail_after_completion()) {
+        notify_and_hold("write", count);
+    }
     if (selected && !fail_after_completion()) {
         errno = EIO;
         return -1;
@@ -200,6 +256,9 @@ ssize_t write(int fd, const void *buffer, size_t length) {
         return -1;
     }
     ssize_t result = function(fd, buffer, length);
+    if (hold && fail_after_completion() && result >= 0) {
+        notify_and_hold("write", count);
+    }
     if (selected && fail_after_completion() && result >= 0) {
         errno = EIO;
         return -1;
