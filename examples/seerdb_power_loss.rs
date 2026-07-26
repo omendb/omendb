@@ -45,8 +45,11 @@ fn run() -> Result<(), String> {
         [_, mode, db_path, oracle_path] if mode == "verify" => {
             verify(Path::new(db_path), Path::new(oracle_path))
         }
+        [_, mode, db_path, oracle_path] if mode == "verify-fault" => {
+            verify_fault(Path::new(db_path), Path::new(oracle_path))
+        }
         _ => Err(format!(
-            "usage: {} <seed|mutate|verify> <db-path> <oracle-path>",
+            "usage: {} <seed|mutate|verify|verify-fault> <db-path> <oracle-path>",
             args.first()
                 .map(String::as_str)
                 .unwrap_or("seerdb_power_loss")
@@ -121,6 +124,48 @@ fn verify(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
         }
         if db.get(BLOB_KEY).map_err(error)?.as_deref() != Some(&vec![expected_blob; BLOB_LEN]) {
             return Err(format!("blob value mismatch on reopen pass {pass}"));
+        }
+        if db
+            .get_at(SnapshotId::new(oracle.snapshot_id), INLINE_KEY)
+            .map_err(error)?
+            .as_deref()
+            != Some(INLINE_OLD)
+        {
+            return Err(format!("retained inline value mismatch on pass {pass}"));
+        }
+        if db
+            .get_at(SnapshotId::new(oracle.snapshot_id), BLOB_KEY)
+            .map_err(error)?
+            .as_deref()
+            != Some(&vec![BLOB_OLD; BLOB_LEN])
+        {
+            return Err(format!("retained blob value mismatch on pass {pass}"));
+        }
+        db.verify().map_err(error)?;
+    }
+    Ok(())
+}
+
+fn verify_fault(db_path: &Path, oracle_path: &Path) -> Result<(), String> {
+    let oracle = read_oracle(oracle_path)?;
+    for pass in 0..2 {
+        let mut db = DB::open(db_path, power_loss_options()?).map_err(error)?;
+        let status = db.durability_status();
+        let inline = db.get(INLINE_KEY).map_err(error)?;
+        let blob = db.get(BLOB_KEY).map_err(error)?;
+        let old_state = status.commit_id.get() == oracle.old_commit
+            && inline.as_deref() == Some(INLINE_OLD)
+            && blob.as_deref() == Some(&vec![BLOB_OLD; BLOB_LEN]);
+        let complete_new_state = status.commit_id.get() > oracle.old_commit
+            && inline.as_deref() == Some(INLINE_NEW)
+            && blob.as_deref() == Some(&vec![BLOB_NEW; BLOB_LEN]);
+        if !old_state && !complete_new_state {
+            return Err(format!(
+                "external fault exposed a partial or unexpected state on reopen pass {pass}: commit={} inline_len={:?} blob_len={:?}",
+                status.commit_id.get(),
+                inline.as_ref().map(Vec::len),
+                blob.as_ref().map(Vec::len)
+            ));
         }
         if db
             .get_at(SnapshotId::new(oracle.snapshot_id), INLINE_KEY)
