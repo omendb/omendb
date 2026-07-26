@@ -106,6 +106,8 @@ struct Config {
     range_width: usize,
     seed: u64,
     durability: DurabilityMode,
+    open_existing: bool,
+    base_operations: usize,
     progress: Option<PathBuf>,
     progress_hold: Option<PathBuf>,
     progress_hold_index: Option<usize>,
@@ -131,6 +133,8 @@ impl Config {
         let mut range_width = 32;
         let mut seed = 7;
         let mut durability = DurabilityMode::Durable;
+        let mut open_existing = false;
+        let mut base_operations = 0;
         let mut progress = None;
         let mut progress_hold = None;
         let mut progress_hold_index = None;
@@ -141,6 +145,11 @@ impl Config {
             let flag = &args[index];
             if flag == "--sync" {
                 durability = DurabilityMode::Durable;
+                index += 1;
+                continue;
+            }
+            if flag == "--open-existing" {
+                open_existing = true;
                 index += 1;
                 continue;
             }
@@ -163,6 +172,7 @@ impl Config {
                         .map_err(|_| format!("invalid {flag}: {value}"))?
                 }
                 "--durability" => durability = DurabilityMode::parse(value)?,
+                "--base-operations" => base_operations = parse_usize(flag, value)?,
                 "--progress" => progress = Some(PathBuf::from(value)),
                 "--progress-hold" => progress_hold = Some(PathBuf::from(value)),
                 "--progress-hold-index" => progress_hold_index = Some(parse_usize(flag, value)?),
@@ -186,6 +196,12 @@ impl Config {
         }
         if progress_hold.is_some() && progress.is_none() {
             return Err("--progress is required when a progress hold is configured".into());
+        }
+        if base_operations > 0 && !open_existing {
+            return Err("--base-operations requires --open-existing".into());
+        }
+        if open_existing && workload != WorkloadKind::BatchPut {
+            return Err("--open-existing currently requires --workload batch-put".into());
         }
         if verify_prefix.is_some() && (progress.is_some() || progress_hold.is_some()) {
             return Err("--verify-prefix cannot be combined with progress controls".into());
@@ -221,6 +237,8 @@ impl Config {
             range_width,
             seed,
             durability,
+            open_existing,
+            base_operations,
             progress,
             progress_hold,
             progress_hold_index,
@@ -251,6 +269,8 @@ fn print_help() {
          --durability durable|buffered\n\
                                   Durability mode (default durable)\n\
          --sync                   Alias for --durability durable\n\n\
+         --open-existing          Open an existing database for a mutation phase\n\
+         --base-operations N      Existing deterministic batch prefix already durable\n\n\
          --progress PATH          Write the next batch/operation boundary here\n\
          --progress-hold PATH     Wait for this path at --progress-hold-index\n\
          --progress-hold-index N  Hold before publishing boundary N\n\
@@ -315,7 +335,8 @@ fn initial_state(config: &Config) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn generate_operations(config: &Config) -> Vec<Operation> {
     let mut rng = Rng::new(config.seed);
     let key_space = config.keys.saturating_mul(2).max(1);
-    (0..config.operations)
+    let total_operations = config.base_operations.saturating_add(config.operations);
+    (0..total_operations)
         .map(|operation| match config.workload {
             WorkloadKind::BatchPut => {
                 let index = rng.index(key_space);
@@ -358,6 +379,7 @@ fn generate_operations(config: &Config) -> Vec<Operation> {
                 }
             }
         })
+        .skip(config.base_operations)
         .collect()
 }
 
@@ -1075,15 +1097,28 @@ fn render_prefix_verification(
     )
 }
 
-fn verify_existing_prefix(config: &Config, prefix: usize) -> BenchResult<String> {
-    let initial = initial_state(config);
-    let operations = generate_operations(config);
+fn expected_existing_oracle(config: &Config) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut oracle = BTreeMap::new();
-    for (key, value) in &initial {
-        oracle.insert(key.clone(), value.clone());
+    for (key, value) in initial_state(config) {
+        oracle.insert(key, value);
     }
-    for operation in operations.iter().take(prefix) {
-        apply_oracle(&mut oracle, operation);
+    if config.base_operations > 0 {
+        let mut base_config = config.clone();
+        base_config.base_operations = 0;
+        base_config.operations = config.base_operations;
+        for operation in generate_operations(&base_config) {
+            apply_oracle(&mut oracle, &operation);
+        }
+    }
+    oracle
+}
+
+fn verify_existing_prefix(config: &Config, prefix: usize) -> BenchResult<String> {
+    let mut oracle = expected_existing_oracle(config);
+    let mut prefix_config = config.clone();
+    prefix_config.operations = prefix;
+    for operation in generate_operations(&prefix_config) {
+        apply_oracle(&mut oracle, &operation);
     }
     let expected_entries = oracle
         .iter()
@@ -1138,17 +1173,41 @@ fn main() -> BenchResult<()> {
         let output = verify_existing_prefix(&config, prefix)?;
         return emit_output(&output, config.output.as_deref());
     }
-    prepare_path(&config.path)?;
+    if config.open_existing {
+        if !config.path.exists() {
+            return Err(format!(
+                "--open-existing requires an existing database path: {}",
+                config.path.display()
+            )
+            .into());
+        }
+    } else {
+        prepare_path(&config.path)?;
+    }
 
     let initial = initial_state(&config);
     let operations = generate_operations(&config);
     let resource_before = process_resource_metrics();
-    let mut engine = Engine::create(config.engine, &config.path, config.durability)?;
-    let mut oracle = BTreeMap::new();
+    let mut engine = if config.open_existing {
+        Engine::open_existing(config.engine, &config.path, config.durability)?
+    } else {
+        Engine::create(config.engine, &config.path, config.durability)?
+    };
+    let mut oracle = if config.open_existing {
+        expected_existing_oracle(&config)
+    } else {
+        BTreeMap::new()
+    };
 
     let preload_started = Instant::now();
-    apply_initial_state(&mut engine, &mut oracle, &initial, config.batch_size)?;
-    let preload_ns = preload_started.elapsed().as_nanos();
+    if !config.open_existing {
+        apply_initial_state(&mut engine, &mut oracle, &initial, config.batch_size)?;
+    }
+    let preload_ns = if config.open_existing {
+        0
+    } else {
+        preload_started.elapsed().as_nanos()
+    };
 
     let (workload_ns, latency, counters, workload_logical_bytes) = run_workload(
         &mut engine,
@@ -1159,7 +1218,11 @@ fn main() -> BenchResult<()> {
         config.progress_hold.as_deref(),
         config.progress_hold_index,
     )?;
-    let logical_bytes = logical_bytes_for_initial_state(&initial) + workload_logical_bytes;
+    let logical_bytes = if config.open_existing {
+        workload_logical_bytes
+    } else {
+        logical_bytes_for_initial_state(&initial) + workload_logical_bytes
+    };
     let expected_entries = oracle
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))

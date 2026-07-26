@@ -62,6 +62,21 @@ peer-only diagnostics; SeerDB rejects it because its common-KV adapter always
 publishes a durable generation per commit. `--sync` remains an alias for
 `--durability durable`. Use `--help` for all workload controls.
 
+For a seeded mutation phase, first run a durable `batch-put`, then reopen the
+same path with `--open-existing --base-operations N`. The next generated
+operations continue the same deterministic trace after the durable baseline;
+`--verify-prefix` checks a complete batch prefix from that baseline across two
+reopens. This mode is used by `tools/common_kv_syscall_faults.sh` to keep
+database creation faults separate from mutation recovery.
+
+On Linux, `tools/common_kv_syscall_faults.sh` builds all three adapters, fails
+each observed `fsync`, `fdatasync`, and rename call once during that seeded
+mutation, and writes a `seerdb-common-kv-syscall-fault-manifest-v1` artifact.
+The manifest records accepted prefixes and host/toolchain metadata. Install a
+native `libclang` package when building the optional RocksDB adapter. This is
+external libc-boundary evidence, not torn-write, block-layer, or power-loss
+equivalence.
+
 The RocksDB adapter requires a working native RocksDB build toolchain. On
 macOS that currently includes `libclang` for the published `rocksdb 0.24.0`
 bindings; the SeerDB/Fjall path does not have that native requirement.

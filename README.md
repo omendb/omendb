@@ -85,6 +85,12 @@ block-layer cache loss, or machine power loss; the privileged
 The Rust positional page-write path is still covered by SeerDB's in-process
 write-fault seams rather than this libc preload.
 
+The same seeded mutation contract is available for the common-KV comparison:
+`tools/common_kv_syscall_faults.sh` passed 105 external sync/rename cases over
+SeerDB, Fjall, and RocksDB on ARM64 Linux, with complete batch-prefix and
+two-reopen verification. Its manifest is diagnostic recovery evidence, not
+incumbent performance or block-layer power-loss equivalence.
+
 ## Portable qualification
 
 Run the deterministic mixed workload and emit a JSON qualification artifact:
