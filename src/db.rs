@@ -3322,8 +3322,11 @@ impl DB {
             if FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.replace(false)) {
                 return Err(std::io::Error::other("injected WAL truncate failure").into());
             }
-
-            sync_directory(&self.path)?;
+            // WAL removal is cleanup after the manifest has selected the
+            // generation. If the directory entry removal is not durable, a
+            // reopen sees the already-published commit and discards the stale
+            // WAL; forcing that non-authoritative deletion would add one
+            // directory sync to every successful publication.
         }
         self.wal_reserved_extent = 0;
 
