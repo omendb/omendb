@@ -31,7 +31,7 @@ use std::os::unix::fs::FileExt as PositionalFileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as PositionalFileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -616,6 +616,7 @@ struct RetentionState {
 struct RetentionLease {
     state: Arc<Mutex<RetentionState>>,
     snapshot_id: SnapshotId,
+    reclamation_dirty: Arc<AtomicBool>,
     released: bool,
 }
 
@@ -1108,6 +1109,7 @@ impl RetentionLease {
                 .lock()
                 .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?
                 .remove(self.snapshot_id)?;
+            self.reclamation_dirty.store(true, Ordering::Release);
             self.released = true;
         }
         Ok(())
@@ -1120,6 +1122,7 @@ impl Drop for RetentionLease {
             if let Ok(mut state) = self.state.lock() {
                 let _ = state.remove(self.snapshot_id);
             }
+            self.reclamation_dirty.store(true, Ordering::Release);
             self.released = true;
         }
     }
@@ -3167,10 +3170,18 @@ impl DB {
             .manifest_history
             .latest()
             .unwrap_or_else(|| self.bootstrap_manifest());
+        if self.engine.reclamation_needs_refresh() {
+            self.engine.refresh_reclamation()?;
+        }
+        let reuse_offsets = self.engine.pending_reuse_offsets();
+        let reused_slots = !reuse_offsets.is_empty();
         // Retire the older manifest slot before page writes can reuse any
-        // physical versions it names. If the new publication fails, both
-        // slots still identify the same current generation and its pages.
-        self.mirror_current_manifest()?;
+        // physical versions it names. Append-only generations do not need
+        // this extra sync because the older fallback root names untouched
+        // pages; reused slots must fence that root before page write-back.
+        if reused_slots {
+            self.mirror_current_manifest()?;
+        }
         // Mutation records have already been written to the WAL by the
         // mutation or batch admission path. The commit envelope is appended
         // and forced only after the new out-of-place pages are durable below.
@@ -3180,8 +3191,6 @@ impl DB {
         // reopens the old root, while a durable commit record is enough to
         // replay the complete generation.
         self.write_wal_to_disk(false)?;
-        let reuse_offsets = self.engine.pending_reuse_offsets();
-        let reused_slots = !reuse_offsets.is_empty();
         self.reuse_ledger
             .push(ReuseAttempt {
                 commit_id: commit.commit_id,
@@ -3194,7 +3203,7 @@ impl DB {
             return Err(error);
         }
         self.persist_reuse_ledger()?;
-        if let Err(error) = self.engine.flush() {
+        if let Err(error) = self.engine.flush_after_reclamation_refresh() {
             // Capacity preflight is guaranteed to issue no page I/O, so its
             // reservation can be removed and the mutation remains retryable.
             // Every other error leaves the reservation durable until reopen
@@ -4131,6 +4140,7 @@ impl DB {
             lease: Some(RetentionLease {
                 state: Arc::clone(&self.retention),
                 snapshot_id,
+                reclamation_dirty: self.engine.reclamation_dirty_handle(),
                 released: false,
             }),
         })
@@ -4205,6 +4215,7 @@ impl DB {
         let mut lease = RetentionLease {
             state: Arc::clone(&self.retention),
             snapshot_id,
+            reclamation_dirty: self.engine.reclamation_dirty_handle(),
             released: false,
         };
         let storage = match self.engine.read_view(manifest.root_page_id) {
@@ -4245,7 +4256,11 @@ impl DB {
         self.retention
             .lock()
             .map_err(|_| Error::Corruption("retention registry mutex is poisoned".into()))?
-            .remove(snapshot_id)
+            .remove(snapshot_id)?;
+        self.engine
+            .reclamation_dirty_handle()
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     fn register_retained_manifest(
@@ -5311,6 +5326,7 @@ impl DB {
             lease: Some(RetentionLease {
                 state: Arc::clone(&self.retention),
                 snapshot_id,
+                reclamation_dirty: self.engine.reclamation_dirty_handle(),
                 released: false,
             }),
             mutations: Vec::new(),
@@ -7901,9 +7917,27 @@ mod tests {
         // The newest slot is corrupt, so reopen must use the independently
         // valid older slot whose checkpoint pruning was required to preserve.
         let manifest_path = path.join(MANIFEST_FILE);
+        let manifest_file = OpenOptions::new().read(true).open(&manifest_path).unwrap();
+        let mut newest = None;
+        for slot in 0..2 {
+            let mut bytes = [0; MANIFEST_SLOT_SIZE];
+            read_exact_at(
+                &manifest_file,
+                (slot * MANIFEST_SLOT_SIZE) as u64,
+                &mut bytes,
+            )
+            .unwrap();
+            if let Some(manifest) = Manifest::from_bytes(&bytes).unwrap()
+                && newest.is_none_or(|(_, current)| manifest.is_newer_than(current))
+            {
+                newest = Some((slot, manifest));
+            }
+        }
+        let newest_slot = newest.expect("published database has a newest manifest").0;
+        drop(manifest_file);
         let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
         manifest_file
-            .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
+            .seek(SeekFrom::Start((newest_slot * MANIFEST_SLOT_SIZE) as u64))
             .unwrap();
         manifest_file
             .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
@@ -8002,6 +8036,20 @@ mod tests {
         let mut reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
         reopened.verify().unwrap();
+    }
+
+    #[test]
+    fn test_db_append_only_publication_skips_manifest_mirror() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("append-only-no-mirror.db");
+        let mut db = DB::open(&path, Options::default()).unwrap();
+
+        db.put(b"key", b"value").unwrap();
+        db.inject_manifest_mirror_sync_failure();
+        db.flush().unwrap();
+
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+        db.verify().unwrap();
     }
 
     #[test]

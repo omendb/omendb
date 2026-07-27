@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::mvcc::{PMT, PageMapping};
 use crate::space::Device;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Cumulative physical work performed by one storage-engine handle.
@@ -166,6 +166,9 @@ pub struct StorageEngine {
     /// Root of the immutable generation when its B-tree pages are still
     /// available through the PMT-backed lazy read path.
     lazy_root: Option<u32>,
+    /// Whether retention/read-view state changed since the free-slot view was
+    /// last refreshed.
+    reclamation_dirty: Arc<AtomicBool>,
     /// Cumulative physical work counters for diagnostics and benchmarks.
     metrics: StorageCounters,
 }
@@ -225,6 +228,7 @@ impl StorageEngine {
             protected_pmts: Arc::new(Mutex::new(Vec::new())),
             rebuild_reserved_offsets: HashSet::new(),
             lazy_root: None,
+            reclamation_dirty: Arc::new(AtomicBool::new(false)),
             metrics: StorageCounters::default(),
         }
     }
@@ -238,6 +242,7 @@ impl StorageEngine {
             .lock()
             .map_err(|_| Error::Corruption("storage PMT lease mutex is poisoned".into()))?
             .push(Arc::clone(&pmt));
+        self.reclamation_dirty.store(true, Ordering::Release);
         let engine = Self {
             btree: BTree::new().with_page_allocator(PageAllocator::new()),
             buffer: Mutex::new(BufferManager::new(buffer_capacity)),
@@ -252,6 +257,7 @@ impl StorageEngine {
             protected_pmts: Arc::clone(&self.protected_pmts),
             rebuild_reserved_offsets: HashSet::new(),
             lazy_root: Some(root_page_id as u32),
+            reclamation_dirty: Arc::clone(&self.reclamation_dirty),
             metrics: StorageCounters::default(),
         };
         Ok(StorageReadView {
@@ -341,7 +347,7 @@ impl StorageEngine {
             .lock()
             .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))? =
             protected_offsets;
-        self.refresh_reclaimable_offsets()
+        self.refresh_reclamation()
     }
 
     /// Refresh the physical reuse view after retention leases or device
@@ -350,11 +356,18 @@ impl StorageEngine {
         self.refresh_reclaimable_offsets()
     }
 
-    fn refresh_reclaimable_offsets(&mut self) -> Result<()> {
-        let device_size = self.device.size()?;
-        let active_offsets: HashSet<_> =
-            self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
-        let protected_offsets = self
+    /// Return whether retention or read-view state invalidated the current
+    /// free-slot view.
+    pub fn reclamation_needs_refresh(&self) -> bool {
+        self.reclamation_dirty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reclamation_dirty_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reclamation_dirty)
+    }
+
+    fn protected_offsets_snapshot(&self) -> Result<HashSet<u64>> {
+        let mut protected_offsets = self
             .protected_offsets
             .lock()
             .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
@@ -364,10 +377,17 @@ impl StorageEngine {
             .lock()
             .map_err(|_| Error::Corruption("storage PMT lease mutex is poisoned".into()))?
             .clone();
-        let mut protected_offsets = protected_offsets;
         for pmt in protected_pmts {
             protected_offsets.extend(pmt.iter().map(|(_, mapping)| mapping.offset));
         }
+        Ok(protected_offsets)
+    }
+
+    fn refresh_reclaimable_offsets(&mut self) -> Result<()> {
+        let device_size = self.device.size()?;
+        let active_offsets: HashSet<_> =
+            self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
+        let protected_offsets = self.protected_offsets_snapshot()?;
         let rebuild_reserved_offsets = &self.rebuild_reserved_offsets;
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
@@ -378,6 +398,7 @@ impl StorageEngine {
             })
             .collect();
         self.next_offset = device_size;
+        self.reclamation_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -452,11 +473,7 @@ impl StorageEngine {
             ));
         }
 
-        let protected_offsets = self
-            .protected_offsets
-            .lock()
-            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
-            .clone();
+        let protected_offsets = self.protected_offsets_snapshot()?;
         let mut free_offsets = self.free_offsets.clone();
         free_offsets.sort_unstable();
         let mut active_pages: Vec<_> = self
@@ -495,11 +512,7 @@ impl StorageEngine {
             return Ok(0);
         }
 
-        let protected_offsets = self
-            .protected_offsets
-            .lock()
-            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
-            .clone();
+        let protected_offsets = self.protected_offsets_snapshot()?;
         let mut free_offsets = self.free_offsets.clone();
         free_offsets.sort_unstable();
 
@@ -565,10 +578,9 @@ impl StorageEngine {
     /// Before that point, the old generation may still be the authoritative
     /// root after a crash and its physical pages must remain untouched.
     pub fn complete_generation(&mut self) {
-        let protected_offsets = match self.protected_offsets.lock() {
-            Ok(protected) => protected.clone(),
-            Err(_) => self.pending_reclaimed_offsets.iter().copied().collect(),
-        };
+        let protected_offsets = self
+            .protected_offsets_snapshot()
+            .unwrap_or_else(|_| self.pending_reclaimed_offsets.iter().copied().collect());
         let reclaimed_pages = self
             .pending_reclaimed_offsets
             .iter()
@@ -821,8 +833,18 @@ impl StorageEngine {
     /// is still retryable and cannot make an uncommitted generation visible.
     pub fn flush(&mut self) -> Result<()> {
         // A lease may have been released since the last publication. Refresh
-        // the allocator view before choosing a reusable physical slot.
-        self.refresh_reclaimable_offsets()?;
+        // the allocator view before choosing a reusable physical slot only
+        // when retention/read-view state made the cached view stale.
+        if self.reclamation_needs_refresh() {
+            self.refresh_reclamation()?;
+        }
+        self.flush_after_reclamation_refresh()
+    }
+
+    /// Flush after the caller has already refreshed the reclamation view and
+    /// made a reuse decision from it. Keeping this boundary explicit avoids a
+    /// second full data-file scan in the durable publication path.
+    pub(crate) fn flush_after_reclamation_refresh(&mut self) -> Result<()> {
         // The bootstrap path rewrites the complete logical tree into a new
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
@@ -1420,17 +1442,14 @@ impl StorageEngine {
             self.free_offsets.clear();
             self.pending_reclaimed_offsets.clear();
             self.pending_reclaimed_cache_keys.clear();
+            self.reclamation_dirty.store(false, Ordering::Release);
             return Ok(());
         }
 
         let device_size = self.device.size()?;
         let active_offsets: HashSet<_> =
             self.pmt.iter().map(|(_, mapping)| mapping.offset).collect();
-        let protected_offsets = self
-            .protected_offsets
-            .lock()
-            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
-            .clone();
+        let protected_offsets = self.protected_offsets_snapshot()?;
         self.free_offsets = (0..device_size)
             .step_by(PAGE_SIZE)
             .filter(|offset| {
@@ -1465,6 +1484,7 @@ impl StorageEngine {
         self.btree = BTree::from_sparse_with_allocator(page_count, root_page_id as u32, allocator);
         self.lazy_root = Some(root_page_id as u32);
         self.next_offset = device_size;
+        self.reclamation_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1764,6 +1784,7 @@ impl StorageEngine {
         self.free_offsets.clear();
         self.pending_reclaimed_offsets.clear();
         self.pending_reclaimed_cache_keys.clear();
+        self.reclamation_dirty.store(false, Ordering::Release);
 
         Ok(())
     }
@@ -1789,6 +1810,7 @@ impl Drop for StorageReadView {
                 .position(|pmt| Arc::ptr_eq(pmt, &self.engine.pmt))
         {
             leases.swap_remove(index);
+            self.engine.reclamation_dirty.store(true, Ordering::Release);
         }
     }
 }

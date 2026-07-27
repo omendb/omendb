@@ -741,10 +741,16 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
         let mut db = DB::open(&path, Options::for_test()).unwrap();
         db.put(b"key", b"before").unwrap();
         db.flush().unwrap();
+        let mirror_case = name.contains("manifest-mirror");
+        if mirror_case {
+            db.put(b"seed", b"seed-value").unwrap();
+            db.flush().unwrap();
+        }
 
         let mut transaction = db.begin_batch_transaction().unwrap();
         transaction.put(b"key", b"after").unwrap();
         inject(&db);
+        let expected_commit = if mirror_case { 3 } else { 2 };
 
         assert!(matches!(
             transaction.commit(&mut db),
@@ -753,9 +759,12 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
         assert!(matches!(
             transaction.state(),
             seerdb::BatchTransactionState::RecoveryRequired { commit }
-                if commit.get() == 2
+                if commit.get() == expected_commit
         ));
-        assert_eq!(transaction.recovery_commit().unwrap().get(), 2);
+        assert_eq!(
+            transaction.recovery_commit().unwrap().get(),
+            expected_commit
+        );
         assert!(db.durability_status().write_fenced);
 
         // A fenced publication may already be durable. The transaction is
@@ -857,6 +866,11 @@ fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
             },
         ])
         .unwrap();
+        let mirror_case = name.contains("manifest-mirror");
+        if mirror_case {
+            db.put(b"seed", b"seed-value").unwrap();
+            db.flush().unwrap();
+        }
 
         let mut transaction = db.begin_batch_transaction().unwrap();
         transaction.put(b"key-a", b"after-a").unwrap();
@@ -864,6 +878,7 @@ fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
         transaction.delete(b"remove-key").unwrap();
         transaction.put(b"new-key", b"after-new").unwrap();
         inject(&db);
+        let expected_commit = if mirror_case { 3 } else { 2 };
 
         assert!(matches!(
             transaction.commit(&mut db),
@@ -872,7 +887,7 @@ fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
         assert!(matches!(
             transaction.state(),
             seerdb::BatchTransactionState::RecoveryRequired { commit }
-                if commit.get() == 2
+                if commit.get() == expected_commit
         ));
         transaction.release().unwrap();
         drop(transaction);
@@ -1588,6 +1603,10 @@ fn dbnext_r0_process_crash_publication_matrix() {
         let mut db = DB::open(path, Options::default()).unwrap();
         db.put(b"key", b"value-1").unwrap();
         db.flush().unwrap();
+        if fault == "manifest-mirror-sync" {
+            db.put(b"seed", b"seed-value").unwrap();
+            db.flush().unwrap();
+        }
         db.put(b"key", b"value-2").unwrap();
 
         match fault.as_str() {

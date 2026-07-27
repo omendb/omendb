@@ -395,6 +395,13 @@ proptest! {
                     .unwrap();
                     let old_commit = db.durability_status().commit_id;
                     retained = db.retain_commit(old_commit).unwrap();
+                    if fault == 8 {
+                        // The manifest mirror is required before physical
+                        // reuse, not for an append-only generation. Seed one
+                        // retired slot so this fault reaches that boundary.
+                        db.put(b"mirror-seed", b"seed-value").unwrap();
+                        db.flush().unwrap();
+                    }
                     db.put(b"fault-key", &new_value).unwrap();
                     match fault {
                         0 => db.inject_sync_failure(),
