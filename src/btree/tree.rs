@@ -477,27 +477,12 @@ impl BTree {
                 return Ok(current);
             }
 
-            // Internal node: find the child to descend into.
-            //
-            // Layout: leftmost_child key_0 child_1 key_1 child_2 ...
-            //
-            // For key < key_0: go to leftmost_child
-            // For key_0 <= key < key_1: go to child_1
-            // etc.
-            let count = node.count();
-            let mut child_id = node.leftmost_child();
-
-            for i in 0..count {
-                let sep_key = node
-                    .key(i)
-                    .ok_or_else(|| BTreeError::Corruption("internal key is malformed".into()))?;
-                if key < sep_key.as_slice() {
-                    break;
-                }
-                child_id = node
-                    .child_id(i)
-                    .ok_or_else(|| BTreeError::Corruption("internal child is malformed".into()))?;
-            }
+            // Internal node: use an allocation-free upper-bound search over
+            // its separator array. Equal separators route to the child on
+            // their right.
+            let child_id = node
+                .child_for_key(key)
+                .ok_or_else(|| BTreeError::Corruption("internal routing is malformed".into()))?;
 
             if child_id > u32::MAX as u64 {
                 return Err(BTreeError::Corruption(

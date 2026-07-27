@@ -560,6 +560,52 @@ impl Node {
         ]))
     }
 
+    /// Compare a stored separator or leaf key with a lookup key without
+    /// allocating when the entry uses the current self-contained encoding.
+    ///
+    /// Older prefix-compressed pages retain the allocating reconstruction
+    /// path through [`Self::key`]. This keeps format compatibility while
+    /// making the normal lookup path operate directly on page bytes.
+    fn compare_key(&self, index: usize, key: &[u8]) -> Option<std::cmp::Ordering> {
+        if index >= self.count() {
+            return None;
+        }
+        let prefix_len = self.entry_prefix_len(index) as usize;
+        let suffix_len = self.entry_suffix_len(index) as usize;
+        if prefix_len == 0 {
+            let start = self.slot_offset(index).checked_add(4)?;
+            let end = start.checked_add(suffix_len)?;
+            return self.data.get(start..end).map(|stored| stored.cmp(key));
+        }
+        self.key(index).map(|stored| stored.as_slice().cmp(key))
+    }
+
+    /// Select the child that owns `key` in an internal node.
+    ///
+    /// Internal separators route equal keys to the child on their right, so
+    /// this is an upper-bound search over the separator array.
+    pub fn child_for_key(&self, key: &[u8]) -> Option<u64> {
+        if !self.is_internal() {
+            return None;
+        }
+
+        let mut lo = 0;
+        let mut hi = self.count();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.compare_key(mid, key)? {
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+
+        if lo == 0 {
+            Some(self.leftmost_child())
+        } else {
+            self.child_id(lo - 1)
+        }
+    }
+
     /// Binary search for a key in this node.
     ///
     /// Returns `Ok(index)` of the FIRST occurrence if found, or `Err(index)`
@@ -577,8 +623,8 @@ impl Node {
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.key(mid) {
-                Some(mid_key) => match mid_key.as_slice().cmp(key) {
+            match self.compare_key(mid, key) {
+                Some(ordering) => match ordering {
                     std::cmp::Ordering::Less => lo = mid + 1,
                     std::cmp::Ordering::Equal => {
                         result = Some(mid);

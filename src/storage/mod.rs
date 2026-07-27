@@ -11,7 +11,7 @@ use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::{PMT, PageMapping};
 use crate::space::Device;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub struct StorageMetrics {
     /// Logical page reads requested through the PMT-backed page seam.
     pub logical_page_reads: u64,
+    /// Lazy lookups served by the parsed immutable-node cache.
+    pub parsed_page_cache_hits: u64,
     /// Physical page reads issued to the data device.
     pub physical_page_reads: u64,
     /// Physical page writes completed on the data device.
@@ -43,6 +45,7 @@ pub struct StorageMetrics {
 #[derive(Debug, Default)]
 struct StorageCounters {
     logical_page_reads: AtomicU64,
+    parsed_page_cache_hits: AtomicU64,
     physical_page_reads: AtomicU64,
     physical_page_writes: AtomicU64,
     page_bytes_read: AtomicU64,
@@ -59,6 +62,7 @@ impl StorageCounters {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         StorageMetrics {
             logical_page_reads: load(&self.logical_page_reads),
+            parsed_page_cache_hits: load(&self.parsed_page_cache_hits),
             physical_page_reads: load(&self.physical_page_reads),
             physical_page_writes: load(&self.physical_page_writes),
             page_bytes_read: load(&self.page_bytes_read),
@@ -89,6 +93,40 @@ struct TreeVerification<'a> {
     blob_pointers: &'a mut Vec<BlobPointer>,
 }
 
+/// Bounded cache of validated immutable page decodes.
+///
+/// The buffer pool already caches raw page images. Keeping the parsed `Node`
+/// separately avoids copying a 4 KiB frame and re-running page decoding and
+/// checksum validation on every lazy lookup. PMT physical versions are part
+/// of the key, so a newly published image cannot reuse a stale parsed node.
+struct ParsedPageCache {
+    capacity: usize,
+    pages: HashMap<PageCacheKey, Arc<Node>>,
+}
+
+impl ParsedPageCache {
+    fn new(buffer_frames: usize) -> Self {
+        Self {
+            capacity: buffer_frames.max(1),
+            pages: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: PageCacheKey) -> Option<Arc<Node>> {
+        self.pages.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: PageCacheKey, node: Arc<Node>) {
+        if !self.pages.contains_key(&key) && self.pages.len() >= self.capacity {
+            // The raw buffer pool is the authoritative bounded cache. A
+            // simple whole-cache reset keeps parsed memory bounded without
+            // adding a second eviction policy to the read path.
+            self.pages.clear();
+        }
+        self.pages.insert(key, node);
+    }
+}
+
 /// Storage engine that coordinates all components.
 ///
 /// Provides persistent storage by serializing B-tree nodes to pages
@@ -98,6 +136,8 @@ pub struct StorageEngine {
     btree: BTree,
     /// Buffer manager (page cache).
     buffer: Mutex<BufferManager>,
+    /// Parsed immutable nodes paired with the raw buffer cache.
+    parsed_page_cache: Mutex<ParsedPageCache>,
     /// Page mapping table (page locations).
     pmt: Arc<PMT>,
     /// Device (file I/O).
@@ -170,9 +210,11 @@ impl StorageEngine {
         device: Device,
         protected_offsets: Arc<Mutex<HashSet<u64>>>,
     ) -> Self {
+        let buffer_frames = buffer.stats().total_frames;
         Self {
             btree: btree.with_page_allocator(allocator),
             buffer: Mutex::new(buffer),
+            parsed_page_cache: Mutex::new(ParsedPageCache::new(buffer_frames)),
             pmt: Arc::new(pmt),
             device,
             next_offset: 0,
@@ -199,6 +241,7 @@ impl StorageEngine {
         let engine = Self {
             btree: BTree::new().with_page_allocator(PageAllocator::new()),
             buffer: Mutex::new(BufferManager::new(buffer_capacity)),
+            parsed_page_cache: Mutex::new(ParsedPageCache::new(buffer_capacity / PAGE_SIZE)),
             pmt,
             device,
             next_offset: 0,
@@ -578,6 +621,12 @@ impl StorageEngine {
     /// mapping version is part of the cache key, so historical and current
     /// page versions cannot alias in the buffer pool.
     fn read_node_from_pmt(&self, pmt: &PMT, page_id: u64) -> Result<Node> {
+        Ok((*self.read_node_arc_from_pmt(pmt, page_id)?).clone())
+    }
+
+    /// Read and validate one immutable logical page, reusing its parsed node
+    /// while the PMT physical version remains unchanged.
+    fn read_node_arc_from_pmt(&self, pmt: &PMT, page_id: u64) -> Result<Arc<Node>> {
         self.metrics
             .logical_page_reads
             .fetch_add(1, Ordering::Relaxed);
@@ -598,6 +647,18 @@ impl StorageEngine {
         }
 
         let page_key = PageCacheKey::new(page_id, mapping.version);
+        if let Some(node) = self
+            .parsed_page_cache
+            .lock()
+            .map_err(|_| Error::Buffer("parsed page cache mutex is poisoned".into()))?
+            .get(page_key)
+        {
+            self.metrics
+                .parsed_page_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(node);
+        }
+
         let mut buf = [0u8; PAGE_SIZE];
         if !self.buffer_lock()?.is_resident_key(page_key) {
             // An immutable PMT-versioned page can be served from the cache
@@ -638,6 +699,11 @@ impl StorageEngine {
                 "page checksum mismatch for page {page_id}"
             )));
         }
+        let node = Arc::new(node);
+        self.parsed_page_cache
+            .lock()
+            .map_err(|_| Error::Buffer("parsed page cache mutex is poisoned".into()))?
+            .insert(page_key, Arc::clone(&node));
         Ok(node)
     }
 
@@ -972,18 +1038,9 @@ impl StorageEngine {
                     return Ok(());
                 }
 
-                let mut child_id = node.leftmost_child();
-                for index in 0..node.count() {
-                    let separator = node.key(index).ok_or_else(|| {
-                        Error::Corruption("internal mutation key is malformed".into())
-                    })?;
-                    if key < separator.as_slice() {
-                        break;
-                    }
-                    child_id = node.child_id(index).ok_or_else(|| {
-                        Error::Corruption("internal mutation child is malformed".into())
-                    })?;
-                }
+                let child_id = node.child_for_key(key).ok_or_else(|| {
+                    Error::Corruption("internal mutation routing is malformed".into())
+                })?;
                 u32::try_from(child_id).map_err(|_| {
                     Error::Corruption("internal mutation child exceeds logical ID width".into())
                 })?
@@ -1095,7 +1152,7 @@ impl StorageEngine {
         key: &[u8],
     ) -> Result<LookupResult> {
         let leaf_id = self.find_leaf_page(pmt, root_page_id, key)?;
-        let node = self.read_node_from_pmt(pmt, leaf_id as u64)?;
+        let node = self.read_node_arc_from_pmt(pmt, leaf_id as u64)?;
         Ok(match node.search(key) {
             Ok(index) => match node.value(index) {
                 Some(ValueRef::Inline(value)) => LookupResult::Found(value.to_vec()),
@@ -1133,7 +1190,7 @@ impl StorageEngine {
         let mut previous_key = None;
 
         loop {
-            let node = self.read_node_from_pmt(pmt, current as u64)?;
+            let node = self.read_node_arc_from_pmt(pmt, current as u64)?;
             let mut index = if first_leaf {
                 first_leaf = false;
                 match node.search(start) {
@@ -1192,22 +1249,13 @@ impl StorageEngine {
                     "cycle detected during lazy B-tree descent".into(),
                 ));
             }
-            let node = self.read_node_from_pmt(pmt, current as u64)?;
+            let node = self.read_node_arc_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(current);
             }
-            let mut child_id = node.leftmost_child();
-            for index in 0..node.count() {
-                let separator = node
-                    .key(index)
-                    .ok_or_else(|| Error::Corruption("lazy internal key is malformed".into()))?;
-                if key < separator.as_slice() {
-                    break;
-                }
-                child_id = node
-                    .child_id(index)
-                    .ok_or_else(|| Error::Corruption("lazy internal child is malformed".into()))?;
-            }
+            let child_id = node
+                .child_for_key(key)
+                .ok_or_else(|| Error::Corruption("lazy internal routing is malformed".into()))?;
             current = u32::try_from(child_id).map_err(|_| {
                 Error::Corruption("lazy internal child ID exceeds logical width".into())
             })?;
@@ -1229,7 +1277,7 @@ impl StorageEngine {
         }
 
         let result = (|| {
-            let node = self.read_node_from_pmt(pmt, current as u64)?;
+            let node = self.read_node_arc_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(current == target);
             }
@@ -1266,7 +1314,7 @@ impl StorageEngine {
                     "cycle detected during lazy next-leaf traversal".into(),
                 ));
             }
-            let node = self.read_node_from_pmt(pmt, current as u64)?;
+            let node = self.read_node_arc_from_pmt(pmt, current as u64)?;
             if node.is_leaf() {
                 return Ok(Some(current));
             }
@@ -1294,7 +1342,7 @@ impl StorageEngine {
             let parent_id = if current == target {
                 parent_hint
             } else {
-                self.read_node_from_pmt(pmt, current as u64)
+                self.read_node_arc_from_pmt(pmt, current as u64)
                     .ok()?
                     .parent_id()
             };
@@ -1302,7 +1350,7 @@ impl StorageEngine {
                 return (current == root_page_id).then_some(None);
             }
 
-            let parent = self.read_node_from_pmt(pmt, parent_id as u64).ok()?;
+            let parent = self.read_node_arc_from_pmt(pmt, parent_id as u64).ok()?;
             if !parent.is_internal() {
                 return None;
             }
@@ -1344,7 +1392,7 @@ impl StorageEngine {
             ));
         }
         for (parent_id, child_position) in path.into_iter().rev() {
-            let parent = self.read_node_from_pmt(pmt, parent_id as u64)?;
+            let parent = self.read_node_arc_from_pmt(pmt, parent_id as u64)?;
             if child_position < parent.count() {
                 let child = parent
                     .child_id(child_position)
@@ -2026,7 +2074,7 @@ mod tests {
             engine.read_node(1),
             Err(Error::Corruption(message)) if message.contains("missing page")
         ));
-        assert!(engine.buffer_stats().hits >= 2);
+        assert!(engine.metrics().parsed_page_cache_hits >= 1);
     }
 
     #[test]
