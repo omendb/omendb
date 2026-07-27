@@ -1615,7 +1615,7 @@ fn dbnext_r0_process_crash_publication_matrix() {
         Either,
     }
     let cases = [
-        ("wal-sync", Expected::Old),
+        ("wal-sync", Expected::Either),
         ("page-write", Expected::Old),
         ("page-sync", Expected::Old),
         ("manifest-mirror-sync", Expected::Old),

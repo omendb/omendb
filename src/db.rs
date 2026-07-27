@@ -1361,6 +1361,8 @@ pub struct DB {
     wal_reserved_extent: u64,
     /// Digest over pending mutation records.
     pending_digest: u32,
+    /// Whether the pending generation changes the durable blob image/catalog.
+    pending_blob_changes: bool,
     /// Whether the database is open.
     is_open: bool,
     /// Whether a failed publication fenced this writer until reopen.
@@ -1882,6 +1884,9 @@ impl DB {
             pending_wal_bytes: 0,
             wal_reserved_extent: 0,
             pending_digest: 0,
+            pending_blob_changes: recovery
+                .as_ref()
+                .is_some_and(|summary| summary.blob_changed),
             is_open: true,
             write_fenced: false,
             read_only,
@@ -1947,7 +1952,8 @@ impl DB {
             .blobs
             .should_separate(value.len())
             .then_some(value.len());
-        if previous_blob.is_some() || appended_value_len.is_some() {
+        let had_previous_blob = previous_blob.is_some();
+        if had_previous_blob || appended_value_len.is_some() {
             self.admit_blob_image(previous_blob.as_ref(), appended_value_len)?;
         }
         if appended_value_len.is_some() {
@@ -1964,6 +1970,7 @@ impl DB {
         }
 
         self.journal_mutation(record)?;
+        self.pending_blob_changes |= had_previous_blob || appended_value_len.is_some();
 
         Ok(())
     }
@@ -2133,6 +2140,7 @@ impl DB {
 
         *self.engine.btree_mut() = candidate_tree;
         self.blobs = candidate_blobs;
+        self.pending_blob_changes = blob_changed;
         self.pending_mutations = next_pending_mutations;
         self.pending_wal_bytes = next_pending_bytes;
         self.pending_digest = next_digest;
@@ -2201,10 +2209,12 @@ impl DB {
             self.admit_blob_image(previous_blob.as_ref(), None)?;
         }
         let found = self.engine.btree_mut().delete(key)?;
-        if found && let Some(pointer) = previous_blob {
+        let blob_changed = found && previous_blob.is_some();
+        if blob_changed && let Some(pointer) = previous_blob {
             self.blobs.mark_deleted(&pointer);
         }
         self.journal_mutation(record)?;
+        self.pending_blob_changes |= blob_changed;
         Ok(found)
     }
 
@@ -3221,13 +3231,17 @@ impl DB {
             .saturating_add(checkpoint_bytes)
             .saturating_add(legacy_meta_bytes);
 
-        self.blobs.set_generation(commit.generation_id.get());
-        let blob_bytes = if self.blobs.is_segmented() {
-            self.write_blob_segments()?
+        let blob_bytes = if self.blobs.is_segmented() || self.pending_blob_changes {
+            self.blobs.set_generation(commit.generation_id.get());
+            if self.blobs.is_segmented() {
+                self.write_blob_segments()?
+            } else {
+                let blob_path = self.path.join(BLOB_FILE);
+                let blob_image = self.blobs.to_bytes();
+                self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?
+            }
         } else {
-            let blob_path = self.path.join(BLOB_FILE);
-            let blob_image = self.blobs.to_bytes();
-            self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?
+            0
         };
         self.publication.blob_bytes_written = self
             .publication
@@ -3353,6 +3367,7 @@ impl DB {
         self.pending_mutations = 0;
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;
+        self.pending_blob_changes = false;
         Ok(())
     }
 
@@ -6076,6 +6091,7 @@ impl DB {
         let mut pending = Vec::new();
         let mut last_commit = None;
         let mut last_commit_offset = 0;
+        let mut blob_changed = false;
         let mut offset = 0u64;
         for record in &records {
             let record_len = record.to_bytes().len() as u64;
@@ -6136,7 +6152,7 @@ impl DB {
                     }
 
                     for mutation in pending.drain(..) {
-                        apply_mutation(mutation, btree, blobs)?;
+                        blob_changed |= apply_mutation(mutation, btree, blobs)?;
                     }
                     last_commit = Some(commit);
                     last_commit_offset = offset;
@@ -6149,6 +6165,7 @@ impl DB {
         Ok(RecoverySummary {
             last_commit,
             last_commit_offset,
+            blob_changed,
         })
     }
 }
@@ -6158,6 +6175,7 @@ impl DB {
 struct RecoverySummary {
     last_commit: Option<CommitRecord>,
     last_commit_offset: u64,
+    blob_changed: bool,
 }
 
 fn error_message(error: Error) -> String {
@@ -6187,13 +6205,15 @@ fn apply_put_mutation(
     value: &[u8],
     btree: &mut BTree,
     blobs: &mut BlobManager,
-) -> Result<()> {
+) -> Result<bool> {
     let previous_blob = match btree.lookup(key)? {
         LookupResult::Blob(pointer) => Some(pointer),
         _ => None,
     };
+    let had_previous_blob = previous_blob.is_some();
 
-    if blobs.should_separate(value.len()) {
+    let separates = blobs.should_separate(value.len());
+    if separates {
         let pointer = blobs.append(key, value.to_vec());
         if let Err(error) = btree.upsert_blob(key, pointer) {
             let _ = blobs.rollback_append(&pointer);
@@ -6206,18 +6226,18 @@ fn apply_put_mutation(
     if let Some(pointer) = previous_blob {
         blobs.mark_deleted(&pointer);
     }
-    Ok(())
+    Ok(separates || had_previous_blob)
 }
 
-fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<()> {
+fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<bool> {
     match record.record_type {
         RecordType::Put => {
             let (key, value) = decode_put_payload(false, &record.payload)?;
-            apply_put_mutation(key, value, btree, blobs)?;
+            apply_put_mutation(key, value, btree, blobs)
         }
         RecordType::PutV2 => {
             let (key, value) = decode_put_payload(true, &record.payload)?;
-            apply_put_mutation(key, value, btree, blobs)?;
+            apply_put_mutation(key, value, btree, blobs)
         }
         RecordType::Delete | RecordType::DeleteV2 => {
             let key =
@@ -6227,17 +6247,16 @@ fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager
                 _ => None,
             };
             let found = btree.delete(key)?;
-            if found && let Some(pointer) = previous_blob {
+            let blob_changed = found && previous_blob.is_some();
+            if blob_changed && let Some(pointer) = previous_blob {
                 blobs.mark_deleted(&pointer);
             }
+            Ok(blob_changed)
         }
-        _ => {
-            return Err(Error::Corruption(
-                "non-mutation passed to WAL applier".into(),
-            ));
-        }
+        _ => Err(Error::Corruption(
+            "non-mutation passed to WAL applier".into(),
+        )),
     }
-    Ok(())
 }
 
 fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
@@ -6915,7 +6934,7 @@ mod tests {
             assert_eq!(metrics.wal_bytes, 0);
             assert!(metrics.publication.wal_bytes_written > 0);
             assert!(metrics.publication.metadata_bytes_written > 0);
-            assert!(metrics.publication.blob_bytes_written > 0);
+            assert_eq!(metrics.publication.blob_bytes_written, 0);
             assert!(metrics.publication.history_bytes_written > 0);
             assert_eq!(
                 metrics.publication.manifest_bytes_written,
