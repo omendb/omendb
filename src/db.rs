@@ -33,7 +33,7 @@ use std::os::windows::fs::FileExt as PositionalFileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(test, feature = "fault-injection"))]
 use std::cell::Cell;
@@ -1266,6 +1266,8 @@ pub struct DBMetrics {
     pub reclaimable_pages: u64,
     /// Cumulative bytes written to publication artifacts by this handle.
     pub publication: PublicationMetrics,
+    /// Cumulative wall-clock time spent in publication phases by this handle.
+    pub publication_timing: PublicationTimingMetrics,
 }
 
 /// Cumulative bytes written to durable publication artifacts.
@@ -1286,6 +1288,41 @@ pub struct PublicationMetrics {
     pub history_bytes_written: u64,
     /// Bytes written to alternating manifest slots.
     pub manifest_bytes_written: u64,
+}
+
+/// Cumulative wall-clock time spent in durable publication phases.
+///
+/// These timings are diagnostic attribution for the current publication
+/// protocol. They are not latency guarantees and may include filesystem cache
+/// and scheduler effects from the host running the database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublicationTimingMetrics {
+    /// Candidate validation, cloning, and in-memory mutation preparation.
+    pub candidate_prepare_ns: u64,
+    /// WAL append and durability barriers.
+    pub wal_write_ns: u64,
+    /// Publication capacity checks and reuse-ledger admission.
+    pub admission_ns: u64,
+    /// Physical page writes and the data-device sync.
+    pub data_flush_ns: u64,
+    /// PMT/allocator checkpoint writes and syncs.
+    pub metadata_write_ns: u64,
+    /// Blob image or segmented catalog/append writes and syncs.
+    pub blob_write_ns: u64,
+    /// Manifest-history append/checkpoint writes and syncs.
+    pub history_write_ns: u64,
+    /// Final publication-directory durability barrier.
+    pub directory_sync_ns: u64,
+    /// Authoritative manifest slot write and sync.
+    pub manifest_write_ns: u64,
+    /// Pre-reuse manifest mirror write and sync.
+    pub manifest_mirror_ns: u64,
+    /// Post-manifest cleanup and reclamation bookkeeping.
+    pub cleanup_ns: u64,
+}
+
+fn elapsed_nanos(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 struct MetaDelta {
@@ -1380,6 +1417,8 @@ pub struct DB {
     wal_admission_failures: u64,
     /// Cumulative publication-artifact write counters.
     publication: PublicationMetrics,
+    /// Cumulative publication phase timings for diagnostics.
+    publication_timing: PublicationTimingMetrics,
 }
 
 impl DB {
@@ -1897,6 +1936,7 @@ impl DB {
             lock_file,
             wal_admission_failures: 0,
             publication: PublicationMetrics::default(),
+            publication_timing: PublicationTimingMetrics::default(),
         };
 
         if !check_only && current_manifest.is_none() && !wal_path.exists() && !meta_path.exists() {
@@ -2015,6 +2055,7 @@ impl DB {
         if mutations.is_empty() {
             return Ok(self.durability_status());
         }
+        let candidate_started = Instant::now();
         if self.pending_mutations != 0 {
             return Err(Error::InvalidArgument(
                 "commit_batch requires a clean pending generation; flush or discard pending mutations first".into(),
@@ -2114,6 +2155,10 @@ impl DB {
             let projected = Self::blob_publication_size(&candidate_blobs)?;
             self.engine.check_artifact_capacity(projected)?;
         }
+        self.publication_timing.candidate_prepare_ns = self
+            .publication_timing
+            .candidate_prepare_ns
+            .saturating_add(elapsed_nanos(candidate_started));
 
         self.ensure_wal_reservation()?;
         if blob_changed && !candidate_blobs.is_segmented() {
@@ -2341,6 +2386,16 @@ impl DB {
 
     /// Write buffered WAL records to disk and optionally force the prefix.
     fn write_wal_to_disk(&mut self, force_sync: bool) -> Result<()> {
+        let started = Instant::now();
+        let result = self.write_wal_to_disk_inner(force_sync);
+        self.publication_timing.wal_write_ns = self
+            .publication_timing
+            .wal_write_ns
+            .saturating_add(elapsed_nanos(started));
+        result
+    }
+
+    fn write_wal_to_disk_inner(&mut self, force_sync: bool) -> Result<()> {
         let mut wal_buf = Vec::new();
         self.wal.flush(&mut wal_buf)?;
         let should_sync = force_sync || self.wal.sync_policy() != SyncPolicy::None;
@@ -3180,7 +3235,13 @@ impl DB {
         // this extra sync because the older fallback root names untouched
         // pages; reused slots must fence that root before page write-back.
         if reused_slots {
-            self.mirror_current_manifest()?;
+            let started = Instant::now();
+            let result = self.mirror_current_manifest();
+            self.publication_timing.manifest_mirror_ns = self
+                .publication_timing
+                .manifest_mirror_ns
+                .saturating_add(elapsed_nanos(started));
+            result?;
         }
         // Mutation records have already been written to the WAL by the
         // mutation or batch admission path. The commit envelope is appended
@@ -3198,12 +3259,24 @@ impl DB {
                 offsets: reuse_offsets,
             })
             .map_err(|message| Error::Corruption(format!("reuse ledger {message}")))?;
-        if let Err(error) = self.preflight_publication_capacity() {
+        let admission_started = Instant::now();
+        let preflight_result = self.preflight_publication_capacity();
+        self.publication_timing.admission_ns = self
+            .publication_timing
+            .admission_ns
+            .saturating_add(elapsed_nanos(admission_started));
+        if let Err(error) = preflight_result {
             self.reuse_ledger.remove_generation(commit.generation_id);
             return Err(error);
         }
         self.persist_reuse_ledger()?;
-        if let Err(error) = self.engine.flush_after_reclamation_refresh() {
+        let flush_started = Instant::now();
+        let flush_result = self.engine.flush_after_reclamation_refresh();
+        self.publication_timing.data_flush_ns = self
+            .publication_timing
+            .data_flush_ns
+            .saturating_add(elapsed_nanos(flush_started));
+        if let Err(error) = flush_result {
             // Capacity preflight is guaranteed to issue no page I/O, so its
             // reservation can be removed and the mutation remains retryable.
             // Every other error leaves the reservation durable until reopen
@@ -3216,6 +3289,7 @@ impl DB {
             return Err(error);
         }
 
+        let metadata_started = Instant::now();
         let checkpoint_path = self
             .path
             .join(format!("seerdb.meta.{}", commit.generation_id.get()));
@@ -3239,7 +3313,12 @@ impl DB {
             .metadata_bytes_written
             .saturating_add(checkpoint_bytes)
             .saturating_add(legacy_meta_bytes);
+        self.publication_timing.metadata_write_ns = self
+            .publication_timing
+            .metadata_write_ns
+            .saturating_add(elapsed_nanos(metadata_started));
 
+        let blob_started = Instant::now();
         let blob_bytes = if self.blobs.is_segmented() || self.pending_blob_changes {
             self.blobs.set_generation(commit.generation_id.get());
             if self.blobs.is_segmented() {
@@ -3256,6 +3335,10 @@ impl DB {
             .publication
             .blob_bytes_written
             .saturating_add(blob_bytes);
+        self.publication_timing.blob_write_ns = self
+            .publication_timing
+            .blob_write_ns
+            .saturating_add(elapsed_nanos(blob_started));
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
@@ -3283,6 +3366,7 @@ impl DB {
             digest: commit.digest,
             format_version: FORMAT_VERSION,
         };
+        let history_started = Instant::now();
         let mut manifest_history = self.manifest_history.clone();
         manifest_history
             .push(manifest)
@@ -3300,14 +3384,30 @@ impl DB {
             .publication
             .history_bytes_written
             .saturating_add(history_bytes);
+        self.publication_timing.history_write_ns = self
+            .publication_timing
+            .history_write_ns
+            .saturating_add(elapsed_nanos(history_started));
         // The candidate checkpoint, blob image, and manifest history have all
         // been file-synced. One final directory barrier makes their renamed or
         // created entries durable before the manifest can select the new
         // generation. The safety mirror and reuse ledger were already synced
         // before page reuse.
-        sync_publication_directory(&self.path)?;
+        let directory_started = Instant::now();
+        let directory_result = sync_publication_directory(&self.path);
+        self.publication_timing.directory_sync_ns = self
+            .publication_timing
+            .directory_sync_ns
+            .saturating_add(elapsed_nanos(directory_started));
+        directory_result?;
         self.manifest_history = manifest_history;
-        self.manifest.publish(manifest)?;
+        let manifest_started = Instant::now();
+        let manifest_result = self.manifest.publish(manifest);
+        self.publication_timing.manifest_write_ns = self
+            .publication_timing
+            .manifest_write_ns
+            .saturating_add(elapsed_nanos(manifest_started));
+        manifest_result?;
         self.publication.manifest_bytes_written = self
             .publication
             .manifest_bytes_written
@@ -3318,6 +3418,7 @@ impl DB {
             return Err(std::io::Error::other("injected post-manifest failure").into());
         }
 
+        let cleanup_started = Instant::now();
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
             self.finish_segment_catalog_backup()?;
@@ -3352,6 +3453,10 @@ impl DB {
             // directory sync to every successful publication.
         }
         self.wal_reserved_extent = 0;
+        self.publication_timing.cleanup_ns = self
+            .publication_timing
+            .cleanup_ns
+            .saturating_add(elapsed_nanos(cleanup_started));
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
@@ -3664,6 +3769,7 @@ impl DB {
             wal_reserved_bytes: self.wal_reserved_extent,
             reclaimable_pages: self.engine.reclaimable_page_count() as u64,
             publication: self.publication,
+            publication_timing: self.publication_timing,
         })
     }
 

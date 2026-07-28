@@ -395,6 +395,17 @@ struct SeerCounters {
     history_bytes_written: u64,
     manifest_bytes_written: u64,
     reclaimed_bytes: u64,
+    candidate_prepare_ns: u64,
+    wal_write_ns: u64,
+    admission_ns: u64,
+    data_flush_ns: u64,
+    metadata_write_ns: u64,
+    blob_write_ns: u64,
+    history_write_ns: u64,
+    directory_sync_ns: u64,
+    manifest_write_ns: u64,
+    manifest_mirror_ns: u64,
+    cleanup_ns: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -703,6 +714,17 @@ impl Engine {
                 history_bytes_written: metrics.publication.history_bytes_written,
                 manifest_bytes_written: metrics.publication.manifest_bytes_written,
                 reclaimed_bytes: metrics.storage.reclaimed_bytes,
+                candidate_prepare_ns: metrics.publication_timing.candidate_prepare_ns,
+                wal_write_ns: metrics.publication_timing.wal_write_ns,
+                admission_ns: metrics.publication_timing.admission_ns,
+                data_flush_ns: metrics.publication_timing.data_flush_ns,
+                metadata_write_ns: metrics.publication_timing.metadata_write_ns,
+                blob_write_ns: metrics.publication_timing.blob_write_ns,
+                history_write_ns: metrics.publication_timing.history_write_ns,
+                directory_sync_ns: metrics.publication_timing.directory_sync_ns,
+                manifest_write_ns: metrics.publication_timing.manifest_write_ns,
+                manifest_mirror_ns: metrics.publication_timing.manifest_mirror_ns,
+                cleanup_ns: metrics.publication_timing.cleanup_ns,
             }),
             #[cfg(feature = "fjall")]
             Self::Fjall(_) => None,
@@ -1006,7 +1028,7 @@ fn render_result(result: &RunResult) -> String {
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
     format!(
-        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_candidate_prepare_ns\": {},\n  \"seerdb_wal_write_ns\": {},\n  \"seerdb_admission_ns\": {},\n  \"seerdb_data_flush_ns\": {},\n  \"seerdb_metadata_write_ns\": {},\n  \"seerdb_blob_write_ns\": {},\n  \"seerdb_history_write_ns\": {},\n  \"seerdb_directory_sync_ns\": {},\n  \"seerdb_manifest_write_ns\": {},\n  \"seerdb_manifest_mirror_ns\": {},\n  \"seerdb_cleanup_ns\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
         config.durability.name(),
@@ -1075,6 +1097,39 @@ fn render_result(result: &RunResult) -> String {
         result
             .seer_counters
             .map_or(0, |counters| counters.reclaimed_bytes),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.candidate_prepare_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.wal_write_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.admission_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.data_flush_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.metadata_write_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.blob_write_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.history_write_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.directory_sync_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.manifest_write_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.manifest_mirror_ns),
+        result
+            .seer_counters
+            .map_or(0, |counters| counters.cleanup_ns),
         amplification.map_or_else(|| "null".to_string(), |value| format!("{value:.3}")),
     )
 }

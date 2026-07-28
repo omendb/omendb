@@ -10,9 +10,10 @@ computes a canonical digest, closes and reopens the database, and checks the
 digest again. It reports operation latency quantiles, throughput, logical
 bytes, recursive on-disk bytes, and SeerDB's internal page/publication counters
 when available. Results use the versioned `seerdb-common-kv-v4` format and
-include reopen verification time, host identity, process CPU time, and peak
-resident memory. Pass `--output PATH` to retain the exact JSON result beside
-stdout for later comparison.
+include reopen verification time, host identity, process CPU time, peak
+resident memory, and cumulative SeerDB publication-phase timings when
+available. Pass `--output PATH` to retain the exact JSON result beside stdout
+for later comparison.
 
 The current peer versions are `fjall 3.1.8` and optional `rocksdb 0.24.0`.
 Use the same workload, seed, value size, batch size, durability mode, and
