@@ -3,12 +3,14 @@
 //! The `DB` struct is the main entry point for the storage engine.
 //! It owns all components and provides the public API.
 
+mod mutation;
 #[path = "db/open.rs"]
 mod open;
 mod options;
 #[path = "db/wal_recovery.rs"]
 mod wal_recovery;
 
+use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
     decode_delete_payload, decode_put_payload, digest_records, extend_digest,
     validate_wal_key_length, validate_wal_put_lengths,
@@ -1526,21 +1528,15 @@ impl DB {
         if had_previous_blob || appended_value_len.is_some() {
             self.admit_blob_image(previous_blob.as_ref(), appended_value_len)?;
         }
-        if appended_value_len.is_some() {
-            let pointer = self.blobs.append(key, value.to_vec());
-            if let Err(error) = self.engine.btree_mut().upsert_blob(key, pointer) {
-                let _ = self.blobs.rollback_append(&pointer);
-                return Err(error.into());
-            }
-        } else {
-            self.engine.btree_mut().upsert(key, value)?;
-        }
-        if let Some(pointer) = previous_blob {
-            self.blobs.mark_deleted(&pointer);
-        }
+        let outcome = apply_mutation(
+            Mutation::Put { key, value },
+            self.engine.btree_mut(),
+            &mut self.blobs,
+        )?;
+        require_blob_deletion(outcome, "put")?;
 
         self.journal_mutation(record)?;
-        self.pending_blob_changes |= had_previous_blob || appended_value_len.is_some();
+        self.pending_blob_changes |= outcome.blob_changed;
 
         Ok(())
     }
@@ -1634,48 +1630,20 @@ impl DB {
         let mut candidate_blobs = self.blobs.clone();
         let mut blob_changed = false;
         for mutation in mutations {
-            match mutation {
-                BatchMutation::Put { key, value } => {
-                    let previous_blob = match candidate_tree.lookup(key).map_err(Error::from)? {
-                        LookupResult::Blob(pointer) => Some(pointer),
-                        _ => None,
-                    };
-                    let separates = candidate_blobs.should_separate(value.len());
-                    if separates {
-                        let pointer = candidate_blobs.append(key, value.clone());
-                        if let Err(error) = candidate_tree.upsert_blob(key, pointer) {
-                            let _ = candidate_blobs.rollback_append(&pointer);
-                            return Err(error.into());
-                        }
-                    } else {
-                        candidate_tree.upsert(key, value).map_err(Error::from)?;
-                    }
-                    if let Some(pointer) = previous_blob {
-                        if !candidate_blobs.mark_deleted(&pointer) {
-                            return Err(Error::Corruption(
-                                "batch replacement references a missing blob".into(),
-                            ));
-                        }
-                        blob_changed = true;
-                    }
-                    blob_changed |= separates;
-                }
-                BatchMutation::Delete { key } => {
-                    let previous_blob = match candidate_tree.lookup(key).map_err(Error::from)? {
-                        LookupResult::Blob(pointer) => Some(pointer),
-                        _ => None,
-                    };
-                    let _ = candidate_tree.delete(key).map_err(Error::from)?;
-                    if let Some(pointer) = previous_blob {
-                        if !candidate_blobs.mark_deleted(&pointer) {
-                            return Err(Error::Corruption(
-                                "batch delete references a missing blob".into(),
-                            ));
-                        }
-                        blob_changed = true;
-                    }
-                }
-            }
+            let outcome = match mutation {
+                BatchMutation::Put { key, value } => apply_mutation(
+                    Mutation::Put { key, value },
+                    &mut candidate_tree,
+                    &mut candidate_blobs,
+                )?,
+                BatchMutation::Delete { key } => apply_mutation(
+                    Mutation::Delete { key },
+                    &mut candidate_tree,
+                    &mut candidate_blobs,
+                )?,
+            };
+            require_blob_deletion(outcome, "batch mutation")?;
+            blob_changed |= outcome.blob_changed;
         }
 
         if blob_changed {
@@ -1783,14 +1751,15 @@ impl DB {
         if previous_blob.is_some() {
             self.admit_blob_image(previous_blob.as_ref(), None)?;
         }
-        let found = self.engine.btree_mut().delete(key)?;
-        let blob_changed = found && previous_blob.is_some();
-        if blob_changed && let Some(pointer) = previous_blob {
-            self.blobs.mark_deleted(&pointer);
-        }
+        let outcome = apply_mutation(
+            Mutation::Delete { key },
+            self.engine.btree_mut(),
+            &mut self.blobs,
+        )?;
+        require_blob_deletion(outcome, "delete")?;
         self.journal_mutation(record)?;
-        self.pending_blob_changes |= blob_changed;
-        Ok(found)
+        self.pending_blob_changes |= outcome.blob_changed;
+        Ok(outcome.changed)
     }
 
     /// Range scan over [start, end).

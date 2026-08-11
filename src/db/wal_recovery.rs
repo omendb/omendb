@@ -1,7 +1,8 @@
 //! WAL replay policy for committed prefixes.
 
+use super::mutation::{Mutation, apply as apply_mutation};
 use super::{BTree, BlobManager, Error, RecoverySummary, Result};
-use crate::btree::{LookupResult, MAX_KEY_SIZE};
+use crate::btree::MAX_KEY_SIZE;
 use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
 use crate::storage::format::Manifest;
 use std::path::Path;
@@ -83,7 +84,35 @@ pub(super) fn recover_from_wal(
                 }
 
                 for mutation in pending.drain(..) {
-                    blob_changed |= apply_mutation(mutation, btree, blobs)?;
+                    let applied = match mutation.record_type {
+                        RecordType::Put => {
+                            let (key, value) = decode_put_payload(false, &mutation.payload)?;
+                            apply_mutation(Mutation::Put { key, value }, btree, blobs)?
+                        }
+                        RecordType::PutV2 => {
+                            let (key, value) = decode_put_payload(true, &mutation.payload)?;
+                            apply_mutation(Mutation::Put { key, value }, btree, blobs)?
+                        }
+                        RecordType::Delete => {
+                            let key = decode_delete_payload(false, &mutation.payload)?;
+                            apply_mutation(Mutation::Delete { key }, btree, blobs)?
+                        }
+                        RecordType::DeleteV2 => {
+                            let key = decode_delete_payload(true, &mutation.payload)?;
+                            apply_mutation(Mutation::Delete { key }, btree, blobs)?
+                        }
+                        RecordType::Commit => {
+                            return Err(Error::Corruption(
+                                "commit record appeared in WAL mutation prefix".into(),
+                            ));
+                        }
+                        _ => {
+                            return Err(Error::Corruption(
+                                "non-mutation passed to WAL applier".into(),
+                            ));
+                        }
+                    };
+                    blob_changed |= applied.blob_changed;
                 }
                 last_commit = Some(commit);
                 last_commit_offset = offset;
@@ -112,65 +141,6 @@ pub(super) fn digest_records(records: &[&WalRecord]) -> u32 {
     records
         .iter()
         .fold(0, |digest, record| extend_digest(digest, record))
-}
-
-fn apply_put_mutation(
-    key: &[u8],
-    value: &[u8],
-    btree: &mut BTree,
-    blobs: &mut BlobManager,
-) -> Result<bool> {
-    let previous_blob = match btree.lookup(key)? {
-        LookupResult::Blob(pointer) => Some(pointer),
-        _ => None,
-    };
-    let had_previous_blob = previous_blob.is_some();
-
-    let separates = blobs.should_separate(value.len());
-    if separates {
-        let pointer = blobs.append(key, value.to_vec());
-        if let Err(error) = btree.upsert_blob(key, pointer) {
-            let _ = blobs.rollback_append(&pointer);
-            return Err(error.into());
-        }
-    } else {
-        btree.upsert(key, value)?;
-    }
-
-    if let Some(pointer) = previous_blob {
-        blobs.mark_deleted(&pointer);
-    }
-    Ok(separates || had_previous_blob)
-}
-
-fn apply_mutation(record: &WalRecord, btree: &mut BTree, blobs: &mut BlobManager) -> Result<bool> {
-    match record.record_type {
-        RecordType::Put => {
-            let (key, value) = decode_put_payload(false, &record.payload)?;
-            apply_put_mutation(key, value, btree, blobs)
-        }
-        RecordType::PutV2 => {
-            let (key, value) = decode_put_payload(true, &record.payload)?;
-            apply_put_mutation(key, value, btree, blobs)
-        }
-        RecordType::Delete | RecordType::DeleteV2 => {
-            let key =
-                decode_delete_payload(record.record_type == RecordType::DeleteV2, &record.payload)?;
-            let previous_blob = match btree.lookup(key)? {
-                LookupResult::Blob(pointer) => Some(pointer),
-                _ => None,
-            };
-            let found = btree.delete(key)?;
-            let blob_changed = found && previous_blob.is_some();
-            if blob_changed && let Some(pointer) = previous_blob {
-                blobs.mark_deleted(&pointer);
-            }
-            Ok(blob_changed)
-        }
-        _ => Err(Error::Corruption(
-            "non-mutation passed to WAL applier".into(),
-        )),
-    }
 }
 
 pub(super) fn decode_put_payload(v2: bool, payload: &[u8]) -> Result<(&[u8], &[u8])> {
