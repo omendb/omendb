@@ -4,6 +4,9 @@
 //! and device to provide persistent storage.
 
 pub mod format;
+mod manifest_store;
+
+pub use manifest_store::ManifestStore;
 
 use crate::allocator::PageAllocator;
 use crate::btree::{BTree, BTreeError, BlobPointer, LookupResult, Node, PAGE_SIZE, ValueRef};
