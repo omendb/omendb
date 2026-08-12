@@ -396,10 +396,13 @@ proptest! {
                     let old_commit = db.durability_status().commit_id;
                     retained = db.retain_commit(old_commit).unwrap();
                     if fault == 8 {
-                        // The manifest mirror is required before physical
-                        // reuse, not for an append-only generation. Seed one
-                        // retired slot so this fault reaches that boundary.
+                        // The retained root protects generation 1's page. Two
+                        // later publications are therefore needed before the
+                        // next generation can reuse an unprotected slot and
+                        // reach the manifest-mirror boundary.
                         db.put(b"mirror-seed", b"seed-value").unwrap();
+                        db.flush().unwrap();
+                        db.put(b"mirror-seed", b"seed-value-2").unwrap();
                         db.flush().unwrap();
                     }
                     db.put(b"fault-key", &new_value).unwrap();
