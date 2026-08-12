@@ -277,6 +277,27 @@ fn test_db_close() {
 }
 
 #[test]
+fn test_db_close_publishes_pending_wal_and_releases_writer() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("graceful-close.db");
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    assert!(path.join(WAL_FILE).is_file());
+
+    db.close().unwrap();
+
+    assert!(!path.join(WAL_FILE).exists());
+    assert_eq!(db.durability_status().pending_mutations, 0);
+    assert!(matches!(db.get(b"key"), Err(Error::InvalidArgument(_))));
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+    reopened.put(b"next", b"value").unwrap();
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_db_runtime_invariants_cover_pending_generation_lifecycle() {
     let dir = tempdir().unwrap();
     let mut db = DB::open(dir.path().join("invariants.db"), Options::default()).unwrap();
