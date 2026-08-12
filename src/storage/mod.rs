@@ -5,16 +5,18 @@
 
 pub mod format;
 mod manifest_store;
+mod page_cache;
 
 pub use manifest_store::ManifestStore;
 
+use self::page_cache::ParsedPageCache;
 use crate::allocator::PageAllocator;
 use crate::btree::{BTree, BTreeError, BlobPointer, LookupResult, Node, PAGE_SIZE, ValueRef};
 use crate::buffer::{BufferManager, BufferStats, GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::{PMT, PageMapping};
 use crate::space::Device;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -94,40 +96,6 @@ struct TreeVerification<'a> {
     pmt: &'a PMT,
     visited: &'a mut HashSet<u32>,
     blob_pointers: &'a mut Vec<BlobPointer>,
-}
-
-/// Bounded cache of validated immutable page decodes.
-///
-/// The buffer pool already caches raw page images. Keeping the parsed `Node`
-/// separately avoids copying a 4 KiB frame and re-running page decoding and
-/// checksum validation on every lazy lookup. PMT physical versions are part
-/// of the key, so a newly published image cannot reuse a stale parsed node.
-struct ParsedPageCache {
-    capacity: usize,
-    pages: HashMap<PageCacheKey, Arc<Node>>,
-}
-
-impl ParsedPageCache {
-    fn new(buffer_frames: usize) -> Self {
-        Self {
-            capacity: buffer_frames.max(1),
-            pages: HashMap::new(),
-        }
-    }
-
-    fn get(&self, key: PageCacheKey) -> Option<Arc<Node>> {
-        self.pages.get(&key).cloned()
-    }
-
-    fn insert(&mut self, key: PageCacheKey, node: Arc<Node>) {
-        if !self.pages.contains_key(&key) && self.pages.len() >= self.capacity {
-            // The raw buffer pool is the authoritative bounded cache. A
-            // simple whole-cache reset keeps parsed memory bounded without
-            // adding a second eviction policy to the read path.
-            self.pages.clear();
-        }
-        self.pages.insert(key, node);
-    }
 }
 
 /// Storage engine that coordinates all components.
