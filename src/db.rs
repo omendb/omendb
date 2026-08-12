@@ -60,6 +60,8 @@ mod snapshot;
 mod transaction;
 #[path = "db/vacuum.rs"]
 mod vacuum;
+#[path = "db/wal_admission.rs"]
+mod wal_admission;
 #[path = "db/wal_recovery.rs"]
 mod wal_recovery;
 
