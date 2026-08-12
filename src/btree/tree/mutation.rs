@@ -3,7 +3,8 @@
 //! This module owns public insert, upsert, delete, and blob-pointer mutation
 //! APIs. It keeps candidate changes atomic when split or resized replacement
 //! fails, then delegates structural propagation to `split.rs`. `tree.rs`
-//! remains the owner of B-tree state, routing, lookup, and range traversal.
+//! remains the owner of B-tree state, while `routing.rs` owns descent and
+//! checked leaf navigation.
 
 use super::{BTree, BTreeError};
 use crate::btree::node::{BlobPointer, InsertError, ValueRef};
