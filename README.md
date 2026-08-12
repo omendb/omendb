@@ -25,6 +25,11 @@ keys and values without a separate database server:
   feature flags exist, but device-specific optimization is not required by the
   baseline contract.
 
+The current alpha uses a fixed 4 KiB page format, exposed as
+`seerdb::PAGE_SIZE`. Page sizing is not an ignored tuning knob: changing it
+requires a separately versioned format and matching buffer/device
+implementation.
+
 SeerDB does not claim durable per-record MVCC, parallel writers, SQL, HA, or
 cross-device performance parity. Those are later DBNext or post-v0.1 concerns.
 
@@ -65,7 +70,7 @@ current design and staged optimization plan.
 
 The current Rust lane is a single-writer durable kernel with concurrent reads,
 root-generation retention, WAL recovery, crash-safe reclamation, and retryable
-capacity refusal. The current release suite passes 223 unit tests, 75 DBNext R0
+capacity refusal. The current release suite passes 225 unit tests, 75 DBNext R0
 tests, storage properties, all-target Clippy, and warnings-as-errors docs. A
 524,288-operation ARM64 Linux workload/recovery soak passed with digest/reopen
 parity, and the DBNext R0 integrity gate accepts its replay and 13 fault cases.

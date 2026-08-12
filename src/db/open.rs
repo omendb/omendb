@@ -6,6 +6,9 @@ impl DB {
         options: Options,
         mode: OpenMode,
     ) -> Result<Self> {
+        // Page size is part of the compiled page, buffer, and on-disk
+        // format. `Options` intentionally does not expose a second page-size
+        // choice that could drift from those owners.
         let path = path.as_ref().to_path_buf();
         let path_preexisted = path.exists();
         let check_only = mode == OpenMode::Check;

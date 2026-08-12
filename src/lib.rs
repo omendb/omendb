@@ -4,6 +4,8 @@
 //! - **Out-of-place writes** (LeanStore-inspired): pages are never updated in place
 //! - **KV separation** (WiscKey-inspired): large values stored separately
 //! - **SSD-native design**: FDP/ZNS support for minimal write amplification
+//! - **Fixed page format**: the current alpha uses [`PAGE_SIZE`] pages; page
+//!   sizing is not silently configurable through [`Options`]
 //! - **Snapshots**: immutable root generations with explicit retained
 //!   historical reads; durable data-version MVCC remains a future extension
 //!
@@ -52,6 +54,7 @@ pub mod space;
 pub mod storage;
 
 // Re-export main types at crate root.
+pub use btree::PAGE_SIZE;
 pub use db::{
     BatchMutation, BatchTransaction, BatchTransactionState, BlobStorageMode, CheckReport,
     CompactionReport, DB, DBMetrics, DurabilityStatus, HistoryPruneReport, Options,

@@ -397,7 +397,7 @@ fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
             "sync_writes": options.sync_writes,
             "use_odirect": options.use_odirect,
             "buffer_pool_size": options.buffer_pool_size,
-            "page_size": options.page_size,
+            "page_size": seerdb::PAGE_SIZE,
             "blob_threshold": options.blob_threshold,
             "max_wal_bytes": options.max_wal_bytes,
         },

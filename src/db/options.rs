@@ -17,13 +17,15 @@ pub enum BlobStorageMode {
 }
 
 /// Configuration options for a database instance.
+///
+/// The alpha on-disk format uses the fixed [`crate::PAGE_SIZE`] page size.
+/// Page sizing is an engine format decision, not a per-database tuning
+/// option; changing it requires a separately versioned format and buffer/I/O
+/// implementation.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Buffer pool size in bytes. Default: 128MB.
     pub buffer_pool_size: usize,
-
-    /// Page size in bytes. Default: 4096.
-    pub page_size: usize,
 
     /// Blob separation threshold. Values larger than this stored in blob files. Default: 1024.
     pub blob_threshold: usize,
@@ -48,7 +50,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             buffer_pool_size: 128 * 1024 * 1024, // 128MB
-            page_size: 4096,
             blob_threshold: DEFAULT_BLOB_THRESHOLD,
             blob_storage: BlobStorageMode::WholeImage,
             use_odirect: false,
@@ -65,5 +66,17 @@ impl Options {
             buffer_pool_size: 4096 * 10, // 10 pages
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PAGE_SIZE;
+
+    #[test]
+    fn alpha_page_format_is_fixed_and_buffer_default_is_aligned() {
+        assert_eq!(PAGE_SIZE, 4096);
+        assert_eq!(Options::default().buffer_pool_size % PAGE_SIZE, 0);
     }
 }

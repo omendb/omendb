@@ -1,6 +1,6 @@
 //! B-tree node format.
 //!
-//! Each node is a fixed-size page (4KB default) with a slotted page layout:
+//! Each node is a fixed-size 4 KiB page with a slotted page layout:
 //!
 //! ```text
 //! [Header: 32 bytes] [Slot 0..N] [...free...] [Entry N] ... [Entry 0]
@@ -14,7 +14,7 @@
 //! form. New mutations intentionally use self-contained keys until a bounded
 //! restart-point compression scheme is implemented and benchmarked.
 
-/// Page size in bytes (4KB).
+/// Fixed physical page size in bytes for the current on-disk format.
 pub const PAGE_SIZE: usize = 4096;
 
 /// Maximum key length that fits in both a leaf entry and a promoted internal
