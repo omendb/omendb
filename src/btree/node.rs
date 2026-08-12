@@ -4,7 +4,8 @@
 //! responsibility:
 //!
 //! - [`access`] reads and searches the page without mutating it.
-//! - [`mutation`] owns inserts, replacements, deletes, and compaction.
+//! - [`mutation`] owns leaf inserts, replacements, deletes, and compaction.
+//! - [`internal_mutation`] owns internal separator and child-pointer inserts.
 //! - [`split`] owns page split and rebuild policy.
 //! - [`page_format`] owns headers, serialization, validation, and checksums.
 //!
@@ -13,6 +14,7 @@
 //! restart-point compression scheme is implemented and benchmarked.
 
 mod access;
+mod internal_mutation;
 mod mutation;
 #[path = "node/page_format.rs"]
 mod page_format;
