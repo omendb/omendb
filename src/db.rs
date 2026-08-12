@@ -114,7 +114,7 @@ use crate::storage::format::{
     ReuseLedger, SnapshotId,
 };
 use fs2::FileExt;
-use retention_state::{RetentionLease, RetentionState};
+use retention_state::RetentionState;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]
@@ -723,58 +723,6 @@ impl DB {
             removed_checkpoints,
             reclaimed_checkpoint_bytes,
         })
-    }
-
-    /// Begin a root-bound byte transaction.
-    ///
-    /// The transaction captures the current published commit and retains its
-    /// physical root in a process-local lease before returning. It can
-    /// therefore read a stable version while the database advances and can
-    /// commit only against that expected base. The short-lived transaction pin
-    /// is intentionally not persisted as a named historical snapshot.
-    pub fn begin_batch_transaction(&mut self) -> Result<BatchTransaction> {
-        self.check_writable()?;
-        self.flush()?;
-        let manifest = self
-            .manifest
-            .load_latest()?
-            .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
-        let snapshot_id = self.register_ephemeral_manifest(manifest)?;
-        Ok(BatchTransaction {
-            base_commit: self.commit_id,
-            snapshot_id,
-            lease: Some(RetentionLease {
-                state: Arc::clone(&self.retention),
-                snapshot_id,
-                reclamation_dirty: self.engine.reclamation_dirty_handle(),
-                released: false,
-            }),
-            mutations: Vec::new(),
-            state: BatchTransactionState::Active,
-        })
-    }
-
-    /// Begin the legacy transaction-ID bookkeeping primitive.
-    ///
-    /// This does not bind reads or writes to a durable SeerDB root. Use
-    /// [`DB::begin_batch_transaction`] for the data-bearing transaction API.
-    pub fn begin_transaction(&self) -> crate::concurrency::Transaction {
-        self.txn_manager.begin()
-    }
-
-    /// Commit a transaction.
-    pub fn commit_transaction(&self, txn: &mut crate::concurrency::Transaction) {
-        self.txn_manager.commit(txn);
-    }
-
-    /// Abort a transaction.
-    pub fn abort_transaction(&self, txn: &mut crate::concurrency::Transaction) {
-        self.txn_manager.abort(txn);
-    }
-
-    /// Get the latest committed transaction ID.
-    pub fn latest_committed_txn(&self) -> u64 {
-        self.txn_manager.latest_committed()
     }
 
     /// Check if the database is open.
