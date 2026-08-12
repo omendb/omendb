@@ -5,13 +5,16 @@
 //! persistence, and manifest mirroring. `DB` remains the mutable state owner;
 //! `publication.rs` remains the publication-ordering authority.
 
+use super::artifact_io::{
+    atomic_write, atomic_write_without_directory_sync, atomic_write_without_fault_injection,
+    sync_directory,
+};
 use super::metadata::{META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_MAGIC};
 use super::wal_recovery::extend_digest;
 use super::{
     BLOB_RESERVATION_FILE, DB, Error, MANIFEST_HISTORY_FILE, META_FILE,
     PUBLICATION_CAPACITY_SAFETY_BYTES, REUSE_LEDGER_FILE, Result, WAL_COMMIT_RECORD_BYTES,
-    WAL_FILE, WAL_RESERVATION_SEGMENT_BYTES, atomic_write, atomic_write_without_directory_sync,
-    atomic_write_without_fault_injection, elapsed_nanos, sync_directory,
+    WAL_FILE, WAL_RESERVATION_SEGMENT_BYTES, elapsed_nanos,
 };
 #[cfg(any(test, feature = "fault-injection"))]
 use super::{

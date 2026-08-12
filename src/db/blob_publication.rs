@@ -7,6 +7,8 @@
 //! artifact publication.
 
 use super::*;
+use crate::space::reserve_file;
+use std::io::{Seek, SeekFrom, Write};
 
 impl DB {
     pub(super) fn write_blob_image(&self, path: &Path, data: &[u8]) -> Result<u64> {
