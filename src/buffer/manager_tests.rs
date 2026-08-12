@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn runtime_invariants_track_frame_map_ownership() {
+    let mut manager = BufferManager::new(PAGE_SIZE);
+    assert!(manager.validate_invariants().is_ok());
+
+    let page = [7u8; PAGE_SIZE];
+    let guard = manager
+        .fetch_key(PageCacheKey::new(4, 9), &page, GuardAccess::Read)
+        .unwrap();
+    assert!(manager.validate_invariants().is_ok());
+    drop(guard);
+    assert!(manager.validate_invariants().is_ok());
+
+    manager.page_map.insert(PageCacheKey::new(5, 10), 0);
+    let error = manager.validate_invariants().unwrap_err();
+    assert!(error.contains("multiple cache keys") || error.contains("key does not match"));
+}
+
+#[test]
 fn test_buffer_manager_new() {
     let bm = BufferManager::new(4096 * 10); // 10 frames
     assert_eq!(bm.capacity(), 10);

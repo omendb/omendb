@@ -5,6 +5,37 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn runtime_invariants_cover_pmt_and_generation_state() {
+    let dir = tempdir().unwrap();
+    let device = Device::open(
+        dir.path().join("data"),
+        &DeviceOptions {
+            use_odirect: false,
+            sync_writes: false,
+            create: true,
+        },
+    )
+    .unwrap();
+    let mut engine = StorageEngine::new(
+        BTree::new(),
+        BufferManager::new(PAGE_SIZE),
+        PMT::new(),
+        PageAllocator::new(),
+        device,
+    );
+
+    assert!(engine.validate_runtime_state().is_ok());
+    engine.btree_mut().insert(b"key", b"value").unwrap();
+    assert!(engine.validate_runtime_state().is_ok());
+    engine.flush().unwrap();
+    assert!(engine.validate_runtime_state().is_ok());
+
+    engine.pmt_mut().insert(9, 0, 1);
+    let error = engine.validate_runtime_state().unwrap_err();
+    assert!(matches!(error, Error::Corruption(message) if message.contains("unaligned offset")));
+}
+
+#[test]
 fn buffer_stages_versioned_writeback_without_aliasing_generations() {
     let dir = tempdir().unwrap();
     let device = Device::open(

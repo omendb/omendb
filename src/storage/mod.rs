@@ -5,6 +5,7 @@
 
 mod flush;
 pub mod format;
+mod invariants;
 mod lazy_read;
 mod manifest_store;
 mod materialization;

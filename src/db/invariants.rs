@@ -41,6 +41,8 @@ impl DB {
             ));
         }
 
+        self.engine.validate_handle_state()?;
+
         if self.pending_mutations == 0 {
             if self.pending_wal_bytes != 0 {
                 return Err(Error::Corruption(

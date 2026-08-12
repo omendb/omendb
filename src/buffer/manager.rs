@@ -243,6 +243,84 @@ impl BufferManager {
         stats
     }
 
+    /// Validate the frame/map ownership contract without touching the device.
+    ///
+    /// `page_map` and each frame are one representation of the same cache
+    /// state. Keeping this check here makes the buffer manager the authority
+    /// for that relationship instead of making StorageEngine understand frame
+    /// internals. The check is intentionally read-only so callers can use it
+    /// before a public operation or after a failed write-back.
+    pub(crate) fn validate_invariants(&self) -> std::result::Result<(), String> {
+        if self.stats.total_frames != self.frames.len() {
+            return Err(format!(
+                "buffer statistics report {} frames but manager owns {}",
+                self.stats.total_frames,
+                self.frames.len()
+            ));
+        }
+        if !self.frames.is_empty() && self.clock_hand >= self.frames.len() {
+            return Err(format!(
+                "buffer clock hand {} exceeds frame count {}",
+                self.clock_hand,
+                self.frames.len()
+            ));
+        }
+
+        let mut mapped_frames = vec![false; self.frames.len()];
+        for (&page_key, &frame_index) in &self.page_map {
+            let Some(frame) = self.frames.get(frame_index) else {
+                return Err(format!(
+                    "cache key {:?} points outside frame pool at index {}",
+                    page_key, frame_index
+                ));
+            };
+            if mapped_frames[frame_index] {
+                return Err(format!(
+                    "multiple cache keys point to frame {}",
+                    frame_index
+                ));
+            }
+            if frame.is_free() {
+                return Err(format!(
+                    "cache key {:?} points to free frame {}",
+                    page_key, frame_index
+                ));
+            }
+            if frame.page_key != Some(page_key) {
+                return Err(format!(
+                    "frame {} key does not match cache map entry",
+                    frame_index
+                ));
+            }
+            mapped_frames[frame_index] = true;
+        }
+
+        let free_frames = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(index, frame)| frame.is_free() && !mapped_frames[*index])
+            .count();
+        if free_frames != self.stats.free_frames {
+            return Err(format!(
+                "buffer statistics report {} free frames but manager has {}",
+                self.stats.free_frames, free_frames
+            ));
+        }
+
+        for (index, frame) in self.frames.iter().enumerate() {
+            if frame.is_free() {
+                if frame.page_key.is_some() || frame.pin_count != 0 || frame.pinned {
+                    return Err(format!("free frame {} retains page or pin state", index));
+                }
+            } else if frame.page_key.is_none() {
+                return Err(format!("resident frame {} has no cache key", index));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Fetch a page into the buffer pool and return a guard.
     ///
     /// If the page is already in the pool, return a guard to it (cache hit).
