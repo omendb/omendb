@@ -7,14 +7,16 @@
 //! implementation. It takes artifact images produced by the real publication
 //! path, materializes durable prefixes in a temporary directory, and lets the
 //! normal `DB::open`/`verify`/historical-read paths decide whether each state is
-//! acceptable. A Linux block-layer power-loss harness still has to validate
-//! these assumptions against ext4/XFS and real cache/barrier behavior.
+//! acceptable. The partial-artifact schedule models bounded write/resource
+//! budgets; it does not replace real ENOSPC or block-layer fault injection. A
+//! Linux power-loss harness still has to validate these assumptions against
+//! ext4/XFS and real cache/barrier behavior.
 
 use seerdb::storage::format::{CommitId, SnapshotId};
-use seerdb::{BatchMutation, DB, Options};
+use seerdb::{BatchMutation, DB, Error, Options};
 use std::fs;
 use std::path::{Path, PathBuf};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
@@ -35,44 +37,70 @@ enum Artifact {
     ReuseLedger,
 }
 
-const PUBLICATION_PREFIXES: &[(&str, &[Artifact], bool)] = &[
-    ("old-generation", &[], false),
-    ("manifest-mirror", &[], false),
-    ("data-pages", &[Artifact::Data], false),
-    (
-        "checkpoints",
-        &[Artifact::Data, Artifact::Checkpoints],
-        false,
-    ),
-    (
-        "blob-image",
-        &[Artifact::Data, Artifact::Checkpoints, Artifact::Blob],
-        false,
-    ),
-    (
-        "commit-wal",
-        &[
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedActive {
+    Old,
+    New,
+    OldOrNew,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublicationStep {
+    name: &'static str,
+    artifacts: &'static [Artifact],
+    expected: ExpectedActive,
+}
+
+const PUBLICATION_SCHEDULE: &[PublicationStep] = &[
+    PublicationStep {
+        name: "old-generation",
+        artifacts: &[],
+        expected: ExpectedActive::Old,
+    },
+    PublicationStep {
+        name: "manifest-mirror",
+        artifacts: &[],
+        expected: ExpectedActive::Old,
+    },
+    PublicationStep {
+        name: "data-pages",
+        artifacts: &[Artifact::Data],
+        expected: ExpectedActive::Old,
+    },
+    PublicationStep {
+        name: "checkpoints",
+        artifacts: &[Artifact::Data, Artifact::Checkpoints],
+        expected: ExpectedActive::Old,
+    },
+    PublicationStep {
+        name: "blob-image",
+        artifacts: &[Artifact::Data, Artifact::Checkpoints, Artifact::Blob],
+        expected: ExpectedActive::Old,
+    },
+    PublicationStep {
+        name: "commit-wal",
+        artifacts: &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
             Artifact::Wal,
         ],
-        true,
-    ),
-    (
-        "history-and-wal",
-        &[
+        expected: ExpectedActive::OldOrNew,
+    },
+    PublicationStep {
+        name: "history-and-wal",
+        artifacts: &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
             Artifact::Wal,
             Artifact::ManifestHistory,
         ],
-        true,
-    ),
-    (
-        "candidate-manifest",
-        &[
+        expected: ExpectedActive::OldOrNew,
+    },
+    PublicationStep {
+        name: "candidate-manifest",
+        artifacts: &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
@@ -80,19 +108,19 @@ const PUBLICATION_PREFIXES: &[(&str, &[Artifact], bool)] = &[
             Artifact::ManifestHistory,
             Artifact::Manifest,
         ],
-        false,
-    ),
-    (
-        "wal-retired",
-        &[
+        expected: ExpectedActive::New,
+    },
+    PublicationStep {
+        name: "wal-retired",
+        artifacts: &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
             Artifact::ManifestHistory,
             Artifact::Manifest,
         ],
-        false,
-    ),
+        expected: ExpectedActive::New,
+    },
 ];
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -128,6 +156,7 @@ fn artifact_names(path: &Path, artifact: Artifact) -> Vec<PathBuf> {
             names.push(entry.path());
         }
     }
+    names.sort();
     names
 }
 
@@ -145,7 +174,6 @@ struct StateOracle<'a> {
     retained: SnapshotId,
     old_commit: CommitId,
     new_commit: CommitId,
-    expected_commits: &'a [CommitId],
     old_inline: &'a [u8],
     new_inline: &'a [u8],
     old_blob: &'a [u8],
@@ -154,60 +182,56 @@ struct StateOracle<'a> {
     retained_blob: &'a [u8],
 }
 
-fn assert_state(path: &Path, oracle: &StateOracle<'_>) {
-    for reopen in 0..2 {
-        let mut db = DB::open(path, Options::for_test()).unwrap_or_else(|error| {
-            panic!("modeled publication state failed to open on pass {reopen}: {error}")
-        });
-        let status = db.durability_status();
-        assert!(
-            oracle.expected_commits.contains(&status.commit_id),
-            "unexpected commit {:?} in modeled state",
-            status.commit_id
-        );
-        let (active_inline, active_blob) = if status.commit_id == oracle.new_commit {
-            (oracle.new_inline, oracle.new_blob)
-        } else {
-            assert_eq!(status.commit_id, oracle.old_commit);
-            (oracle.old_inline, oracle.old_blob)
-        };
-        assert_eq!(db.get(b"inline-key").unwrap(), Some(active_inline.to_vec()));
-        assert_eq!(db.get(b"blob-key").unwrap(), Some(active_blob.to_vec()));
-        assert_eq!(
-            db.get_at(oracle.retained, b"inline-key").unwrap(),
-            Some(oracle.retained_inline.to_vec())
-        );
-        assert_eq!(
-            db.get_at(oracle.retained, b"blob-key").unwrap(),
-            Some(oracle.retained_blob.to_vec())
-        );
-        db.verify().unwrap();
-        drop(db);
+struct PublicationFixture {
+    root: TempDir,
+    old: PathBuf,
+    candidate: PathBuf,
+    retained: SnapshotId,
+    old_commit: CommitId,
+    new_commit: CommitId,
+    old_inline: Vec<u8>,
+    new_inline: Vec<u8>,
+    old_blob: Vec<u8>,
+    new_blob: Vec<u8>,
+}
+
+impl PublicationFixture {
+    fn oracle(&self) -> StateOracle<'_> {
+        StateOracle {
+            retained: self.retained,
+            old_commit: self.old_commit,
+            new_commit: self.new_commit,
+            old_inline: &self.old_inline,
+            new_inline: &self.new_inline,
+            old_blob: &self.old_blob,
+            new_blob: &self.new_blob,
+            retained_inline: &self.old_inline,
+            retained_blob: &self.old_blob,
+        }
     }
 }
 
-#[test]
-fn modeled_publication_prefixes_reopen_old_or_complete_new() {
+fn build_fixture() -> PublicationFixture {
     let root = tempdir().unwrap();
     let live = root.path().join("live");
     let old = root.path().join("old");
     let candidate = root.path().join("candidate");
     let recovered = root.path().join("recovered");
-    let retained_inline = b"inline-old".to_vec();
-    let retained_blob = vec![0x11; 4096];
-    let candidate_inline = b"inline-new".to_vec();
-    let candidate_blob = vec![0x22; 4096];
+    let old_inline = b"inline-old".to_vec();
+    let old_blob = vec![0x11; 4096];
+    let new_inline = b"inline-new".to_vec();
+    let new_blob = vec![0x22; 4096];
 
     let retained = {
         let mut db = DB::open(&live, Options::for_test()).unwrap();
         db.commit_batch(&[
             BatchMutation::Put {
                 key: b"inline-key".to_vec(),
-                value: retained_inline.clone(),
+                value: old_inline.clone(),
             },
             BatchMutation::Put {
                 key: b"blob-key".to_vec(),
-                value: retained_blob.clone(),
+                value: old_blob.clone(),
             },
         ])
         .unwrap();
@@ -220,8 +244,8 @@ fn modeled_publication_prefixes_reopen_old_or_complete_new() {
 
     {
         let mut db = DB::open(&live, Options::for_test()).unwrap();
-        db.put(b"inline-key", &candidate_inline).unwrap();
-        db.put(b"blob-key", &candidate_blob).unwrap();
+        db.put(b"inline-key", &new_inline).unwrap();
+        db.put(b"blob-key", &new_blob).unwrap();
         db.inject_after_manifest_failure();
         assert!(db.flush().is_err());
         drop(db);
@@ -246,36 +270,226 @@ fn modeled_publication_prefixes_reopen_old_or_complete_new() {
         .commit_id;
     assert!(new_commit > old_commit);
 
-    for (name, artifacts, allow_old_or_new) in PUBLICATION_PREFIXES {
-        let materialized = root.path().join(name);
-        copy_tree(&old, &materialized);
-        for artifact in *artifacts {
-            replace_artifact(&materialized, &candidate, *artifact);
-        }
+    PublicationFixture {
+        root,
+        old,
+        candidate,
+        retained,
+        old_commit,
+        new_commit,
+        old_inline,
+        new_inline,
+        old_blob,
+        new_blob,
+    }
+}
 
-        let expected_commits = if *allow_old_or_new {
-            &[old_commit, new_commit][..]
-        } else if matches!(
-            *name,
-            "old-generation" | "manifest-mirror" | "data-pages" | "checkpoints" | "blob-image"
-        ) {
-            &[old_commit][..]
-        } else {
-            &[new_commit][..]
-        };
-        let oracle = StateOracle {
-            retained,
-            old_commit,
-            new_commit,
-            expected_commits,
-            old_inline: &retained_inline,
-            new_inline: &candidate_inline,
-            old_blob: &retained_blob,
-            new_blob: &candidate_blob,
-            retained_inline: &retained_inline,
-            retained_blob: &retained_blob,
-        };
-        assert_state(&materialized, &oracle);
+#[derive(Clone, Debug)]
+struct PartialArtifactCase {
+    artifact: Artifact,
+    file_name: String,
+    bytes: usize,
+}
+
+fn partial_artifact_cases(candidate: &Path) -> Vec<PartialArtifactCase> {
+    let artifacts = [
+        Artifact::Data,
+        Artifact::Checkpoints,
+        Artifact::Blob,
+        Artifact::Wal,
+        Artifact::ManifestHistory,
+        Artifact::Manifest,
+        Artifact::ReuseLedger,
+    ];
+    let mut cases = Vec::new();
+    for artifact in artifacts {
+        for path in artifact_names(candidate, artifact).into_iter().take(2) {
+            let length = fs::metadata(&path).unwrap().len() as usize;
+            let mut budgets = vec![0, 1, length / 2, length.saturating_sub(1)];
+            budgets.sort_unstable();
+            budgets.dedup();
+            for bytes in budgets.into_iter().filter(|bytes| *bytes < length) {
+                cases.push(PartialArtifactCase {
+                    artifact,
+                    file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    bytes,
+                });
+            }
+        }
+    }
+    cases
+}
+
+fn replace_partial_artifact(materialized: &Path, candidate: &Path, case: &PartialArtifactCase) {
+    for path in artifact_names(materialized, case.artifact) {
+        fs::remove_file(path).unwrap();
+    }
+    let source = candidate.join(&case.file_name);
+    let bytes = fs::read(source).unwrap();
+    fs::write(materialized.join(&case.file_name), &bytes[..case.bytes]).unwrap();
+}
+
+struct PublicationSimulator<'a> {
+    fixture: &'a PublicationFixture,
+}
+
+impl<'a> PublicationSimulator<'a> {
+    fn new(fixture: &'a PublicationFixture) -> Self {
+        Self { fixture }
+    }
+
+    fn materialize_prefix(&self, index: usize, step: PublicationStep) -> PathBuf {
+        let path = self
+            .fixture
+            .root
+            .path()
+            .join(format!("publication-prefix-{index}-{}", step.name));
+        copy_tree(&self.fixture.old, &path);
+        for artifact in step.artifacts {
+            replace_artifact(&path, &self.fixture.candidate, *artifact);
+        }
+        path
+    }
+
+    fn materialize_partial(&self, index: usize, case: &PartialArtifactCase) -> PathBuf {
+        let path = self
+            .fixture
+            .root
+            .path()
+            .join(format!("publication-partial-{index}-{:?}", case.artifact));
+        copy_tree(&self.fixture.old, &path);
+        replace_partial_artifact(&path, &self.fixture.candidate, case);
+        path
+    }
+}
+
+fn verify_state(path: &Path, oracle: &StateOracle<'_>) -> Result<CommitId, Error> {
+    let mut db = DB::open(path, Options::for_test())?;
+    let commit = db.durability_status().commit_id;
+    assert!(
+        commit == oracle.old_commit || commit == oracle.new_commit,
+        "unexpected commit {commit:?} in modeled state"
+    );
+    let (active_inline, active_blob) = if commit == oracle.new_commit {
+        (oracle.new_inline, oracle.new_blob)
+    } else {
+        (oracle.old_inline, oracle.old_blob)
+    };
+    assert_eq!(db.get(b"inline-key")?, Some(active_inline.to_vec()));
+    assert_eq!(db.get(b"blob-key")?, Some(active_blob.to_vec()));
+    assert_eq!(
+        db.get_at(oracle.retained, b"inline-key")?,
+        Some(oracle.retained_inline.to_vec())
+    );
+    assert_eq!(
+        db.get_at(oracle.retained, b"blob-key")?,
+        Some(oracle.retained_blob.to_vec())
+    );
+    db.verify()?;
+    drop(db);
+    Ok(commit)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalKind {
+    Io,
+    Corruption,
+    Check,
+    NeedsRecovery,
+    Wal,
+    Snapshot,
+    Resource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryOutcome {
+    Committed(CommitId),
+    Refused(RefusalKind),
+}
+
+fn classify_refusal(error: &Error) -> RefusalKind {
+    match error {
+        Error::Io(_) => RefusalKind::Io,
+        Error::Corruption(_) => RefusalKind::Corruption,
+        Error::Check { .. } => RefusalKind::Check,
+        Error::NeedsRecovery(_) => RefusalKind::NeedsRecovery,
+        Error::Wal(_) => RefusalKind::Wal,
+        Error::SnapshotUnavailable(_) => RefusalKind::Snapshot,
+        Error::DiskFull | Error::CapacityPreflight | Error::Backpressure { .. } => {
+            RefusalKind::Resource
+        }
+        other => panic!("unexpected refusal for partial publication artifact: {other}"),
+    }
+}
+
+fn replay_twice(path: &Path, oracle: &StateOracle<'_>) -> RecoveryOutcome {
+    let first = verify_state(path, oracle);
+    let second = verify_state(path, oracle);
+    match (first, second) {
+        (Ok(first), Ok(second)) => {
+            assert_eq!(first, second, "recovery changed commit identity on reopen");
+            RecoveryOutcome::Committed(first)
+        }
+        (Err(first), Err(second)) => {
+            let first = classify_refusal(&first);
+            let second = classify_refusal(&second);
+            assert_eq!(first, second, "recovery refusal changed on reopen");
+            RecoveryOutcome::Refused(first)
+        }
+        (first, second) => {
+            panic!("recovery was not deterministic: first={first:?}, second={second:?}")
+        }
+    }
+}
+
+fn assert_state(path: &Path, oracle: &StateOracle<'_>, expected: ExpectedActive) {
+    let outcome = replay_twice(path, oracle);
+    let RecoveryOutcome::Committed(commit) = outcome else {
+        panic!("publication prefix refused unexpectedly: {outcome:?}");
+    };
+    match expected {
+        ExpectedActive::Old => assert_eq!(commit, oracle.old_commit),
+        ExpectedActive::New => assert_eq!(commit, oracle.new_commit),
+        ExpectedActive::OldOrNew => {
+            assert!(commit == oracle.old_commit || commit == oracle.new_commit)
+        }
+    }
+}
+
+#[test]
+fn modeled_publication_prefixes_reopen_old_or_complete_new() {
+    let fixture = build_fixture();
+    let oracle = fixture.oracle();
+    let simulator = PublicationSimulator::new(&fixture);
+
+    for (index, step) in PUBLICATION_SCHEDULE.iter().copied().enumerate() {
+        let materialized = simulator.materialize_prefix(index, step);
+        assert_state(&materialized, &oracle, step.expected);
+    }
+}
+
+#[test]
+fn modeled_partial_artifact_schedules_reopen_whole_or_refuse() {
+    let fixture = build_fixture();
+    let oracle = fixture.oracle();
+    let simulator = PublicationSimulator::new(&fixture);
+    let cases = partial_artifact_cases(&fixture.candidate);
+    assert!(
+        !cases.is_empty(),
+        "fixture must contain publication artifacts"
+    );
+
+    for (index, case) in cases.iter().enumerate() {
+        let materialized = simulator.materialize_partial(index, case);
+        match replay_twice(&materialized, &oracle) {
+            RecoveryOutcome::Committed(commit) => assert!(
+                commit == fixture.old_commit || commit == fixture.new_commit,
+                "partial artifact {:?} at {} bytes produced unexpected commit {commit:?}",
+                case,
+                case.bytes,
+            ),
+            RecoveryOutcome::Refused(_) => {}
+        }
     }
 }
 
