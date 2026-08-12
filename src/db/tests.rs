@@ -285,6 +285,13 @@ fn test_db_close_publishes_pending_wal_and_releases_writer() {
     db.put(b"key", b"value").unwrap();
     assert!(path.join(WAL_FILE).is_file());
 
+    db.inject_capacity_limit(0);
+    assert!(matches!(db.close(), Err(Error::CapacityPreflight)));
+    assert_eq!(db.durability_status().pending_mutations, 1);
+    assert!(!db.durability_status().write_fenced);
+    assert!(path.join(WAL_FILE).is_file());
+
+    db.inject_capacity_limit(u64::MAX);
     db.close().unwrap();
 
     assert!(!path.join(WAL_FILE).exists());
