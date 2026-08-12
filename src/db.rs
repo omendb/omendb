@@ -32,6 +32,8 @@ mod history_prune;
 mod invariants;
 #[path = "db/metadata.rs"]
 mod metadata;
+#[path = "db/metadata_codec.rs"]
+mod metadata_codec;
 mod mutation;
 #[path = "db/open.rs"]
 mod open;
@@ -58,7 +60,7 @@ mod vacuum;
 mod wal_recovery;
 
 #[cfg(test)]
-use metadata::{MAX_META_DELTA_CHAIN, META_DELTA_MAGIC, META_MAGIC};
+use metadata_codec::{MAX_META_DELTA_CHAIN, META_DELTA_MAGIC, META_MAGIC};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use artifact_io::atomic_write_reserved;

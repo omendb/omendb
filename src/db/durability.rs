@@ -9,7 +9,7 @@ use super::artifact_io::{
     atomic_write, atomic_write_without_directory_sync, atomic_write_without_fault_injection,
     sync_directory,
 };
-use super::metadata::{META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_MAGIC};
+use super::metadata_codec::{META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_MAGIC};
 use super::wal_recovery::extend_digest;
 use super::{
     BLOB_RESERVATION_FILE, DB, Error, MANIFEST_HISTORY_FILE, META_FILE,
