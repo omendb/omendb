@@ -1,72 +1,21 @@
-//! Segmented blob catalog encoding, replay, and persisted-frontier state.
+//! Segmented blob catalog frontier and replay state.
 //!
-//! This module owns the SEERBLC1 anchor and SEERBCD1 delta protocols. The
-//! parent `BlobManager` remains the authority for live blob files and GC;
-//! this module owns the segmented catalog representation and durable
-//! frontier bookkeeping.
+//! The versioned SEERBLC1/SEERBCD1 byte protocols live in
+//! [`super::segment_catalog_format`]. The parent `BlobManager` remains the
+//! authority for live blob files and GC; this module owns catalog projection,
+//! durable frontier bookkeeping, and replay into live state.
 
 use super::cursor::Cursor;
+use super::segment_catalog_format::{
+    self, MAX_SEGMENT_CATALOG_DELTAS, SEGMENT_CATALOG_MAGIC, SEGMENT_CATALOG_VERSION,
+    SegmentCatalogDelta, SegmentCatalogDeltaEntry,
+};
 use super::{BlobFile, BlobManager, BlobRecord, DEFAULT_SEGMENT_TARGET_SIZE};
 use crate::btree::node::BlobPointer;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-const SEGMENT_CATALOG_MAGIC: [u8; 8] = *b"SEERBLC1";
-const SEGMENT_CATALOG_VERSION: u32 = 1;
-const SEGMENT_CATALOG_DELTA_MAGIC: [u8; 8] = *b"SEERBCD1";
-const SEGMENT_CATALOG_DELTA_VERSION: u32 = 1;
-const MAX_SEGMENT_CATALOG_DELTAS: u32 = 64;
-
-#[derive(Debug)]
-enum SegmentCatalogDeltaEntry {
-    Upsert {
-        file_id: u32,
-        data_len: u64,
-        deleted_offsets: Vec<u64>,
-    },
-    Remove {
-        file_id: u32,
-    },
-}
-
-#[derive(Debug)]
-struct SegmentCatalogDelta {
-    generation_id: u64,
-    parent_generation_id: u64,
-    entries: Vec<SegmentCatalogDeltaEntry>,
-}
-
-pub(super) fn is_segment_catalog(buf: &[u8]) -> bool {
-    buf.starts_with(&SEGMENT_CATALOG_MAGIC)
-}
-
 impl BlobManager {
-    /// Return the checksummed catalog for the segmented layout. Record bytes
-    /// are deliberately absent: the catalog names a prefix of each segment
-    /// and stores only deletion metadata needed by the active root.
-    pub(crate) fn to_segment_catalog_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&SEGMENT_CATALOG_MAGIC);
-        buf.extend_from_slice(&SEGMENT_CATALOG_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(self.threshold as u64).to_le_bytes());
-        buf.extend_from_slice(&self.generation_id.to_le_bytes());
-        buf.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
-        for file in &self.files {
-            buf.extend_from_slice(&file.file_id().to_le_bytes());
-            buf.extend_from_slice(&(file.to_bytes().len() as u64).to_le_bytes());
-            let deleted_offsets: Vec<_> = file.deleted_offsets().collect();
-            buf.extend_from_slice(&(deleted_offsets.len() as u32).to_le_bytes());
-            for offset in deleted_offsets {
-                buf.extend_from_slice(&offset.to_le_bytes());
-            }
-        }
-        let total_length = buf.len().saturating_add(12) as u64;
-        buf.extend_from_slice(&total_length.to_le_bytes());
-        let checksum = crc32c::crc32c(&buf);
-        buf.extend_from_slice(&checksum.to_le_bytes());
-        buf
-    }
-
     fn segment_catalog_delta_entries(&self) -> Option<Vec<SegmentCatalogDeltaEntry>> {
         let mut file_ids = BTreeSet::new();
         file_ids.extend(self.files.iter().map(|file| file.file_id()));
@@ -110,182 +59,7 @@ impl BlobManager {
     /// authoritative manifest still points at the previous generation.
     pub(crate) fn to_segment_catalog_delta_bytes(&self) -> Option<Vec<u8>> {
         let entries = self.segment_catalog_delta_entries()?;
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&SEGMENT_CATALOG_DELTA_MAGIC);
-        buf.extend_from_slice(&SEGMENT_CATALOG_DELTA_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&self.generation_id.to_le_bytes());
-        buf.extend_from_slice(&self.persisted_generation_id.to_le_bytes());
-        buf.extend_from_slice(&u32::try_from(entries.len()).ok()?.to_le_bytes());
-        for entry in entries {
-            match entry {
-                SegmentCatalogDeltaEntry::Upsert {
-                    file_id,
-                    data_len,
-                    deleted_offsets,
-                } => {
-                    buf.extend_from_slice(&file_id.to_le_bytes());
-                    buf.extend_from_slice(&0u32.to_le_bytes());
-                    buf.extend_from_slice(&data_len.to_le_bytes());
-                    buf.extend_from_slice(
-                        &u32::try_from(deleted_offsets.len()).ok()?.to_le_bytes(),
-                    );
-                    for offset in deleted_offsets {
-                        buf.extend_from_slice(&offset.to_le_bytes());
-                    }
-                }
-                SegmentCatalogDeltaEntry::Remove { file_id } => {
-                    buf.extend_from_slice(&file_id.to_le_bytes());
-                    buf.extend_from_slice(&1u32.to_le_bytes());
-                }
-            }
-        }
-        let frame_length = u64::try_from(buf.len().checked_add(4)?).ok()?;
-        buf[12..20].copy_from_slice(&frame_length.to_le_bytes());
-        let checksum = crc32c::crc32c(&buf);
-        buf.extend_from_slice(&checksum.to_le_bytes());
-        Some(buf)
-    }
-
-    /// Return the valid prefix of an append-only delta log. A short, torn, or
-    /// corrupt suffix is intentionally excluded from the prefix so the next
-    /// writer can truncate it before appending a new frame.
-    pub(crate) fn segment_catalog_delta_prefix_len(buf: &[u8]) -> Option<usize> {
-        let mut position = 0usize;
-        while position < buf.len() {
-            let remaining = buf.len().checked_sub(position)?;
-            if remaining < 44 {
-                break;
-            }
-            let frame = buf.get(position..)?;
-            if frame.get(..8)? != SEGMENT_CATALOG_DELTA_MAGIC
-                || u32::from_le_bytes(frame.get(8..12)?.try_into().ok()?)
-                    != SEGMENT_CATALOG_DELTA_VERSION
-            {
-                break;
-            }
-            let frame_length =
-                usize::try_from(u64::from_le_bytes(frame.get(12..20)?.try_into().ok()?)).ok()?;
-            if !(44..=remaining).contains(&frame_length) {
-                break;
-            }
-            let frame = frame.get(..frame_length)?;
-            let stored_checksum =
-                u32::from_le_bytes(frame.get(frame_length - 4..)?.try_into().ok()?);
-            if stored_checksum != crc32c::crc32c(frame.get(..frame_length - 4)?) {
-                break;
-            }
-            if Self::parse_segment_catalog_delta_frame(frame).is_none() {
-                break;
-            }
-            position = position.checked_add(frame_length)?;
-        }
-        Some(position)
-    }
-
-    /// Return the valid delta-log prefix that does not advance beyond the
-    /// authoritative catalog generation. A failed publication can leave a
-    /// complete future frame behind; the next writer must discard that
-    /// abandoned branch before appending a retry for the same generation.
-    pub(crate) fn segment_catalog_delta_prefix_len_through_generation(
-        buf: &[u8],
-        generation_id: u64,
-    ) -> Option<usize> {
-        let prefix = Self::segment_catalog_delta_prefix_len(buf)?;
-        let mut position = 0usize;
-        while position < prefix {
-            let frame_length = usize::try_from(u64::from_le_bytes(
-                buf.get(position + 12..position + 20)?.try_into().ok()?,
-            ))
-            .ok()?;
-            let end = position.checked_add(frame_length)?;
-            let frame = Self::parse_segment_catalog_delta_frame(buf.get(position..end)?)?;
-            if frame.generation_id > generation_id {
-                break;
-            }
-            position = end;
-        }
-        Some(position)
-    }
-
-    fn parse_segment_catalog_delta_frame(buf: &[u8]) -> Option<SegmentCatalogDelta> {
-        if buf.len() < 44
-            || buf.get(..8)? != SEGMENT_CATALOG_DELTA_MAGIC
-            || u32::from_le_bytes(buf.get(8..12)?.try_into().ok()?) != SEGMENT_CATALOG_DELTA_VERSION
-            || usize::try_from(u64::from_le_bytes(buf.get(12..20)?.try_into().ok()?)).ok()?
-                != buf.len()
-        {
-            return None;
-        }
-        let stored_checksum = u32::from_le_bytes(buf.get(buf.len() - 4..)?.try_into().ok()?);
-        if stored_checksum != crc32c::crc32c(buf.get(..buf.len() - 4)?) {
-            return None;
-        }
-
-        let generation_id = u64::from_le_bytes(buf.get(20..28)?.try_into().ok()?);
-        let parent_generation_id = u64::from_le_bytes(buf.get(28..36)?.try_into().ok()?);
-        let entry_count =
-            usize::try_from(u32::from_le_bytes(buf.get(36..40)?.try_into().ok()?)).ok()?;
-        let mut cursor = Cursor::new(buf.get(40..buf.len() - 4)?);
-        let mut entries = Vec::with_capacity(entry_count);
-        let mut previous_file_id = 0u32;
-        for _ in 0..entry_count {
-            let file_id = cursor.u32()?;
-            if file_id == 0 || file_id <= previous_file_id {
-                return None;
-            }
-            previous_file_id = file_id;
-            match cursor.u32()? {
-                0 => {
-                    let data_len = cursor.u64()?;
-                    let deleted_count = usize::try_from(cursor.u32()?).ok()?;
-                    if deleted_count > cursor.remaining() / std::mem::size_of::<u64>() {
-                        return None;
-                    }
-                    let mut deleted_offsets = Vec::with_capacity(deleted_count);
-                    let mut previous_offset = None;
-                    for _ in 0..deleted_count {
-                        let offset = cursor.u64()?;
-                        if previous_offset.is_some_and(|previous| offset <= previous) {
-                            return None;
-                        }
-                        previous_offset = Some(offset);
-                        deleted_offsets.push(offset);
-                    }
-                    entries.push(SegmentCatalogDeltaEntry::Upsert {
-                        file_id,
-                        data_len,
-                        deleted_offsets,
-                    });
-                }
-                1 => entries.push(SegmentCatalogDeltaEntry::Remove { file_id }),
-                _ => return None,
-            }
-        }
-        cursor.finish()?;
-        Some(SegmentCatalogDelta {
-            generation_id,
-            parent_generation_id,
-            entries,
-        })
-    }
-
-    fn parse_segment_catalog_delta_log(buf: &[u8]) -> Option<Vec<SegmentCatalogDelta>> {
-        let prefix = Self::segment_catalog_delta_prefix_len(buf)?;
-        let mut position = 0usize;
-        let mut deltas = Vec::new();
-        while position < prefix {
-            let frame_length = usize::try_from(u64::from_le_bytes(
-                buf.get(position + 12..position + 20)?.try_into().ok()?,
-            ))
-            .ok()?;
-            let end = position.checked_add(frame_length)?;
-            deltas.push(Self::parse_segment_catalog_delta_frame(
-                buf.get(position..end)?,
-            )?);
-            position = end;
-        }
-        Some(deltas)
+        segment_catalog_format::encode_segment_catalog_delta(self, &entries)
     }
 
     /// Return the current serialized bytes for one segment. The caller can
@@ -400,7 +174,7 @@ impl BlobManager {
         if target_generation < manager.generation_id {
             return None;
         }
-        let deltas = Self::parse_segment_catalog_delta_log(delta_log)?;
+        let deltas = segment_catalog_format::parse_segment_catalog_delta_log(delta_log)?;
         let mut path = Vec::new();
         let mut current_generation = target_generation;
         let mut visited = HashSet::new();

@@ -14,6 +14,8 @@ mod cursor;
 mod image_format;
 #[path = "segment_catalog.rs"]
 mod segment_catalog;
+#[path = "segment_catalog_format.rs"]
+mod segment_catalog_format;
 
 /// Default threshold for blob separation (1KB).
 pub const DEFAULT_BLOB_THRESHOLD: usize = 1024;
@@ -116,7 +118,7 @@ impl BlobManager {
     }
 
     pub(crate) fn is_segment_catalog(buf: &[u8]) -> bool {
-        segment_catalog::is_segment_catalog(buf)
+        segment_catalog_format::is_segment_catalog(buf)
     }
 
     /// Get the blob threshold.
