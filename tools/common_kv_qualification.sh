@@ -190,10 +190,6 @@ run_benchmark() {
     local output_path="$output_dir/runs/$label.json"
     local stdout_path="$output_dir/runs/$label.stdout"
     local trace_path="$output_dir/traces/$workload.json"
-    local trace_args=()
-    if [[ ! -e "$trace_path" ]]; then
-        trace_args=(--trace-output "$trace_path")
-    fi
 
     echo "common_kv_qualification: run $label" >&2
     run_with_prefix "$binary" \
@@ -202,7 +198,7 @@ run_benchmark() {
         --durability durable \
         --path "$db_path" \
         --output "$output_path" \
-        "${trace_args[@]}" \
+        --trace-output "$trace_path" \
         --keys "$keys" \
         --operations "$operations" \
         --batch-size "$batch_size" \
