@@ -66,6 +66,26 @@ impl DB {
                 kind: CheckFailureKind::Wal,
                 message,
             },
+            Error::Wal(message) => Error::Check {
+                kind: CheckFailureKind::Wal,
+                message,
+            },
+            Error::Blob(error) => Error::Check {
+                kind: CheckFailureKind::Blob,
+                message: error.to_string(),
+            },
+            Error::Buffer(message) => Error::Check {
+                kind: CheckFailureKind::Runtime,
+                message,
+            },
+            Error::BTree(message) => Error::Check {
+                kind: CheckFailureKind::Structure,
+                message,
+            },
+            Error::SnapshotUnavailable(message) => Error::Check {
+                kind: CheckFailureKind::Checkpoint,
+                message,
+            },
             Error::Corruption(message) => Error::Check {
                 kind: default_kind,
                 message,

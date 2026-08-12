@@ -223,6 +223,61 @@ fn test_check_classifies_runtime_storage_state_failures() {
 }
 
 #[test]
+fn test_check_classifies_nested_owner_failures() {
+    let cases = [
+        (
+            Error::Wal("invalid recovery frontier".into()),
+            CheckFailureKind::Wal,
+        ),
+        (
+            Error::Buffer("pinned frame".into()),
+            CheckFailureKind::Runtime,
+        ),
+        (
+            Error::BTree("malformed routing".into()),
+            CheckFailureKind::Structure,
+        ),
+        (
+            Error::SnapshotUnavailable("retained checkpoint is unavailable".into()),
+            CheckFailureKind::Checkpoint,
+        ),
+    ];
+
+    for (error, expected_kind) in cases {
+        assert!(matches!(
+            DB::map_check_error(CheckFailureKind::Format, error),
+            Error::Check { kind, .. } if kind == expected_kind
+        ));
+    }
+}
+
+#[test]
+fn test_check_classifies_unavailable_retained_checkpoint() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("unavailable-retained-checkpoint.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"retained", b"value").unwrap();
+    db.flush().unwrap();
+    db.retain_commit(db.durability_status().commit_id).unwrap();
+    db.close().unwrap();
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path.join(DATA_FILE))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    assert!(matches!(
+        DB::check(&path, Options::default()),
+        Err(Error::Check {
+            kind: CheckFailureKind::Checkpoint,
+            message
+        }) if message.contains("beyond the data file")
+    ));
+}
+
+#[test]
 fn test_db_put_get() {
     let dir = tempdir().unwrap();
     let mut db = DB::open(dir.path().join("test.db"), Options::default()).unwrap();
