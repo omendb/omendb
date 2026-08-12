@@ -26,6 +26,8 @@ mod durability;
 mod faults;
 #[path = "db/history_prune.rs"]
 mod history_prune;
+#[path = "db/invariants.rs"]
+mod invariants;
 #[path = "db/metadata.rs"]
 mod metadata;
 mod mutation;
@@ -633,7 +635,7 @@ impl DB {
         if !self.is_open {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        Ok(())
+        self.validate_runtime_state()
     }
 
     /// Reject ordinary reads after a failed publication until reopen restores

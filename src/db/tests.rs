@@ -245,6 +245,22 @@ fn test_db_close() {
 }
 
 #[test]
+fn test_db_runtime_invariants_cover_pending_generation_lifecycle() {
+    let dir = tempdir().unwrap();
+    let mut db = DB::open(dir.path().join("invariants.db"), Options::default()).unwrap();
+
+    assert!(db.validate_runtime_state().is_ok());
+    db.put(b"key", b"value").unwrap();
+    assert!(db.validate_runtime_state().is_ok());
+    db.flush().unwrap();
+    assert!(db.validate_runtime_state().is_ok());
+
+    db.pending_wal_bytes = 1;
+    let error = db.get(b"key").unwrap_err();
+    assert!(matches!(error, Error::Corruption(message) if message.contains("pending WAL bytes")));
+}
+
+#[test]
 fn test_db_meta_persistence() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
