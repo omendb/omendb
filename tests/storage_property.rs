@@ -5,7 +5,7 @@
 use proptest::prelude::*;
 #[cfg(feature = "fault-injection")]
 use seerdb::Error;
-use seerdb::{BatchMutation, BlobStorageMode, DB, Options};
+use seerdb::{BatchMutation, BatchTransactionState, BlobStorageMode, DB, Options};
 use std::collections::BTreeMap;
 #[cfg(feature = "fault-injection")]
 use std::fs;
@@ -483,6 +483,99 @@ fn assert_snapshot_matches_model(db: &DB, snapshot_id: seerdb::SnapshotId, model
     );
     for (key, value) in model {
         assert_eq!(db.get_at(snapshot_id, key).unwrap(), Some(value.clone()));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 8,
+        max_shrink_iters: 1_000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn batch_transactions_preserve_overlay_and_commit_model(
+        transactions in prop::collection::vec(
+            (
+                prop::collection::vec(
+                    (1u8..32, prop::collection::vec(any::<u8>(), 0..256), any::<bool>()),
+                    0..7
+                ),
+                any::<bool>()
+            ),
+            1..16
+        )
+    ) {
+        for segmented in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("transaction-property.db");
+            let options = Options {
+                blob_storage: if segmented {
+                    BlobStorageMode::Segmented
+                } else {
+                    BlobStorageMode::WholeImage
+                },
+                ..Options::default()
+            };
+            let mut db = DB::create(&path, options.clone()).unwrap();
+            let blob_key = key(0);
+            let blob_value = vec![0xB6; 2_048];
+            db.commit_batch(&[BatchMutation::Put {
+                key: blob_key.clone(),
+                value: blob_value.clone(),
+            }])
+            .unwrap();
+            let mut model = Model::from([(blob_key, blob_value)]);
+
+            for (index, (staged, should_commit)) in transactions.iter().enumerate() {
+                let mut transaction = db.begin_batch_transaction().unwrap();
+                let mut overlay = model.clone();
+
+                for (key_id, value, is_put) in staged {
+                    let mutation_key = key(*key_id);
+                    if *is_put {
+                        transaction.put(&mutation_key, value).unwrap();
+                        overlay.insert(mutation_key.clone(), value.clone());
+                    } else {
+                        transaction.delete(&mutation_key).unwrap();
+                        overlay.remove(&mutation_key);
+                    }
+                    assert_eq!(
+                        transaction.get(&db, &mutation_key).unwrap(),
+                        overlay.get(&mutation_key).cloned()
+                    );
+                    assert_eq!(
+                        transaction
+                            .range(&db, b"property-key-000", b"property-key-999")
+                            .unwrap(),
+                        model_range(&overlay, b"property-key-000", b"property-key-999")
+                    );
+                }
+
+                if *should_commit {
+                    transaction.commit(&mut db).unwrap();
+                    assert_eq!(transaction.state(), BatchTransactionState::Committed);
+                    model = overlay;
+                } else {
+                    transaction.abort().unwrap();
+                    assert_eq!(transaction.state(), BatchTransactionState::Aborted);
+                }
+
+                assert_matches_model(&db, &model);
+                if index % 4 == 3 {
+                    db.verify().unwrap();
+                    db.close().unwrap();
+                    db = DB::open(&path, options.clone()).unwrap();
+                    db.verify().unwrap();
+                    assert_matches_model(&db, &model);
+                }
+            }
+
+            db.close().unwrap();
+            let mut reopened = DB::open(&path, options).unwrap();
+            assert_matches_model(&reopened, &model);
+            reopened.verify().unwrap();
+        }
     }
 }
 
