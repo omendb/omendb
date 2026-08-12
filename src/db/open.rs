@@ -40,7 +40,13 @@ impl DB {
                 // newly created database directory while retaining its files.
                 sync_directory_chain(path.parent().unwrap_or_else(|| Path::new(".")))?;
             }
-            OpenMode::Normal if !path.exists() => fs::create_dir_all(&path)?,
+            OpenMode::Normal if !path.exists() => {
+                fs::create_dir_all(&path)?;
+                // `open` is also an open-or-create API. Keep its creation
+                // boundary as durable as `create` when nested parents were
+                // materialized by `create_dir_all`.
+                sync_directory_chain(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            }
             OpenMode::Check | OpenMode::Normal => {}
         }
 

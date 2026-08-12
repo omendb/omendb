@@ -21,6 +21,22 @@ fn test_db_open() {
 }
 
 #[test]
+fn test_db_open_creates_nested_path_and_reopens() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nested").join("database.db");
+
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_db_rejects_zero_frame_buffer_pool_before_creating_path() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("invalid-options.db");
