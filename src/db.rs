@@ -5,6 +5,8 @@
 
 #[path = "db/archive.rs"]
 mod archive;
+#[path = "db/blob_layout.rs"]
+mod blob_layout;
 #[path = "db/blob_publication.rs"]
 mod blob_publication;
 #[path = "db/blob_read_view.rs"]
@@ -34,6 +36,13 @@ mod wal_recovery;
 use metadata::{MAX_META_DELTA_CHAIN, META_DELTA_MAGIC};
 use metadata::{META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_MAGIC};
 
+#[cfg(test)]
+use blob_layout::MAX_SEGMENTED_CATALOG_DELETED_ENTRIES;
+use blob_layout::{
+    BLOB_DELTA_FILE, BLOB_FILE, BLOB_RESERVATION_FILE, BLOB_REWRITE_BACKUP_FILE,
+    BLOB_SEGMENT_PREFIX, blob_segment_path, blob_storage_size, parse_blob_catalog,
+    retained_blob_path, segmented_catalog_needs_consolidation,
+};
 use blob_read_view::BlobReadView;
 use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
@@ -62,7 +71,7 @@ use crate::storage::format::{
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
 use retention::{RetentionLease, RetentionState};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -101,11 +110,6 @@ thread_local! {
 
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
-const BLOB_FILE: &str = "seerdb.blob";
-const BLOB_DELTA_FILE: &str = "seerdb.blob.delta";
-const BLOB_SEGMENT_PREFIX: &str = "seerdb.blob.segment.";
-const BLOB_RESERVATION_FILE: &str = "seerdb.blob.reserve";
-const BLOB_REWRITE_BACKUP_FILE: &str = "seerdb.blob.rewrite-old";
 const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
@@ -115,102 +119,9 @@ const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
-/// Maximum accumulated deletion offsets before explicit segmented catalog
-/// consolidation is requested by `DB::gc()`.
-const MAX_SEGMENTED_CATALOG_DELETED_ENTRIES: usize = 4096;
 const WAL_RESERVATION_SEGMENT_BYTES: u64 = 1024 * 1024;
 const WAL_COMMIT_RECORD_BYTES: u64 = (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
 const PUBLICATION_CAPACITY_SAFETY_BYTES: u64 = 8 * PAGE_SIZE as u64;
-
-fn retained_blob_path(path: &Path, snapshot_id: SnapshotId) -> PathBuf {
-    path.join(format!("{BLOB_FILE}.retained.{}", snapshot_id.get()))
-}
-
-fn blob_segment_path(path: &Path, file_id: u32) -> PathBuf {
-    path.join(format!("{BLOB_SEGMENT_PREFIX}{file_id:010}"))
-}
-
-fn read_blob_segments(path: &Path) -> Result<HashMap<u32, Vec<u8>>> {
-    let mut segments = HashMap::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(suffix) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix(BLOB_SEGMENT_PREFIX))
-        else {
-            continue;
-        };
-        let file_id = suffix
-            .parse::<u32>()
-            .map_err(|_| Error::Corruption("blob segment has an invalid file ID".into()))?;
-        if file_id == 0
-            || file_id == u32::MAX
-            || segments.insert(file_id, fs::read(entry.path())?).is_some()
-        {
-            return Err(Error::Corruption(
-                "blob segment IDs are invalid or duplicated".into(),
-            ));
-        }
-    }
-    Ok(segments)
-}
-
-fn parse_blob_catalog(
-    path: &Path,
-    bytes: &[u8],
-    target_generation: Option<u64>,
-) -> Result<Option<BlobManager>> {
-    if BlobManager::is_segment_catalog(bytes) {
-        let segments = read_blob_segments(path)?;
-        let delta_log = match fs::read(path.join(BLOB_DELTA_FILE)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let parsed = BlobManager::from_segment_catalog_with_delta_log(
-            bytes,
-            &segments,
-            &delta_log,
-            target_generation,
-        );
-        Ok(parsed)
-    } else {
-        Ok(BlobManager::from_bytes(bytes))
-    }
-}
-
-fn blob_storage_size(path: &Path) -> Result<u64> {
-    let mut total = match fs::metadata(path.join(BLOB_FILE)) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(BLOB_SEGMENT_PREFIX)
-        {
-            total = total.saturating_add(entry.metadata()?.len());
-        }
-    }
-    if let Ok(metadata) = fs::metadata(path.join(BLOB_DELTA_FILE)) {
-        total = total.saturating_add(metadata.len());
-    }
-    Ok(total)
-}
-
-fn segmented_catalog_needs_consolidation(blobs: &BlobManager) -> bool {
-    blobs.is_segmented()
-        && (blobs.total_deleted_entries() > MAX_SEGMENTED_CATALOG_DELETED_ENTRIES
-            || blobs.catalog_needs_consolidation())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenMode {

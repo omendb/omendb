@@ -6,6 +6,7 @@
 //! mutable blob image and catalog.
 
 use super::*;
+use std::collections::HashMap;
 
 pub(super) struct BlobReadView {
     files: HashMap<u32, File>,
