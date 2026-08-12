@@ -107,6 +107,32 @@ faulted-process refusal, old/complete-new or complete-prefix recovery, stable
 two-reopen verification, and the fact that resource equivalence was not
 collected.
 
+After either fault harness completes, use `tools/common_kv_compare.py` to turn
+the combined multi-engine manifest into a pairwise differential report:
+
+```bash
+python3 tools/common_kv_compare.py \
+  --manifest /tmp/seerdb-common-kv-faults/manifest.json \
+  --require-engines seerdb,fjall,rocksdb \
+  --output /tmp/seerdb-common-kv-faults/comparison.json \
+  --require-equivalent
+```
+
+The comparison validates the shared trace identity and required case coverage,
+then compares logical execution, recovery, and two-reopen outcomes for every
+engine pair. Syscall failed-call indexes and observed call counts are
+mechanical details and are deliberately excluded from equivalence. `accepted`
+means only that this fault-outcome comparison passed; `resource_qualified`
+remains false when the source manifest records `resource_outcome:
+not-collected`. Unsupported, incomplete, malformed, or different-outcome
+reports never pass `--require-equivalent`.
+
+The comparator's contract tests run with:
+
+```bash
+python3 -m unittest tools/test_common_kv_compare.py
+```
+
 The RocksDB adapter requires a working native RocksDB build toolchain. On
 macOS that currently includes `libclang` for the published `rocksdb 0.24.0`
 bindings; the SeerDB/Fjall path does not have that native requirement.
