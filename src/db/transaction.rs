@@ -265,27 +265,4 @@ impl DB {
             state: BatchTransactionState::Active,
         })
     }
-
-    /// Begin the legacy transaction-ID bookkeeping primitive.
-    ///
-    /// This does not bind reads or writes to a durable SeerDB root. Use
-    /// [`DB::begin_batch_transaction`] for the data-bearing transaction API.
-    pub fn begin_transaction(&self) -> crate::concurrency::Transaction {
-        self.txn_manager.begin()
-    }
-
-    /// Commit a transaction.
-    pub fn commit_transaction(&self, txn: &mut crate::concurrency::Transaction) {
-        self.txn_manager.commit(txn);
-    }
-
-    /// Abort a transaction.
-    pub fn abort_transaction(&self, txn: &mut crate::concurrency::Transaction) {
-        self.txn_manager.abort(txn);
-    }
-
-    /// Get the latest committed transaction ID.
-    pub fn latest_committed_txn(&self) -> u64 {
-        self.txn_manager.latest_committed()
-    }
 }

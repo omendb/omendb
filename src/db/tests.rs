@@ -1698,34 +1698,6 @@ fn test_db_replays_legacy_wal_put_record() {
 }
 
 #[test]
-fn test_db_transaction() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-
-    let db = DB::open(&path, Options::default()).unwrap();
-
-    // Begin a transaction.
-    let mut txn = db.begin_transaction();
-    assert!(txn.is_active());
-    assert_eq!(txn.id(), 1);
-
-    // Commit the transaction.
-    db.commit_transaction(&mut txn);
-    assert!(!txn.is_active());
-    assert_eq!(db.latest_committed_txn(), 1);
-
-    // Begin another transaction.
-    let mut txn2 = db.begin_transaction();
-    assert_eq!(txn2.id(), 2);
-    assert_eq!(txn2.snapshot_id(), 1); // Can see txn 1
-
-    // Abort the transaction.
-    db.abort_transaction(&mut txn2);
-    assert!(!txn2.is_active());
-    assert_eq!(db.latest_committed_txn(), 1); // Still 1
-}
-
-#[test]
 fn test_db_vacuum_step_is_bounded_and_crash_safe() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bounded-vacuum.db");
@@ -1810,42 +1782,6 @@ fn test_db_vacuum_final_write_disk_full_reopens_old_root() {
     let mut reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
     reopened.verify().unwrap();
-}
-
-#[test]
-fn test_db_concurrent_transactions() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-
-    let db = DB::open(&path, Options::default()).unwrap();
-    let db = std::sync::Arc::new(db);
-    let mut handles = vec![];
-
-    // Spawn multiple threads that create transactions.
-    for _ in 0..10 {
-        let db = std::sync::Arc::clone(&db);
-        handles.push(std::thread::spawn(move || {
-            let mut txn = db.begin_transaction();
-            // Simulate some work.
-            std::thread::yield_now();
-            db.commit_transaction(&mut txn);
-            txn.id()
-        }));
-    }
-
-    // Wait for all threads to complete.
-    let mut ids = vec![];
-    for handle in handles {
-        ids.push(handle.join().unwrap());
-    }
-
-    // All transactions should have unique IDs.
-    ids.sort();
-    ids.dedup();
-    assert_eq!(ids.len(), 10);
-
-    // Latest committed should be the max ID.
-    assert_eq!(db.latest_committed_txn(), 10);
 }
 
 #[test]

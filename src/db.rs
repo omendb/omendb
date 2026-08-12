@@ -111,7 +111,6 @@ use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
 use crate::btree::{BTree, BlobPointer, LookupResult, MAX_KEY_SIZE, PAGE_SIZE, RangeCursor};
 use crate::buffer::BufferManager;
-use crate::concurrency::TransactionManager;
 use crate::error::{CheckFailureKind, Error, Result};
 use crate::mvcc::PMT;
 use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
@@ -232,8 +231,6 @@ pub struct DB {
     vacuum: Option<VacuumState>,
     /// Durable retained-root registry shared with retained snapshot handles.
     retention: Arc<Mutex<RetentionState>>,
-    /// Transaction manager for MVCC.
-    txn_manager: TransactionManager,
     /// Authoritative root-generation publication store.
     manifest: ManifestStore,
     /// Durable descriptors for historical roots that can be retained later.

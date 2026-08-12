@@ -4,7 +4,5 @@
 //! out-of-place B-tree, including hybrid latches and optimistic locking.
 
 mod latch;
-mod txn;
 
 pub use latch::HybridLatch;
-pub use txn::{Transaction, TransactionId, TransactionManager, TransactionState};

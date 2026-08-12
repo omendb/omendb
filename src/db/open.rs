@@ -561,7 +561,6 @@ impl DB {
             blobs: components.blobs,
             vacuum: None,
             retention: catalog.retention,
-            txn_manager: TransactionManager::new(),
             manifest: catalog.manifest,
             manifest_history: catalog.manifest_history,
             reuse_ledger: catalog.reuse_ledger,
