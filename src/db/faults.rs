@@ -21,6 +21,7 @@ thread_local! {
     pub(super) static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
@@ -152,6 +153,13 @@ impl DB {
     /// Inject one failure while syncing a segmented blob suffix.
     pub fn inject_blob_segment_sync_failure(&self) {
         FAIL_NEXT_BLOB_SEGMENT_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after a complete segmented-catalog write but before
+    /// its sync. This covers delta append and full consolidation; reopen must
+    /// treat resulting future state as non-authoritative and retry truncation.
+    pub fn inject_blob_segment_catalog_after_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE.with(|failure| failure.set(true));
     }
 
     /// Inject one failure while syncing a segmented blob catalog temp file.

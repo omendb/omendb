@@ -2392,35 +2392,53 @@ fn test_db_segmented_compaction_advances_catalog_generation() {
 }
 
 #[test]
-fn test_db_segmented_catalog_delta_sync_failure_discards_future_frame() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("segmented-catalog-delta-sync-failure.db");
-    let options = Options {
-        blob_storage: BlobStorageMode::Segmented,
-        blob_threshold: 4,
-        ..Options::default()
-    };
-    let base = vec![0xE7; 2_000];
-    let pending = vec![0xE8; 2_100];
-    let mut db = DB::create(&path, options).unwrap();
-    db.put(b"base", &base).unwrap();
-    db.flush().unwrap();
-    db.put(b"pending", &pending).unwrap();
-    db.inject_blob_segment_catalog_sync_failure();
-    assert!(db.flush().is_err());
-    assert!(db.durability_status().write_fenced);
-    assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
-    assert!(path.join(BLOB_DELTA_FILE).is_file());
-    drop(db);
+fn test_db_segmented_catalog_delta_write_failures_discard_future_frame() {
+    let failures = [
+        (
+            "after-write",
+            DB::inject_blob_segment_catalog_after_write_failure as fn(&DB),
+        ),
+        (
+            "sync",
+            DB::inject_blob_segment_catalog_sync_failure as fn(&DB),
+        ),
+    ];
 
-    let mut reopened = DB::open(&path, Options::default()).unwrap();
-    assert_eq!(reopened.get(b"base").unwrap(), Some(base));
-    assert_eq!(reopened.get(b"pending").unwrap(), None);
-    reopened.verify().unwrap();
-    reopened.put(b"pending", &pending).unwrap();
-    reopened.flush().unwrap();
-    assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
-    reopened.verify().unwrap();
+    for (name, inject_failure) in failures {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(format!("segmented-catalog-delta-{name}-failure.db"));
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xE7; 2_000];
+        let pending = vec![0xE8; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+        db.put(b"pending", &pending).unwrap();
+        inject_failure(&db);
+        assert!(
+            db.flush().is_err(),
+            "{name} catalog delta write should fail"
+        );
+        assert!(db.durability_status().write_fenced);
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(path.join(BLOB_DELTA_FILE).is_file());
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        reopened.verify().unwrap();
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        reopened.verify().unwrap();
+    }
 }
 
 #[test]

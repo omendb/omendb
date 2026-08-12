@@ -90,7 +90,7 @@ proptest! {
         dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
     ) {
         for segmented in [false, true] {
-            for fault in 0u8..9 {
+            for fault in 0u8..10 {
                 if !segmented && fault >= 3 {
                     continue;
                 }
@@ -141,6 +141,7 @@ proptest! {
                     6 => db.inject_blob_segment_catalog_torn_write_failure(),
                     7 => db.inject_blob_segment_sync_failure(),
                     8 => db.inject_blob_segment_catalog_sync_failure(),
+                    9 => db.inject_blob_segment_catalog_after_write_failure(),
                     _ => unreachable!(),
                 }
                 assert!(db.gc().is_err());

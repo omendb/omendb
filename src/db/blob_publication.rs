@@ -103,6 +103,13 @@ impl DB {
         file.flush()?;
 
         #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE.with(|failure| failure.replace(false)) {
+            return Err(
+                std::io::Error::other("injected failure after blob catalog delta write").into(),
+            );
+        }
+
+        #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected blob catalog sync failure").into());
         }

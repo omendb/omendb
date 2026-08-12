@@ -11,9 +11,10 @@ use super::{BLOB_RESERVATION_FILE, Error, Result, WAL_RESERVATION_FILE};
 #[cfg(any(test, feature = "fault-injection"))]
 use super::{
     FAIL_NEXT_ATOMIC_RENAME, FAIL_NEXT_ATOMIC_SHORT_WRITE, FAIL_NEXT_ATOMIC_TORN_WRITE,
-    FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME, FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE,
-    FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC, FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE,
-    FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC, FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE, FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE, FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE, FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC,
+    FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
 };
 use crate::space::{preallocate_file, reserve_file};
 use std::fs::{self, File, OpenOptions};
@@ -87,6 +88,14 @@ fn atomic_write_with_options(
         }
     }
     file.flush()?;
+
+    #[cfg(any(test, feature = "fault-injection"))]
+    if inject_faults
+        && path.file_name().is_some_and(|name| name == BLOB_FILE)
+        && FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE.with(|failure| failure.replace(false))
+    {
+        return Err(std::io::Error::other("injected failure after blob catalog write").into());
+    }
 
     #[cfg(any(test, feature = "fault-injection"))]
     if inject_faults
