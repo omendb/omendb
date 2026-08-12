@@ -99,7 +99,7 @@ impl DB {
                 LookupResult::Deleted | LookupResult::NotFound => continue,
             };
             if state.candidate_blobs.should_separate(value.len()) {
-                let pointer = state.candidate_blobs.append(&key, value);
+                let pointer = state.candidate_blobs.append(&key, value)?;
                 state.candidate_tree.upsert_blob(&key, pointer)?;
             } else {
                 state.candidate_tree.upsert(&key, &value)?;

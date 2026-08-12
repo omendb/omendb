@@ -1907,7 +1907,11 @@ fn segmented_catalog_consolidation_bound_is_explicit() {
     let mut blobs = BlobManager::with_threshold_and_mode(1, true);
     let mut pointers = Vec::with_capacity(MAX_SEGMENTED_CATALOG_DELETED_ENTRIES + 1);
     for index in 0..=MAX_SEGMENTED_CATALOG_DELETED_ENTRIES {
-        pointers.push(blobs.append(&index.to_le_bytes(), vec![index as u8; 2]));
+        pointers.push(
+            blobs
+                .append(&index.to_le_bytes(), vec![index as u8; 2])
+                .unwrap(),
+        );
     }
 
     for pointer in pointers.iter().take(MAX_SEGMENTED_CATALOG_DELETED_ENTRIES) {

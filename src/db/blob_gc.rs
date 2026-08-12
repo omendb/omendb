@@ -114,7 +114,7 @@ impl DB {
                     pointer.file_id, pointer.offset, pointer.length
                 ))
             })?;
-            let replacement = candidate_blobs.append(&key, value.to_vec());
+            let replacement = candidate_blobs.append(&key, value.to_vec())?;
             candidate_tree
                 .upsert_blob(&key, replacement)
                 .map_err(Error::from)?;

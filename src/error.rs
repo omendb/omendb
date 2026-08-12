@@ -1,5 +1,6 @@
 //! Crate-level error types.
 
+use crate::blob::BlobManagerError;
 use crate::btree::{BTreeError, InsertError, SplitError};
 use crate::buffer::BufferError;
 use crate::storage::format::CommitId;
@@ -138,6 +139,10 @@ pub enum Error {
     /// Buffer pool could not safely provide a page frame.
     #[error("buffer error: {0}")]
     Buffer(String),
+
+    /// Blob manager could not allocate or append a blob record.
+    #[error("blob error: {0}")]
+    Blob(#[from] BlobManagerError),
 }
 
 /// Result type for database operations.

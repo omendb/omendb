@@ -51,7 +51,7 @@ fn apply_put(
     let separates = blobs.should_separate(value.len());
 
     if separates {
-        let pointer = blobs.append(key, value.to_vec());
+        let pointer = blobs.append(key, value.to_vec())?;
         if let Err(error) = btree.upsert_blob(key, pointer) {
             let _ = blobs.rollback_append(&pointer);
             return Err(error.into());

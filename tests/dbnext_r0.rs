@@ -2308,8 +2308,8 @@ fn dbnext_r0_newer_blob_image_cannot_reclaim_manifest_value() {
     // Simulate a blob image written for a newer generation whose manifest
     // publication did not complete. The old manifest still owns offset 0.
     let mut newer = BlobManager::new();
-    let old_pointer = newer.append(b"large", old_value.clone());
-    newer.append(b"large", vec![0x22; 2_048]);
+    let old_pointer = newer.append(b"large", old_value.clone()).unwrap();
+    newer.append(b"large", vec![0x22; 2_048]).unwrap();
     assert!(newer.mark_deleted(&old_pointer));
     let mut bytes = newer.to_bytes();
     bytes[20..28].copy_from_slice(&2u64.to_le_bytes());
