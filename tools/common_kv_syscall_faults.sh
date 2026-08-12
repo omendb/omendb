@@ -67,6 +67,7 @@ done
 [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
 
 mkdir -p "$output_dir/baselines" "$output_dir/runs"
+trace_artifact="$output_dir/trace.json"
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/seerdb-common-kv-syscall-faults-build.XXXXXX")
 cleanup() {
     local exit_code=$?
@@ -172,10 +173,15 @@ for engine in seerdb fjall rocksdb; do
     mkdir -p "$trace"
     cp -a "$baseline/db" "$trace/db"
     set_mutation_args "$engine" "$trace/db"
+    trace_args=()
+    if [[ ! -e "$trace_artifact" ]]; then
+        trace_args=(--trace-output "$trace_artifact")
+    fi
     LD_PRELOAD="$injector" \
     SEERDB_FAULT_SYSCALL=none \
     SEERDB_FAULT_TRACE="$trace/syscalls.log" \
         "$binary" "${mutation_args[@]}" \
+        "${trace_args[@]}" \
         >"$trace/mutate.stdout" 2>"$trace/mutate.stderr"
 
     for syscall in fsync fdatasync rename; do
@@ -262,6 +268,19 @@ def command_output(*command):
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
 
+trace_path = output_dir / "trace.json"
+if not trace_path.is_file():
+    raise SystemExit(f"missing exact trace artifact: {trace_path}")
+trace = json.loads(trace_path.read_text())
+if trace.get("format") != "seerdb-common-kv-trace-v1":
+    raise SystemExit(f"unexpected trace format: {trace.get('format')}")
+if (
+    trace.get("workload") != "batch-put"
+    or trace.get("base_operations") != base_operations
+    or trace.get("trace_operation_count") != operations
+):
+    raise SystemExit("trace parameters do not match syscall-fault qualification")
+
 observed = []
 for line in (output_dir / "observed.tsv").read_text().splitlines():
     engine, syscall, count = line.split("\t")
@@ -299,6 +318,8 @@ manifest = {
     "batch_size": batch_size,
     "value_bytes": value_bytes,
     "seed": seed,
+    "trace_artifact": "trace.json",
+    "trace_digest_fnv1a64": trace["trace_digest_fnv1a64"],
     "fault_domain": "external libc boundary; one observed fsync/fdatasync/rename call returns EIO before or after completion",
     "accepted_states": "a complete batch prefix after the durable baseline, verified across two fresh reopens",
     "modes": ["before", "after"],

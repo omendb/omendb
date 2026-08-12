@@ -113,7 +113,7 @@ if [[ -n ${SEERDB_BENCH_CPUSET:-} ]]; then
 fi
 
 [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
-mkdir -p "$output_dir/runs" "$output_dir/db"
+mkdir -p "$output_dir/runs" "$output_dir/db" "$output_dir/traces"
 
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/seerdb-common-kv-build.XXXXXX")
 cleanup() {
@@ -189,6 +189,11 @@ run_benchmark() {
     local db_path="$output_dir/db/$label"
     local output_path="$output_dir/runs/$label.json"
     local stdout_path="$output_dir/runs/$label.stdout"
+    local trace_path="$output_dir/traces/$workload.json"
+    local trace_args=()
+    if [[ ! -e "$trace_path" ]]; then
+        trace_args=(--trace-output "$trace_path")
+    fi
 
     echo "common_kv_qualification: run $label" >&2
     run_with_prefix "$binary" \
@@ -197,6 +202,7 @@ run_benchmark() {
         --durability durable \
         --path "$db_path" \
         --output "$output_path" \
+        "${trace_args[@]}" \
         --keys "$keys" \
         --operations "$operations" \
         --batch-size "$batch_size" \
@@ -260,6 +266,22 @@ expected = len(engines) * len(workloads) * repetitions
 if len(runs) != expected:
     raise SystemExit(f"expected {expected} measured JSON results, found {len(runs)}")
 
+trace_artifacts = {}
+for workload in workloads:
+    path = output_dir / "traces" / f"{workload}.json"
+    if not path.is_file():
+        raise SystemExit(f"missing exact trace artifact for {workload}: {path}")
+    trace = json.loads(path.read_text())
+    if trace.get("format") != "seerdb-common-kv-trace-v1":
+        raise SystemExit(f"unexpected trace format for {workload}: {trace.get('format')}")
+    if trace.get("workload") != workload or trace.get("trace_operation_count") != operations:
+        raise SystemExit(f"trace parameters do not match qualification for {workload}")
+    trace_artifacts[workload] = {
+        "path": path.relative_to(output_dir).as_posix(),
+        "trace_digest_fnv1a64": trace["trace_digest_fnv1a64"],
+        "trace_operation_count": trace["trace_operation_count"],
+    }
+
 def median_metric(records, name):
     return statistics.median(record[name] for record in records)
 
@@ -272,9 +294,17 @@ for engine in engines:
         digests = {record["digest_fnv1a64"] for record in records}
         if len(digests) != 1:
             raise SystemExit(f"digest mismatch across repetitions for {engine}/{workload}: {sorted(digests)}")
+        trace_digests = {record["trace_digest_fnv1a64"] for record in records}
+        expected_trace_digest = trace_artifacts[workload]["trace_digest_fnv1a64"]
+        if trace_digests != {expected_trace_digest}:
+            raise SystemExit(
+                f"trace mismatch for {engine}/{workload}: "
+                f"runs={sorted(trace_digests)} artifact={expected_trace_digest}"
+            )
         summary[f"{engine}/{workload}"] = {
             "repetitions": len(records),
             "digest_fnv1a64": records[0]["digest_fnv1a64"],
+            "trace_digest_fnv1a64": expected_trace_digest,
             "throughput_ops_per_sec_median": median_metric(records, "throughput_ops_per_sec"),
             "throughput_ops_per_sec_min": min(record["throughput_ops_per_sec"] for record in records),
             "throughput_ops_per_sec_max": max(record["throughput_ops_per_sec"] for record in records),
@@ -304,6 +334,7 @@ manifest = {
         "range_width": range_width,
         "seed": seed,
     },
+    "trace_artifacts": trace_artifacts,
     "environment": {
         "os": platform.platform(),
         "kernel": command_output("uname", "-srmo"),

@@ -70,6 +70,7 @@ is_positive_integer() {
 
 [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
 mkdir -p "$output_dir/runs" "$output_dir/db"
+trace_path="$output_dir/trace.json"
 
 build_root=$(mktemp -d "${TMPDIR:-/tmp}/seerdb-common-kv-faults-build.XXXXXX")
 cleanup() {
@@ -161,6 +162,10 @@ run_case() {
     local verify_json="$run_dir/verify.json"
     local child_stdout="$run_dir/child.stdout"
     local child_stderr="$run_dir/child.stderr"
+    local trace_args=()
+    if [[ ! -e "$trace_path" ]]; then
+        trace_args=(--trace-output "$trace_path")
+    fi
 
     mkdir -p "$run_dir"
     echo "common_kv_faults: kill $label before batch $prefix" >&2
@@ -175,6 +180,7 @@ run_case() {
         --value-bytes "$value_bytes" \
         --range-width 1 \
         --seed "$seed" \
+        "${trace_args[@]}" \
         --progress "$progress" \
         --progress-hold "$hold" \
         --progress-hold-index "$prefix" \
@@ -238,6 +244,15 @@ def command_output(*command):
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
 
+trace_path = output_dir / "trace.json"
+if not trace_path.is_file():
+    raise SystemExit(f"missing exact trace artifact: {trace_path}")
+trace = json.loads(trace_path.read_text())
+if trace.get("format") != "seerdb-common-kv-trace-v1":
+    raise SystemExit(f"unexpected trace format: {trace.get('format')}")
+if trace.get("workload") != "batch-put" or trace.get("trace_operation_count") != operations:
+    raise SystemExit("trace parameters do not match process-crash qualification")
+
 records = []
 for path in sorted((output_dir / "runs").glob("*/verify.json")):
     engine, case_name = path.parent.name.split(".", 1)
@@ -280,6 +295,8 @@ manifest = {
     "batch_size": batch_size,
     "value_bytes": value_bytes,
     "seed": seed,
+    "trace_artifact": "trace.json",
+    "trace_digest_fnv1a64": trace["trace_digest_fnv1a64"],
     "termination_boundary": "child SIGKILL after observing a pre-batch progress marker and while held before that batch commit",
     "accepted_states": {
         "old-state": "all batches before boundary are present; boundary batch is absent",

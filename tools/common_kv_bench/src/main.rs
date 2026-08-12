@@ -99,6 +99,7 @@ struct Config {
     workload: WorkloadKind,
     path: PathBuf,
     output: Option<PathBuf>,
+    trace_output: Option<PathBuf>,
     keys: usize,
     operations: usize,
     batch_size: usize,
@@ -126,6 +127,7 @@ impl Config {
         let mut workload = WorkloadKind::Mixed;
         let mut path = None;
         let mut output = None;
+        let mut trace_output = None;
         let mut keys = 1_000;
         let mut operations = 4_000;
         let mut batch_size = 16;
@@ -161,6 +163,7 @@ impl Config {
                 "--workload" => workload = WorkloadKind::parse(value)?,
                 "--path" => path = Some(PathBuf::from(value)),
                 "--output" => output = Some(PathBuf::from(value)),
+                "--trace-output" => trace_output = Some(PathBuf::from(value)),
                 "--keys" => keys = parse_usize(flag, value)?,
                 "--operations" => operations = parse_usize(flag, value)?,
                 "--batch-size" => batch_size = parse_usize(flag, value)?,
@@ -230,6 +233,7 @@ impl Config {
             workload,
             path,
             output,
+            trace_output,
             keys,
             operations,
             batch_size,
@@ -260,6 +264,7 @@ fn print_help() {
          --workload batch-put|mixed|point-read|range-read\n\
          --path PATH             Fresh or empty database directory\n\
          --output PATH            Also write the versioned JSON result artifact\n\
+         --trace-output PATH      Write the exact versioned generated operation trace\n\
          --keys N                 Initial/key-space size (default 1000)\n\
          --operations N           Measured operation count (default 4000)\n\
          --batch-size N           Write batch size (default 16)\n\
@@ -381,6 +386,100 @@ fn generate_operations(config: &Config) -> Vec<Operation> {
         })
         .skip(config.base_operations)
         .collect()
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        result.push_str(&format!("{byte:02x}"));
+    }
+    result
+}
+
+fn trace_digest(operations: &[Operation]) -> u64 {
+    fn feed_byte(hash: &mut u64, byte: u8) {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    fn feed_bytes(hash: &mut u64, bytes: &[u8]) {
+        for byte in (bytes.len() as u64).to_le_bytes() {
+            feed_byte(hash, byte);
+        }
+        for &byte in bytes {
+            feed_byte(hash, byte);
+        }
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    for operation in operations {
+        match operation {
+            Operation::Put { key, value } => {
+                feed_byte(&mut hash, b'p');
+                feed_bytes(&mut hash, key);
+                feed_bytes(&mut hash, value);
+            }
+            Operation::Delete { key } => {
+                feed_byte(&mut hash, b'd');
+                feed_bytes(&mut hash, key);
+            }
+            Operation::Get { key } => {
+                feed_byte(&mut hash, b'g');
+                feed_bytes(&mut hash, key);
+            }
+            Operation::Range { start, end } => {
+                feed_byte(&mut hash, b'r');
+                feed_bytes(&mut hash, start);
+                feed_bytes(&mut hash, end);
+            }
+        }
+    }
+    hash
+}
+
+fn render_trace(config: &Config, operations: &[Operation]) -> String {
+    let mut output = format!(
+        "{{\n  \"format\": \"seerdb-common-kv-trace-v1\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"keys\": {},\n  \"measured_operations\": {},\n  \"base_operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"trace_operation_count\": {},\n  \"trace_digest_fnv1a64\": \"{:016x}\",\n  \"trace\": [\n",
+        config.workload.name(),
+        config.durability.name(),
+        config.keys,
+        config.operations,
+        config.base_operations,
+        config.batch_size,
+        config.value_bytes,
+        config.range_width,
+        config.seed,
+        operations.len(),
+        trace_digest(operations),
+    );
+
+    for (index, operation) in operations.iter().enumerate() {
+        if index > 0 {
+            output.push_str(",\n");
+        }
+        match operation {
+            Operation::Put { key, value } => output.push_str(&format!(
+                "    {{\"op\": \"put\", \"key_hex\": \"{}\", \"value_hex\": \"{}\"}}",
+                hex_bytes(key),
+                hex_bytes(value),
+            )),
+            Operation::Delete { key } => output.push_str(&format!(
+                "    {{\"op\": \"delete\", \"key_hex\": \"{}\"}}",
+                hex_bytes(key),
+            )),
+            Operation::Get { key } => output.push_str(&format!(
+                "    {{\"op\": \"get\", \"key_hex\": \"{}\"}}",
+                hex_bytes(key),
+            )),
+            Operation::Range { start, end } => output.push_str(&format!(
+                "    {{\"op\": \"range\", \"start_hex\": \"{}\", \"end_hex\": \"{}\"}}",
+                hex_bytes(start),
+                hex_bytes(end),
+            )),
+        }
+    }
+    output.push_str("\n  ]\n}");
+    output
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -793,6 +892,7 @@ struct RunResult {
     logical_bytes: u64,
     final_keys: usize,
     digest: u64,
+    trace_digest: u64,
     disk_bytes: u64,
     seer_counters: Option<SeerCounters>,
 }
@@ -1028,7 +1128,7 @@ fn render_result(result: &RunResult) -> String {
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
     format!(
-        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_candidate_prepare_ns\": {},\n  \"seerdb_wal_write_ns\": {},\n  \"seerdb_admission_ns\": {},\n  \"seerdb_data_flush_ns\": {},\n  \"seerdb_metadata_write_ns\": {},\n  \"seerdb_blob_write_ns\": {},\n  \"seerdb_history_write_ns\": {},\n  \"seerdb_directory_sync_ns\": {},\n  \"seerdb_manifest_write_ns\": {},\n  \"seerdb_manifest_mirror_ns\": {},\n  \"seerdb_cleanup_ns\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"trace_digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_candidate_prepare_ns\": {},\n  \"seerdb_wal_write_ns\": {},\n  \"seerdb_admission_ns\": {},\n  \"seerdb_data_flush_ns\": {},\n  \"seerdb_metadata_write_ns\": {},\n  \"seerdb_blob_write_ns\": {},\n  \"seerdb_history_write_ns\": {},\n  \"seerdb_directory_sync_ns\": {},\n  \"seerdb_manifest_write_ns\": {},\n  \"seerdb_manifest_mirror_ns\": {},\n  \"seerdb_cleanup_ns\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
         config.durability.name(),
@@ -1060,6 +1160,7 @@ fn render_result(result: &RunResult) -> String {
         result.logical_bytes,
         result.final_keys,
         result.digest,
+        result.trace_digest,
         result.disk_bytes,
         result.resources.user_cpu_ns,
         result.resources.system_cpu_ns,
@@ -1222,6 +1323,29 @@ fn emit_output(output: &str, path: Option<&Path>) -> BenchResult<()> {
     Ok(())
 }
 
+fn emit_trace(output: &str, path: &Path) -> BenchResult<()> {
+    let output = format!("{output}\n");
+    if path.exists() {
+        let existing = fs::read_to_string(path)?;
+        if existing != output {
+            return Err(format!(
+                "trace artifact already exists with different content: {}",
+                path.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, output)?;
+    Ok(())
+}
+
 fn main() -> BenchResult<()> {
     let config = Config::parse()?;
     if let Some(prefix) = config.verify_prefix {
@@ -1242,6 +1366,10 @@ fn main() -> BenchResult<()> {
 
     let initial = initial_state(&config);
     let operations = generate_operations(&config);
+    let trace_digest = trace_digest(&operations);
+    if let Some(path) = config.trace_output.as_deref() {
+        emit_trace(&render_trace(&config, &operations), path)?;
+    }
     let resource_before = process_resource_metrics();
     let mut engine = if config.open_existing {
         Engine::open_existing(config.engine, &config.path, config.durability)?
@@ -1311,6 +1439,7 @@ fn main() -> BenchResult<()> {
         logical_bytes,
         final_keys: expected_entries.len(),
         digest: expected_digest,
+        trace_digest,
         disk_bytes,
         seer_counters,
     };
