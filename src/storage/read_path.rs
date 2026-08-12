@@ -7,11 +7,16 @@
 //! coordination.
 
 use super::StorageEngine;
-use crate::btree::{LookupResult, Node, PAGE_SIZE};
+use super::page_cache::ParsedPageCache;
+use crate::allocator::PageAllocator;
+use crate::btree::{BTree, LookupResult, Node, PAGE_SIZE};
+use crate::buffer::BufferManager;
 use crate::buffer::{GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use crate::mvcc::PMT;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 /// An immutable, generation-bound read handle.
@@ -41,6 +46,38 @@ impl StorageReadView {
     pub(crate) fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, LookupResult)>> {
         self.engine
             .range_at(self.root_page_id, self.engine.pmt(), start, end)
+    }
+}
+
+impl StorageEngine {
+    /// Create a read-only handle pinned to the current PMT and root.
+    pub(crate) fn read_view(&self, root_page_id: u64) -> Result<StorageReadView> {
+        let buffer_capacity = self.buffer_stats().total_frames * PAGE_SIZE;
+        let pmt = Arc::clone(&self.pmt);
+        let device = self.device.clone_for_read()?;
+        self.protected_pmts
+            .lock()
+            .map_err(|_| Error::Corruption("storage PMT lease mutex is poisoned".into()))?
+            .push(Arc::clone(&pmt));
+        self.reclamation_dirty.store(true, Ordering::Release);
+        let engine = Self {
+            btree: BTree::new().with_page_allocator(PageAllocator::new()),
+            buffer: Mutex::new(BufferManager::new(buffer_capacity)),
+            parsed_page_cache: Mutex::new(ParsedPageCache::new(buffer_capacity / PAGE_SIZE)),
+            pmt,
+            device,
+            next_offset: 0,
+            free_offsets: Vec::new(),
+            pending_reclaimed_offsets: Vec::new(),
+            pending_reclaimed_cache_keys: Vec::new(),
+            protected_offsets: Arc::clone(&self.protected_offsets),
+            protected_pmts: Arc::clone(&self.protected_pmts),
+            rebuild_reserved_offsets: HashSet::new(),
+            lazy_root: Some(root_page_id as u32),
+            reclamation_dirty: Arc::clone(&self.reclamation_dirty),
+            metrics: super::StorageCounters::default(),
+        };
+        Ok(StorageReadView::new(engine, root_page_id))
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::btree::LookupResult;
+use crate::btree::{LookupResult, PAGE_SIZE};
 use crate::space::DeviceOptions;
 use std::fs;
 use tempfile::tempdir;
