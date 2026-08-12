@@ -17,6 +17,8 @@ mod blob_layout;
 mod blob_publication;
 #[path = "db/blob_read_view.rs"]
 mod blob_read_view;
+#[path = "db/capacity.rs"]
+mod capacity;
 #[path = "db/compaction.rs"]
 mod compaction;
 #[path = "db/diagnostics.rs"]
