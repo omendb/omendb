@@ -8,6 +8,7 @@
 
 use super::{BTree, BTreeError, PageId};
 use crate::btree::node::{BlobPointer, InsertError, Node};
+use std::collections::HashSet;
 
 impl BTree {
     /// Allocate a new node and return its page ID.
@@ -33,7 +34,9 @@ impl BTree {
         value: &[u8],
     ) -> Result<(), BTreeError> {
         let (median_key, right_node) = {
-            let leaf = self.node_mut(leaf_id).expect("leaf_id should be valid");
+            let leaf = self
+                .node_mut(leaf_id)
+                .ok_or(BTreeError::MissingPage(leaf_id))?;
             leaf.split().map_err(BTreeError::SplitFailed)?
         };
 
@@ -46,18 +49,20 @@ impl BTree {
         };
 
         self.node_mut(target_id)
-            .expect("target_id should be valid")
+            .ok_or(BTreeError::MissingPage(target_id))?
             .insert(key, value)
             .map_err(BTreeError::InsertFailed)?;
 
         if leaf_id == self.root {
             self.create_new_root(leaf_id, &median_key, right_id)?;
         } else {
-            let parent_id = self
-                .parent_of(leaf_id)
-                .expect("parent should exist for non-root node");
+            let parent_id = self.parent_of(leaf_id)?.ok_or_else(|| {
+                BTreeError::Corruption(format!(
+                    "split leaf {leaf_id} is not reachable from a parent"
+                ))
+            })?;
             self.node_mut(right_id)
-                .expect("right node should be valid")
+                .ok_or(BTreeError::MissingPage(right_id))?
                 .set_parent_id(parent_id);
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
@@ -74,7 +79,9 @@ impl BTree {
         ptr: BlobPointer,
     ) -> Result<(), BTreeError> {
         let (median_key, right_node) = {
-            let leaf = self.node_mut(leaf_id).expect("leaf_id should be valid");
+            let leaf = self
+                .node_mut(leaf_id)
+                .ok_or(BTreeError::MissingPage(leaf_id))?;
             leaf.split().map_err(BTreeError::SplitFailed)?
         };
 
@@ -86,18 +93,20 @@ impl BTree {
         };
 
         self.node_mut(target_id)
-            .expect("target_id should be valid")
+            .ok_or(BTreeError::MissingPage(target_id))?
             .insert_blob(key, ptr)
             .map_err(BTreeError::InsertFailed)?;
 
         if leaf_id == self.root {
             self.create_new_root(leaf_id, &median_key, right_id)?;
         } else {
-            let parent_id = self
-                .parent_of(leaf_id)
-                .expect("parent should exist for non-root node");
+            let parent_id = self.parent_of(leaf_id)?.ok_or_else(|| {
+                BTreeError::Corruption(format!(
+                    "split leaf {leaf_id} is not reachable from a parent"
+                ))
+            })?;
             self.node_mut(right_id)
-                .expect("right node should be valid")
+                .ok_or(BTreeError::MissingPage(right_id))?
                 .set_parent_id(parent_id);
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
@@ -124,47 +133,68 @@ impl BTree {
         let new_root_id = self.alloc_node(new_root)?;
 
         self.node_mut(left_id)
-            .expect("left_id should be valid")
+            .ok_or(BTreeError::MissingPage(left_id))?
             .set_parent_id(new_root_id);
         self.node_mut(right_id)
-            .expect("right_id should be valid")
+            .ok_or(BTreeError::MissingPage(right_id))?
             .set_parent_id(new_root_id);
 
         self.root = new_root_id;
         Ok(())
     }
 
-    /// Find the parent of a given node (by DFS).
-    fn find_parent(&self, current: PageId, target: PageId) -> Option<PageId> {
+    /// Find the parent of a given node (by DFS), validating the traversed
+    /// structure instead of turning malformed state into a panic or loop.
+    fn find_parent(
+        &self,
+        current: PageId,
+        target: PageId,
+        active: &mut HashSet<PageId>,
+    ) -> Result<Option<PageId>, BTreeError> {
         if current == target {
-            return None;
+            return Ok(None);
+        }
+        if !active.insert(current) {
+            return Err(BTreeError::Corruption(
+                "cycle detected while locating split parent".into(),
+            ));
         }
 
-        let node = self.node(current)?;
-        if node.is_leaf() {
-            return None;
-        }
+        let result = (|| {
+            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;
+            if node.is_leaf() {
+                return Ok(None);
+            }
 
-        let leftmost_child = node.leftmost_child() as u32;
-        if leftmost_child == target {
-            return Some(current);
-        }
-        if let Some(parent) = self.find_parent(leftmost_child, target) {
-            return Some(parent);
-        }
+            let leftmost_child = u32::try_from(node.leftmost_child()).map_err(|_| {
+                BTreeError::Corruption("internal child page ID exceeds width".into())
+            })?;
+            if leftmost_child == target {
+                return Ok(Some(current));
+            }
+            if let Some(parent) = self.find_parent(leftmost_child, target, active)? {
+                return Ok(Some(parent));
+            }
 
-        for i in 0..node.count() {
-            if let Some(child_id) = node.child_id(i) {
-                if child_id as u32 == target {
-                    return Some(current);
+            for i in 0..node.count() {
+                let child_id = node
+                    .child_id(i)
+                    .ok_or_else(|| BTreeError::Corruption("internal child is malformed".into()))?;
+                let child_id = u32::try_from(child_id).map_err(|_| {
+                    BTreeError::Corruption("internal child page ID exceeds width".into())
+                })?;
+                if child_id == target {
+                    return Ok(Some(current));
                 }
-                if let Some(parent) = self.find_parent(child_id as u32, target) {
-                    return Some(parent);
+                if let Some(parent) = self.find_parent(child_id, target, active)? {
+                    return Ok(Some(parent));
                 }
             }
-        }
 
-        None
+            Ok(None)
+        })();
+        active.remove(&current);
+        result
     }
 
     /// Return a node's recorded parent when it points back to this child,
@@ -175,9 +205,9 @@ impl BTree {
     /// page is not necessarily the page that currently references `node_id`.
     /// Validating the edge preserves the O(1) common path while keeping the
     /// structural walk as a safe fallback for legacy or malformed metadata.
-    fn parent_of(&self, node_id: PageId) -> Option<PageId> {
+    fn parent_of(&self, node_id: PageId) -> Result<Option<PageId>, BTreeError> {
         if node_id == self.root {
-            return None;
+            return Ok(None);
         }
 
         if let Some(recorded_parent) = self.node(node_id).map(Node::parent_id)
@@ -186,10 +216,10 @@ impl BTree {
                 .node(recorded_parent)
                 .is_some_and(|parent| self.references_child(parent, node_id))
         {
-            return Some(recorded_parent);
+            return Ok(Some(recorded_parent));
         }
 
-        self.find_parent(self.root, node_id)
+        self.find_parent(self.root, node_id, &mut HashSet::new())
     }
 
     fn references_child(&self, parent: &Node, child_id: PageId) -> bool {
@@ -206,7 +236,7 @@ impl BTree {
     ) -> Result<(), BTreeError> {
         let result = self
             .node_mut(parent_id)
-            .expect("parent_id should be valid")
+            .ok_or(BTreeError::MissingPage(parent_id))?
             .insert_child(key, right_child_id as u64);
 
         match result {
@@ -224,7 +254,9 @@ impl BTree {
         right_child_id: PageId,
     ) -> Result<(), BTreeError> {
         let (median_key, right_node) = {
-            let node = self.node_mut(node_id).expect("node_id should be valid");
+            let node = self
+                .node_mut(node_id)
+                .ok_or(BTreeError::MissingPage(node_id))?;
             node.split().map_err(BTreeError::SplitFailed)?
         };
 
@@ -238,7 +270,7 @@ impl BTree {
         };
 
         self.node_mut(target_id)
-            .expect("target_id should be valid")
+            .ok_or(BTreeError::MissingPage(target_id))?
             .insert_child(key, right_child_id as u64)
             .map_err(BTreeError::InsertFailed)?;
         self.node_mut(right_child_id)
@@ -248,11 +280,13 @@ impl BTree {
         if node_id == self.root {
             self.create_new_root(node_id, &median_key, right_id)?;
         } else {
-            let parent_id = self
-                .parent_of(node_id)
-                .expect("parent should exist for non-root node");
+            let parent_id = self.parent_of(node_id)?.ok_or_else(|| {
+                BTreeError::Corruption(format!(
+                    "split internal page {node_id} is not reachable from a parent"
+                ))
+            })?;
             self.node_mut(right_id)
-                .expect("right node should be valid")
+                .ok_or(BTreeError::MissingPage(right_id))?
                 .set_parent_id(parent_id);
             self.insert_into_internal(parent_id, &median_key, right_id)?;
         }
@@ -304,7 +338,9 @@ impl BTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), BTreeError> {
-        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+        let node = self
+            .node_mut(leaf_id)
+            .ok_or(BTreeError::MissingPage(leaf_id))?;
         node.remove_entry(index).map_err(BTreeError::InsertFailed)?;
         while let Ok(duplicate_index) = node.search(key) {
             node.remove_entry(duplicate_index)
@@ -313,7 +349,7 @@ impl BTree {
 
         match self
             .node_mut(leaf_id)
-            .expect("leaf_id should be valid")
+            .ok_or(BTreeError::MissingPage(leaf_id))?
             .insert(key, value)
         {
             Ok(()) => Ok(()),

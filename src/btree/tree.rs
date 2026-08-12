@@ -230,11 +230,13 @@ impl BTree {
 
     /// Get a mutable reference to a node by page ID.
     fn node_mut(&mut self, id: PageId) -> Option<&mut Node> {
-        self.dirty_pages.insert(id);
-        self.nodes
+        let node = self
+            .nodes
             .get_mut(id as usize)
             .and_then(Option::as_mut)
-            .map(Arc::make_mut)
+            .map(Arc::make_mut)?;
+        self.dirty_pages.insert(id);
+        Some(node)
     }
 
     /// Insert a key-value pair into the B-tree.
@@ -245,7 +247,7 @@ impl BTree {
         let leaf_id = self.find_leaf(key)?;
         let result = self
             .node_mut(leaf_id)
-            .expect("leaf_id should be valid")
+            .ok_or(BTreeError::MissingPage(leaf_id))?
             .insert(key, value);
 
         match result {
@@ -288,7 +290,7 @@ impl BTree {
         );
         if same_size_inline {
             self.node_mut(leaf_id)
-                .expect("leaf_id should be valid")
+                .ok_or(BTreeError::MissingPage(leaf_id))?
                 .replace_value(index, value);
             return Ok(());
         }
@@ -299,7 +301,7 @@ impl BTree {
         let page_allocator = self.page_allocator.clone();
         let result = match self
             .node_mut(leaf_id)
-            .expect("leaf_id should be valid")
+            .ok_or(BTreeError::MissingPage(leaf_id))?
             .replace_value_resized(index, value)
         {
             Ok(()) => Ok(()),
@@ -344,7 +346,9 @@ impl BTree {
     /// Returns true if the key was found (even if already deleted).
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, BTreeError> {
         let leaf_id = self.find_leaf(key)?;
-        let node = self.node_mut(leaf_id).expect("leaf_id should be valid");
+        let node = self
+            .node_mut(leaf_id)
+            .ok_or(BTreeError::MissingPage(leaf_id))?;
 
         let index = match node.search(key) {
             Ok(index) => index,
@@ -366,7 +370,7 @@ impl BTree {
         let leaf_id = self.find_leaf(key)?;
         match self
             .node_mut(leaf_id)
-            .expect("leaf_id should be valid")
+            .ok_or(BTreeError::MissingPage(leaf_id))?
             .insert_blob(key, ptr)
         {
             Ok(()) => Ok(()),
