@@ -30,6 +30,8 @@ mod faults;
 mod history_prune;
 #[path = "db/invariants.rs"]
 mod invariants;
+#[path = "db/io.rs"]
+mod io;
 #[path = "db/metadata.rs"]
 mod metadata;
 #[path = "db/metadata_codec.rs"]
@@ -122,13 +124,10 @@ use crate::storage::format::{
     ReuseLedger, SnapshotId,
 };
 use fs2::FileExt;
+pub(super) use io::{decode_u32, decode_u64, read_exact_at};
 use retention_state::RetentionState;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-#[cfg(unix)]
-use std::os::unix::fs::FileExt as PositionalFileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as PositionalFileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -154,59 +153,6 @@ enum OpenMode {
     Normal,
     Create,
     Check,
-}
-
-fn read_exact_at(file: &File, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut filled = 0;
-        while filled < buffer.len() {
-            let count = file.read_at(&mut buffer[filled..], offset + filled as u64)?;
-            if count == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "file read reached end of file",
-                ));
-            }
-            filled += count;
-        }
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        let mut filled = 0;
-        while filled < buffer.len() {
-            let count = file.seek_read(&mut buffer[filled..], offset + filled as u64)?;
-            if count == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "file read reached end of file",
-                ));
-            }
-            filled += count;
-        }
-        Ok(())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let mut cloned = file.try_clone()?;
-        cloned.seek(SeekFrom::Start(offset))?;
-        cloned.read_exact(buffer)
-    }
-}
-
-fn decode_u32(bytes: &[u8]) -> Result<u32> {
-    let bytes: [u8; 4] = bytes
-        .try_into()
-        .map_err(|_| Error::Corruption("truncated blob integer".into()))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn decode_u64(bytes: &[u8]) -> Result<u64> {
-    let bytes: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| Error::Corruption("truncated blob integer".into()))?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 /// A seerdb database instance.
