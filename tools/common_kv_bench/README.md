@@ -38,7 +38,7 @@ tools/common_kv_qualification.sh --output-dir /tmp/seerdb-common-kv-qualificatio
 ```
 
 The script preserves each `seerdb-common-kv-v4` result and writes a
-`seerdb-common-kv-qualification-v1` manifest with median latency/throughput,
+`seerdb-common-kv-qualification-v2` manifest with median latency/throughput,
 reopen time, disk bytes, resource metadata, the exact trace parameters, and
 the final-state digest. It leaves the filesystem cache intact and records that
 policy; use a controlled Linux/NVMe host and an explicit CPU set through
@@ -48,6 +48,11 @@ control. The script refuses non-Linux hosts unless
 It fails before running the matrix if any requested adapter fails to build or
 its expected executable is missing, so a partial run cannot be mistaken for a
 completed comparison manifest.
+
+Use `--batch-sizes 1,4,16` to run one matched workload matrix across several
+explicit write-batch boundaries. Each size gets distinct raw-run labels and
+trace artifacts, and the manifest summarizes every engine/workload/batch-size
+cell. `--batch-size N` remains the single-size spelling.
 
 ## Examples
 
