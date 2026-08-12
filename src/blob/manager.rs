@@ -8,6 +8,8 @@ use crate::btree::node::BlobPointer;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+#[path = "cursor.rs"]
+mod cursor;
 #[path = "image_format.rs"]
 mod image_format;
 #[path = "segment_catalog.rs"]
@@ -60,41 +62,6 @@ pub struct BlobManager {
     /// Target size for the active segmented blob file. A record larger than
     /// this target is kept intact in its own segment.
     segment_target_size: u64,
-}
-
-/// Bounded cursor shared by the blob image and segmented catalog parsers.
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.position)
-    }
-
-    fn take(&mut self, length: usize) -> Option<&'a [u8]> {
-        let end = self.position.checked_add(length)?;
-        let bytes = self.bytes.get(self.position..end)?;
-        self.position = end;
-        Some(bytes)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn finish(self) -> Option<()> {
-        (self.position == self.bytes.len()).then_some(())
-    }
 }
 
 impl BlobManager {

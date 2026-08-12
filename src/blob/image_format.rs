@@ -1,6 +1,7 @@
 //! Compatibility whole-image encoding and validation for blob state.
 
-use super::{BlobManager, Cursor, DEFAULT_BLOB_THRESHOLD, DEFAULT_SEGMENT_TARGET_SIZE};
+use super::cursor::Cursor;
+use super::{BlobManager, DEFAULT_BLOB_THRESHOLD, DEFAULT_SEGMENT_TARGET_SIZE};
 use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
 use std::collections::{HashMap, HashSet};

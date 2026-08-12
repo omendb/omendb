@@ -5,7 +5,8 @@
 //! this module owns the segmented catalog representation and durable
 //! frontier bookkeeping.
 
-use super::{BlobFile, BlobManager, BlobRecord, Cursor, DEFAULT_SEGMENT_TARGET_SIZE};
+use super::cursor::Cursor;
+use super::{BlobFile, BlobManager, BlobRecord, DEFAULT_SEGMENT_TARGET_SIZE};
 use crate::btree::node::BlobPointer;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
