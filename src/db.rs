@@ -21,6 +21,9 @@ mod compaction;
 mod diagnostics;
 #[path = "db/durability.rs"]
 mod durability;
+#[cfg(any(test, feature = "fault-injection"))]
+#[path = "db/faults.rs"]
+mod faults;
 #[path = "db/metadata.rs"]
 mod metadata;
 mod mutation;
@@ -53,8 +56,6 @@ use metadata::{MAX_META_DELTA_CHAIN, META_DELTA_MAGIC, META_MAGIC};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use artifact_io::atomic_write_reserved;
-#[cfg(any(test, feature = "fault-injection"))]
-use artifact_io::inject_atomic_rename_failure;
 use artifact_io::{
     atomic_write, atomic_write_without_directory_sync, atomic_write_without_fault_injection,
     cleanup_orphaned_temporary_artifacts, clear_blob_reservation, clear_wal_reservation,
@@ -68,6 +69,18 @@ use blob_layout::{
     retained_blob_path, segmented_catalog_needs_consolidation,
 };
 use blob_read_view::BlobReadView;
+#[cfg(test)]
+use faults::inject_atomic_rename_failure;
+#[cfg(any(test, feature = "fault-injection"))]
+use faults::{
+    FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE, FAIL_NEXT_AFTER_MANIFEST, FAIL_NEXT_ATOMIC_RENAME,
+    FAIL_NEXT_ATOMIC_SHORT_WRITE, FAIL_NEXT_ATOMIC_TORN_WRITE, FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME, FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC, FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE,
+    FAIL_NEXT_BLOB_SEGMENT_SYNC, FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC,
+    FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC, FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE,
+    FAIL_NEXT_WAL_SYNC, FAIL_NEXT_WAL_TRUNCATE, FAIL_NEXT_WAL_WRITE,
+};
 use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
     decode_delete_payload, decode_put_payload, digest_records, extend_digest,
@@ -112,31 +125,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use vacuum::VacuumState;
-
-#[cfg(any(test, feature = "fault-injection"))]
-use std::cell::Cell;
-
-#[cfg(any(test, feature = "fault-injection"))]
-thread_local! {
-    static FAIL_NEXT_ATOMIC_RENAME: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_WAL_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_WAL_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_WAL_SYNC: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_WAL_AFTER_SYNC: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_AFTER_MANIFEST: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_WAL_TRUNCATE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
-    static FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
-}
 
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
@@ -735,180 +723,6 @@ impl DB {
             removed_checkpoints,
             reclaimed_checkpoint_bytes,
         })
-    }
-
-    /// Inject one device sync failure for the feature-gated fault harness.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_sync_failure(&self) {
-        self.engine.inject_sync_failure();
-    }
-
-    /// Inject one device page-write failure for the feature-gated fault harness.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_write_failure(&self) {
-        self.engine.inject_write_failure();
-    }
-
-    /// Inject one failure after a complete page write and before publication.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_after_write_failure(&self) {
-        self.engine.inject_after_write_failure();
-    }
-
-    /// Inject one failure after the complete page generation is written but
-    /// before its device durability sync.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_page_range_sync_failure(&self) {
-        self.engine.inject_page_range_sync_failure();
-    }
-
-    /// Inject one final-write ENOSPC after a page write may have completed.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_final_write_disk_full(&self) {
-        self.engine.inject_final_write_disk_full();
-    }
-
-    /// Inject one disk-full result for the feature-gated fault harness.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_disk_full(&self) {
-        self.engine.inject_disk_full();
-    }
-
-    /// Set a persistent device capacity limit for the feature-gated fault harness.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_capacity_limit(&self, capacity: u64) {
-        self.engine.inject_capacity_limit(capacity);
-    }
-
-    /// Inject one atomic artifact rename failure for the feature-gated fault
-    /// harness. The next atomic publication on this thread fails before the
-    /// rename, leaving the previous artifact available for recovery.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_atomic_rename_failure(&self) {
-        inject_atomic_rename_failure();
-    }
-
-    /// Inject one failure before the next WAL append.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_wal_write_failure(&self) {
-        FAIL_NEXT_WAL_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after the next WAL append but before its sync.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_wal_after_write_failure(&self) {
-        FAIL_NEXT_WAL_AFTER_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure at the next WAL sync boundary.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_wal_sync_failure(&self) {
-        FAIL_NEXT_WAL_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after the next WAL sync boundary.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_wal_after_sync_failure(&self) {
-        FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure at the next manifest sync boundary.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_manifest_sync_failure(&self) {
-        self.manifest.inject_sync_failure();
-    }
-
-    /// Inject one failure at the safety mirror sync boundary before page reuse.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_manifest_mirror_sync_failure(&self) {
-        self.manifest.inject_mirror_sync_failure();
-    }
-
-    /// Inject one failure at the coalesced artifact-directory barrier before
-    /// the next user manifest publication.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_publication_directory_sync_failure(&self) {
-        FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one final directory-sync failure after history pruning removes
-    /// obsolete checkpoint files. The active manifest remains authoritative;
-    /// reopen should accept the pruned or unpruned directory state.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_history_prune_directory_sync_failure(&self) {
-        FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after the next manifest becomes authoritative.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_after_manifest_failure(&self) {
-        FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after the next WAL file is removed.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_wal_truncate_failure(&self) {
-        FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one truncated atomic checkpoint image before manifest publish.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_atomic_short_write_failure(&self) {
-        FAIL_NEXT_ATOMIC_SHORT_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one checksum-corrupted atomic checkpoint image before manifest
-    /// publish.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_atomic_torn_write_failure(&self) {
-        FAIL_NEXT_ATOMIC_TORN_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after a mixed-blob rewrite image is durable but
-    /// before its maintenance manifest is published.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_after_blob_rewrite_image_failure(&self) {
-        FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after a segmented blob suffix is durable but before
-    /// its catalog is published.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_after_write_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure while syncing a segmented blob suffix.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_sync_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure while syncing a segmented blob catalog temp file.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_catalog_sync_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after a segmented blob catalog temp file is synced
-    /// but before it replaces the previous catalog.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_catalog_rename_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME.with(|failure| failure.set(true));
-    }
-
-    /// Inject one truncated segmented blob catalog image before manifest
-    /// publication.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_catalog_short_write_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE.with(|failure| failure.set(true));
-    }
-
-    /// Inject one checksum-corrupted segmented blob catalog image before
-    /// manifest publication.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_blob_segment_catalog_torn_write_failure(&self) {
-        FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE.with(|failure| failure.set(true));
     }
 
     /// Begin a root-bound byte transaction.
