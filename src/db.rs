@@ -60,6 +60,8 @@ mod read_view;
 mod reports;
 #[path = "db/retention.rs"]
 mod retention;
+#[path = "db/retention_artifacts.rs"]
+mod retention_artifacts;
 #[path = "db/retention_state.rs"]
 mod retention_state;
 #[path = "db/single_write.rs"]
