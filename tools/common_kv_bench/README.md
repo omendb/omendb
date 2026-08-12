@@ -93,7 +93,14 @@ completion during that seeded mutation, and writes a
 accepted prefixes and host/toolchain metadata. Install a native `libclang`
 package when building the optional RocksDB adapter. This is external
 libc-boundary evidence, not torn-write, block-layer, or power-loss
-equivalence.
+equivalence. On a non-Linux host, set
+`SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1` to write the same versioned manifest
+with `status: unsupported` and `accepted: false`; the default remains a
+fail-closed exit status 2.
+
+`tools/common_kv_faults.sh` uses the same explicit unsupported-platform
+contract for its Linux process-termination manifest. An unsupported manifest
+is an outcome record, never a successful recovery or comparison result.
 
 The RocksDB adapter requires a working native RocksDB build toolchain. On
 macOS that currently includes `libclang` for the published `rocksdb 0.24.0`

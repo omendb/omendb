@@ -23,6 +23,10 @@ The harness runs seerdb, fjall, and rocksdb. It traces each engine's seeded
 mutation, fails every observed fsync, fdatasync, and rename call once both
 before and after completion, and accepts only a complete batch prefix after
 two fresh reopens.
+
+Set SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1 on a non-Linux host to write a
+versioned manifest with status=unsupported and exit successfully. Without that
+opt-in, the Linux-only gate fails closed with exit status 2.
 EOF
 }
 
@@ -54,7 +58,7 @@ while (($#)); do
     esac
 done
 
-[[ $(uname -s) == Linux ]] || die "requires Linux"
+platform_name=$(uname -s)
 for command in awk cargo cc cp git python3 uname; do
     command -v "$command" >/dev/null || die "missing required command: $command"
 done
@@ -64,6 +68,64 @@ done
 [[ $seed =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer"
 ((base_operations % batch_size == 0 && operations % batch_size == 0)) || \
     die "base and mutation operations must be batch-aligned"
+
+if [[ $platform_name != Linux ]]; then
+    if [[ ${SEERDB_COMMON_KV_RECORD_UNSUPPORTED:-0} != 1 ]]; then
+        die "requires Linux; set SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1 to write an explicit unsupported manifest"
+    fi
+    [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
+    mkdir -p "$output_dir"
+    python3 - "$output_dir" "$repo_root" "$platform_name" "$keys" "$base_operations" "$operations" "$batch_size" "$value_bytes" "$seed" <<'PY'
+import json
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+output_dir = Path(sys.argv[1])
+repo_root = Path(sys.argv[2])
+host_os, keys, base_operations, operations, batch_size, value_bytes, seed = sys.argv[3:]
+
+def command_output(*command):
+    try:
+        return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unavailable"
+
+manifest = {
+    "format": "seerdb-common-kv-syscall-fault-manifest-v1",
+    "status": "unsupported",
+    "accepted": False,
+    "outcome": "unsupported-platform",
+    "reason": "external libc-boundary qualification requires Linux",
+    "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
+    "host_os": host_os,
+    "host_platform": platform.platform(),
+    "host_arch": platform.machine(),
+    "durability": "durable",
+    "workload": "batch-put seeded mutation",
+    "keys": int(keys),
+    "base_operations": int(base_operations),
+    "operations": int(operations),
+    "batch_size": int(batch_size),
+    "value_bytes": int(value_bytes),
+    "seed": int(seed),
+    "cases": [],
+    "not_exercised": [
+        "Linux libc-boundary fault injection was not executed",
+        "torn or short block writes",
+        "block-layer reordering or cache loss",
+        "machine power loss",
+        "filesystem crash-consistency races outside intercepted calls",
+    ],
+}
+(output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+print(json.dumps(manifest, indent=2))
+PY
+    echo "common_kv_syscall_faults: unsupported manifest $output_dir/manifest.json" >&2
+    exit 0
+fi
+
 [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
 
 mkdir -p "$output_dir/baselines" "$output_dir/runs"

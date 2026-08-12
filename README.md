@@ -153,6 +153,10 @@ This writes a `seerdb-common-kv-process-crash-manifest-v1` with six Linux
 cases, SIGKILL status, two reopen checks, and the accepted prefix digest for
 SeerDB, Fjall, and RocksDB. It does not claim recovery from a kill during
 fsync/page write or from block-layer power loss; those remain separate gates.
+On a non-Linux host, set `SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1` to write an
+explicit `status: unsupported`, `accepted: false` manifest instead of silently
+turning the missing Linux capability into a completed result. The default
+remains a fail-closed exit status 2.
 
 ## Verification
 

@@ -21,6 +21,10 @@ Options:
 The harness runs seerdb, fjall, and rocksdb. For each engine it kills one child
 before batch 64 (old state) and one before batch 80 (complete-new state), then
 verifies the expected prefix across two reopens.
+
+Set SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1 on a non-Linux host to write a
+versioned manifest with status=unsupported and exit successfully. Without that
+opt-in, the Linux-only gate fails closed with exit status 2.
 EOF
 }
 
@@ -50,7 +54,7 @@ while (($#)); do
     esac
 done
 
-[[ $(uname -s) == Linux ]] || die "requires Linux for process-termination qualification"
+platform_name=$(uname -s)
 for command in cargo git python3 uname; do
     command -v "$command" >/dev/null || die "missing required command: $command"
 done
@@ -67,6 +71,60 @@ is_positive_integer() {
 ((operations >= 80)) || die "--operations must reach the complete-new prefix 80"
 ((batch_size > 0 && 64 % batch_size == 0 && 80 % batch_size == 0)) || \
     die "--batch-size must divide both recovery prefixes 64 and 80"
+
+if [[ $platform_name != Linux ]]; then
+    if [[ ${SEERDB_COMMON_KV_RECORD_UNSUPPORTED:-0} != 1 ]]; then
+        die "requires Linux for process-termination qualification; set SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1 to write an explicit unsupported manifest"
+    fi
+    [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
+    mkdir -p "$output_dir"
+    python3 - "$output_dir" "$repo_root" "$platform_name" "$keys" "$operations" "$batch_size" "$value_bytes" "$seed" <<'PY'
+import json
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+output_dir = Path(sys.argv[1])
+repo_root = Path(sys.argv[2])
+host_os, keys, operations, batch_size, value_bytes, seed = sys.argv[3:]
+
+def command_output(*command):
+    try:
+        return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unavailable"
+
+manifest = {
+    "format": "seerdb-common-kv-process-crash-manifest-v1",
+    "status": "unsupported",
+    "accepted": False,
+    "outcome": "unsupported-platform",
+    "reason": "process-termination qualification requires Linux",
+    "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
+    "host_os": host_os,
+    "host_platform": platform.platform(),
+    "host_arch": platform.machine(),
+    "durability": "durable",
+    "workload": "batch-put",
+    "keys": int(keys),
+    "operations": int(operations),
+    "batch_size": int(batch_size),
+    "value_bytes": int(value_bytes),
+    "seed": int(seed),
+    "cases": [],
+    "unsupported_boundaries": [
+        "Linux process-termination qualification was not executed",
+        "SIGKILL during fsync/page write is not exercised",
+        "block-layer power loss and torn-write recovery are not exercised",
+    ],
+}
+(output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+print(json.dumps(manifest, indent=2))
+PY
+    echo "common_kv_faults: unsupported manifest $output_dir/manifest.json" >&2
+    exit 0
+fi
 
 [[ ! -e "$output_dir" ]] || die "output directory already exists: $output_dir"
 mkdir -p "$output_dir/runs" "$output_dir/db"
