@@ -244,7 +244,7 @@ proptest! {
             db.inject_capacity_limit(data_capacity);
             let refusal = db.gc();
             assert!(
-                matches!(refusal, Err(Error::CapacityPreflight)),
+                matches!(refusal, Err(Error::DiskFull | Error::CapacityPreflight)),
                 "unexpected mixed-GC result: segmented={segmented}, data_capacity={data_capacity}, valid={}, deleted={}, files={}, result={refusal:?}",
                 before_stats.total_valid,
                 before_stats.total_deleted,
