@@ -8,7 +8,7 @@
 use super::StorageEngine;
 use crate::btree::PAGE_SIZE;
 use crate::error::{Error, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 impl StorageEngine {
     /// Validate only relationships needed before an ordinary public handle
@@ -102,9 +102,28 @@ impl StorageEngine {
             &active_offsets,
             true,
         )?;
+        validate_offset_lists_are_disjoint(&[
+            ("free", &self.free_offsets),
+            ("pending reclaimed", &self.pending_reclaimed_offsets),
+            ("rebuild reserved", &rebuild_reserved_offsets),
+        ])?;
 
         Ok(())
     }
+}
+
+fn validate_offset_lists_are_disjoint(lists: &[(&str, &[u64])]) -> Result<()> {
+    let mut owners = HashMap::new();
+    for &(name, offsets) in lists {
+        for &offset in offsets {
+            if let Some(previous) = owners.insert(offset, name) {
+                return Err(Error::Corruption(format!(
+                    "physical offset {offset} appears in both {previous} and {name} lists"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_offset_list(

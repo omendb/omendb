@@ -36,6 +36,39 @@ fn runtime_invariants_cover_pmt_and_generation_state() {
 }
 
 #[test]
+fn runtime_invariants_reject_overlapping_physical_offset_owners() {
+    let dir = tempdir().unwrap();
+    let device = Device::open(
+        dir.path().join("data"),
+        &DeviceOptions {
+            use_odirect: false,
+            sync_writes: false,
+            create: true,
+        },
+    )
+    .unwrap();
+    let mut engine = StorageEngine::new(
+        BTree::new(),
+        BufferManager::new(PAGE_SIZE),
+        PMT::new(),
+        PageAllocator::new(),
+        device,
+    );
+
+    engine.next_offset = PAGE_SIZE as u64;
+    engine.free_offsets = vec![0];
+    engine.pending_reclaimed_offsets = vec![0];
+    engine.pending_reclaimed_cache_keys = vec![PageCacheKey::new(0, 1)];
+
+    let error = engine.validate_runtime_state().unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Corruption(message)
+            if message.contains("physical offset 0 appears in both free and pending reclaimed lists")
+    ));
+}
+
+#[test]
 fn buffer_stages_versioned_writeback_without_aliasing_generations() {
     let dir = tempdir().unwrap();
     let device = Device::open(
