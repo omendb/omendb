@@ -160,7 +160,15 @@ fsync/page write or from block-layer power loss; those remain separate gates.
 cargo test --release --all-features --tests
 cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+cargo deny check all
 ```
+
+`deny.toml` is the repository dependency policy. It denies unknown registries
+and Git sources, rejects wildcard requirements, allows only the reviewed
+license set, and requires a crate-specific exception for the transitive
+`r-efi` license expression. `cargo audit` is a complementary local RustSec
+check; neither result replaces GitHub's default-branch advisory state or a
+release review.
 
 The privileged `tools/linux_power_loss.sh` runner is separate and requires a
 Linux host with loop devices, `dm-log-writes`, and `replay-log`. It records an

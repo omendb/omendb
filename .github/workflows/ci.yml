@@ -19,6 +19,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --all-features --all-targets
 
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.19.0 --locked
+      - run: cargo deny check all
+
   test:
     name: Test
     runs-on: ubuntu-latest
