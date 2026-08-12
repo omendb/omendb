@@ -32,6 +32,8 @@ mod history_prune;
 mod invariants;
 #[path = "db/io.rs"]
 mod io;
+#[path = "db/lifecycle.rs"]
+mod lifecycle;
 #[path = "db/metadata.rs"]
 mod metadata;
 #[path = "db/metadata_codec.rs"]
@@ -131,7 +133,6 @@ use crate::storage::format::{
     MANIFEST_SLOT_SIZE, Manifest, ManifestHistory, ManifestStore, PmtCheckpointId, ReuseAttempt,
     ReuseLedger, SnapshotId,
 };
-use fs2::FileExt;
 pub(super) use io::{decode_u32, decode_u64, read_exact_at};
 use retention_state::RetentionState;
 use std::collections::HashSet;
@@ -304,20 +305,6 @@ impl DB {
         self.verify()
     }
 
-    /// Close the database (flush and sync).
-    pub fn close(&mut self) -> Result<()> {
-        if self.is_open {
-            if !self.read_only {
-                self.flush()?;
-            }
-            self.is_open = false;
-            if let Some(lock_file) = self.lock_file.take() {
-                let _ = lock_file.unlock();
-            }
-        }
-        Ok(())
-    }
-
     /// Get blob GC statistics.
     pub fn blob_stats(&self) -> BlobStats {
         BlobStats {
@@ -366,81 +353,6 @@ impl DB {
         })
     }
 
-    /// Check if the database is open.
-    fn check_open(&self) -> Result<()> {
-        if !self.is_open {
-            return Err(Error::InvalidArgument("database is closed".into()));
-        }
-        self.validate_runtime_state()
-    }
-
-    /// Reject ordinary reads after a failed publication until reopen restores
-    /// the last authoritative root. The in-memory mutation overlay may be
-    /// newer than the manifest after an ambiguous write, so exposing it would
-    /// make one handle disagree with the state a crash recovery would choose.
-    fn check_readable(&self) -> Result<()> {
-        self.check_open()?;
-        if self.write_fenced {
-            return Err(Error::NeedsRecovery(
-                "reads fenced after a failed durable publication; reopen required".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Reject writes after a failed publication until the database is reopened.
-    fn check_writable(&self) -> Result<()> {
-        self.check_open()?;
-        if self.read_only {
-            return Err(Error::ReadOnly);
-        }
-        if self.write_fenced {
-            return Err(Error::NeedsRecovery(
-                "writer fenced after a failed durable publication; reopen required".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_maintenance_idle(&self) -> Result<()> {
-        if self.vacuum.is_some() {
-            return Err(Error::MaintenanceInProgress("logical vacuum"));
-        }
-        Ok(())
-    }
-
-    fn acquire_writer_lock(path: &Path) -> Result<File> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(Error::DatabaseBusy)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn acquire_source_shared_lock(path: &Path) -> Result<Option<File>> {
-        let lock_path = path.join(LOCK_FILE);
-        if !lock_path.is_file() {
-            return Ok(None);
-        }
-
-        let file = OpenOptions::new().read(true).open(lock_path)?;
-        match fs2::FileExt::try_lock_shared(&file) {
-            Ok(()) => Ok(Some(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(Error::DatabaseBusy)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
     /// Generate a stable-enough identity for a newly created database.
     fn new_database_id(path: &Path) -> DatabaseId {
         let now = SystemTime::now()
@@ -479,18 +391,6 @@ struct RecoverySummary {
     last_commit: Option<CommitRecord>,
     last_commit_offset: u64,
     blob_changed: bool,
-}
-
-impl Drop for DB {
-    fn drop(&mut self) {
-        // Don't call close() — let the WAL persist for crash recovery.
-        // The user should explicitly call close() or flush() to ensure
-        // data is persisted and WAL is cleaned up.
-        // If the process crashes, the WAL file will be preserved for recovery.
-        if let Some(lock_file) = self.lock_file.take() {
-            let _ = lock_file.unlock();
-        }
-    }
 }
 
 #[cfg(test)]
