@@ -20,6 +20,9 @@ pub enum CheckFailureKind {
     /// The selected PMT/allocator checkpoint is invalid or mismatched.
     #[error("checkpoint")]
     Checkpoint,
+    /// An owner-local runtime or storage-state invariant is invalid.
+    #[error("runtime state")]
+    Runtime,
     /// A physical data page is missing, malformed, or has a bad checksum.
     #[error("data page")]
     DataPage,

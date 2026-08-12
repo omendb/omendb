@@ -97,9 +97,9 @@ impl DB {
     }
 
     fn verify_inner(&mut self) -> std::result::Result<VerificationReport, VerificationFailure> {
-        self.engine.validate_runtime_state().map_err(|error| {
-            VerificationFailure::from_error(CheckFailureKind::Checkpoint, error)
-        })?;
+        self.engine
+            .validate_runtime_state()
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Runtime, error))?;
         let manifest = self
             .manifest
             .load_latest()

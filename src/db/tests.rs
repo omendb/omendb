@@ -208,6 +208,21 @@ fn test_db_check_does_not_create_missing_path() {
 }
 
 #[test]
+fn test_check_classifies_runtime_storage_state_failures() {
+    let error = DB::map_check_error(
+        CheckFailureKind::Runtime,
+        Error::Corruption("buffer ownership invariant failed".into()),
+    );
+    assert!(matches!(
+        error,
+        Error::Check {
+            kind: CheckFailureKind::Runtime,
+            message
+        } if message.contains("buffer ownership invariant")
+    ));
+}
+
+#[test]
 fn test_db_put_get() {
     let dir = tempdir().unwrap();
     let mut db = DB::open(dir.path().join("test.db"), Options::default()).unwrap();
