@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
+use crate::btree::node::BlobPointer;
+
 use super::*;
 
 #[test]
