@@ -1,6 +1,8 @@
 //! Database configuration options.
 
 use crate::blob::DEFAULT_BLOB_THRESHOLD;
+use crate::btree::PAGE_SIZE;
+use crate::error::{Error, Result};
 
 /// Physical layout used for separated values.
 ///
@@ -60,6 +62,16 @@ impl Default for Options {
 }
 
 impl Options {
+    /// Validate configuration before opening or creating filesystem state.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.buffer_pool_size < PAGE_SIZE {
+            return Err(Error::InvalidArgument(format!(
+                "buffer_pool_size must be at least one page ({PAGE_SIZE} bytes)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Create options for testing (small buffer pool).
     pub fn for_test() -> Self {
         Self {
@@ -78,5 +90,17 @@ mod tests {
     fn alpha_page_format_is_fixed_and_buffer_default_is_aligned() {
         assert_eq!(PAGE_SIZE, 4096);
         assert_eq!(Options::default().buffer_pool_size % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn rejects_zero_frame_buffer_pool() {
+        let options = Options {
+            buffer_pool_size: PAGE_SIZE - 1,
+            ..Options::default()
+        };
+        assert!(matches!(
+            options.validate(),
+            Err(Error::InvalidArgument(message)) if message.contains("at least one page")
+        ));
     }
 }

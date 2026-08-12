@@ -21,6 +21,22 @@ fn test_db_open() {
 }
 
 #[test]
+fn test_db_rejects_zero_frame_buffer_pool_before_creating_path() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("invalid-options.db");
+    let options = Options {
+        buffer_pool_size: PAGE_SIZE - 1,
+        ..Options::default()
+    };
+
+    assert!(matches!(
+        DB::open(&path, options),
+        Err(Error::InvalidArgument(message)) if message.contains("at least one page")
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
 fn test_db_open_rejects_existing_directory_without_storage_artifacts() {
     let dir = tempdir().unwrap();
     let empty_path = dir.path().join("empty.db");

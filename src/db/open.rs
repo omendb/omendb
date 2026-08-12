@@ -6,6 +6,7 @@ impl DB {
         options: Options,
         mode: OpenMode,
     ) -> Result<Self> {
+        options.validate()?;
         // Page size is part of the compiled page, buffer, and on-disk
         // format. `Options` intentionally does not expose a second page-size
         // choice that could drift from those owners.
