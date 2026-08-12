@@ -164,6 +164,12 @@ impl From<InsertError> for Error {
                 Error::InvalidArgument("entry is too large for a B-tree page".into())
             }
             InsertError::WrongNodeType => Error::BTree("wrong node type for operation".into()),
+            InsertError::InvalidIndex(index) => {
+                Error::InvalidArgument(format!("B-tree entry index {index} is out of bounds"))
+            }
+            InsertError::ValueSizeMismatch { expected, actual } => Error::InvalidArgument(format!(
+                "B-tree replacement size mismatch: expected {expected}, got {actual}"
+            )),
             InsertError::DuplicateKey(_) => Error::DuplicateKey,
         }
     }

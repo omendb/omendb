@@ -291,7 +291,8 @@ impl BTree {
         if same_size_inline {
             self.node_mut(leaf_id)
                 .ok_or(BTreeError::MissingPage(leaf_id))?
-                .replace_value(index, value);
+                .replace_value(index, value)
+                .map_err(BTreeError::InsertFailed)?;
             return Ok(());
         }
 

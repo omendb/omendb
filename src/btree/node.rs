@@ -481,7 +481,14 @@ impl Node {
     ///
     /// The new value must be the same size as the old value.
     /// This is used for upsert when the value size doesn't change.
-    pub fn replace_value(&mut self, index: usize, new_value: &[u8]) {
+    pub fn replace_value(&mut self, index: usize, new_value: &[u8]) -> Result<(), InsertError> {
+        if !self.is_leaf() {
+            return Err(InsertError::WrongNodeType);
+        }
+        if index >= self.count() {
+            return Err(InsertError::InvalidIndex(index));
+        }
+
         let entry_off = self.slot_offset(index);
         let suffix_len = self.entry_suffix_len(index) as usize;
         let vt_off = entry_off + 4 + suffix_len;
@@ -489,23 +496,30 @@ impl Node {
 
         // Verify the new value is the same size.
         let old_value_type = self.data[vt_off];
-        if old_value_type == ValueType::Inline as u8 {
-            // Find the old value size by looking at neighboring entries.
-            let val_end = (0..self.count())
-                .filter(|&i| i != index)
-                .map(|i| self.slot_offset(i))
-                .filter(|&off| off > entry_off)
-                .min()
-                .unwrap_or(PAGE_SIZE);
-            let old_size = val_end - val_start;
-            assert_eq!(new_value.len(), old_size, "replace_value: size mismatch");
-        } else {
-            // For tombstone/blob, just overwrite with new inline value.
-            // This is a simplification — in production, we'd handle this more carefully.
+        if old_value_type != ValueType::Inline as u8 {
+            return Err(InsertError::WrongNodeType);
+        }
+
+        // Find the old value size by looking at neighboring entries.
+        let val_end = (0..self.count())
+            .filter(|&i| i != index)
+            .map(|i| self.slot_offset(i))
+            .filter(|&off| off > entry_off)
+            .min()
+            .unwrap_or(PAGE_SIZE);
+        let old_size = val_end
+            .checked_sub(val_start)
+            .ok_or(InsertError::WrongNodeType)?;
+        if new_value.len() != old_size {
+            return Err(InsertError::ValueSizeMismatch {
+                expected: old_size,
+                actual: new_value.len(),
+            });
         }
 
         self.data[val_start..val_start + new_value.len()].copy_from_slice(new_value);
         self.data[vt_off] = ValueType::Inline as u8;
+        Ok(())
     }
 
     /// Replace an entry with a value of any size, rebuilding the leaf when
@@ -872,6 +886,10 @@ pub enum InsertError {
     EntryTooLarge,
     #[error("wrong node type for this operation")]
     WrongNodeType,
+    #[error("entry index {0} is out of bounds")]
+    InvalidIndex(usize),
+    #[error("replacement value size mismatch: expected {expected}, got {actual}")]
+    ValueSizeMismatch { expected: usize, actual: usize },
     #[error("duplicate key at index {0}")]
     DuplicateKey(usize),
 }
