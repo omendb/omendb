@@ -117,9 +117,6 @@ impl DB {
     }
 
     fn verify_inner(&mut self) -> std::result::Result<VerificationReport, VerificationFailure> {
-        self.engine
-            .validate_runtime_state()
-            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Runtime, error))?;
         let manifest = self
             .manifest
             .load_latest()
@@ -143,6 +140,14 @@ impl DB {
             .engine
             .verify_pages(manifest.root_page_id)
             .map_err(|error| VerificationFailure::from_error(CheckFailureKind::DataPage, error))?;
+        // Check the coordinator relationships after the durable page boundary.
+        // A truncated data file can make the derived allocation frontier
+        // unaligned; the missing page is the actionable failure for check and
+        // repair callers, while runtime validation still classifies unrelated
+        // in-memory ownership and reclamation defects.
+        self.engine
+            .validate_runtime_state()
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Runtime, error))?;
         let blob_pointers = self
             .engine
             .verify_tree(manifest.root_page_id)

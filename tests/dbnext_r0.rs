@@ -2504,13 +2504,17 @@ fn dbnext_r0_unrecoverable_repair_refuses_truncated_data() {
         .set_len(original_length - 1)
         .unwrap();
 
-    assert!(matches!(
-        DB::check(&source_path, Options::default()),
-        Err(Error::Check {
-            kind: CheckFailureKind::DataPage,
-            ..
-        })
-    ));
+    let check = DB::check(&source_path, Options::default());
+    assert!(
+        matches!(
+            &check,
+            Err(Error::Check {
+                kind: CheckFailureKind::DataPage,
+                ..
+            })
+        ),
+        "truncated data check returned {check:?}"
+    );
     assert!(matches!(
         DB::repair(&source_path, &destination_path, Options::default()),
         Err(Error::Check {
