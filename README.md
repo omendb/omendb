@@ -165,11 +165,26 @@ remains a fail-closed exit status 2.
 
 ## Verification
 
+Routine CI runs the fast repository gate:
+
 ```bash
-cargo test --release --all-features --tests
+cargo check --all-features --all-targets
+cargo test --all-features --all-targets
+cargo fmt --all -- --check
 cargo clippy --all-features --all-targets -- -D warnings
+```
+
+Extended validation is available through manual dispatch of the `Extended
+validation` GitHub Actions workflow and runs automatically for `v*` release
+tags. Run the same release, documentation, dependency, and dedicated
+filesystem gates locally with:
+
+```bash
+cargo test --release --all-features --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 cargo deny check all
+SEERDB_ENOSPC_ROOT=/path/to/size-limited-filesystem \
+  cargo test --all-features --test real_enospc -- --ignored
 ```
 
 `deny.toml` is the repository dependency policy. It denies unknown registries

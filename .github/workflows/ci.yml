@@ -10,75 +10,24 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: Check
+  checks:
+    name: Checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --all-features --all-targets
-
-  dependency-policy:
-    name: Dependency policy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.19.0 --locked
-      - run: cargo deny check all
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-features --all-targets
-      - run: cargo test --release --all-features --all-targets
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
-          components: rustfmt
-      - run: cargo fmt --all --check
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: cargo clippy --all-features --all-targets -- -D warnings
-
-  docs:
-    name: Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo doc --all-features --no-deps
-
-  real-enospc:
-    name: Real filesystem ENOSPC
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Mount dedicated size-limited filesystem
-        run: |
-          sudo mkdir -p /mnt/seerdb-enospc
-          sudo mount -t tmpfs -o size=64m,nr_inodes=10000 tmpfs /mnt/seerdb-enospc
-          echo "SEERDB_ENOSPC_ROOT=/mnt/seerdb-enospc" >> "$GITHUB_ENV"
-      - name: Exercise real capacity refusal and retry
-        run: cargo test --all-features --test real_enospc -- --ignored
-      - name: Unmount dedicated filesystem
-        if: always()
-        run: sudo umount /mnt/seerdb-enospc
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check all targets
+        run: cargo check --all-features --all-targets
+      - name: Run Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Run debug tests
+        run: cargo test --all-features --all-targets
