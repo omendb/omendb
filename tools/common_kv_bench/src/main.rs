@@ -878,6 +878,23 @@ struct RunCounters {
     reads: usize,
     ranges: usize,
     deletes: usize,
+    write_batches: usize,
+    max_write_batch_size: usize,
+}
+
+fn is_write_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::Put { .. } | Operation::Delete { .. })
+}
+
+fn next_write_batch_end(operations: &[Operation], start: usize, batch_size: usize) -> usize {
+    let mut end = start;
+    while end < operations.len()
+        && end.saturating_sub(start) < batch_size
+        && is_write_operation(&operations[end])
+    {
+        end += 1;
+    }
+    end
 }
 
 #[derive(Debug)]
@@ -888,6 +905,7 @@ struct RunResult {
     reopen_ns: u128,
     resources: ResourceMetrics,
     latency: LatencyStats,
+    write_batch_latency: LatencyStats,
     counters: RunCounters,
     logical_bytes: u64,
     final_keys: usize,
@@ -997,8 +1015,9 @@ fn run_workload(
     progress: Option<&Path>,
     progress_hold: Option<&Path>,
     progress_hold_index: Option<usize>,
-) -> BenchResult<(u128, LatencyStats, RunCounters, u64)> {
+) -> BenchResult<(u128, LatencyStats, LatencyStats, RunCounters, u64)> {
     let mut latencies = Vec::new();
+    let mut write_batch_latencies = Vec::new();
     let mut counters = RunCounters::default();
     let mut logical_bytes = 0;
     let started = Instant::now();
@@ -1016,7 +1035,11 @@ fn run_workload(
             )?;
             let batch_started = Instant::now();
             engine.write_batch(chunk)?;
-            latencies.push(batch_started.elapsed().as_nanos());
+            let batch_latency = batch_started.elapsed().as_nanos();
+            latencies.push(batch_latency);
+            write_batch_latencies.push(batch_latency);
+            counters.write_batches += 1;
+            counters.max_write_batch_size = counters.max_write_batch_size.max(chunk.len());
             for operation in chunk {
                 if let Operation::Put { key, value } = operation {
                     counters.writes += 1;
@@ -1027,27 +1050,48 @@ fn run_workload(
         }
         counters.measured_operations = operations.len();
     } else {
-        for (operation_index, operation) in operations.iter().enumerate() {
+        let mut operation_index = 0;
+        while operation_index < operations.len() {
+            let operation = &operations[operation_index];
             publish_progress_boundary(
                 progress,
                 progress_hold,
                 progress_hold_index,
                 operation_index,
             )?;
+            if is_write_operation(operation) {
+                let batch_end = next_write_batch_end(operations, operation_index, batch_size);
+                let batch = &operations[operation_index..batch_end];
+                let batch_started = Instant::now();
+                engine.write_batch(batch)?;
+                let batch_latency = batch_started.elapsed().as_nanos();
+                latencies.push(batch_latency);
+                write_batch_latencies.push(batch_latency);
+                counters.write_batches += 1;
+                counters.max_write_batch_size = counters.max_write_batch_size.max(batch.len());
+                for operation in batch {
+                    match operation {
+                        Operation::Put { key, value } => {
+                            counters.writes += 1;
+                            logical_bytes += (key.len() + value.len()) as u64;
+                        }
+                        Operation::Delete { key } => {
+                            counters.deletes += 1;
+                            logical_bytes += key.len() as u64;
+                        }
+                        Operation::Get { .. } | Operation::Range { .. } => {
+                            unreachable!("read operation passed to a write batch")
+                        }
+                    }
+                    apply_oracle(oracle, operation);
+                }
+                counters.measured_operations += batch.len();
+                operation_index = batch_end;
+                continue;
+            }
+
             let operation_started = Instant::now();
             match operation {
-                Operation::Put { key, value } => {
-                    engine.write_batch(std::slice::from_ref(operation))?;
-                    counters.writes += 1;
-                    logical_bytes += (key.len() + value.len()) as u64;
-                    apply_oracle(oracle, operation);
-                }
-                Operation::Delete { key } => {
-                    engine.write_batch(std::slice::from_ref(operation))?;
-                    counters.deletes += 1;
-                    logical_bytes += key.len() as u64;
-                    apply_oracle(oracle, operation);
-                }
                 Operation::Get { key } => {
                     verify_get(engine, oracle, key)?;
                     counters.reads += 1;
@@ -1056,15 +1100,20 @@ fn run_workload(
                     verify_range(engine, oracle, start, end)?;
                     counters.ranges += 1;
                 }
+                Operation::Put { .. } | Operation::Delete { .. } => {
+                    unreachable!("write operation should have taken the batch path")
+                }
             }
             latencies.push(operation_started.elapsed().as_nanos());
             counters.measured_operations += 1;
+            operation_index += 1;
         }
     }
 
     Ok((
         started.elapsed().as_nanos(),
         latency_stats(&mut latencies),
+        latency_stats(&mut write_batch_latencies),
         counters,
         logical_bytes,
     ))
@@ -1128,7 +1177,7 @@ fn render_result(result: &RunResult) -> String {
             .map(|counters| counters.page_bytes_written as f64 / result.logical_bytes as f64)
     };
     format!(
-        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"trace_digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_candidate_prepare_ns\": {},\n  \"seerdb_wal_write_ns\": {},\n  \"seerdb_admission_ns\": {},\n  \"seerdb_data_flush_ns\": {},\n  \"seerdb_metadata_write_ns\": {},\n  \"seerdb_blob_write_ns\": {},\n  \"seerdb_history_write_ns\": {},\n  \"seerdb_directory_sync_ns\": {},\n  \"seerdb_manifest_write_ns\": {},\n  \"seerdb_manifest_mirror_ns\": {},\n  \"seerdb_cleanup_ns\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
+        "{{\n  \"format\": \"seerdb-common-kv-v4\",\n  \"engine\": \"{}\",\n  \"workload\": \"{}\",\n  \"durability\": \"{}\",\n  \"host_os\": \"{}\",\n  \"host_arch\": \"{}\",\n  \"keys\": {},\n  \"operations\": {},\n  \"batch_size\": {},\n  \"value_bytes\": {},\n  \"range_width\": {},\n  \"seed\": {},\n  \"preload_ns\": {},\n  \"workload_ns\": {},\n  \"reopen_ns\": {},\n  \"throughput_ops_per_sec\": {:.3},\n  \"latency_unit\": \"{}\",\n  \"p50_ns\": {},\n  \"p95_ns\": {},\n  \"p99_ns\": {},\n  \"max_ns\": {},\n  \"write_batch_count\": {},\n  \"max_write_batch_size\": {},\n  \"write_batch_p50_ns\": {},\n  \"write_batch_p95_ns\": {},\n  \"write_batch_p99_ns\": {},\n  \"write_batch_max_ns\": {},\n  \"writes\": {},\n  \"deletes\": {},\n  \"point_reads\": {},\n  \"ranges\": {},\n  \"logical_bytes\": {},\n  \"final_keys\": {},\n  \"digest_fnv1a64\": \"{:016x}\",\n  \"trace_digest_fnv1a64\": \"{:016x}\",\n  \"disk_bytes\": {},\n  \"process_user_cpu_ns\": {},\n  \"process_system_cpu_ns\": {},\n  \"process_max_rss_bytes\": {},\n  \"seerdb_physical_page_writes\": {},\n  \"seerdb_page_bytes_written\": {},\n  \"seerdb_generation_flushes\": {},\n  \"seerdb_data_syncs\": {},\n  \"seerdb_wal_bytes_written\": {},\n  \"seerdb_metadata_bytes_written\": {},\n  \"seerdb_blob_bytes_written\": {},\n  \"seerdb_history_bytes_written\": {},\n  \"seerdb_manifest_bytes_written\": {},\n  \"seerdb_reclaimed_bytes\": {},\n  \"seerdb_candidate_prepare_ns\": {},\n  \"seerdb_wal_write_ns\": {},\n  \"seerdb_admission_ns\": {},\n  \"seerdb_data_flush_ns\": {},\n  \"seerdb_metadata_write_ns\": {},\n  \"seerdb_blob_write_ns\": {},\n  \"seerdb_history_write_ns\": {},\n  \"seerdb_directory_sync_ns\": {},\n  \"seerdb_manifest_write_ns\": {},\n  \"seerdb_manifest_mirror_ns\": {},\n  \"seerdb_cleanup_ns\": {},\n  \"seerdb_page_write_amplification\": {}\n}}",
         config.engine.name(),
         config.workload.name(),
         config.durability.name(),
@@ -1144,15 +1193,21 @@ fn render_result(result: &RunResult) -> String {
         result.workload_ns,
         result.reopen_ns,
         throughput,
-        if config.workload == WorkloadKind::BatchPut {
-            "batch"
-        } else {
-            "operation"
+        match config.workload {
+            WorkloadKind::BatchPut => "write-batch",
+            WorkloadKind::Mixed => "operation-or-write-batch",
+            WorkloadKind::PointRead | WorkloadKind::RangeRead => "operation",
         },
         result.latency.p50_ns,
         result.latency.p95_ns,
         result.latency.p99_ns,
         result.latency.max_ns,
+        result.counters.write_batches,
+        result.counters.max_write_batch_size,
+        result.write_batch_latency.p50_ns,
+        result.write_batch_latency.p95_ns,
+        result.write_batch_latency.p99_ns,
+        result.write_batch_latency.max_ns,
         result.counters.writes,
         result.counters.deletes,
         result.counters.reads,
@@ -1392,15 +1447,16 @@ fn main() -> BenchResult<()> {
         preload_started.elapsed().as_nanos()
     };
 
-    let (workload_ns, latency, counters, workload_logical_bytes) = run_workload(
-        &mut engine,
-        &mut oracle,
-        &operations,
-        config.batch_size,
-        config.progress.as_deref(),
-        config.progress_hold.as_deref(),
-        config.progress_hold_index,
-    )?;
+    let (workload_ns, latency, write_batch_latency, counters, workload_logical_bytes) =
+        run_workload(
+            &mut engine,
+            &mut oracle,
+            &operations,
+            config.batch_size,
+            config.progress.as_deref(),
+            config.progress_hold.as_deref(),
+            config.progress_hold_index,
+        )?;
     let logical_bytes = if config.open_existing {
         workload_logical_bytes
     } else {
@@ -1435,6 +1491,7 @@ fn main() -> BenchResult<()> {
         reopen_ns,
         resources,
         latency,
+        write_batch_latency,
         counters,
         logical_bytes,
         final_keys: expected_entries.len(),
@@ -1445,4 +1502,33 @@ fn main() -> BenchResult<()> {
     };
     let output = render_result(&result);
     emit_output(&output, result.config.output.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Operation, next_write_batch_end};
+
+    fn put(index: usize) -> Operation {
+        Operation::Put {
+            key: vec![index as u8],
+            value: vec![index as u8],
+        }
+    }
+
+    #[test]
+    fn write_batches_respect_batch_size() {
+        let operations = vec![put(0), put(1), put(2), put(3)];
+
+        assert_eq!(next_write_batch_end(&operations, 0, 1), 1);
+        assert_eq!(next_write_batch_end(&operations, 0, 3), 3);
+        assert_eq!(next_write_batch_end(&operations, 3, 3), 4);
+    }
+
+    #[test]
+    fn write_batches_stop_before_reads() {
+        let operations = vec![put(0), put(1), Operation::Get { key: vec![9] }, put(2)];
+
+        assert_eq!(next_write_batch_end(&operations, 0, 4), 2);
+        assert_eq!(next_write_batch_end(&operations, 3, 4), 4);
+    }
 }

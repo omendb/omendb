@@ -21,6 +21,14 @@ filesystem when comparing engines. These numbers are diagnostic until they
 are repeated on a documented Linux/NVMe matrix with warm-up, repetitions, and
 matched tuning.
 
+`--batch-size` is an execution contract, not only a label. `batch-put` groups
+the measured puts into fixed-size write batches. `mixed` groups contiguous
+`put`/`delete` runs up to that size and never crosses a `get` or `range`, so
+read ordering remains unchanged. Result artifacts report
+`write_batch_count`, `max_write_batch_size`, and separate write-batch latency
+quantiles; `latency_unit` identifies whether the general quantiles are
+operations, write batches, or mixed execution units.
+
 For a repeatable Linux baseline with raw runs and an aggregate manifest, use
 `tools/common_kv_qualification.sh`. It defaults to three durable repetitions
 and one discarded warm-up for `batch-put` and `mixed` across all three engines:
