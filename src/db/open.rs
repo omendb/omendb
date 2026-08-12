@@ -1,20 +1,20 @@
 use super::*;
 
-struct OpenPaths {
-    path: PathBuf,
+pub(super) struct OpenPaths {
+    pub(super) path: PathBuf,
     path_preexisted: bool,
-    data: PathBuf,
-    wal: PathBuf,
-    meta: PathBuf,
+    pub(super) data: PathBuf,
+    pub(super) wal: PathBuf,
+    pub(super) meta: PathBuf,
     manifest: PathBuf,
 }
 
-struct OpenCatalog {
-    read_only: bool,
-    check_only: bool,
+pub(super) struct OpenCatalog {
+    pub(super) read_only: bool,
+    pub(super) check_only: bool,
     lock_file: Option<File>,
+    pub(super) current_manifest: Option<Manifest>,
     manifest: ManifestStore,
-    current_manifest: Option<Manifest>,
     manifest_history: ManifestHistory,
     reuse_ledger: ReuseLedger,
     database_id: DatabaseId,
@@ -24,14 +24,7 @@ struct OpenCatalog {
     next_commit_id: CommitId,
     next_generation_id: GenerationId,
     retention: Arc<Mutex<RetentionState>>,
-    protected_offsets: Arc<Mutex<HashSet<u64>>>,
-}
-
-struct OpenComponents {
-    engine: StorageEngine,
-    wal: WalManager,
-    blobs: BlobManager,
-    recovery: Option<RecoverySummary>,
+    pub(super) protected_offsets: Arc<Mutex<HashSet<u64>>>,
 }
 
 struct OpenRetention {
@@ -401,143 +394,6 @@ impl DB {
             protected_offsets,
         })
     }
-
-    fn build_open_components(
-        paths: &OpenPaths,
-        options: &Options,
-        catalog: &OpenCatalog,
-    ) -> Result<OpenComponents> {
-        let device_opts = DeviceOptions {
-            use_odirect: options.use_odirect,
-            sync_writes: options.sync_writes,
-            create: !catalog.read_only,
-        };
-        let device = if catalog.check_only {
-            Device::open_read_only(&paths.data, &device_opts)?
-        } else {
-            Device::open(&paths.data, &device_opts)?
-        };
-        let buffer = BufferManager::new(options.buffer_pool_size);
-        let sync_policy = if options.sync_writes {
-            SyncPolicy::FDataSync
-        } else {
-            SyncPolicy::None
-        };
-        let wal = WalManager::new(sync_policy);
-        let recovered_blob_bytes = Self::recover_blob_rewrite_backup(
-            &paths.path,
-            catalog.current_manifest,
-            catalog.read_only,
-        )?;
-        let blob_path = paths.path.join(BLOB_FILE);
-        let mut blobs = if blob_path.exists() {
-            let blob_data = recovered_blob_bytes
-                .as_deref()
-                .map_or_else(|| fs::read(&blob_path), |bytes| Ok(bytes.to_vec()))?;
-            match parse_blob_catalog(
-                &paths.path,
-                &blob_data,
-                catalog
-                    .current_manifest
-                    .map(|manifest| manifest.generation_id.get()),
-            )? {
-                Some(blobs) => blobs,
-                None if catalog.check_only => {
-                    return Err(Error::Check {
-                        kind: CheckFailureKind::Blob,
-                        message: "blob catalog or segment is invalid".into(),
-                    });
-                }
-                None => {
-                    return Err(Error::Corruption(
-                        "blob catalog or segment is invalid".into(),
-                    ));
-                }
-            }
-        } else {
-            BlobManager::with_threshold_and_mode(
-                options.blob_threshold,
-                options.blob_storage == BlobStorageMode::Segmented,
-            )
-        };
-        if catalog
-            .current_manifest
-            .is_some_and(|current| blobs.generation_id() != current.generation_id.get())
-        {
-            blobs.clear_deletion_metadata();
-        }
-
-        let (pmt, allocator) = Self::load_open_metadata(paths, catalog)?;
-        let mut engine = StorageEngine::new_with_protected_offsets(
-            BTree::new(),
-            buffer,
-            pmt,
-            allocator,
-            device,
-            Arc::clone(&catalog.protected_offsets),
-        );
-        let retained_offsets = catalog
-            .protected_offsets
-            .lock()
-            .map_err(|_| Error::Corruption("retention protection mutex is poisoned".into()))?
-            .clone();
-        engine.set_protected_offsets(retained_offsets)?;
-        if let Some(current) = catalog.current_manifest {
-            engine.load_from_manifest(current.root_page_id)?;
-        } else if !paths.wal.exists() {
-            engine.load_from_disk()?;
-        }
-        if paths.wal.exists() && !catalog.check_only {
-            engine.ensure_materialized()?;
-        }
-        let recovery = if paths.wal.exists() && !catalog.check_only {
-            Some(wal_recovery::recover_from_wal(
-                &paths.wal,
-                catalog.current_manifest,
-                engine.btree_mut(),
-                &mut blobs,
-            )?)
-        } else {
-            None
-        };
-        Ok(OpenComponents {
-            engine,
-            wal,
-            blobs,
-            recovery,
-        })
-    }
-
-    fn load_open_metadata(
-        paths: &OpenPaths,
-        catalog: &OpenCatalog,
-    ) -> Result<(PMT, PageAllocator)> {
-        if let Some(current) = catalog.current_manifest {
-            if current.pmt_checkpoint_id.get() == 0 {
-                return Ok((PMT::new(), PageAllocator::new()));
-            }
-            let checkpoint_path = paths
-                .path
-                .join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
-            return Self::load_meta(&checkpoint_path).map_err(|error| {
-                if catalog.check_only {
-                    Self::map_checkpoint_check_error(error)
-                } else {
-                    error
-                }
-            });
-        }
-        if paths.meta.exists() {
-            return Self::load_meta(&paths.meta).map_err(|error| {
-                if catalog.check_only {
-                    Self::map_checkpoint_check_error(error)
-                } else {
-                    error
-                }
-            });
-        }
-        Ok((PMT::new(), PageAllocator::new()))
-    }
 }
 
 impl DB {
@@ -549,7 +405,7 @@ impl DB {
         options.validate()?;
         let paths = OpenPaths::prepare(path, mode)?;
         let catalog = Self::load_open_catalog(&paths, mode)?;
-        let components = Self::build_open_components(&paths, &options, &catalog)?;
+        let components = open_components::build(&paths, &options, &catalog)?;
 
         let current_manifest = catalog.current_manifest;
         let recovery = components.recovery;
