@@ -424,3 +424,7 @@ struct RecoverySummary {
 #[cfg(test)]
 #[path = "db/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db/published_commits_tests.rs"]
+mod published_commits_tests;
