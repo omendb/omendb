@@ -129,16 +129,30 @@ bench_name=seerdb-common-kv-bench
 build_engine() {
     local engine=$1
     local target_dir="$build_root/$engine"
+    local binary="$target_dir/release/$bench_name"
     case "$engine" in
         seerdb|fjall)
-            cargo build --release --manifest-path "$bench_manifest" --target-dir "$target_dir" >&2
+            if ! cargo build --release --manifest-path "$bench_manifest" --target-dir "$target_dir" >&2; then
+                echo "common_kv_qualification: failed to build $engine" >&2
+                return 1
+            fi
             ;;
         rocksdb)
-            cargo build --release --manifest-path "$bench_manifest" --target-dir "$target_dir" \
-                --no-default-features --features rocksdb >&2
+            if ! cargo build --release --manifest-path "$bench_manifest" --target-dir "$target_dir" \
+                --no-default-features --features rocksdb >&2; then
+                echo "common_kv_qualification: failed to build $engine" >&2
+                return 1
+            fi
             ;;
+        *)
+            echo "common_kv_qualification: unknown engine $engine" >&2
+            return 1
     esac
-    echo "$target_dir/release/$bench_name"
+    if [[ ! -x "$binary" ]]; then
+        echo "common_kv_qualification: build succeeded but binary is missing: $binary" >&2
+        return 1
+    fi
+    echo "$binary"
 }
 
 for engine in "${engines[@]}"; do

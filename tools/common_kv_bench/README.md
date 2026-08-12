@@ -37,6 +37,9 @@ policy; use a controlled Linux/NVMe host and an explicit CPU set through
 `SEERDB_BENCH_CPUSET` when a qualification result needs tighter resource
 control. The script refuses non-Linux hosts unless
 `SEERDB_COMMON_KV_ALLOW_NONLINUX=1` is set for a diagnostic run.
+It fails before running the matrix if any requested adapter fails to build or
+its expected executable is missing, so a partial run cannot be mistaken for a
+completed comparison manifest.
 
 ## Examples
 
