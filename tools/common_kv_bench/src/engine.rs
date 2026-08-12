@@ -4,7 +4,10 @@
 //! `main.rs`. This module owns only the backend lifecycle and the narrow
 //! operations needed to execute that trace against each engine.
 
-use super::{BenchResult, DurabilityMode, EngineKind, Operation, report::SeerCounters};
+use super::BenchResult;
+use super::config::{DurabilityMode, EngineKind};
+use super::report::SeerCounters;
+use super::trace::Operation;
 use std::path::Path;
 
 #[cfg(feature = "fjall")]

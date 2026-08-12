@@ -3,7 +3,7 @@
 //! The generated operations and in-memory oracle are the comparison authority.
 //! Backend adapters execute this model but do not define its semantics.
 
-use super::{Config, WorkloadKind};
+use super::config::{Config, WorkloadKind};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]

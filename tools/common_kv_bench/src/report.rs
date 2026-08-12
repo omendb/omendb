@@ -4,8 +4,8 @@
 //! This module owns the values produced by a run, process-resource sampling,
 //! latency summaries, and the stable JSON-shaped diagnostic artifacts.
 
+use super::config::{Config, WorkloadKind};
 use super::trace::digest;
-use super::{Config, WorkloadKind};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct SeerCounters {
