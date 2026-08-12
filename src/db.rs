@@ -39,6 +39,8 @@ mod metadata_codec;
 mod mutation;
 #[path = "db/open.rs"]
 mod open;
+#[path = "db/open_catalog.rs"]
+mod open_catalog;
 #[path = "db/open_components.rs"]
 mod open_components;
 mod options;

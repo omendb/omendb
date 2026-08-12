@@ -5,7 +5,8 @@
 //! replay. Path creation, manifest/identity reconciliation, retention state,
 //! and final `DB` assembly remain in `open.rs`.
 
-use super::open::{OpenCatalog, OpenPaths};
+use super::open::OpenPaths;
+use super::open_catalog::OpenCatalog;
 use super::*;
 
 pub(super) struct OpenComponents {
