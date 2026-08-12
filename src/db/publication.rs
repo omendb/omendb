@@ -6,6 +6,11 @@
 
 use super::*;
 
+struct PublicationPreparation {
+    parent_manifest: Manifest,
+    reused_slots: bool,
+}
+
 impl DB {
     /// Publish a generation after its pages and checkpoints are durable.
     pub(super) fn publish_generation(
@@ -14,6 +19,20 @@ impl DB {
         append_commit: bool,
         recovered_wal_offset: u64,
     ) -> Result<()> {
+        let preparation = self.prepare_generation_publication(commit)?;
+        let wal_path = self.write_generation_artifacts(
+            commit,
+            append_commit,
+            recovered_wal_offset,
+            preparation.parent_manifest,
+        )?;
+        self.finish_generation_publication(commit, preparation.reused_slots, wal_path)
+    }
+
+    fn prepare_generation_publication(
+        &mut self,
+        commit: CommitRecord,
+    ) -> Result<PublicationPreparation> {
         let parent_manifest = self
             .manifest_history
             .latest()
@@ -52,6 +71,7 @@ impl DB {
                 offsets: reuse_offsets,
             })
             .map_err(|message| Error::Corruption(format!("reuse ledger {message}")))?;
+
         let admission_started = Instant::now();
         let preflight_result = self.preflight_publication_capacity();
         self.publication_timing.admission_ns = self
@@ -63,6 +83,7 @@ impl DB {
             return Err(error);
         }
         self.persist_reuse_ledger()?;
+
         let flush_started = Instant::now();
         let flush_result = self.engine.flush_after_reclamation_refresh();
         self.publication_timing.data_flush_ns = self
@@ -82,6 +103,19 @@ impl DB {
             return Err(error);
         }
 
+        Ok(PublicationPreparation {
+            parent_manifest,
+            reused_slots,
+        })
+    }
+
+    fn write_generation_artifacts(
+        &mut self,
+        commit: CommitRecord,
+        append_commit: bool,
+        recovered_wal_offset: u64,
+        parent_manifest: Manifest,
+    ) -> Result<PathBuf> {
         let metadata_started = Instant::now();
         let checkpoint_path = self
             .path
@@ -211,6 +245,15 @@ impl DB {
             return Err(std::io::Error::other("injected post-manifest failure").into());
         }
 
+        Ok(wal_path)
+    }
+
+    fn finish_generation_publication(
+        &mut self,
+        commit: CommitRecord,
+        reused_slots: bool,
+        wal_path: PathBuf,
+    ) -> Result<()> {
         let cleanup_started = Instant::now();
         if self.blobs.is_segmented() {
             self.prune_unreferenced_blob_segments()?;
