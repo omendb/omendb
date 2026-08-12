@@ -11,6 +11,7 @@ mod materialization;
 mod page_cache;
 mod read_path;
 mod reclamation;
+mod retention_format;
 mod verification;
 
 pub use manifest_store::ManifestStore;
