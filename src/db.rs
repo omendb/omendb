@@ -27,8 +27,14 @@ mod open;
 mod options;
 #[path = "db/publication.rs"]
 mod publication;
+#[path = "db/read_view.rs"]
+mod read_view;
 #[path = "db/retention.rs"]
 mod retention;
+#[path = "db/retention_state.rs"]
+mod retention_state;
+#[path = "db/snapshot.rs"]
+mod snapshot;
 #[path = "db/transaction.rs"]
 mod transaction;
 #[path = "db/vacuum.rs"]
@@ -63,7 +69,8 @@ use wal_recovery::{
 };
 
 pub use options::{BlobStorageMode, Options};
-pub use retention::{ReadView, RetainedSnapshot, Snapshot};
+pub use read_view::ReadView;
+pub use snapshot::{RetainedSnapshot, Snapshot};
 pub use transaction::{BatchMutation, BatchTransaction, BatchTransactionState};
 
 use crate::allocator::PageAllocator;
@@ -82,7 +89,7 @@ use crate::storage::format::{
 };
 use crate::storage::{StorageEngine, StorageMetrics};
 use fs2::FileExt;
-use retention::{RetentionLease, RetentionState};
+use retention_state::{RetentionLease, RetentionState};
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 #[cfg(unix)]

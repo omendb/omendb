@@ -4,7 +4,7 @@
 //! owns the staged mutation list, root-bound read overlay, expected-base
 //! commit contract, and cleanup state for one data-bearing transaction.
 
-use super::retention::RetentionLease;
+use super::retention_state::RetentionLease;
 use super::{
     DB, DurabilityStatus, Error, Result, validate_wal_key_length, validate_wal_put_lengths,
 };

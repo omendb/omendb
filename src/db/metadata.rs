@@ -5,7 +5,7 @@
 //! offset validation, and metadata footprint calculations used by that state
 //! machine.
 
-use super::retention::RetentionState;
+use super::retention_state::RetentionState;
 use super::{
     BLOB_FILE, DATA_FILE, DB, atomic_write, atomic_write_without_directory_sync,
     retained_blob_path, sync_directory,
