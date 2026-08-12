@@ -103,8 +103,10 @@ The same seeded mutation contract is available for the common-KV comparison:
 `tools/common_kv_syscall_faults.sh` passed 210 external sync/rename cases over
 SeerDB, Fjall, and RocksDB on ARM64 Linux: every observed call was tested both
 before and after completion, with complete batch-prefix and two-reopen
-verification. Its manifest is diagnostic recovery evidence, not incumbent
-performance or block-layer power-loss equivalence.
+verification. Its manifest classifies process refusal/completion, complete or
+shorter-prefix recovery, stable two-reopen verification, and uncollected
+resource equivalence separately. It is diagnostic recovery evidence, not
+incumbent performance or block-layer power-loss equivalence.
 
 ## Portable qualification
 
@@ -153,6 +155,9 @@ This writes a `seerdb-common-kv-process-crash-manifest-v1` with six Linux
 cases, SIGKILL status, two reopen checks, and the accepted prefix digest for
 SeerDB, Fjall, and RocksDB. It does not claim recovery from a kill during
 fsync/page write or from block-layer power loss; those remain separate gates.
+Each accepted case also records normalized execution, recovery, reopen, and
+resource outcomes so process termination, old/complete-new recovery, stable
+two-reopen verification, and uncollected resource equivalence remain distinct.
 On a non-Linux host, set `SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1` to write an
 explicit `status: unsupported`, `accepted: false` manifest instead of silently
 turning the missing Linux capability into a completed result. The default

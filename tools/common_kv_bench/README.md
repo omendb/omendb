@@ -100,7 +100,12 @@ fail-closed exit status 2.
 
 `tools/common_kv_faults.sh` uses the same explicit unsupported-platform
 contract for its Linux process-termination manifest. An unsupported manifest
-is an outcome record, never a successful recovery or comparison result.
+is an outcome record, never a successful recovery or comparison result. Linux
+fault manifests use normalized `execution_outcome`, `recovery_outcome`,
+`reopen_outcome`, and `resource_outcome` fields: they distinguish a SIGKILL or
+faulted-process refusal, old/complete-new or complete-prefix recovery, stable
+two-reopen verification, and the fact that resource equivalence was not
+collected.
 
 The RocksDB adapter requires a working native RocksDB build toolchain. On
 macOS that currently includes `libclang` for the published `rocksdb 0.24.0`

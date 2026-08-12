@@ -100,6 +100,10 @@ manifest = {
     "status": "unsupported",
     "accepted": False,
     "outcome": "unsupported-platform",
+    "execution_outcome": "unsupported",
+    "recovery_outcome": "unsupported",
+    "reopen_outcome": "unsupported",
+    "resource_outcome": "not-collected",
     "reason": "process-termination qualification requires Linux",
     "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
     "host_os": host_os,
@@ -330,6 +334,10 @@ for path in sorted((output_dir / "runs").glob("*/verify.json")):
         "case": case_name,
         "requested_prefix": expected_prefix,
         "child_exit_code": status,
+        "execution_outcome": "terminated-by-sigkill",
+        "recovery_outcome": case_name,
+        "reopen_outcome": "stable-two-reopen",
+        "resource_outcome": "not-collected",
         "verifier": path.relative_to(output_dir).as_posix(),
         "accepted": True,
         "reopen_passes": record["reopen_passes"],
@@ -342,6 +350,8 @@ if len(records) != 6:
 
 manifest = {
     "format": "seerdb-common-kv-process-crash-manifest-v1",
+    "status": "accepted",
+    "outcome": "all-cases-accepted",
     "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
     "host_os": platform.system(),
     "host_arch": platform.machine(),
@@ -356,6 +366,12 @@ manifest = {
     "trace_artifact": "trace.json",
     "trace_digest_fnv1a64": trace["trace_digest_fnv1a64"],
     "termination_boundary": "child SIGKILL after observing a pre-batch progress marker and while held before that batch commit",
+    "outcome_taxonomy": {
+        "execution_outcome": "terminated-by-sigkill means the requested process boundary was reached",
+        "recovery_outcome": "old-state or complete-new-state is the accepted logical prefix classification",
+        "reopen_outcome": "stable-two-reopen means both fresh verifier opens matched the requested prefix",
+        "resource_outcome": "not-collected means this wrapper does not qualify resource equivalence",
+    },
     "accepted_states": {
         "old-state": "all batches before boundary are present; boundary batch is absent",
         "complete-new-state": "all batches through the preceding boundary are present; next boundary batch is absent",

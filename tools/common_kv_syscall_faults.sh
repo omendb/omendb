@@ -97,6 +97,10 @@ manifest = {
     "status": "unsupported",
     "accepted": False,
     "outcome": "unsupported-platform",
+    "execution_outcome": "unsupported",
+    "recovery_outcome": "unsupported",
+    "reopen_outcome": "unsupported",
+    "resource_outcome": "not-collected",
     "reason": "external libc-boundary qualification requires Linux",
     "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
     "host_os": host_os,
@@ -359,6 +363,10 @@ for line in (output_dir / "cases.tsv").read_text().splitlines():
         "observed_calls": int(observed_calls),
         "child_exit_status": int(child_status),
         "accepted_prefix": int(prefix),
+        "execution_outcome": "refused" if int(child_status) != 0 else "completed",
+        "recovery_outcome": "complete-new-state" if int(prefix) == operations else "complete-prefix",
+        "reopen_outcome": "stable-two-reopen",
+        "resource_outcome": "not-collected",
         "accepted": True,
         "reopen_passes": 2,
     })
@@ -368,6 +376,8 @@ if not cases:
 
 manifest = {
     "format": "seerdb-common-kv-syscall-fault-manifest-v1",
+    "status": "accepted",
+    "outcome": "all-cases-accepted",
     "repo_head": command_output("git", "-C", str(repo_root), "rev-parse", "HEAD"),
     "host_os": platform.system(),
     "host_arch": platform.machine(),
@@ -383,6 +393,12 @@ manifest = {
     "trace_artifact": "trace.json",
     "trace_digest_fnv1a64": trace["trace_digest_fnv1a64"],
     "fault_domain": "external libc boundary; one observed fsync/fdatasync/rename call returns EIO before or after completion",
+    "outcome_taxonomy": {
+        "execution_outcome": "refused means the faulted mutation process returned non-zero; completed means it returned zero",
+        "recovery_outcome": "complete-new-state means the full mutation prefix was durable; complete-prefix means a shorter complete batch prefix was recovered",
+        "reopen_outcome": "stable-two-reopen means both fresh verifier opens matched the accepted prefix",
+        "resource_outcome": "not-collected means this wrapper does not qualify resource equivalence",
+    },
     "accepted_states": "a complete batch prefix after the durable baseline, verified across two fresh reopens",
     "modes": ["before", "after"],
     "not_exercised": [
