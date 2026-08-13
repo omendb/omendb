@@ -9,6 +9,7 @@ mod invariants;
 mod lazy_read;
 mod manifest_store;
 mod materialization;
+mod metrics;
 mod page_cache;
 mod read_path;
 mod reclamation;
@@ -16,8 +17,10 @@ mod retention_format;
 mod verification;
 
 pub use manifest_store::ManifestStore;
+pub use metrics::StorageMetrics;
 pub(crate) use read_path::StorageReadView;
 
+use self::metrics::StorageCounters;
 use self::page_cache::ParsedPageCache;
 use crate::allocator::PageAllocator;
 use crate::btree::BTree;
@@ -26,69 +29,8 @@ use crate::error::{Error, Result};
 use crate::mvcc::PMT;
 use crate::space::Device;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
-
-/// Cumulative physical work performed by one storage-engine handle.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StorageMetrics {
-    /// Logical page reads requested through the PMT-backed page seam.
-    pub logical_page_reads: u64,
-    /// Lazy lookups served by the parsed immutable-node cache.
-    pub parsed_page_cache_hits: u64,
-    /// Physical page reads issued to the data device.
-    pub physical_page_reads: u64,
-    /// Physical page writes completed on the data device.
-    pub physical_page_writes: u64,
-    /// Bytes read from the data device for page operations.
-    pub page_bytes_read: u64,
-    /// Bytes written to the data device for page operations.
-    pub page_bytes_written: u64,
-    /// Published generation flushes completed by this handle.
-    pub generation_flushes: u64,
-    /// Successful data-device sync calls.
-    pub syncs: u64,
-    /// Physical pages made reusable after a publication barrier.
-    pub reclaimed_pages: u64,
-    /// Bytes made reusable after a publication barrier.
-    pub reclaimed_bytes: u64,
-    /// Deterministic capacity preflight failures.
-    pub capacity_preflight_failures: u64,
-}
-
-#[derive(Debug, Default)]
-struct StorageCounters {
-    logical_page_reads: AtomicU64,
-    parsed_page_cache_hits: AtomicU64,
-    physical_page_reads: AtomicU64,
-    physical_page_writes: AtomicU64,
-    page_bytes_read: AtomicU64,
-    page_bytes_written: AtomicU64,
-    generation_flushes: AtomicU64,
-    syncs: AtomicU64,
-    reclaimed_pages: AtomicU64,
-    reclaimed_bytes: AtomicU64,
-    capacity_preflight_failures: AtomicU64,
-}
-
-impl StorageCounters {
-    fn snapshot(&self) -> StorageMetrics {
-        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        StorageMetrics {
-            logical_page_reads: load(&self.logical_page_reads),
-            parsed_page_cache_hits: load(&self.parsed_page_cache_hits),
-            physical_page_reads: load(&self.physical_page_reads),
-            physical_page_writes: load(&self.physical_page_writes),
-            page_bytes_read: load(&self.page_bytes_read),
-            page_bytes_written: load(&self.page_bytes_written),
-            generation_flushes: load(&self.generation_flushes),
-            syncs: load(&self.syncs),
-            reclaimed_pages: load(&self.reclaimed_pages),
-            reclaimed_bytes: load(&self.reclaimed_bytes),
-            capacity_preflight_failures: load(&self.capacity_preflight_failures),
-        }
-    }
-}
 
 fn capacity_preflight_error(error: std::io::Error) -> Error {
     if matches!(
