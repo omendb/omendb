@@ -91,8 +91,8 @@ use artifact_io::{
 use blob_layout::MAX_SEGMENTED_CATALOG_DELETED_ENTRIES;
 use blob_layout::{
     BLOB_DELTA_FILE, BLOB_FILE, BLOB_RESERVATION_FILE, BLOB_REWRITE_BACKUP_FILE,
-    BLOB_SEGMENT_PREFIX, blob_segment_path, blob_storage_size, parse_blob_catalog,
-    retained_blob_path, segmented_catalog_needs_consolidation,
+    BLOB_SEGMENT_PREFIX, blob_segment_path, parse_blob_catalog, retained_blob_path,
+    segmented_catalog_needs_consolidation,
 };
 use blob_read_view::BlobReadView;
 #[cfg(test)]
@@ -331,32 +331,6 @@ impl DB {
             pending_mutations: self.pending_mutations,
             write_fenced: self.write_fenced,
         }
-    }
-
-    /// Return storage counters and current artifact sizes for observability.
-    pub fn metrics(&self) -> Result<DBMetrics> {
-        self.check_open()?;
-        let artifact_size = |name: &str| -> Result<u64> {
-            let path = self.path.join(name);
-            match fs::metadata(path) {
-                Ok(metadata) => Ok(metadata.len()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-                Err(error) => Err(error.into()),
-            }
-        };
-
-        Ok(DBMetrics {
-            storage: self.engine.metrics(),
-            wal_admission_failures: self.wal_admission_failures,
-            buffer: self.engine.buffer_stats(),
-            data_bytes: artifact_size(DATA_FILE)?,
-            blob_bytes: blob_storage_size(&self.path)?,
-            wal_bytes: artifact_size(WAL_FILE)?,
-            wal_reserved_bytes: self.wal_reserved_extent,
-            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
-            publication: self.publication,
-            publication_timing: self.publication_timing,
-        })
     }
 
     /// Generate a stable-enough identity for a newly created database.

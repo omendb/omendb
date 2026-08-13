@@ -4,9 +4,14 @@
 //! the authority that creates, updates, and publishes the state they report.
 
 use crate::buffer::BufferStats;
+use crate::error::Result;
 use crate::storage::StorageMetrics;
 use crate::storage::format::{CommitId, DatabaseId, GenerationId, HistoryId};
+use std::fs;
 use std::time::Instant;
+
+use super::blob_layout::blob_storage_size;
+use super::{DATA_FILE, DB, WAL_FILE};
 
 /// Blob GC statistics.
 pub struct BlobStats {
@@ -268,6 +273,34 @@ pub struct PublicationTimingMetrics {
     pub manifest_mirror_ns: u64,
     /// Post-manifest cleanup and reclamation bookkeeping.
     pub cleanup_ns: u64,
+}
+
+impl DB {
+    /// Return storage counters and current artifact sizes for observability.
+    pub fn metrics(&self) -> Result<DBMetrics> {
+        self.check_open()?;
+        let artifact_size = |name: &str| -> Result<u64> {
+            let path = self.path.join(name);
+            match fs::metadata(path) {
+                Ok(metadata) => Ok(metadata.len()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error.into()),
+            }
+        };
+
+        Ok(DBMetrics {
+            storage: self.engine.metrics(),
+            wal_admission_failures: self.wal_admission_failures,
+            buffer: self.engine.buffer_stats(),
+            data_bytes: artifact_size(DATA_FILE)?,
+            blob_bytes: blob_storage_size(&self.path)?,
+            wal_bytes: artifact_size(WAL_FILE)?,
+            wal_reserved_bytes: self.wal_reserved_extent,
+            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
+            publication: self.publication,
+            publication_timing: self.publication_timing,
+        })
+    }
 }
 
 pub(crate) fn elapsed_nanos(start: Instant) -> u64 {

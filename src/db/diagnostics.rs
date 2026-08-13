@@ -7,6 +7,7 @@
 //! `db.rs`; lower-level page and graph verification remains in
 //! `src/storage/verification.rs`.
 
+use super::blob_layout::blob_storage_size;
 use super::*;
 
 #[derive(Debug)]
