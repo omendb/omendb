@@ -305,6 +305,22 @@ impl DB {
         Ok(())
     }
 
+    /// Finish the post-manifest cleanup for segmented blob publication.
+    ///
+    /// The manifest is the publication barrier. After it is durable, stale
+    /// segments and the previous catalog backup are derived artifacts that
+    /// can be removed. A failure may leave either artifact behind; reopening
+    /// and the next publication reconcile them through the authoritative
+    /// catalog and manifest history.
+    pub(super) fn finish_segmented_blob_publication_cleanup(&self) -> Result<()> {
+        if !self.blobs.is_segmented() {
+            return Ok(());
+        }
+        self.prune_unreferenced_blob_segments()?;
+        self.finish_segment_catalog_backup()?;
+        Ok(())
+    }
+
     fn write_blob_image_with_directory_sync(
         &self,
         path: &Path,

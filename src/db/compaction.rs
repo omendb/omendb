@@ -121,10 +121,7 @@ impl DB {
             return Err(std::io::Error::other("injected post-manifest failure").into());
         }
 
-        if self.blobs.is_segmented() {
-            self.prune_unreferenced_blob_segments()?;
-            self.finish_segment_catalog_backup()?;
-        }
+        self.finish_segmented_blob_publication_cleanup()?;
         self.engine.complete_generation();
         self.generation_id = generation_id;
         self.next_generation_id = GenerationId::new(

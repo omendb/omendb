@@ -255,10 +255,7 @@ impl DB {
         wal_path: PathBuf,
     ) -> Result<()> {
         let cleanup_started = Instant::now();
-        if self.blobs.is_segmented() {
-            self.prune_unreferenced_blob_segments()?;
-            self.finish_segment_catalog_backup()?;
-        }
+        self.finish_segmented_blob_publication_cleanup()?;
 
         let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
         let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
