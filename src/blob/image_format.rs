@@ -4,7 +4,7 @@ use super::cursor::Cursor;
 use super::{BlobManager, DEFAULT_BLOB_THRESHOLD, DEFAULT_SEGMENT_TARGET_SIZE};
 use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const BLOB_FORMAT_MAGIC: [u8; 8] = *b"SEERBLB1";
@@ -163,11 +163,7 @@ impl BlobManager {
             threshold,
             generation_id,
             segmented: false,
-            persisted_lengths: HashMap::new(),
-            persisted_deleted_offsets: HashMap::new(),
-            persisted_generation_id: 0,
-            catalog_delta_count: 0,
-            catalog_persisted: false,
+            catalog: super::segment_catalog::SegmentCatalogState::default(),
             segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }
@@ -205,11 +201,7 @@ impl BlobManager {
             threshold: DEFAULT_BLOB_THRESHOLD,
             generation_id: 0,
             segmented: false,
-            persisted_lengths: HashMap::new(),
-            persisted_deleted_offsets: HashMap::new(),
-            persisted_generation_id: 0,
-            catalog_delta_count: 0,
-            catalog_persisted: false,
+            catalog: super::segment_catalog::SegmentCatalogState::default(),
             segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }

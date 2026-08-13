@@ -97,7 +97,7 @@ pub(super) fn encode_segment_catalog_delta(
     buf.extend_from_slice(&SEGMENT_CATALOG_DELTA_VERSION.to_le_bytes());
     buf.extend_from_slice(&0u64.to_le_bytes());
     buf.extend_from_slice(&manager.generation_id.to_le_bytes());
-    buf.extend_from_slice(&manager.persisted_generation_id.to_le_bytes());
+    buf.extend_from_slice(&manager.catalog.persisted_generation_id.to_le_bytes());
     buf.extend_from_slice(&u32::try_from(entries.len()).ok()?.to_le_bytes());
     for entry in entries {
         match entry {

@@ -15,11 +15,30 @@ use crate::btree::node::BlobPointer;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+/// Durable frontier and replay bookkeeping for the segmented catalog.
+///
+/// `BlobManager` owns live files and pointer mutation. This value owns the
+/// derived catalog frontier that describes which segment bytes and deletion
+/// offsets are already durable.
+#[derive(Clone, Default)]
+pub(super) struct SegmentCatalogState {
+    /// Catalog length already durable for each segment.
+    pub(super) persisted_lengths: HashMap<u32, u64>,
+    /// Deletion offsets already represented by the durable catalog frontier.
+    pub(super) persisted_deleted_offsets: HashMap<u32, BTreeSet<u64>>,
+    /// Generation represented by the durable catalog frontier.
+    pub(super) persisted_generation_id: u64,
+    /// Number of delta frames after the full catalog anchor.
+    pub(super) catalog_delta_count: u32,
+    /// Whether a full or delta catalog has been durably initialized.
+    pub(super) catalog_persisted: bool,
+}
+
 impl BlobManager {
     fn segment_catalog_delta_entries(&self) -> Option<Vec<SegmentCatalogDeltaEntry>> {
         let mut file_ids = BTreeSet::new();
         file_ids.extend(self.files.iter().map(|file| file.file_id()));
-        file_ids.extend(self.persisted_lengths.keys().copied());
+        file_ids.extend(self.catalog.persisted_lengths.keys().copied());
 
         let mut entries = Vec::new();
         for file_id in file_ids {
@@ -30,8 +49,9 @@ impl BlobManager {
             };
 
             let data_len = file.serialized_size()?;
-            let previous_len = self.persisted_lengths.get(&file_id).copied();
+            let previous_len = self.catalog.persisted_lengths.get(&file_id).copied();
             let previous_deleted = self
+                .catalog
                 .persisted_deleted_offsets
                 .get(&file_id)
                 .cloned()
@@ -41,7 +61,10 @@ impl BlobManager {
                 .filter(|offset| !previous_deleted.contains(offset))
                 .collect::<Vec<_>>();
             if previous_len != Some(data_len)
-                || !self.persisted_deleted_offsets.contains_key(&file_id)
+                || !self
+                    .catalog
+                    .persisted_deleted_offsets
+                    .contains_key(&file_id)
                 || !deleted_offsets.is_empty()
             {
                 entries.push(SegmentCatalogDeltaEntry::Upsert {
@@ -73,17 +96,21 @@ impl BlobManager {
     }
 
     pub(crate) fn persisted_segment_length(&self, file_id: u32) -> u64 {
-        self.persisted_lengths.get(&file_id).copied().unwrap_or(0)
+        self.catalog
+            .persisted_lengths
+            .get(&file_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn persisted_segment_catalog_generation(&self) -> u64 {
-        self.persisted_generation_id
+        self.catalog.persisted_generation_id
     }
 
     /// Bytes that the next segmented publication will write: the catalog plus
     /// any record suffixes not yet covered by a durable catalog frontier.
     pub(crate) fn segment_write_size(&self) -> Option<u64> {
-        let mut size = if !self.catalog_persisted || self.catalog_needs_consolidation() {
+        let mut size = if !self.catalog.catalog_persisted || self.catalog_needs_consolidation() {
             u64::try_from(self.to_segment_catalog_bytes().len()).ok()?
         } else {
             u64::try_from(self.to_segment_catalog_delta_bytes()?.len()).ok()?
@@ -115,7 +142,7 @@ impl BlobManager {
             let record_size = BlobRecord::OVERHEAD_SIZE.checked_add(value_len)?;
             if self.files.is_empty() || self.should_rollover(value_len) {
                 let entry_overhead =
-                    if !self.catalog_persisted || self.catalog_needs_consolidation() {
+                    if !self.catalog.catalog_persisted || self.catalog_needs_consolidation() {
                         4 + 8 + 4
                     } else {
                         4 + 4 + 8 + 4
@@ -129,27 +156,31 @@ impl BlobManager {
 
     pub(crate) fn mark_segment_delta_persisted(&mut self) {
         self.capture_persisted_state();
-        self.catalog_delta_count = self.catalog_delta_count.saturating_add(1);
+        self.catalog.catalog_delta_count = self.catalog.catalog_delta_count.saturating_add(1);
     }
 
     pub(crate) fn mark_segment_catalog_consolidated(&mut self) {
         self.capture_persisted_state();
-        self.catalog_delta_count = 0;
+        self.catalog.catalog_delta_count = 0;
     }
 
     pub(super) fn capture_persisted_state(&mut self) {
         for file in &self.files {
-            self.persisted_lengths
+            self.catalog
+                .persisted_lengths
                 .insert(file.file_id(), file.to_bytes().len() as u64);
-            self.persisted_deleted_offsets
+            self.catalog
+                .persisted_deleted_offsets
                 .insert(file.file_id(), file.deleted_offsets().collect());
         }
-        self.persisted_lengths
+        self.catalog
+            .persisted_lengths
             .retain(|file_id, _| self.files.iter().any(|file| file.file_id() == *file_id));
-        self.persisted_deleted_offsets
+        self.catalog
+            .persisted_deleted_offsets
             .retain(|file_id, _| self.files.iter().any(|file| file.file_id() == *file_id));
-        self.persisted_generation_id = self.generation_id;
-        self.catalog_persisted = true;
+        self.catalog.persisted_generation_id = self.generation_id;
+        self.catalog.catalog_persisted = true;
     }
 
     pub(crate) fn segment_file_ids(&self) -> Vec<u32> {
@@ -157,7 +188,8 @@ impl BlobManager {
     }
 
     pub(crate) fn catalog_needs_consolidation(&self) -> bool {
-        self.catalog_persisted && self.catalog_delta_count >= MAX_SEGMENT_CATALOG_DELTAS
+        self.catalog.catalog_persisted
+            && self.catalog.catalog_delta_count >= MAX_SEGMENT_CATALOG_DELTAS
     }
 
     /// Load a full catalog anchor and apply the manifest-selected delta path.
@@ -267,11 +299,13 @@ impl BlobManager {
             threshold,
             generation_id,
             segmented: true,
-            persisted_lengths,
-            persisted_deleted_offsets,
-            persisted_generation_id: generation_id,
-            catalog_delta_count: 0,
-            catalog_persisted: true,
+            catalog: SegmentCatalogState {
+                persisted_lengths,
+                persisted_deleted_offsets,
+                persisted_generation_id: generation_id,
+                catalog_delta_count: 0,
+                catalog_persisted: true,
+            },
             segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         })
     }
@@ -291,7 +325,7 @@ impl BlobManager {
                     data_len,
                     deleted_offsets,
                 } => {
-                    let previous_len = self.persisted_lengths.get(file_id).copied();
+                    let previous_len = self.catalog.persisted_lengths.get(file_id).copied();
                     if previous_len.is_some_and(|previous| *data_len < previous) {
                         return None;
                     }
@@ -299,6 +333,7 @@ impl BlobManager {
                     let segment = segments.get(file_id)?.get(..data_len)?;
                     let mut file = BlobFile::from_bytes(*file_id, segment)?;
                     let mut all_deleted = self
+                        .catalog
                         .persisted_deleted_offsets
                         .get(file_id)
                         .cloned()
@@ -318,8 +353,12 @@ impl BlobManager {
                     } else {
                         self.files.push(Arc::new(file));
                     }
-                    self.persisted_lengths.insert(*file_id, data_len as u64);
-                    self.persisted_deleted_offsets.insert(*file_id, all_deleted);
+                    self.catalog
+                        .persisted_lengths
+                        .insert(*file_id, data_len as u64);
+                    self.catalog
+                        .persisted_deleted_offsets
+                        .insert(*file_id, all_deleted);
                     self.next_file_id = self.next_file_id.max(file_id.checked_add(1)?);
                 }
                 SegmentCatalogDeltaEntry::Remove { file_id } => {
@@ -327,15 +366,15 @@ impl BlobManager {
                         return None;
                     }
                     self.files.retain(|file| file.file_id() != *file_id);
-                    self.persisted_lengths.remove(file_id);
-                    self.persisted_deleted_offsets.remove(file_id);
+                    self.catalog.persisted_lengths.remove(file_id);
+                    self.catalog.persisted_deleted_offsets.remove(file_id);
                 }
             }
         }
         self.generation_id = delta.generation_id;
-        self.persisted_generation_id = delta.generation_id;
-        self.catalog_delta_count = self.catalog_delta_count.saturating_add(1);
-        self.catalog_persisted = true;
+        self.catalog.persisted_generation_id = delta.generation_id;
+        self.catalog.catalog_delta_count = self.catalog.catalog_delta_count.saturating_add(1);
+        self.catalog.catalog_persisted = true;
         Some(())
     }
 }

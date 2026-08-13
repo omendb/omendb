@@ -5,7 +5,6 @@
 
 use crate::blob::file::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
-use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[path = "cursor.rs"]
@@ -49,18 +48,8 @@ pub struct BlobManager {
     generation_id: u64,
     /// Whether records live in separate append-only segment files.
     segmented: bool,
-    /// Catalog length already durable for each segment. A failed publication
-    /// may leave an ignored suffix in a segment, so the next catalog always
-    /// appends from this frontier rather than trusting physical file length.
-    persisted_lengths: HashMap<u32, u64>,
-    /// Deletion offsets already represented by the durable catalog frontier.
-    persisted_deleted_offsets: HashMap<u32, BTreeSet<u64>>,
-    /// Generation represented by the durable catalog frontier.
-    persisted_generation_id: u64,
-    /// Number of delta frames after the full catalog anchor.
-    catalog_delta_count: u32,
-    /// Whether a full or delta catalog has been durably initialized.
-    catalog_persisted: bool,
+    /// Persisted segmented-catalog frontier and replay state.
+    catalog: segment_catalog::SegmentCatalogState,
     /// Target size for the active segmented blob file. A record larger than
     /// this target is kept intact in its own segment.
     segment_target_size: u64,
@@ -80,11 +69,7 @@ impl BlobManager {
             threshold,
             generation_id: 0,
             segmented: false,
-            persisted_lengths: HashMap::new(),
-            persisted_deleted_offsets: HashMap::new(),
-            persisted_generation_id: 0,
-            catalog_delta_count: 0,
-            catalog_persisted: false,
+            catalog: segment_catalog::SegmentCatalogState::default(),
             segment_target_size: DEFAULT_SEGMENT_TARGET_SIZE,
         }
     }
@@ -198,7 +183,7 @@ impl BlobManager {
         }
         self.next_file_id = file_id.checked_add(1)?;
         self.files.push(Arc::new(BlobFile::new(file_id)));
-        self.persisted_lengths.entry(file_id).or_insert(0);
+        self.catalog.persisted_lengths.entry(file_id).or_insert(0);
         Some(file_id)
     }
 

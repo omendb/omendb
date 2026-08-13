@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 #[test]
 fn test_blob_manager_new() {
