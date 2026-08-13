@@ -64,6 +64,8 @@ mod retention;
 mod retention_artifacts;
 #[path = "db/retention_state.rs"]
 mod retention_state;
+#[path = "db/segmented_blob_publication.rs"]
+mod segmented_blob_publication;
 #[path = "db/single_write.rs"]
 mod single_write;
 #[path = "db/snapshot.rs"]
