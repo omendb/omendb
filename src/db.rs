@@ -359,6 +359,10 @@ mod tests;
 mod diagnostic_tests;
 
 #[cfg(test)]
+#[path = "db/blob_gc_tests.rs"]
+mod blob_gc_tests;
+
+#[cfg(test)]
 #[path = "db/segmented_tests.rs"]
 mod segmented_tests;
 
