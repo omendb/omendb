@@ -87,8 +87,6 @@ use artifact_io::{
     cleanup_orphaned_temporary_artifacts, clear_blob_reservation, clear_wal_reservation,
     sync_directory, sync_directory_chain, sync_publication_directory,
 };
-#[cfg(test)]
-use blob_layout::MAX_SEGMENTED_CATALOG_DELETED_ENTRIES;
 use blob_layout::{
     BLOB_DELTA_FILE, BLOB_FILE, BLOB_RESERVATION_FILE, BLOB_REWRITE_BACKUP_FILE,
     BLOB_SEGMENT_PREFIX, blob_segment_path, parse_blob_catalog, retained_blob_path,
@@ -353,6 +351,10 @@ struct RecoverySummary {
 #[cfg(test)]
 #[path = "db/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db/segmented_tests.rs"]
+mod segmented_tests;
 
 #[cfg(test)]
 #[path = "db/published_commits_tests.rs"]
