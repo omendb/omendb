@@ -355,6 +355,10 @@ struct RecoverySummary {
 mod tests;
 
 #[cfg(test)]
+#[path = "db/diagnostic_tests.rs"]
+mod diagnostic_tests;
+
+#[cfg(test)]
 #[path = "db/segmented_tests.rs"]
 mod segmented_tests;
 
