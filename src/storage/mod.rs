@@ -287,6 +287,16 @@ impl StorageEngine {
     pub fn check_artifact_capacity(&self, length: u64) -> Result<()> {
         self.device.check_capacity(length).map_err(Error::from)
     }
+
+    /// Admit an artifact image before a maintenance candidate is installed.
+    ///
+    /// A deterministic capacity refusal at this boundary has issued no
+    /// storage mutation, so callers can retry after restoring capacity.
+    pub fn preflight_artifact_capacity(&self, length: u64) -> Result<()> {
+        self.device
+            .check_capacity(length)
+            .map_err(capacity_preflight_error)
+    }
 }
 
 #[cfg(test)]

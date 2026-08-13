@@ -140,7 +140,7 @@ impl DB {
             candidate_tree.page_allocator(),
         )?;
         self.preflight_maintenance_capacity(candidate_data_bytes, metadata_bytes, blob_bytes)?;
-        self.engine.check_artifact_capacity(blob_bytes)?;
+        self.engine.preflight_artifact_capacity(blob_bytes)?;
         self.engine.preflight_rebuild_capacity(&candidate_tree)?;
         if !candidate_blobs.is_segmented() {
             self.reserve_blob_image(blob_bytes)?;
