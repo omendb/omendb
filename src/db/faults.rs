@@ -30,6 +30,7 @@ thread_local! {
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
@@ -207,5 +208,10 @@ impl DB {
     /// Inject one checksum-corrupted segmented catalog-delta append.
     pub fn inject_blob_segment_catalog_delta_torn_write_failure(&self) {
         FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure after an unreferenced segmented blob file is removed.
+    pub fn inject_blob_segment_prune_after_remove_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE.with(|failure| failure.set(true));
     }
 }

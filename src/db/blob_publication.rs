@@ -291,6 +291,12 @@ impl DB {
             if !live.contains(&file_id) {
                 fs::remove_file(entry.path())?;
                 removed = true;
+
+                #[cfg(any(test, feature = "fault-injection"))]
+                if FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE.with(|failure| failure.replace(false))
+                {
+                    return Err(std::io::Error::other("injected blob segment prune failure").into());
+                }
             }
         }
         if removed {

@@ -6,7 +6,7 @@ use super::blob_layout::{
 };
 use super::{BatchMutation, BlobManager, BlobStorageMode, DB, Options};
 use proptest::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use tempfile::tempdir;
 
@@ -278,6 +278,87 @@ fn test_db_segmented_gc_prunes_unreferenced_segments() {
     let mut reopened = DB::open(&path, Options::default()).unwrap();
     assert!(!old_segment.exists());
     assert_eq!(reopened.get(b"live").unwrap(), Some(value));
+    reopened.verify().unwrap();
+}
+
+#[test]
+fn test_db_segmented_prune_failure_reopens_and_retries_cleanup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("segmented-prune-failure.db");
+    let options = Options {
+        blob_storage: BlobStorageMode::Segmented,
+        blob_threshold: 4,
+        ..Options::default()
+    };
+    let value = vec![0xD3; 2_000];
+    let mut db = DB::create(&path, options).unwrap();
+    db.blobs.set_segment_target_size_for_test(7_000);
+    for key in [
+        b"live-1".as_slice(),
+        b"dead-1",
+        b"dead-2",
+        b"live-2",
+        b"dead-3",
+        b"dead-4",
+    ] {
+        db.put(key, &value).unwrap();
+    }
+    db.flush().unwrap();
+    assert!(db.blobs.segment_file_ids().len() >= 2);
+
+    for key in [b"dead-1".as_slice(), b"dead-2", b"dead-3", b"dead-4"] {
+        db.delete(key).unwrap();
+    }
+    db.flush().unwrap();
+    db.inject_blob_segment_prune_after_remove_failure();
+    assert!(db.gc().is_err());
+    assert!(db.durability_status().write_fenced);
+
+    let active = db
+        .blobs
+        .segment_file_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let stale_before_reopen = fs::read_dir(&path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("seerdb.blob.segment."))
+                .and_then(|file_id| file_id.parse::<u32>().ok())
+        })
+        .filter(|file_id| !active.contains(file_id))
+        .count();
+    assert!(stale_before_reopen > 0);
+    drop(db);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"live-1").unwrap(), Some(value.clone()));
+    assert_eq!(reopened.get(b"live-2").unwrap(), Some(value));
+    reopened.verify().unwrap();
+
+    reopened.put(b"retry", b"cleanup").unwrap();
+    reopened.flush().unwrap();
+    let active = reopened
+        .blobs
+        .segment_file_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let stale_after_retry = fs::read_dir(&path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("seerdb.blob.segment."))
+                .and_then(|file_id| file_id.parse::<u32>().ok())
+        })
+        .filter(|file_id| !active.contains(file_id))
+        .count();
+    assert_eq!(stale_after_retry, 0);
     reopened.verify().unwrap();
 }
 
