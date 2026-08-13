@@ -86,6 +86,9 @@ pub struct BlobFile {
     file_id: u32,
     /// In-memory buffer of records.
     records: Vec<BlobRecord>,
+    /// Serialized offset of each record, kept in the same order as `records`.
+    /// This is derived state used for binary-search pointer lookup.
+    record_offsets: Vec<u64>,
     /// Current offset (total bytes written).
     offset: u64,
     /// Number of valid (non-deleted) entries.
@@ -102,6 +105,7 @@ impl BlobFile {
         Self {
             file_id,
             records: Vec::new(),
+            record_offsets: Vec::new(),
             offset: 0,
             valid_count: 0,
             deleted_count: 0,
@@ -148,6 +152,7 @@ impl BlobFile {
 
         self.offset += record.serialized_size() as u64;
         self.valid_count += 1;
+        self.record_offsets.push(current_offset);
         self.records.push(record);
 
         (current_offset, length)
@@ -173,6 +178,7 @@ impl BlobFile {
         }
 
         self.records.pop();
+        self.record_offsets.pop();
         self.offset = offset;
         self.valid_count = self.valid_count.saturating_sub(1);
         true
@@ -190,19 +196,9 @@ impl BlobFile {
 
     /// Read a value at the given offset and length.
     pub fn read(&self, offset: u64, length: u32) -> Option<&[u8]> {
-        // Find the record that contains this offset.
-        let mut current_offset = 0u64;
-        for record in &self.records {
-            let record_size = record.serialized_size() as u64;
-            if current_offset == offset {
-                if record.value.len() == length as usize {
-                    return Some(&record.value);
-                }
-                return None;
-            }
-            current_offset += record_size;
-        }
-        None
+        let index = self.record_offsets.binary_search(&offset).ok()?;
+        let record = self.records.get(index)?;
+        (record.value.len() == length as usize).then_some(record.value.as_slice())
     }
 
     /// Mark an entry as deleted (for GC).
@@ -240,24 +236,15 @@ impl BlobFile {
     /// Mark every record deleted for a pointer-rewriting compaction.
     pub(crate) fn mark_all_deleted(&mut self) {
         self.deleted_offsets.clear();
-        let mut offset = 0u64;
-        for record in &self.records {
+        for &offset in &self.record_offsets {
             self.deleted_offsets.insert(offset);
-            offset = offset.saturating_add(record.serialized_size() as u64);
         }
         self.deleted_count = self.records.len();
         self.valid_count = 0;
     }
 
     fn has_record_at(&self, offset: u64) -> bool {
-        let mut current_offset = 0u64;
-        for record in &self.records {
-            if current_offset == offset {
-                return true;
-            }
-            current_offset = current_offset.saturating_add(record.serialized_size() as u64);
-        }
-        false
+        self.record_offsets.binary_search(&offset).is_ok()
     }
 
     /// Serialize all records to bytes.
@@ -272,9 +259,11 @@ impl BlobFile {
     /// Deserialize from bytes.
     pub fn from_bytes(file_id: u32, buf: &[u8]) -> Option<Self> {
         let mut records = Vec::new();
+        let mut record_offsets = Vec::new();
         let mut pos = 0;
 
         while pos < buf.len() {
+            record_offsets.push(u64::try_from(pos).ok()?);
             let record = BlobRecord::from_bytes(&buf[pos..])?;
             let size = record.serialized_size();
             records.push(record);
@@ -287,6 +276,7 @@ impl BlobFile {
         Some(Self {
             file_id,
             records,
+            record_offsets,
             offset,
             valid_count,
             deleted_count: 0,
@@ -326,6 +316,28 @@ mod tests {
 
         let data = file.read(offset, length).unwrap();
         assert_eq!(data, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_blob_file_indexed_lookup_survives_many_records_and_reopen() {
+        let mut file = BlobFile::new(1);
+        let mut pointers = Vec::new();
+        for index in 0..256u16 {
+            pointers.push(file.append([0; 8], vec![index as u8; usize::from(index) + 1]));
+        }
+
+        let (offset, length) = pointers[193];
+        assert_eq!(file.read(offset, length), Some(&vec![193; 194][..]));
+        assert!(file.read(offset + 1, length).is_none());
+        assert!(file.mark_deleted(offset));
+        assert!(!file.mark_deleted(offset));
+
+        let restored = BlobFile::from_bytes(1, &file.to_bytes()).unwrap();
+        assert_eq!(
+            restored.read(pointers[192].0, pointers[192].1),
+            Some(&vec![192; 193][..])
+        );
+        assert_eq!(restored.read(offset, length), Some(&vec![193; 194][..]));
     }
 
     #[test]
