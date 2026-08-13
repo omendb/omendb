@@ -92,7 +92,6 @@ use blob_layout::MAX_SEGMENTED_CATALOG_DELETED_ENTRIES;
 use blob_layout::{
     BLOB_DELTA_FILE, BLOB_FILE, BLOB_RESERVATION_FILE, BLOB_REWRITE_BACKUP_FILE,
     BLOB_SEGMENT_PREFIX, blob_segment_path, parse_blob_catalog, retained_blob_path,
-    segmented_catalog_needs_consolidation,
 };
 use blob_read_view::BlobReadView;
 #[cfg(test)]
@@ -309,28 +308,6 @@ impl DB {
         self.check_writable()?;
         self.flush()?;
         self.verify()
-    }
-
-    /// Get blob GC statistics.
-    pub fn blob_stats(&self) -> BlobStats {
-        BlobStats {
-            files_needing_gc: self.blobs.files_needing_gc().len(),
-            total_valid: self.blobs.total_valid_entries(),
-            total_deleted: self.blobs.total_deleted_entries(),
-            catalog_needs_consolidation: segmented_catalog_needs_consolidation(&self.blobs),
-        }
-    }
-
-    /// Return durable identity and publication state for diagnostics/recovery.
-    pub fn durability_status(&self) -> DurabilityStatus {
-        DurabilityStatus {
-            database_id: self.database_id,
-            history_id: self.history_id,
-            generation_id: self.generation_id,
-            commit_id: self.commit_id,
-            pending_mutations: self.pending_mutations,
-            write_fenced: self.write_fenced,
-        }
     }
 
     /// Generate a stable-enough identity for a newly created database.

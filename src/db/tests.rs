@@ -1,5 +1,6 @@
 //! DB coordinator behavior and recovery tests.
 
+use super::blob_layout::segmented_catalog_needs_consolidation;
 use super::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;

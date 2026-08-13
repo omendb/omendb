@@ -5,6 +5,7 @@
 //! live records, pointers, and low-level file/catalog state; `DB` retains the
 //! manifest barrier, page publication, capacity admission, and recovery fence.
 
+use super::blob_layout::segmented_catalog_needs_consolidation;
 use super::*;
 
 impl DB {

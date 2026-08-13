@@ -10,7 +10,7 @@ use crate::storage::format::{CommitId, DatabaseId, GenerationId, HistoryId};
 use std::fs;
 use std::time::Instant;
 
-use super::blob_layout::blob_storage_size;
+use super::blob_layout::{blob_storage_size, segmented_catalog_needs_consolidation};
 use super::{DATA_FILE, DB, WAL_FILE};
 
 /// Blob GC statistics.
@@ -276,6 +276,28 @@ pub struct PublicationTimingMetrics {
 }
 
 impl DB {
+    /// Get blob GC statistics.
+    pub fn blob_stats(&self) -> BlobStats {
+        BlobStats {
+            files_needing_gc: self.blobs.files_needing_gc().len(),
+            total_valid: self.blobs.total_valid_entries(),
+            total_deleted: self.blobs.total_deleted_entries(),
+            catalog_needs_consolidation: segmented_catalog_needs_consolidation(&self.blobs),
+        }
+    }
+
+    /// Return durable identity and publication state for diagnostics/recovery.
+    pub fn durability_status(&self) -> DurabilityStatus {
+        DurabilityStatus {
+            database_id: self.database_id,
+            history_id: self.history_id,
+            generation_id: self.generation_id,
+            commit_id: self.commit_id,
+            pending_mutations: self.pending_mutations,
+            write_fenced: self.write_fenced,
+        }
+    }
+
     /// Return storage counters and current artifact sizes for observability.
     pub fn metrics(&self) -> Result<DBMetrics> {
         self.check_open()?;
