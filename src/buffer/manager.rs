@@ -177,6 +177,11 @@ impl BufferManager {
                 }
             } else if frame.page_key.is_none() {
                 return Err(format!("resident frame {} has no cache key", index));
+            } else if frame.pinned != (frame.pin_count != 0) {
+                return Err(format!(
+                    "resident frame {} has inconsistent explicit pin metadata",
+                    index
+                ));
             }
         }
 

@@ -19,6 +19,25 @@ fn runtime_invariants_track_frame_map_ownership() {
 }
 
 #[test]
+fn runtime_invariants_reject_inconsistent_explicit_pin_metadata() {
+    let mut manager = BufferManager::new(PAGE_SIZE);
+    let page = [7u8; PAGE_SIZE];
+    let guard = manager
+        .fetch_key(PageCacheKey::new(4, 9), &page, GuardAccess::Read)
+        .unwrap();
+    drop(guard);
+
+    manager.frames[0].pinned = true;
+    let error = manager.validate_invariants().unwrap_err();
+    assert!(error.contains("inconsistent explicit pin metadata"));
+
+    manager.frames[0].pinned = false;
+    manager.frames[0].pin_count = 1;
+    let error = manager.validate_invariants().unwrap_err();
+    assert!(error.contains("inconsistent explicit pin metadata"));
+}
+
+#[test]
 fn test_buffer_manager_new() {
     let bm = BufferManager::new(4096 * 10); // 10 frames
     assert_eq!(bm.capacity(), 10);
