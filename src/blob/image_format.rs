@@ -156,6 +156,7 @@ impl BlobManager {
         }
 
         cursor.finish()?;
+        files.sort_unstable_by_key(|file| file.file_id());
 
         Some(Self {
             files,
@@ -195,6 +196,7 @@ impl BlobManager {
         }
 
         cursor.finish()?;
+        files.sort_unstable_by_key(|file| file.file_id());
         Some(Self {
             files,
             next_file_id,

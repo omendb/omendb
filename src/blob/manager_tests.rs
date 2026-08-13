@@ -72,6 +72,54 @@ fn test_blob_multiple_appends() {
 }
 
 #[test]
+fn test_blob_file_ids_are_canonicalized_for_indexed_lookup() {
+    let mut manager = BlobManager::new();
+    let mut high = BlobFile::new(9);
+    let (high_offset, high_length) = high.append([0; 8], vec![9; 1500]);
+    let mut low = BlobFile::new(2);
+    let (low_offset, low_length) = low.append([0; 8], vec![2; 1500]);
+    manager.files.push(Arc::new(high));
+    manager.files.push(Arc::new(low));
+
+    let restored = BlobManager::from_bytes(&manager.to_bytes()).unwrap();
+    assert_eq!(restored.segment_file_ids(), vec![2, 9]);
+    assert_eq!(
+        restored.read(&BlobPointer {
+            file_id: 9,
+            offset: high_offset,
+            length: high_length,
+        }),
+        Some(&vec![9; 1500][..])
+    );
+    assert_eq!(
+        restored.read(&BlobPointer {
+            file_id: 2,
+            offset: low_offset,
+            length: low_length,
+        }),
+        Some(&vec![2; 1500][..])
+    );
+
+    let mut segmented = BlobManager::with_threshold_and_mode(1024, true);
+    let mut high = BlobFile::new(9);
+    high.append([0; 8], vec![9; 1500]);
+    let mut low = BlobFile::new(2);
+    low.append([0; 8], vec![2; 1500]);
+    segmented.files.push(Arc::new(high));
+    segmented.files.push(Arc::new(low));
+    segmented.set_generation(7);
+    let catalog = segmented.to_segment_catalog_bytes();
+    let segments = segmented
+        .files
+        .iter()
+        .map(|file| (file.file_id(), file.to_bytes()))
+        .collect::<HashMap<_, _>>();
+    let restored =
+        BlobManager::from_segment_catalog_with_delta_log(&catalog, &segments, &[], None).unwrap();
+    assert_eq!(restored.segment_file_ids(), vec![2, 9]);
+}
+
+#[test]
 fn test_blob_manager_clone_isolated_after_mutation() {
     let mut original = BlobManager::new();
     let pointer = original.append(b"key", vec![1; 1500]).unwrap();

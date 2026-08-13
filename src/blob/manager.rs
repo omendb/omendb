@@ -56,6 +56,22 @@ pub struct BlobManager {
 }
 
 impl BlobManager {
+    /// Return the position of a file by its stable ID.
+    ///
+    /// Blob files are kept in ascending file-ID order. The order is an
+    /// in-memory indexing invariant; the file ID remains the durable
+    /// identity and the vector remains the authoritative live-file state.
+    fn file_index(&self, file_id: u32) -> Option<usize> {
+        self.files
+            .binary_search_by_key(&file_id, |file| file.file_id())
+            .ok()
+    }
+
+    fn file_by_id(&self, file_id: u32) -> Option<&Arc<BlobFile>> {
+        self.file_index(file_id)
+            .and_then(|index| self.files.get(index))
+    }
+
     /// Create a new blob manager with the default threshold.
     pub fn new() -> Self {
         Self::with_threshold(DEFAULT_BLOB_THRESHOLD)
@@ -206,9 +222,7 @@ impl BlobManager {
     }
 
     fn can_mark_deleted(&self, pointer: &BlobPointer) -> bool {
-        self.files
-            .iter()
-            .find(|file| file.file_id() == pointer.file_id)
+        self.file_by_id(pointer.file_id)
             .is_some_and(|file| file.can_mark_deleted(pointer.offset))
     }
 
@@ -238,22 +252,16 @@ impl BlobManager {
 
     /// Read a value from a blob file.
     pub fn read(&self, ptr: &BlobPointer) -> Option<&[u8]> {
-        self.files
-            .iter()
-            .find(|f| f.file_id() == ptr.file_id)
+        self.file_by_id(ptr.file_id)
             .and_then(|f| f.read(ptr.offset, ptr.length))
     }
 
     /// Mark an entry as deleted (for GC).
     pub fn mark_deleted(&mut self, ptr: &BlobPointer) -> bool {
-        if let Some(file) = self
-            .files
-            .iter_mut()
-            .find(|file| file.file_id() == ptr.file_id)
-        {
-            return Arc::make_mut(file).mark_deleted(ptr.offset);
-        }
-        false
+        let Some(index) = self.file_index(ptr.file_id) else {
+            return false;
+        };
+        Arc::make_mut(&mut self.files[index]).mark_deleted(ptr.offset)
     }
 
     /// Get files that need garbage collection.
@@ -291,9 +299,7 @@ impl BlobManager {
 
         let mut reclaimed = 0;
         for file_id in files_to_gc {
-            // Find the file.
-            let file_idx = self.files.iter().position(|f| f.file_id() == file_id);
-            if let Some(idx) = file_idx {
+            if let Some(idx) = self.file_index(file_id) {
                 let file = &self.files[idx];
                 let total = file.record_count();
                 let valid = file.valid_count();

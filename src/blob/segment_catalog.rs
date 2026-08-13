@@ -42,7 +42,7 @@ impl BlobManager {
 
         let mut entries = Vec::new();
         for file_id in file_ids {
-            let current = self.files.iter().find(|file| file.file_id() == file_id);
+            let current = self.file_by_id(file_id);
             let Some(file) = current else {
                 entries.push(SegmentCatalogDeltaEntry::Remove { file_id });
                 continue;
@@ -89,10 +89,7 @@ impl BlobManager {
     /// compare its length with [`Self::persisted_segment_length`] and append
     /// only the new suffix.
     pub(crate) fn segment_bytes(&self, file_id: u32) -> Option<Vec<u8>> {
-        self.files
-            .iter()
-            .find(|file| file.file_id() == file_id)
-            .map(|file| file.to_bytes())
+        self.file_by_id(file_id).map(|file| file.to_bytes())
     }
 
     pub(crate) fn persisted_segment_length(&self, file_id: u32) -> u64 {
@@ -173,12 +170,13 @@ impl BlobManager {
                 .persisted_deleted_offsets
                 .insert(file.file_id(), file.deleted_offsets().collect());
         }
+        let live_file_ids: HashSet<_> = self.files.iter().map(|file| file.file_id()).collect();
         self.catalog
             .persisted_lengths
-            .retain(|file_id, _| self.files.iter().any(|file| file.file_id() == *file_id));
+            .retain(|file_id, _| live_file_ids.contains(file_id));
         self.catalog
             .persisted_deleted_offsets
-            .retain(|file_id, _| self.files.iter().any(|file| file.file_id() == *file_id));
+            .retain(|file_id, _| live_file_ids.contains(file_id));
         self.catalog.persisted_generation_id = self.generation_id;
         self.catalog.catalog_persisted = true;
     }
@@ -296,6 +294,7 @@ impl BlobManager {
             files.push(Arc::new(file));
         }
         cursor.finish()?;
+        files.sort_unstable_by_key(|file| file.file_id());
         Some(Self {
             files,
             next_file_id,
@@ -347,14 +346,14 @@ impl BlobManager {
                         }
                     }
                     file.restore_deleted(&all_deleted.iter().copied().collect::<Vec<_>>())?;
-                    if let Some(index) = self
-                        .files
-                        .iter()
-                        .position(|file| file.file_id() == *file_id)
-                    {
+                    if let Some(index) = self.file_index(*file_id) {
                         self.files[index] = Arc::new(file);
                     } else {
-                        self.files.push(Arc::new(file));
+                        let insert_at = self
+                            .files
+                            .binary_search_by_key(file_id, |file| file.file_id())
+                            .unwrap_or_else(|index| index);
+                        self.files.insert(insert_at, Arc::new(file));
                     }
                     self.catalog
                         .persisted_lengths
@@ -365,10 +364,8 @@ impl BlobManager {
                     self.next_file_id = self.next_file_id.max(file_id.checked_add(1)?);
                 }
                 SegmentCatalogDeltaEntry::Remove { file_id } => {
-                    if self.files.iter().all(|file| file.file_id() != *file_id) {
-                        return None;
-                    }
-                    self.files.retain(|file| file.file_id() != *file_id);
+                    let index = self.file_index(*file_id)?;
+                    self.files.remove(index);
                     self.catalog.persisted_lengths.remove(file_id);
                     self.catalog.persisted_deleted_offsets.remove(file_id);
                 }
