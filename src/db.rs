@@ -32,6 +32,9 @@ mod durability;
 mod faults;
 #[path = "db/history_prune.rs"]
 mod history_prune;
+#[cfg(test)]
+#[path = "db/history_prune_tests.rs"]
+mod history_prune_tests;
 #[path = "db/invariants.rs"]
 mod invariants;
 #[path = "db/io.rs"]
