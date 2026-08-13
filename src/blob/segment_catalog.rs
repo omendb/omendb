@@ -206,7 +206,10 @@ impl BlobManager {
         if target_generation < manager.generation_id {
             return None;
         }
-        let deltas = segment_catalog_format::parse_segment_catalog_delta_log(delta_log)?;
+        let deltas = segment_catalog_format::parse_segment_catalog_delta_log_through_generation(
+            delta_log,
+            target_generation,
+        )?;
         let mut path = Vec::new();
         let mut current_generation = target_generation;
         let mut visited = HashSet::new();

@@ -250,6 +250,73 @@ fn test_segment_catalog_delta_roundtrip_and_torn_suffix() {
 }
 
 #[test]
+fn test_segment_catalog_replay_bounds_chain_and_skips_future_entry_counts() {
+    let mut manager = BlobManager::with_threshold_and_mode(1024, true);
+    let first = manager.append(b"first", vec![1; 1500]).unwrap();
+    manager.set_generation(1);
+    let anchor = manager.to_segment_catalog_bytes();
+    manager.capture_persisted_state();
+
+    let second = manager.append(b"second", vec![2; 1500]).unwrap();
+    manager.set_generation(2);
+    let first_delta = manager.to_segment_catalog_delta_bytes().unwrap();
+    manager.capture_persisted_state();
+
+    // This frame is after the manifest-selected generation. Its entry count
+    // is intentionally hostile; replay must stop at the future generation
+    // before allocating the declared vector.
+    manager.set_generation(3);
+    let mut future_delta = manager.to_segment_catalog_delta_bytes().unwrap();
+    future_delta[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+    let checksum = crc32c::crc32c(&future_delta[..future_delta.len() - 4]);
+    let checksum_start = future_delta.len() - 4;
+    future_delta[checksum_start..].copy_from_slice(&checksum.to_le_bytes());
+
+    let segments = HashMap::from([(first.file_id, manager.segment_bytes(first.file_id).unwrap())]);
+    let mut delta_log = first_delta.clone();
+    delta_log.extend_from_slice(&future_delta);
+    let restored =
+        BlobManager::from_segment_catalog_with_delta_log(&anchor, &segments, &delta_log, Some(2))
+            .unwrap();
+    assert_eq!(restored.generation_id(), 2);
+    assert_eq!(restored.read(&second), Some(&vec![2; 1500][..]));
+
+    let mut long_chain = first_delta;
+    for generation in 3..=(2 + super::segment_catalog_format::MAX_SEGMENT_CATALOG_DELTAS as u64) {
+        manager.set_generation(generation);
+        manager
+            .append(format!("key-{generation}").as_bytes(), vec![3; 1500])
+            .unwrap();
+        let delta = manager.to_segment_catalog_delta_bytes().unwrap();
+        long_chain.extend_from_slice(&delta);
+        manager.capture_persisted_state();
+    }
+    let segments = manager
+        .segment_file_ids()
+        .into_iter()
+        .map(|file_id| (file_id, manager.segment_bytes(file_id).unwrap()))
+        .collect();
+    assert!(
+        BlobManager::from_segment_catalog_with_delta_log(
+            &anchor,
+            &segments,
+            &long_chain,
+            Some(2 + super::segment_catalog_format::MAX_SEGMENT_CATALOG_DELTAS as u64 - 1),
+        )
+        .is_some()
+    );
+    assert!(
+        BlobManager::from_segment_catalog_with_delta_log(
+            &anchor,
+            &segments,
+            &long_chain,
+            Some(2 + super::segment_catalog_format::MAX_SEGMENT_CATALOG_DELTAS as u64),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn test_blob_manager_rejects_future_format_and_duplicate_ids() {
     let mut manager = BlobManager::new();
     manager.append(b"key", vec![1; 1500]).unwrap();

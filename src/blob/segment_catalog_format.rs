@@ -127,54 +127,53 @@ pub(super) fn encode_segment_catalog_delta(
     Some(buf)
 }
 
+#[cfg(test)]
 fn delta_prefix_len(buf: &[u8]) -> Option<usize> {
     let mut position = 0usize;
-    while position < buf.len() {
-        let remaining = buf.len().checked_sub(position)?;
-        if remaining < 44 {
-            break;
-        }
-        let frame = buf.get(position..)?;
-        if frame.get(..8)? != SEGMENT_CATALOG_DELTA_MAGIC
-            || u32::from_le_bytes(frame.get(8..12)?.try_into().ok()?)
-                != SEGMENT_CATALOG_DELTA_VERSION
-        {
-            break;
-        }
-        let frame_length =
-            usize::try_from(u64::from_le_bytes(frame.get(12..20)?.try_into().ok()?)).ok()?;
-        if !(44..=remaining).contains(&frame_length) {
-            break;
-        }
-        let frame = frame.get(..frame_length)?;
-        let stored_checksum = u32::from_le_bytes(frame.get(frame_length - 4..)?.try_into().ok()?);
-        if stored_checksum != crc32c::crc32c(frame.get(..frame_length - 4)?) {
-            break;
-        }
+    while let Some((end, _)) = delta_frame_header(buf, position) {
+        let frame = buf.get(position..end)?;
         if parse_segment_catalog_delta_frame(frame).is_none() {
-            break;
-        }
-        position = position.checked_add(frame_length)?;
-    }
-    Some(position)
-}
-
-fn delta_prefix_len_through_generation(buf: &[u8], generation_id: u64) -> Option<usize> {
-    let prefix = delta_prefix_len(buf)?;
-    let mut position = 0usize;
-    while position < prefix {
-        let frame_length = usize::try_from(u64::from_le_bytes(
-            buf.get(position + 12..position + 20)?.try_into().ok()?,
-        ))
-        .ok()?;
-        let end = position.checked_add(frame_length)?;
-        let frame = parse_segment_catalog_delta_frame(buf.get(position..end)?)?;
-        if frame.generation_id > generation_id {
             break;
         }
         position = end;
     }
     Some(position)
+}
+
+fn delta_prefix_len_through_generation(buf: &[u8], generation_id: u64) -> Option<usize> {
+    let mut position = 0usize;
+    while let Some((end, frame_generation)) = delta_frame_header(buf, position) {
+        if frame_generation > generation_id {
+            break;
+        }
+        let frame = buf.get(position..end)?;
+        if parse_segment_catalog_delta_frame(frame).is_none() {
+            break;
+        }
+        position = end;
+    }
+    Some(position)
+}
+
+/// Read only the fixed header needed to identify the frame boundary and
+/// generation. Callers can stop at a future generation before parsing its
+/// entry count, checksum, or variable-sized vectors.
+fn delta_frame_header(buf: &[u8], position: usize) -> Option<(usize, u64)> {
+    let frame = buf.get(position..)?;
+    if frame.len() < 44
+        || frame.get(..8)? != SEGMENT_CATALOG_DELTA_MAGIC
+        || u32::from_le_bytes(frame.get(8..12)?.try_into().ok()?) != SEGMENT_CATALOG_DELTA_VERSION
+    {
+        return None;
+    }
+    let frame_length =
+        usize::try_from(u64::from_le_bytes(frame.get(12..20)?.try_into().ok()?)).ok()?;
+    if !(44..=frame.len()).contains(&frame_length) {
+        return None;
+    }
+    let end = position.checked_add(frame_length)?;
+    let generation_id = u64::from_le_bytes(frame.get(20..28)?.try_into().ok()?);
+    Some((end, generation_id))
 }
 
 fn parse_segment_catalog_delta_frame(buf: &[u8]) -> Option<SegmentCatalogDelta> {
@@ -238,17 +237,27 @@ fn parse_segment_catalog_delta_frame(buf: &[u8]) -> Option<SegmentCatalogDelta> 
     })
 }
 
-pub(super) fn parse_segment_catalog_delta_log(buf: &[u8]) -> Option<Vec<SegmentCatalogDelta>> {
-    let prefix = delta_prefix_len(buf)?;
+pub(super) fn parse_segment_catalog_delta_log_through_generation(
+    buf: &[u8],
+    target_generation: u64,
+) -> Option<Vec<SegmentCatalogDelta>> {
     let mut position = 0usize;
     let mut deltas = Vec::new();
-    while position < prefix {
-        let frame_length = usize::try_from(u64::from_le_bytes(
-            buf.get(position + 12..position + 20)?.try_into().ok()?,
-        ))
-        .ok()?;
-        let end = position.checked_add(frame_length)?;
-        deltas.push(parse_segment_catalog_delta_frame(buf.get(position..end)?)?);
+    while let Some((end, frame_generation)) = delta_frame_header(buf, position) {
+        // The manifest-selected generation is authoritative. Any later frame
+        // belongs to an abandoned publication branch and must not be parsed
+        // or allowed to grow replay memory.
+        if frame_generation > target_generation {
+            break;
+        }
+        if deltas.len() >= MAX_SEGMENT_CATALOG_DELTAS as usize {
+            return None;
+        }
+        let frame = buf.get(position..end)?;
+        let Some(delta) = parse_segment_catalog_delta_frame(frame) else {
+            break;
+        };
+        deltas.push(delta);
         position = end;
     }
     Some(deltas)
