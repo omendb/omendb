@@ -118,6 +118,25 @@ impl DB {
     }
 
     fn verify_inner(&mut self) -> std::result::Result<VerificationReport, VerificationFailure> {
+        let manifest = self.load_verified_manifest()?;
+        let (verified_pages, data_bytes, blob_pointers) =
+            self.verify_active_generation(&manifest)?;
+        self.verify_blob_pointers(&blob_pointers)?;
+        self.verify_checkpoint_artifact(&manifest)?;
+        let blob_bytes = self.verify_blob_artifact()?;
+        let wal_bytes = self.verify_wal_artifact()?;
+
+        Ok(VerificationReport {
+            durability: self.durability_status(),
+            verified_pages,
+            data_bytes,
+            blob_bytes,
+            wal_bytes,
+            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
+        })
+    }
+
+    fn load_verified_manifest(&mut self) -> std::result::Result<Manifest, VerificationFailure> {
         let manifest = self
             .manifest
             .load_latest()
@@ -136,7 +155,13 @@ impl DB {
                 message: "manifest identity does not match the open database".into(),
             });
         }
+        Ok(manifest)
+    }
 
+    fn verify_active_generation(
+        &mut self,
+        manifest: &Manifest,
+    ) -> std::result::Result<(u64, u64, Vec<BlobPointer>), VerificationFailure> {
         let (verified_pages, data_bytes) = self
             .engine
             .verify_pages(manifest.root_page_id)
@@ -153,8 +178,15 @@ impl DB {
             .engine
             .verify_tree(manifest.root_page_id)
             .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Structure, error))?;
+        Ok((verified_pages, data_bytes, blob_pointers))
+    }
+
+    fn verify_blob_pointers(
+        &self,
+        blob_pointers: &[BlobPointer],
+    ) -> std::result::Result<(), VerificationFailure> {
         for pointer in blob_pointers {
-            if self.blobs.read(&pointer).is_none() {
+            if self.blobs.read(pointer).is_none() {
                 return Err(VerificationFailure {
                     kind: CheckFailureKind::Blob,
                     message: format!(
@@ -164,69 +196,71 @@ impl DB {
                 });
             }
         }
+        Ok(())
+    }
 
-        if manifest.pmt_checkpoint_id.get() != 0 {
-            let checkpoint_path = self
-                .path
-                .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-            let (checkpoint_pmt, checkpoint_allocator) = Self::load_meta(&checkpoint_path)
-                .map_err(|error| {
-                    VerificationFailure::from_error(CheckFailureKind::Checkpoint, error)
-                })?;
-            if checkpoint_pmt.to_bytes() != self.engine.pmt().to_bytes()
-                || checkpoint_allocator.to_bytes() != self.engine.allocator().to_bytes()
-            {
-                return Err(VerificationFailure {
-                    kind: CheckFailureKind::Checkpoint,
-                    message: "manifest checkpoint does not match active PMT or allocator".into(),
-                });
-            }
+    fn verify_checkpoint_artifact(
+        &self,
+        manifest: &Manifest,
+    ) -> std::result::Result<(), VerificationFailure> {
+        if manifest.pmt_checkpoint_id.get() == 0 {
+            return Ok(());
         }
 
+        let checkpoint_path = self
+            .path
+            .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
+        let (checkpoint_pmt, checkpoint_allocator) =
+            Self::load_meta(&checkpoint_path).map_err(|error| {
+                VerificationFailure::from_error(CheckFailureKind::Checkpoint, error)
+            })?;
+        if checkpoint_pmt.to_bytes() != self.engine.pmt().to_bytes()
+            || checkpoint_allocator.to_bytes() != self.engine.allocator().to_bytes()
+        {
+            return Err(VerificationFailure {
+                kind: CheckFailureKind::Checkpoint,
+                message: "manifest checkpoint does not match active PMT or allocator".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_blob_artifact(&self) -> std::result::Result<u64, VerificationFailure> {
         let blob_path = self.path.join(BLOB_FILE);
-        let blob_bytes = if blob_path.exists() {
-            let bytes = fs::read(&blob_path).map_err(|error| {
-                VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
-            })?;
-            parse_blob_catalog(&self.path, &bytes, Some(self.generation_id.get()))
-                .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
-                .ok_or_else(|| VerificationFailure {
-                    kind: CheckFailureKind::Blob,
-                    message: "blob catalog failed integrity verification".into(),
-                })?;
-            blob_storage_size(&self.path)
-                .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
-        } else {
-            0
-        };
+        if !blob_path.exists() {
+            return Ok(0);
+        }
 
+        let bytes = fs::read(&blob_path).map_err(|error| {
+            VerificationFailure::from_error(CheckFailureKind::Blob, error.into())
+        })?;
+        parse_blob_catalog(&self.path, &bytes, Some(self.generation_id.get()))
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))?
+            .ok_or_else(|| VerificationFailure {
+                kind: CheckFailureKind::Blob,
+                message: "blob catalog failed integrity verification".into(),
+            })?;
+        blob_storage_size(&self.path)
+            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Blob, error))
+    }
+
+    fn verify_wal_artifact(&self) -> std::result::Result<u64, VerificationFailure> {
         let wal_path = self.path.join(WAL_FILE);
-        let wal_bytes = if wal_path.exists() {
-            let bytes = fs::read(&wal_path).map_err(|error| {
-                VerificationFailure::from_error(CheckFailureKind::Wal, error.into())
-            })?;
-            let (_, status) = WalManager::parse_records_with_status(&bytes);
-            if status == ParseStatus::Corrupt
-                || (!self.check_only && status != ParseStatus::Complete)
-            {
-                return Err(VerificationFailure {
-                    kind: CheckFailureKind::Wal,
-                    message: format!("WAL integrity status is {status:?}"),
-                });
-            }
-            bytes.len() as u64
-        } else {
-            0
-        };
+        if !wal_path.exists() {
+            return Ok(0);
+        }
 
-        Ok(VerificationReport {
-            durability: self.durability_status(),
-            verified_pages,
-            data_bytes,
-            blob_bytes,
-            wal_bytes,
-            reclaimable_pages: self.engine.reclaimable_page_count() as u64,
-        })
+        let bytes = fs::read(&wal_path).map_err(|error| {
+            VerificationFailure::from_error(CheckFailureKind::Wal, error.into())
+        })?;
+        let (_, status) = WalManager::parse_records_with_status(&bytes);
+        if status == ParseStatus::Corrupt || (!self.check_only && status != ParseStatus::Complete) {
+            return Err(VerificationFailure {
+                kind: CheckFailureKind::Wal,
+                message: format!("WAL integrity status is {status:?}"),
+            });
+        }
+        Ok(bytes.len() as u64)
     }
 
     fn wal_check_status(&mut self) -> Result<WalCheckStatus> {
