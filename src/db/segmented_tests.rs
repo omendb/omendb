@@ -469,6 +469,14 @@ fn test_db_segmented_catalog_delta_write_failures_discard_future_frame() {
             "sync",
             DB::inject_blob_segment_catalog_sync_failure as fn(&DB),
         ),
+        (
+            "short",
+            DB::inject_blob_segment_catalog_delta_short_write_failure as fn(&DB),
+        ),
+        (
+            "torn",
+            DB::inject_blob_segment_catalog_delta_torn_write_failure as fn(&DB),
+        ),
     ];
 
     for (name, inject_failure) in failures {

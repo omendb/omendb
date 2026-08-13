@@ -28,6 +28,8 @@ thread_local! {
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
 }
@@ -195,5 +197,15 @@ impl DB {
     /// manifest publication.
     pub fn inject_blob_segment_catalog_torn_write_failure(&self) {
         FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one partial segmented catalog-delta append.
+    pub fn inject_blob_segment_catalog_delta_short_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_SHORT_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one checksum-corrupted segmented catalog-delta append.
+    pub fn inject_blob_segment_catalog_delta_torn_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE.with(|failure| failure.set(true));
     }
 }

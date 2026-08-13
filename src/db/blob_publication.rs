@@ -87,19 +87,49 @@ impl DB {
             self.blobs.persisted_segment_catalog_generation(),
         )
         .ok_or_else(|| Error::Corruption("segmented catalog delta log is invalid".into()))?;
+        let prefix = u64::try_from(prefix).map_err(|_| Error::DiskFull)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&delta_path)?;
-        if u64::try_from(prefix).map_err(|_| Error::DiskFull)? != file.metadata()?.len() {
-            file.set_len(u64::try_from(prefix).map_err(|_| Error::DiskFull)?)?;
+        if prefix != file.metadata()?.len() {
+            file.set_len(prefix)?;
         }
-        file.seek(SeekFrom::Start(
-            u64::try_from(prefix).map_err(|_| Error::DiskFull)?,
-        ))?;
+        file.seek(SeekFrom::Start(prefix))?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        let short_write =
+            FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_SHORT_WRITE.with(|failure| failure.replace(false));
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let short_write = false;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        let torn_write =
+            FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE.with(|failure| failure.replace(false));
+        #[cfg(not(any(test, feature = "fault-injection")))]
+        let torn_write = false;
+
+        if short_write {
+            let partial_len = (delta.len() / 2).max(1).min(delta.len());
+            file.write_all(&delta[..partial_len])?;
+            file.flush()?;
+            return Err(std::io::Error::other("injected short blob catalog delta write").into());
+        }
+
         file.write_all(delta)?;
+
+        if torn_write {
+            if !delta.is_empty() {
+                let offset = delta.len() / 2;
+                file.seek(SeekFrom::Start(prefix + offset as u64))?;
+                file.write_all(&[delta[offset] ^ 0xA5])?;
+            }
+            file.flush()?;
+            return Err(std::io::Error::other("injected torn blob catalog delta write").into());
+        }
+
         file.flush()?;
 
         #[cfg(any(test, feature = "fault-injection"))]
