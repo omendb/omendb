@@ -4,6 +4,8 @@
 //! recovery, only mutation prefixes closed by a valid commit envelope are
 //! replayed.
 
+mod record;
 mod wal;
 
-pub use wal::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord};
+pub use record::{ParseStatus, RecordType, WalRecord};
+pub use wal::{SyncPolicy, WalManager};
