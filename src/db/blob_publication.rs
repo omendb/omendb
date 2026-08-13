@@ -117,10 +117,7 @@ impl DB {
         Ok(delta.len() as u64)
     }
 
-    pub(super) fn write_blob_segments(&mut self) -> Result<u64> {
-        let catalog_path = self.path.join(BLOB_FILE);
-        let consolidate = !catalog_path.exists() || self.blobs.catalog_needs_consolidation();
-        self.prepare_segment_catalog_backup(consolidate)?;
+    fn write_segment_suffixes(&self) -> Result<u64> {
         let mut bytes_written = 0u64;
         for file_id in self.blobs.segment_file_ids() {
             let data = self
@@ -177,21 +174,34 @@ impl DB {
             }
         }
 
+        Ok(bytes_written)
+    }
+
+    fn publish_segment_catalog(&mut self, consolidate: bool) -> Result<u64> {
+        let catalog_path = self.path.join(BLOB_FILE);
         if consolidate {
             let catalog = self.blobs.to_segment_catalog_bytes();
             atomic_write_without_directory_sync(&catalog_path, &catalog)?;
-            bytes_written = bytes_written.saturating_add(catalog.len() as u64);
             self.blobs.mark_segment_catalog_consolidated();
+            Ok(catalog.len() as u64)
         } else {
             let delta = self
                 .blobs
                 .to_segment_catalog_delta_bytes()
                 .ok_or_else(|| Error::Corruption("segmented catalog delta overflows".into()))?;
-            bytes_written =
-                bytes_written.saturating_add(self.append_segment_catalog_delta(&delta)?);
+            let bytes_written = self.append_segment_catalog_delta(&delta)?;
             self.blobs.mark_segment_delta_persisted();
+            Ok(bytes_written)
         }
-        Ok(bytes_written)
+    }
+
+    pub(super) fn write_blob_segments(&mut self) -> Result<u64> {
+        let catalog_path = self.path.join(BLOB_FILE);
+        let consolidate = !catalog_path.exists() || self.blobs.catalog_needs_consolidation();
+        self.prepare_segment_catalog_backup(consolidate)?;
+        let segment_bytes = self.write_segment_suffixes()?;
+        let catalog_bytes = self.publish_segment_catalog(consolidate)?;
+        Ok(segment_bytes.saturating_add(catalog_bytes))
     }
 
     /// Remove segment files no longer named by the authoritative active
