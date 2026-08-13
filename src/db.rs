@@ -55,6 +55,9 @@ mod open_components;
 mod options;
 #[path = "db/publication.rs"]
 mod publication;
+#[cfg(test)]
+#[path = "db/publication_recovery_tests.rs"]
+mod publication_recovery_tests;
 #[path = "db/query.rs"]
 mod query;
 #[path = "db/read_view.rs"]
