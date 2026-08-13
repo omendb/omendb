@@ -3,6 +3,8 @@
 //! This module coordinates the B-tree, buffer manager, PMT, allocator,
 //! and device to provide persistent storage.
 
+#[cfg(any(test, feature = "fault-injection"))]
+mod faults;
 mod flush;
 pub mod format;
 mod invariants;
@@ -180,49 +182,6 @@ impl StorageEngine {
         self.buffer
             .lock()
             .map_err(|_| Error::Buffer("buffer pool mutex is poisoned".into()))
-    }
-
-    /// Inject one device sync failure for publication-boundary tests.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_sync_failure(&self) {
-        self.device.inject_sync_failure();
-    }
-
-    /// Inject one device page-write failure for publication-boundary tests.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_write_failure(&self) {
-        self.device.inject_write_failure();
-    }
-
-    /// Inject one failure after a complete device page write.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_after_write_failure(&self) {
-        self.device.inject_after_write_failure();
-    }
-
-    /// Inject one failure after the complete page generation is written but
-    /// before its device durability sync.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_page_range_sync_failure(&self) {
-        self.device.inject_page_range_sync_failure();
-    }
-
-    /// Inject one final-write ENOSPC after a page write may have completed.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_final_write_disk_full(&self) {
-        self.device.inject_final_write_disk_full();
-    }
-
-    /// Inject one deterministic disk-full result for recovery tests.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_disk_full(&self) {
-        self.device.inject_disk_full();
-    }
-
-    /// Set a persistent device capacity limit for recovery tests.
-    #[cfg(any(test, feature = "fault-injection"))]
-    pub fn inject_capacity_limit(&self, capacity: u64) {
-        self.device.inject_capacity_limit(capacity);
     }
 
     /// Reject an artifact image that exceeds the deterministic device budget.
