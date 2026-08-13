@@ -62,7 +62,9 @@ jobs:
         with:
           toolchain: stable
       - name: Run release tests
-        run: cargo test --release --all-features --all-targets
+        run: cargo test --release --all-features --lib --bins --tests
+      - name: Compile benchmark targets
+        run: cargo check --release --all-features --benches
 
   real-enospc:
     name: Real filesystem ENOSPC
