@@ -391,6 +391,58 @@ fn test_db_runtime_invariants_cover_pending_generation_lifecycle() {
 }
 
 #[test]
+fn test_db_runtime_invariants_reject_published_frontier_identity_drift() {
+    let dir = tempdir().unwrap();
+    let mut db = DB::open(dir.path().join("frontier-identity.db"), Options::default()).unwrap();
+    let current = db.manifest_history.latest().unwrap();
+    db.manifest_history.reset(Manifest {
+        commit_id: CommitId::new(current.commit_id.get().saturating_add(1)),
+        ..current
+    });
+
+    let error = db.get(b"key").unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::Corruption(message) if message.contains("published manifest commit")
+    ));
+}
+
+#[test]
+fn test_db_runtime_invariants_reject_clean_root_drift() {
+    let dir = tempdir().unwrap();
+    let mut db = DB::open(dir.path().join("frontier-root.db"), Options::default()).unwrap();
+    let current = db.manifest_history.latest().unwrap();
+    db.manifest_history.reset(Manifest {
+        root_page_id: current.root_page_id.saturating_add(1),
+        ..current
+    });
+
+    let error = db.get(b"key").unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::Corruption(message) if message.contains("clean B-tree root")
+    ));
+}
+
+#[test]
+fn test_db_runtime_invariants_preserve_recovery_fence_outcome() {
+    let dir = tempdir().unwrap();
+    let mut db = DB::open(dir.path().join("frontier-fenced.db"), Options::default()).unwrap();
+    let current = db.manifest_history.latest().unwrap();
+    db.manifest_history.reset(Manifest {
+        commit_id: CommitId::new(current.commit_id.get().saturating_add(1)),
+        ..current
+    });
+    db.write_fenced = true;
+
+    let error = db.get(b"key").unwrap_err();
+
+    assert!(matches!(error, Error::NeedsRecovery(_)));
+}
+
+#[test]
 fn test_db_meta_persistence() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");

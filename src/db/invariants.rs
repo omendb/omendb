@@ -41,6 +41,13 @@ impl DB {
             ));
         }
 
+        // A fenced handle may contain a partially published in-memory
+        // frontier. Its recovery-required outcome must remain visible to the
+        // caller instead of being replaced by a derived identity error.
+        if !self.write_fenced {
+            self.validate_published_frontier()?;
+        }
+
         self.engine.validate_handle_state()?;
 
         if self.pending_mutations == 0 {
@@ -77,6 +84,49 @@ impl DB {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_published_frontier(&self) -> Result<()> {
+        let Some(current) = self.manifest_history.latest() else {
+            // A directory containing only an uncommitted or torn WAL prefix
+            // has no published frontier yet. Open discards that prefix and
+            // permits the first successful publication to create the initial
+            // manifest-history entry.
+            if self.commit_id == CommitId::new(0) && self.generation_id == GenerationId::new(0) {
+                return Ok(());
+            }
+            return Err(Error::Corruption(
+                "published manifest history is empty".into(),
+            ));
+        };
+        if current.database_id != self.database_id {
+            return Err(Error::Corruption(
+                "published manifest database identity differs from the coordinator".into(),
+            ));
+        }
+        if current.history_id != self.history_id {
+            return Err(Error::Corruption(
+                "published manifest history identity differs from the coordinator".into(),
+            ));
+        }
+        if current.generation_id != self.generation_id {
+            return Err(Error::Corruption(
+                "published manifest generation differs from the coordinator".into(),
+            ));
+        }
+        if current.commit_id != self.commit_id {
+            return Err(Error::Corruption(
+                "published manifest commit differs from the coordinator".into(),
+            ));
+        }
+        if self.pending_mutations == 0
+            && current.root_page_id != self.engine.btree().root_id() as u64
+        {
+            return Err(Error::Corruption(
+                "clean B-tree root differs from the published manifest".into(),
+            ));
+        }
         Ok(())
     }
 }
