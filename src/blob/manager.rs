@@ -3,7 +3,7 @@
 //! Manages multiple blob files for KV separation. Handles appending,
 //! reading, and garbage collection of blob files.
 
-use crate::blob::file::{BlobFile, BlobRecord};
+use crate::blob::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
 use std::sync::Arc;
 

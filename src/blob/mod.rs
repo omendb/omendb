@@ -6,6 +6,8 @@
 
 mod manager;
 mod file;
+mod record;
 
 pub use manager::{BlobManager, BlobManagerError, DEFAULT_BLOB_THRESHOLD};
 pub use file::BlobFile;
+pub(crate) use record::BlobRecord;

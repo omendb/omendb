@@ -2,7 +2,7 @@
 
 use super::cursor::Cursor;
 use super::{BlobManager, DEFAULT_BLOB_THRESHOLD, DEFAULT_SEGMENT_TARGET_SIZE};
-use crate::blob::file::{BlobFile, BlobRecord};
+use crate::blob::{BlobFile, BlobRecord};
 use crate::btree::node::BlobPointer;
 use std::collections::HashSet;
 use std::sync::Arc;
