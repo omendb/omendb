@@ -224,6 +224,46 @@ def _validate_syscall_cases(cases: Any) -> tuple[list[dict[str, Any]], dict[str,
     return normalized, coverage
 
 
+def _validate_syscall_outcomes(
+    cases: list[dict[str, Any]], identity: dict[str, Any]
+) -> None:
+    """Validate outcome fields that define a complete mutation prefix.
+
+    The source harness records only complete batch prefixes. Without this
+    check, two engines could report the same malformed prefix and the pairwise
+    comparator would incorrectly call the result equivalent.
+    """
+
+    batch_size = identity["batch_size"]
+    operations = identity["operations"]
+    if batch_size <= 0:
+        raise ManifestError("manifest.batch_size must be positive")
+    if operations <= 0:
+        raise ManifestError("manifest.operations must be positive")
+    if operations % batch_size != 0:
+        raise ManifestError(
+            "manifest.operations must be divisible by manifest.batch_size"
+        )
+
+    for index, case in enumerate(cases):
+        prefix = case["accepted_prefix"]
+        if prefix < 0 or prefix > operations:
+            raise ManifestError(
+                f"case[{index}].accepted_prefix must be between 0 and operations"
+            )
+        if prefix % batch_size != 0:
+            raise ManifestError(
+                f"case[{index}].accepted_prefix must be a complete batch prefix"
+            )
+        expected_recovery = (
+            "complete-new-state" if prefix == operations else "complete-prefix"
+        )
+        if case["recovery_outcome"] != expected_recovery:
+            raise ManifestError(
+                f"case[{index}].recovery_outcome does not match accepted_prefix"
+            )
+
+
 def _validate_manifest(
     manifest: Any,
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -247,6 +287,7 @@ def _validate_manifest(
         cases, coverage = _validate_process_cases(manifest.get("cases"))
     else:
         cases, coverage = _validate_syscall_cases(manifest.get("cases"))
+        _validate_syscall_outcomes(cases, identity)
     return manifest_format, identity, cases, coverage
 
 

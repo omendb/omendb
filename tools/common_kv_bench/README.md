@@ -120,9 +120,11 @@ python3 tools/common_kv_compare.py \
 
 The comparison validates the shared trace identity and required case coverage,
 then compares logical execution, recovery, and two-reopen outcomes for every
-engine pair. Syscall failed-call indexes and observed call counts are
-mechanical details and are deliberately excluded from equivalence. `accepted`
-means only that this fault-outcome comparison passed; `resource_qualified`
+engine pair. It also rejects syscall manifests whose accepted prefix is outside
+the requested mutation range, is not batch-aligned, or disagrees with the
+declared recovery outcome. Syscall failed-call indexes and observed call counts
+are mechanical details and are deliberately excluded from equivalence.
+`accepted` means only that this fault-outcome comparison passed; `resource_qualified`
 remains false when the source manifest records `resource_outcome:
 not-collected`. Unsupported, incomplete, malformed, or different-outcome
 reports never pass `--require-equivalent`.

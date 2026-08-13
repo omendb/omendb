@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from common_kv_compare import compare_manifest
+from common_kv_compare import ManifestError, compare_manifest
 
 
 def process_manifest(*, different: bool = False) -> dict:
@@ -108,6 +108,18 @@ class CommonKvCompareTests(unittest.TestCase):
         report = compare_manifest(syscall_manifest(), ["fjall", "seerdb"])
         self.assertEqual(report["status"], "accepted")
         self.assertTrue(report["accepted"])
+
+    def test_syscall_malformed_prefix_is_rejected_before_comparison(self):
+        manifest = syscall_manifest()
+        manifest["cases"][0]["accepted_prefix"] = 15
+        with self.assertRaisesRegex(ManifestError, "complete batch prefix"):
+            compare_manifest(manifest, ["fjall", "seerdb"])
+
+    def test_syscall_recovery_label_must_match_prefix(self):
+        manifest = syscall_manifest()
+        manifest["cases"][0]["accepted_prefix"] = 64
+        with self.assertRaisesRegex(ManifestError, "does not match accepted_prefix"):
+            compare_manifest(manifest, ["fjall", "seerdb"])
 
     def test_missing_required_engine_is_incomplete(self):
         report = compare_manifest(process_manifest(), ["fjall", "rocksdb", "seerdb"])
