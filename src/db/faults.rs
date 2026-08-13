@@ -21,6 +21,8 @@ thread_local! {
     pub(super) static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME: Cell<bool> = const { Cell::new(false) };
@@ -148,6 +150,16 @@ impl DB {
     /// its catalog is published.
     pub fn inject_blob_segment_after_write_failure(&self) {
         FAIL_NEXT_BLOB_SEGMENT_AFTER_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one partial segmented blob suffix write.
+    pub fn inject_blob_segment_short_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_SHORT_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one checksum-corrupted segmented blob suffix write.
+    pub fn inject_blob_segment_torn_write_failure(&self) {
+        FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE.with(|failure| failure.set(true));
     }
 
     /// Inject one failure while syncing a segmented blob suffix.

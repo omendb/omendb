@@ -156,7 +156,37 @@ impl DB {
             reserve_file(&file, new_len)?;
             file.set_len(new_len)?;
             file.seek(SeekFrom::Start(persisted))?;
-            file.write_all(&data[persisted_usize..])?;
+            let suffix = &data[persisted_usize..];
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            let short_write =
+                FAIL_NEXT_BLOB_SEGMENT_SHORT_WRITE.with(|failure| failure.replace(false));
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let short_write = false;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            let torn_write =
+                FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE.with(|failure| failure.replace(false));
+            #[cfg(not(any(test, feature = "fault-injection")))]
+            let torn_write = false;
+
+            if short_write {
+                let partial_len = (suffix.len() / 2).max(1);
+                file.write_all(&suffix[..partial_len])?;
+                file.flush()?;
+                return Err(std::io::Error::other("injected short blob segment write").into());
+            }
+
+            file.write_all(suffix)?;
+
+            if torn_write {
+                let offset = suffix.len() / 2;
+                file.seek(SeekFrom::Start(persisted + offset as u64))?;
+                file.write_all(&[suffix[offset] ^ 0xA5])?;
+                file.flush()?;
+                return Err(std::io::Error::other("injected torn blob segment write").into());
+            }
+
             file.flush()?;
 
             #[cfg(any(test, feature = "fault-injection"))]

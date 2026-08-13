@@ -321,6 +321,61 @@ fn test_db_segmented_append_failure_ignores_orphan_suffix() {
 }
 
 #[test]
+fn test_db_segmented_partial_append_failures_ignore_suffix() {
+    let failures = [
+        (
+            "short",
+            DB::inject_blob_segment_short_write_failure as fn(&DB),
+        ),
+        (
+            "torn",
+            DB::inject_blob_segment_torn_write_failure as fn(&DB),
+        ),
+    ];
+
+    for (name, inject_failure) in failures {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(format!("segmented-{name}-append-failure.db"));
+        let options = Options {
+            blob_storage: BlobStorageMode::Segmented,
+            blob_threshold: 4,
+            ..Options::default()
+        };
+        let base = vec![0xE9; 2_000];
+        let pending = vec![0xEA; 2_100];
+        let mut db = DB::create(&path, options).unwrap();
+        db.put(b"base", &base).unwrap();
+        db.flush().unwrap();
+
+        let segment = blob_segment_path(&path, 1);
+        let catalog_before = fs::read(path.join(BLOB_FILE)).unwrap();
+        let segment_len_before = fs::metadata(&segment).unwrap().len();
+
+        db.put(b"pending", &pending).unwrap();
+        inject_failure(&db);
+        assert!(db.flush().is_err(), "{name} suffix write should fail");
+        assert!(db.durability_status().write_fenced);
+        assert!(fs::metadata(&segment).unwrap().len() > segment_len_before);
+        assert_eq!(fs::read(path.join(BLOB_FILE)).unwrap(), catalog_before);
+        assert!(!path.join(BLOB_REWRITE_BACKUP_FILE).exists());
+        assert!(!path.join(BLOB_DELTA_FILE).exists());
+        drop(db);
+
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(reopened.get(b"base").unwrap(), Some(base));
+        assert_eq!(reopened.get(b"pending").unwrap(), None);
+        reopened.verify().unwrap();
+
+        reopened.put(b"pending", &pending).unwrap();
+        reopened.flush().unwrap();
+        assert_eq!(reopened.get(b"pending").unwrap(), Some(pending));
+        reopened.verify().unwrap();
+    }
+}
+
+#[test]
 fn test_db_segmented_catalog_delta_chain_reopens_and_preserves_anchor() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("segmented-catalog-delta-chain.db");

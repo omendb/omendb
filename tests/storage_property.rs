@@ -90,7 +90,7 @@ proptest! {
         dead_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
     ) {
         for segmented in [false, true] {
-            for fault in 0u8..10 {
+            for fault in 0u8..12 {
                 if !segmented && fault >= 3 {
                     continue;
                 }
@@ -136,12 +136,14 @@ proptest! {
                     1 => db.inject_final_write_disk_full(),
                     2 => db.inject_atomic_rename_failure(),
                     3 => db.inject_blob_segment_after_write_failure(),
-                    4 => db.inject_blob_segment_catalog_rename_failure(),
-                    5 => db.inject_blob_segment_catalog_short_write_failure(),
-                    6 => db.inject_blob_segment_catalog_torn_write_failure(),
-                    7 => db.inject_blob_segment_sync_failure(),
-                    8 => db.inject_blob_segment_catalog_sync_failure(),
-                    9 => db.inject_blob_segment_catalog_after_write_failure(),
+                    4 => db.inject_blob_segment_short_write_failure(),
+                    5 => db.inject_blob_segment_torn_write_failure(),
+                    6 => db.inject_blob_segment_catalog_rename_failure(),
+                    7 => db.inject_blob_segment_catalog_short_write_failure(),
+                    8 => db.inject_blob_segment_catalog_torn_write_failure(),
+                    9 => db.inject_blob_segment_sync_failure(),
+                    10 => db.inject_blob_segment_catalog_sync_failure(),
+                    11 => db.inject_blob_segment_catalog_after_write_failure(),
                     _ => unreachable!(),
                 }
                 assert!(db.gc().is_err());
