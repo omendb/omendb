@@ -359,5 +359,9 @@ mod tests;
 mod segmented_tests;
 
 #[cfg(test)]
+#[path = "db/publication_admission_tests.rs"]
+mod publication_admission_tests;
+
+#[cfg(test)]
 #[path = "db/published_commits_tests.rs"]
 mod published_commits_tests;
