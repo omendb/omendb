@@ -7,7 +7,9 @@
 mod frame;
 mod guard;
 mod manager;
+mod types;
 
 pub use frame::Frame;
 pub use guard::{GuardAccess, PageGuard};
-pub use manager::{BufferError, BufferManager, BufferStats, PageCacheKey, Writeback};
+pub use manager::BufferManager;
+pub use types::{BufferError, BufferStats, PageCacheKey, Writeback};
