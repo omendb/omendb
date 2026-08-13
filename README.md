@@ -70,7 +70,7 @@ current design and staged optimization plan.
 
 The current Rust lane is a single-writer durable kernel with concurrent reads,
 root-generation retention, WAL recovery, crash-safe reclamation, and retryable
-capacity refusal. The current release suite passes 240 unit tests, 75 DBNext R0
+capacity refusal. The current release suite passes 241 unit tests, 75 DBNext R0
 tests, 7 storage properties, all-target Clippy, and warnings-as-errors docs. A
 524,288-operation ARM64 Linux workload/recovery soak passed with digest/reopen
 parity, and the DBNext R0 integrity gate accepts its replay and 13 fault cases.
