@@ -8,9 +8,11 @@ publish = false
 default = ["fjall"]
 fjall = ["dep:fjall"]
 rocksdb = ["dep:rocksdb"]
+redb = ["dep:redb"]
 
 [dependencies]
 seerdb = { path = "../.." }
 fjall = { version = "3.1.8", optional = true }
 rocksdb = { version = "0.24.0", optional = true, default-features = false, features = ["lz4"] }
+redb = { version = "3", optional = true }
 libc = "0.2.189"

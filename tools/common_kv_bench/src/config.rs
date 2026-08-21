@@ -9,6 +9,7 @@ pub(super) enum EngineKind {
     SeerDb,
     Fjall,
     RocksDb,
+    Redb,
 }
 
 impl EngineKind {
@@ -17,9 +18,11 @@ impl EngineKind {
             "seerdb" => Ok(Self::SeerDb),
             "fjall" => Ok(Self::Fjall),
             "rocksdb" => Ok(Self::RocksDb),
-            _ => {
-                Err(format!("unknown engine {value:?}; expected seerdb, fjall, or rocksdb").into())
-            }
+            "redb" => Ok(Self::Redb),
+            _ => Err(
+                format!("unknown engine {value:?}; expected seerdb, fjall, rocksdb, or redb")
+                    .into(),
+            ),
         }
     }
 
@@ -28,6 +31,7 @@ impl EngineKind {
             Self::SeerDb => "seerdb",
             Self::Fjall => "fjall",
             Self::RocksDb => "rocksdb",
+            Self::Redb => "redb",
         }
     }
 }
@@ -86,7 +90,7 @@ impl DurabilityMode {
         }
     }
 
-    #[cfg(any(feature = "fjall", feature = "rocksdb"))]
+    #[cfg(any(feature = "fjall", feature = "rocksdb", feature = "redb"))]
     pub(super) fn sync_writes(self) -> bool {
         matches!(self, Self::Durable)
     }

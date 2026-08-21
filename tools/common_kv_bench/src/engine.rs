@@ -23,6 +23,18 @@ pub(super) struct RocksDbEngine {
     durable: bool,
 }
 
+#[cfg(feature = "redb")]
+use redb::ReadableDatabase;
+
+#[cfg(feature = "redb")]
+pub(super) struct RedbEngine {
+    db: redb::Database,
+    durable: bool,
+}
+
+#[cfg(feature = "redb")]
+const REDB_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("kv");
+
 pub(super) enum Engine {
     SeerDb {
         db: Box<seerdb::DB>,
@@ -31,6 +43,8 @@ pub(super) enum Engine {
     Fjall(FjallEngine),
     #[cfg(feature = "rocksdb")]
     RocksDb(RocksDbEngine),
+    #[cfg(feature = "redb")]
+    Redb(RedbEngine),
 }
 
 impl Engine {
@@ -89,6 +103,20 @@ impl Engine {
                 #[cfg(not(feature = "rocksdb"))]
                 {
                     Err("RocksDB support is disabled; rebuild with --features rocksdb".into())
+                }
+            }
+            EngineKind::Redb => {
+                #[cfg(feature = "redb")]
+                {
+                    let db = redb::Database::builder().create(path)?;
+                    Ok(Self::Redb(RedbEngine {
+                        db,
+                        durable: durability.sync_writes(),
+                    }))
+                }
+                #[cfg(not(feature = "redb"))]
+                {
+                    Err("redb support is disabled; rebuild with --features redb".into())
                 }
             }
         }
@@ -150,6 +178,20 @@ impl Engine {
                     Err("RocksDB support is disabled; rebuild with --features rocksdb".into())
                 }
             }
+            EngineKind::Redb => {
+                #[cfg(feature = "redb")]
+                {
+                    let db = redb::Database::builder().open(path)?;
+                    Ok(Self::Redb(RedbEngine {
+                        db,
+                        durable: durability.sync_writes(),
+                    }))
+                }
+                #[cfg(not(feature = "redb"))]
+                {
+                    Err("redb support is disabled; rebuild with --features redb".into())
+                }
+            }
         }
     }
 
@@ -208,6 +250,32 @@ impl Engine {
                 write_options.set_sync(engine.durable);
                 engine.db.write_opt(batch, &write_options)?;
             }
+            #[cfg(feature = "redb")]
+            Self::Redb(engine) => {
+                let mut txn = engine.db.begin_write()?;
+                txn.set_durability(if engine.durable {
+                    redb::Durability::Immediate
+                } else {
+                    redb::Durability::None
+                })?;
+                {
+                    let mut table = txn.open_table(REDB_TABLE)?;
+                    for operation in mutations {
+                        match operation {
+                            Operation::Put { key, value } => {
+                                table.insert(key.as_slice(), value.as_slice())?;
+                            }
+                            Operation::Delete { key } => {
+                                table.remove(key.as_slice())?;
+                            }
+                            Operation::Get { .. } | Operation::Range { .. } => {
+                                unreachable!("read operation passed to write_batch")
+                            }
+                        }
+                    }
+                }
+                txn.commit()?;
+            }
         }
         Ok(())
     }
@@ -219,6 +287,12 @@ impl Engine {
             Self::Fjall(engine) => Ok(engine.keyspace.get(key)?.map(|value| value.to_vec())),
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(engine) => Ok(engine.db.get(key)?),
+            #[cfg(feature = "redb")]
+            Self::Redb(engine) => {
+                let txn = engine.db.begin_read()?;
+                let table = txn.open_table(REDB_TABLE)?;
+                Ok(table.get(key)?.map(|value| value.value().to_vec()))
+            }
         }
     }
 
@@ -247,6 +321,17 @@ impl Engine {
                         break;
                     }
                     entries.push((key.to_vec(), value.to_vec()));
+                }
+                Ok(entries)
+            }
+            #[cfg(feature = "redb")]
+            Self::Redb(engine) => {
+                let txn = engine.db.begin_read()?;
+                let table = txn.open_table(REDB_TABLE)?;
+                let mut entries = Vec::new();
+                for row in table.range(start..end)? {
+                    let (key, value) = row?;
+                    entries.push((key.value().to_vec(), value.value().to_vec()));
                 }
                 Ok(entries)
             }
@@ -282,6 +367,8 @@ impl Engine {
             Self::Fjall(_) => None,
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(_) => None,
+            #[cfg(feature = "redb")]
+            Self::Redb(_) => None,
         }
     }
 
@@ -292,6 +379,8 @@ impl Engine {
             Self::Fjall(_) => {}
             #[cfg(feature = "rocksdb")]
             Self::RocksDb(_) => {}
+            #[cfg(feature = "redb")]
+            Self::Redb(_) => {}
         }
         Ok(())
     }

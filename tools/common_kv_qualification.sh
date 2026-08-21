@@ -12,7 +12,7 @@ usage: tools/common_kv_qualification.sh [options]
 Options:
   --output-dir PATH       Fresh directory for raw runs and manifest
                           (default: /tmp/seerdb-common-kv-qualification-TIMESTAMP)
-  --engines LIST          Comma-separated: seerdb,fjall,rocksdb
+  --engines LIST          Comma-separated: seerdb,fjall,rocksdb,redb
                           (default: seerdb,fjall,rocksdb)
   --workloads LIST        Comma-separated workload names
                           (default: batch-put,mixed)
@@ -111,7 +111,7 @@ done
 
 for engine in "${engines[@]}"; do
     case "$engine" in
-        seerdb|fjall|rocksdb) ;;
+        seerdb|fjall|rocksdb|redb) ;;
         *) die "unknown engine '$engine'" ;;
     esac
 done
@@ -158,6 +158,13 @@ build_engine() {
                 return 1
             fi
             ;;
+        redb)
+            if ! cargo build --release --manifest-path "$bench_manifest" --target-dir "$target_dir" \
+                --no-default-features --features redb >&2; then
+                echo "common_kv_qualification: failed to build $engine" >&2
+                return 1
+            fi
+            ;;
         *)
             echo "common_kv_qualification: unknown engine $engine" >&2
             return 1
@@ -176,6 +183,7 @@ for engine in "${engines[@]}"; do
         seerdb) seerdb_binary=$built_binary ;;
         fjall) fjall_binary=$built_binary ;;
         rocksdb) rocksdb_binary=$built_binary ;;
+        redb) redb_binary=$built_binary ;;
     esac
 done
 
@@ -184,6 +192,10 @@ binary_for_engine() {
         seerdb) echo "$seerdb_binary" ;;
         fjall) echo "$fjall_binary" ;;
         rocksdb) echo "$rocksdb_binary" ;;
+        redb)
+            [[ -n ${redb_binary:-} ]] || die "no binary built for engine '$1'"
+            echo "$redb_binary"
+            ;;
     esac
 }
 
