@@ -7,6 +7,8 @@
 //! device-backed directory; on Linux /tmp is tmpfs and the footprint
 //! numbers would not reflect real storage.
 
+#![allow(clippy::disallowed_methods)]
+
 use seerdb::{BatchMutation, DB, Options};
 use std::fs;
 use std::path::{Path, PathBuf};
