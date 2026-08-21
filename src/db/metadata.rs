@@ -9,7 +9,10 @@
 //! published manifest.
 
 #[cfg(any(test, feature = "fault-injection"))]
-use super::faults::{FAIL_NEXT_META_LOG_SYNC, FAIL_NEXT_META_LOG_WRITE};
+use super::faults::{
+    FAIL_NEXT_META_LOG_SHORT_WRITE, FAIL_NEXT_META_LOG_SYNC, FAIL_NEXT_META_LOG_TORN_WRITE,
+    FAIL_NEXT_META_LOG_WRITE,
+};
 use super::metadata_codec::{
     MAX_META_DELTA_CHAIN, META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_DELTA_MAGIC,
     META_LOG_FRAME_HEADER_SIZE, META_LOG_HEADER_SIZE, META_MAGIC, MetaLogEntry, ParsedMetaLog,
@@ -281,6 +284,35 @@ impl DB {
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_META_LOG_WRITE.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected metadata log write failure").into());
+        }
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_META_LOG_SHORT_WRITE.with(|failure| failure.replace(false)) {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            if !existed {
+                file.write_all(&meta_log_header_bytes())?;
+            }
+            let _ = file.write_all(&frame[..frame.len() / 2]);
+            let _ = file.sync_all();
+            return Err(std::io::Error::other("injected metadata log short write failure").into());
+        }
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_META_LOG_TORN_WRITE.with(|failure| failure.replace(false)) {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            if !existed {
+                file.write_all(&meta_log_header_bytes())?;
+            }
+            file.write_all(&frame)?;
+            // Trailing garbage behind the frame bytes: the frame checksum
+            // still matches, but the log ends in an abandoned partial frame.
+            let _ = file.write_all(&[0xA5; 7]);
+            let _ = file.sync_all();
+            return Err(std::io::Error::other("injected metadata log torn write failure").into());
         }
         let mut file = OpenOptions::new()
             .create(true)

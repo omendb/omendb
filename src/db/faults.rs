@@ -34,6 +34,8 @@ thread_local! {
     pub(super) static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_SYNC: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_META_LOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_META_LOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
 }
 
 impl DB {
@@ -108,6 +110,17 @@ impl DB {
     /// Inject one failure at the next metadata log sync boundary.
     pub fn inject_meta_log_sync_failure(&self) {
         FAIL_NEXT_META_LOG_SYNC.with(|failure| failure.set(true));
+    }
+
+    /// Inject one short metadata-log frame write followed by a failure.
+    pub fn inject_meta_log_short_write_failure(&self) {
+        FAIL_NEXT_META_LOG_SHORT_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one torn metadata-log append (frame bytes plus trailing
+    /// garbage) followed by a failure.
+    pub fn inject_meta_log_torn_write_failure(&self) {
+        FAIL_NEXT_META_LOG_TORN_WRITE.with(|failure| failure.set(true));
     }
 
     /// Inject one failure at the next manifest sync boundary.
