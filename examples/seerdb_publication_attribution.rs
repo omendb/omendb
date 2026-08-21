@@ -61,6 +61,7 @@ struct Args {
     batch_size: usize,
     value_bytes: usize,
     reopens: usize,
+    path: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
@@ -70,6 +71,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         batch_size: DEFAULT_BATCH_SIZE,
         value_bytes: DEFAULT_VALUE_BYTES,
         reopens: 3,
+        path: None,
     };
     let mut argv = env::args().skip(1);
     let take =
@@ -85,9 +87,16 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--batch-size" => args.batch_size = take(&mut argv, "--batch-size")?,
             "--value-bytes" => args.value_bytes = take(&mut argv, "--value-bytes")?,
             "--reopens" => args.reopens = take(&mut argv, "--reopens")?,
+            "--path" => {
+                args.path = Some(
+                    argv.next()
+                        .ok_or_else(|| "--path requires a value".to_string())?
+                        .into(),
+                )
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: seerdb_publication_attribution [--keys N] [--operations N] [--batch-size N] [--value-bytes N] [--reopens N]"
+                    "usage: seerdb_publication_attribution [--keys N] [--operations N] [--batch-size N] [--value-bytes N] [--reopens N] [--path DIR]"
                 );
                 std::process::exit(0);
             }
@@ -136,8 +145,21 @@ fn phase_names() -> [(&'static str, PhaseField); 11] {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("db");
+    // Default to a temp dir, but allow pinning the database to a caller-
+    // chosen filesystem: on Linux /tmp is frequently tmpfs, where syncs are
+    // no-ops and fallocate zeroes pages, so attribution there does not
+    // reflect device-backed publication cost.
+    let _tempdir;
+    let path = match &args.path {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
+            dir.join("db")
+        }
+        None => {
+            _tempdir = tempfile::tempdir()?;
+            _tempdir.path().join("db")
+        }
+    };
     let value = value_bytes(args.value_bytes);
 
     let mut db = DB::create(&path, Options::default())?;
