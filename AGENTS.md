@@ -55,6 +55,14 @@ cargo clippy --all-features -- -D warnings
 - Tests: `cargo test --lib` (all pass)
 - Clippy: `cargo clippy --all-features -- -D warnings` (zero warnings)
 - Docs: `cargo doc --no-deps` (zero warnings)
+- Format: `cargo fmt --all --check` (zero diffs; standardized formatting is required)
+
+### Benchmark placement
+
+On Linux, `/tmp` is tmpfs: syncs are no-ops, so benchmark and attribution
+results measured there are invalid. Run the attribution harness with
+`--path <device-backed dir>` and the common-KV matrix with an output dir
+under `$HOME`.
 
 ## Architecture
 
