@@ -7,6 +7,23 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Process-wide count of successful durability barriers (file and data
+/// syncs) across every publication artifact: WAL, data device, metadata
+/// log, manifest history, manifest slots, blob segments/catalogs, and
+/// artifact writes. The per-engine [`StorageMetrics::syncs`] counter only
+/// covers the data device; attribution needs the full barrier count.
+pub(crate) static DURABILITY_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one completed durability sync at any layer.
+pub(crate) fn record_durability_sync() {
+    DURABILITY_SYNCS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Load the cumulative durability-sync count.
+pub(crate) fn durability_syncs() -> u64 {
+    DURABILITY_SYNCS.load(Ordering::Relaxed)
+}
+
 /// Cumulative physical work performed by one storage-engine handle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorageMetrics {

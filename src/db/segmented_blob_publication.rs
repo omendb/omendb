@@ -127,6 +127,7 @@ impl DB {
             return Err(std::io::Error::other("injected blob catalog sync failure").into());
         }
         file.sync_all()?;
+        crate::storage::record_durability_sync();
         Ok(delta.len() as u64)
     }
 
@@ -207,6 +208,7 @@ impl DB {
                 return Err(std::io::Error::other("injected blob segment sync failure").into());
             }
             file.sync_all()?;
+            crate::storage::record_durability_sync();
             bytes_written = bytes_written.saturating_add(new_len - persisted);
 
             #[cfg(any(test, feature = "fault-injection"))]

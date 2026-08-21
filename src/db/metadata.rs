@@ -256,6 +256,7 @@ impl DB {
             let file = OpenOptions::new().write(true).open(&log_path)?;
             file.set_len(parsed.valid_len as u64)?;
             file.sync_all()?;
+            crate::storage::record_durability_sync();
         }
 
         let payload = match (parent.pmt_checkpoint_id.get(), parsed.as_ref()) {
@@ -327,6 +328,7 @@ impl DB {
             return Err(std::io::Error::other("injected metadata log sync failure").into());
         }
         file.sync_all()?;
+        crate::storage::record_durability_sync();
 
         let header_bytes = u64::from(!existed) * META_LOG_HEADER_SIZE as u64;
         Ok((header_bytes + frame.len() as u64, !existed))

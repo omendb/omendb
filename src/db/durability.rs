@@ -96,6 +96,7 @@ impl DB {
             let file = OpenOptions::new().write(true).open(&path)?;
             file.set_len(complete_len)?;
             file.sync_all()?;
+            crate::storage::record_durability_sync();
             if sync_parent {
                 sync_directory(&self.path)?;
             }
@@ -107,6 +108,7 @@ impl DB {
         bytes_written = bytes_written.saturating_add(entry.len() as u64);
         file.flush()?;
         file.sync_all()?;
+        crate::storage::record_durability_sync();
         if sync_parent {
             sync_directory(&self.path)?;
         } else {

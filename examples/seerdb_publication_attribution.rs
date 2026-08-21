@@ -43,6 +43,7 @@ struct PhaseDelta {
     page_bytes_written: u64,
     physical_page_writes: u64,
     syncs: u64,
+    durability_syncs: u64,
     logical_dirty_bytes: u64,
 }
 
@@ -107,6 +108,10 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         return Err("all counts must be positive".into());
     }
     Ok(args)
+}
+
+fn durability_syncs(db: &DB) -> u64 {
+    db.durability_sync_count()
 }
 
 fn snapshot(
@@ -200,10 +205,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .sum();
 
         let (storage_before, publication_before, timing_before) = snapshot(&db)?;
+        let durability_syncs_before = durability_syncs(&db);
         let started = Instant::now();
         db.commit_batch(&mutations)?;
         let elapsed_ns = started.elapsed().as_nanos();
         let (storage_after, publication_after, timing_after) = snapshot(&db)?;
+        let durability_syncs_after = durability_syncs(&db);
 
         deltas.push(PhaseDelta {
             elapsed_ns,
@@ -262,6 +269,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .physical_page_writes
                 .saturating_sub(storage_before.physical_page_writes),
             syncs: storage_after.syncs.saturating_sub(storage_before.syncs),
+            durability_syncs: durability_syncs_after.saturating_sub(durability_syncs_before),
             logical_dirty_bytes: logical_dirty,
         });
         index = end;
@@ -295,6 +303,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let total_logical_dirty: u64 = deltas.iter().map(|d| d.logical_dirty_bytes).sum();
     let total_page_writes: u64 = deltas.iter().map(|d| d.physical_page_writes).sum();
     let total_syncs: u64 = deltas.iter().map(|d| d.syncs).sum();
+    let total_durability_syncs: u64 = deltas.iter().map(|d| d.durability_syncs).sum();
     let total_wal_bytes: u64 = deltas.iter().map(|d| d.wal_bytes_written).sum();
     let total_metadata_bytes: u64 = deltas.iter().map(|d| d.metadata_bytes_written).sum();
     let total_history_bytes: u64 = deltas.iter().map(|d| d.history_bytes_written).sum();
@@ -346,7 +355,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "blob_bytes": total_blob_bytes / publications,
             "history_bytes": total_history_bytes / publications,
             "manifest_bytes": total_manifest_bytes / publications,
-            "syncs": total_syncs as f64 / publications as f64,
+            "data_device_syncs": total_syncs as f64 / publications as f64,
+            "durability_syncs": total_durability_syncs as f64 / publications as f64,
         },
         "write_amplification": {
             "page_bytes_per_logical_dirty_byte": page_amp,

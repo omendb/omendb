@@ -104,6 +104,7 @@ fn atomic_write_with_options(
         return Err(std::io::Error::other("injected blob catalog sync failure").into());
     }
     file.sync_all()?;
+    crate::storage::record_durability_sync();
     drop(file);
 
     #[cfg(any(test, feature = "fault-injection"))]
@@ -155,6 +156,7 @@ pub(super) fn atomic_write_reserved(
     file.write_all(data)?;
     file.flush()?;
     file.sync_all()?;
+    crate::storage::record_durability_sync();
     drop(file);
 
     #[cfg(any(test, feature = "fault-injection"))]
@@ -182,6 +184,7 @@ pub(super) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()?;
+        crate::storage::record_durability_sync();
     }
     Ok(())
 }

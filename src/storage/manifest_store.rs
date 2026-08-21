@@ -128,6 +128,7 @@ impl ManifestStore {
         }
 
         self.file.sync_all()?;
+        crate::storage::record_durability_sync();
         Ok(())
     }
 

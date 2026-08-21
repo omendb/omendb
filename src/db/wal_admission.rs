@@ -72,6 +72,7 @@ impl DB {
                     SyncPolicy::SyncAll => file.sync_all()?,
                     SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data()?,
                 }
+                crate::storage::record_durability_sync();
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.replace(false)) {
                     return Err(std::io::Error::other("injected post-WAL-sync failure").into());
@@ -155,6 +156,7 @@ impl DB {
                 return Err(Error::DiskFull);
             }
             file.sync_data()?;
+            crate::storage::record_durability_sync();
             sync_directory(&self.path)?;
         }
         self.wal_reserved_extent = target;

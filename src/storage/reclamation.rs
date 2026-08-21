@@ -261,6 +261,7 @@ impl StorageEngine {
                 .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
         }
         self.device.sync()?;
+        super::record_durability_sync();
         self.metrics.syncs.fetch_add(1, Ordering::Relaxed);
 
         let mut retired_offsets = Vec::with_capacity(moves.len());

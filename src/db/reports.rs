@@ -276,6 +276,12 @@ pub struct PublicationTimingMetrics {
 }
 
 impl DB {
+    /// Cumulative durability barriers (file and data syncs) across every
+    /// publication artifact, including those outside the data device.
+    pub fn durability_sync_count(&self) -> u64 {
+        crate::storage::durability_syncs()
+    }
+
     /// Get blob GC statistics.
     pub fn blob_stats(&self) -> BlobStats {
         BlobStats {

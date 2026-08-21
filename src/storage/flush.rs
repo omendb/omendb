@@ -144,6 +144,7 @@ impl StorageEngine {
         #[cfg(any(test, feature = "fault-injection"))]
         self.device.check_page_range_sync()?;
         self.device.sync()?;
+        crate::storage::record_durability_sync();
         {
             let mut buffer = self.buffer_lock()?;
             for writeback in pending_writebacks {

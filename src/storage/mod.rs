@@ -20,6 +20,7 @@ mod verification;
 
 pub use manifest_store::ManifestStore;
 pub use metrics::StorageMetrics;
+pub(crate) use metrics::{durability_syncs, record_durability_sync};
 pub(crate) use read_path::StorageReadView;
 
 use self::metrics::StorageCounters;
