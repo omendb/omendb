@@ -206,12 +206,8 @@ impl ReuseLedger {
                 return Err("reuse ledger offsets are truncated");
             }
             let mut offsets = Vec::with_capacity(offset_count);
-            for chunk in bytes[cursor..offsets_end].chunks_exact(8) {
-                offsets.push(u64::from_le_bytes(
-                    chunk
-                        .try_into()
-                        .map_err(|_| "reuse ledger offset is truncated")?,
-                ));
+            for chunk in bytes[cursor..offsets_end].as_chunks::<8>().0 {
+                offsets.push(u64::from_le_bytes(*chunk));
             }
             cursor = offsets_end;
             ledger.push(ReuseAttempt {

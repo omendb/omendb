@@ -86,6 +86,7 @@ impl DB {
             }
         })?;
         Self::validate_selected_artifacts(paths, current_manifest, check_only)?;
+        Self::validate_selected_artifacts(paths, current_manifest, check_only)?;
         if check_only && current_manifest.is_none() {
             return Err(Error::Check {
                 kind: CheckFailureKind::Manifest,
@@ -196,9 +197,13 @@ impl DB {
         read_only: bool,
     ) -> Result<ManifestHistory> {
         let history_path = paths.path.join(MANIFEST_HISTORY_FILE);
-        let mut history = if history_path.exists() {
-            let bytes = fs::read(&history_path)?;
-            ManifestHistory::from_bytes(&bytes)
+        let existing_bytes = if history_path.exists() {
+            Some(fs::read(&history_path)?)
+        } else {
+            None
+        };
+        let mut history = if let Some(bytes) = existing_bytes.as_ref() {
+            ManifestHistory::from_bytes(bytes)
                 .map_err(|message| Error::Corruption(format!("manifest history {message}")))?
         } else {
             ManifestHistory::new()
@@ -216,7 +221,12 @@ impl DB {
                 let bytes = history
                     .to_bytes()
                     .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-                atomic_write(&history_path, &bytes)?;
+                // Reconciliation usually changes nothing on a clean reopen.
+                // Rewriting an identical image would cost two durability
+                // barriers per open, so persist only when content differs.
+                if existing_bytes.as_deref() != Some(bytes.as_slice()) {
+                    atomic_write(&history_path, &bytes)?;
+                }
             }
         }
         Ok(history)

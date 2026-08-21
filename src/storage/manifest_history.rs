@@ -187,7 +187,8 @@ impl ManifestHistory {
         let complete_len = complete_len / MANIFEST_HISTORY_ENTRY_SIZE * MANIFEST_HISTORY_ENTRY_SIZE;
         for chunk in bytes
             [MANIFEST_HISTORY_HEADER_SIZE..MANIFEST_HISTORY_HEADER_SIZE + complete_len]
-            .chunks_exact(MANIFEST_HISTORY_ENTRY_SIZE)
+            .as_chunks::<{ MANIFEST_HISTORY_ENTRY_SIZE }>()
+            .0
         {
             let slot: &[u8; MANIFEST_SLOT_SIZE] = chunk[..MANIFEST_SLOT_SIZE]
                 .try_into()
