@@ -78,7 +78,9 @@ fn decode_hex(value: &str, context: &str) -> AnyResult<Vec<u8>> {
 
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, pair)| {
             let high = hex_digit(pair[0]).ok_or_else(|| {
@@ -152,10 +154,10 @@ fn sha256_hex(input: &[u8]) -> String {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut schedule = [0u32; 64];
-        for (word, bytes) in schedule[..16].iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_be_bytes(bytes.try_into().expect("four-byte SHA word"));
+        for (word, bytes) in schedule[..16].iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for index in 16..64 {
             let s0 = schedule[index - 15].rotate_right(7)

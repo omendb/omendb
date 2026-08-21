@@ -5,7 +5,6 @@
 //! retains current mutable state and publication ordering.
 
 use super::*;
-use crate::db::artifact_io::sync_history_prune_directory;
 use std::collections::BTreeSet;
 
 impl DB {
@@ -61,8 +60,10 @@ impl DB {
         );
         for manifest in protected_manifests {
             if manifest.pmt_checkpoint_id.get() != 0 {
-                retained_checkpoints.extend(Self::load_meta_ancestors(
-                    &self.path,
+                let parsed = DB::read_meta_log(&self.path)?
+                    .ok_or_else(|| Error::Corruption("metadata log is missing".into()))?;
+                retained_checkpoints.extend(DB::meta_log_ancestors(
+                    &parsed,
                     manifest.pmt_checkpoint_id.get(),
                 )?);
             }
@@ -73,32 +74,8 @@ impl DB {
             self.manifest_history = history;
         }
 
-        let mut removed_checkpoints = 0u64;
-        let mut reclaimed_checkpoint_bytes = 0u64;
-        for entry in fs::read_dir(&self.path)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(generation) = name
-                .to_str()
-                .and_then(|name| name.strip_prefix("seerdb.meta."))
-                .and_then(|suffix| suffix.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if retained_checkpoints.contains(&generation) {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            if !metadata.is_file() {
-                continue;
-            }
-            fs::remove_file(entry.path())?;
-            removed_checkpoints = removed_checkpoints.saturating_add(1);
-            reclaimed_checkpoint_bytes = reclaimed_checkpoint_bytes.saturating_add(metadata.len());
-        }
-        if removed_checkpoints > 0 {
-            sync_history_prune_directory(&self.path)?;
-        }
+        let (removed_checkpoints, reclaimed_checkpoint_bytes) =
+            self.compact_metadata_log(&retained_checkpoints)?;
 
         Ok(HistoryPruneReport {
             retained_generations: retained.len() as u64,

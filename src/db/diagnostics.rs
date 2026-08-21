@@ -207,11 +207,9 @@ impl DB {
             return Ok(());
         }
 
-        let checkpoint_path = self
-            .path
-            .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-        let (checkpoint_pmt, checkpoint_allocator) =
-            Self::load_meta(&checkpoint_path).map_err(|error| {
+        let (checkpoint_pmt, checkpoint_allocator, _) = self
+            .load_meta_by_id(manifest.pmt_checkpoint_id.get())
+            .map_err(|error| {
                 VerificationFailure::from_error(CheckFailureKind::Checkpoint, error)
             })?;
         if checkpoint_pmt.to_bytes() != self.engine.pmt().to_bytes()

@@ -21,7 +21,7 @@ fn test_db_retains_manifest_fallback_before_reusing_pages() {
     // generation, but only after both manifest slots have been fenced to
     // the current root. Fail before the new manifest is published.
     db.put(b"key", b"value-3").unwrap();
-    inject_atomic_rename_failure();
+    db.inject_meta_log_write_failure();
     assert!(matches!(db.flush(), Err(Error::Io(_))));
     drop(db);
 
@@ -52,10 +52,11 @@ fn test_db_prune_history_preserves_inactive_manifest_checkpoint() {
     db.put(b"key", b"value-2").unwrap();
     db.flush().unwrap();
 
-    let first_checkpoint = path.join("seerdb.meta.1");
-    assert!(first_checkpoint.is_file());
+    let metadata_log = DB::metadata_log_path(&path);
+    assert!(metadata_log.is_file());
     db.prune_history().unwrap();
-    assert!(first_checkpoint.is_file());
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(parsed.frames.iter().any(|frame| frame.checkpoint_id == 1));
     db.close().unwrap();
 
     // The newest slot is corrupt, so reopen must use the independently
@@ -93,23 +94,24 @@ fn test_db_prune_history_preserves_inactive_manifest_checkpoint() {
 }
 
 #[test]
-fn test_db_history_prune_directory_failure_reopens_and_retries() {
+fn test_db_history_prune_compaction_failure_reopens_and_retries() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("prune-directory-failure.db");
+    let path = dir.path().join("prune-compaction-failure.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
     db.put(b"key", b"value-0").unwrap();
     db.flush().unwrap();
-    for revision in 1..=MAX_META_DELTA_CHAIN + 1 {
+    for revision in 1..=MAX_META_DELTA_CHAIN as i32 + 2 {
         db.put(b"key", format!("value-{revision}").as_bytes())
             .unwrap();
         db.flush().unwrap();
     }
     db.put(b"key", b"value-final").unwrap();
     db.flush().unwrap();
-    let obsolete_checkpoint = path.join("seerdb.meta.1");
-    assert!(obsolete_checkpoint.is_file());
+    let metadata_log = DB::metadata_log_path(&path);
+    let log_len_before = fs::metadata(&metadata_log).unwrap().len();
+    assert!(log_len_before > 0);
 
-    db.inject_history_prune_directory_sync_failure();
+    db.inject_atomic_rename_failure();
     assert!(matches!(db.prune_history(), Err(Error::Io(_))));
     drop(db);
 
@@ -117,10 +119,13 @@ fn test_db_history_prune_directory_failure_reopens_and_retries() {
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-final".to_vec()));
     reopened.verify().unwrap();
     let report = reopened.prune_history().unwrap();
-    assert_eq!(report.removed_checkpoints, 0);
+    assert!(report.removed_checkpoints > 0);
     reopened.close().unwrap();
 
-    let reopened = DB::open(&path, Options::default()).unwrap();
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-final".to_vec()));
-    assert!(!obsolete_checkpoint.is_file());
+    let log_len_after = fs::metadata(&metadata_log).unwrap().len();
+    assert!(log_len_after < log_len_before);
+    reopened.verify().unwrap();
+    reopened.close().unwrap();
 }

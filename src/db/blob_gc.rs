@@ -185,10 +185,12 @@ impl DB {
             .load_latest()?
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
         let generation_id = self.next_generation_id;
-        let checkpoint_path = self
-            .path
-            .join(format!("seerdb.meta.{}", generation_id.get()));
-        let checkpoint_bytes = self.save_generation_meta(&checkpoint_path, current)?;
+        let (checkpoint_bytes, meta_log_created) =
+            self.append_generation_meta(generation_id.get(), current)?;
+        debug_assert!(
+            !meta_log_created,
+            "maintenance requires a published database"
+        );
         let meta_path = self.path.join(META_FILE);
         let legacy_meta_bytes = if meta_path.is_file() {
             0

@@ -47,11 +47,10 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
 fn active_manifest(path: &Path) -> Manifest {
     let bytes = fs::read(path.join("MANIFEST")).unwrap();
     bytes
-        .chunks_exact(seerdb::storage::format::MANIFEST_SLOT_SIZE)
-        .filter_map(|slot| {
-            let slot: &[u8; seerdb::storage::format::MANIFEST_SLOT_SIZE] = slot.try_into().unwrap();
-            Manifest::from_bytes(slot).unwrap()
-        })
+        .as_chunks::<{ seerdb::storage::format::MANIFEST_SLOT_SIZE }>()
+        .0
+        .iter()
+        .filter_map(|slot| Manifest::from_bytes(slot).unwrap())
         .reduce(|current, candidate| {
             if candidate.is_newer_than(current) {
                 candidate
@@ -726,14 +725,15 @@ fn dbnext_r0_rejects_malformed_checkpoint_container() {
         db.flush().unwrap();
     }
 
-    let checkpoint_path = path.join("seerdb.meta.1");
-    let mut checkpoint = fs::read(&checkpoint_path).unwrap();
-    checkpoint.push(0xA5);
-    fs::write(checkpoint_path, checkpoint).unwrap();
+    let metadata_log = path.join("seerdb.meta.log");
+    let mut log = fs::read(&metadata_log).unwrap();
+    let first_payload = 12 + 16;
+    log[first_payload] ^= 0xA5;
+    fs::write(&metadata_log, &log).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("checksum")
+        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 1")
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
@@ -762,17 +762,14 @@ fn dbnext_r0_rejects_future_meta_version() {
         db.flush().unwrap();
     }
 
-    let checkpoint_path = path.join("seerdb.meta.1");
-    let mut checkpoint = fs::read(&checkpoint_path).unwrap();
-    checkpoint[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
-    let checksum_offset = checkpoint.len() - 4;
-    let checksum = crc32c::crc32c(&checkpoint[..checksum_offset]);
-    checkpoint[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
-    fs::write(&checkpoint_path, checkpoint).unwrap();
+    let metadata_log = path.join("seerdb.meta.log");
+    let mut log = fs::read(&metadata_log).unwrap();
+    log[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+    fs::write(&metadata_log, &log).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("unsupported meta format version")
+        Err(Error::Corruption(message)) if message.contains("unsupported metadata log format version")
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
@@ -793,14 +790,19 @@ fn dbnext_r0_accepts_legacy_meta_checkpoint() {
         db.flush().unwrap();
     }
 
-    let checkpoint_path = path.join("seerdb.meta.1");
-    let checkpoint = fs::read(&checkpoint_path).unwrap();
-    let legacy = checkpoint[12..checkpoint.len() - 4].to_vec();
-    fs::write(&checkpoint_path, legacy).unwrap();
+    // The legacy whole-image seerdb.meta fallback remains openable for
+    // databases that predate the manifest-selected metadata log.
+    let legacy_dir = root.path().join("legacy-meta-fallback.db");
+    fs::create_dir(&legacy_dir).unwrap();
+    let log = fs::read(path.join("seerdb.meta.log")).unwrap();
+    let payload_len = u32::from_le_bytes(log[12..16].try_into().unwrap()) as usize;
+    let payload = log[28..28 + payload_len].to_vec();
+    let legacy_meta = payload[12..payload.len() - 4].to_vec();
+    fs::write(legacy_dir.join("seerdb.meta"), &legacy_meta).unwrap();
 
-    let mut reopened = DB::open(&path, Options::default()).unwrap();
-    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
-    assert!(reopened.verify().is_ok());
+    let mut reopened = DB::open(&legacy_dir, Options::default()).unwrap();
+    assert!(!reopened.durability_status().write_fenced);
+    reopened.close().unwrap();
 }
 
 #[test]

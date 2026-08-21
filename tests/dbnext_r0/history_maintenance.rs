@@ -294,12 +294,27 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
         }])
         .unwrap();
 
-    let second_checkpoint = path.join(format!("seerdb.meta.{}", second.generation_id.get()));
-    let first_checkpoint = path.join(format!("seerdb.meta.{}", first.generation_id.get()));
-    let third_checkpoint = path.join(format!("seerdb.meta.{}", third.generation_id.get()));
-    assert!(first_checkpoint.is_file());
-    assert!(second_checkpoint.is_file());
-    assert!(third_checkpoint.is_file());
+    let metadata_log = path.join("seerdb.meta.log");
+    let frame_ids = || {
+        let bytes = fs::read(&metadata_log).unwrap();
+        let mut ids = Vec::new();
+        let mut cursor = 12usize;
+        while cursor + 16 <= bytes.len() {
+            let payload_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            ids.push(u64::from_le_bytes(
+                bytes[cursor + 8..cursor + 16].try_into().unwrap(),
+            ));
+            cursor += 16 + payload_len;
+            if cursor > bytes.len() {
+                break;
+            }
+        }
+        ids
+    };
+    assert!(frame_ids().contains(&first.generation_id.get()));
+    assert!(frame_ids().contains(&second.generation_id.get()));
+    assert!(frame_ids().contains(&third.generation_id.get()));
 
     let report = db.prune_history().unwrap();
     assert_eq!(report.retained_generations, 3);
@@ -307,9 +322,7 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     // The current delta checkpoint also depends on its full and delta
     // ancestors even though the middle logical manifest is unretained.
     assert_eq!(report.removed_checkpoints, 0);
-    assert!(second_checkpoint.exists());
-    assert!(first_checkpoint.is_file());
-    assert!(third_checkpoint.is_file());
+    assert!(frame_ids().contains(&first.generation_id.get()));
     assert_eq!(
         db.get_at(snapshot_id, b"versioned").unwrap(),
         Some(b"one".to_vec())
@@ -325,8 +338,7 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
     let report = reopened.prune_history().unwrap();
     assert_eq!(report.retained_generations, 2);
     assert_eq!(report.removed_checkpoints, 0);
-    assert!(first_checkpoint.exists());
-    assert!(third_checkpoint.is_file());
+    assert!(frame_ids().contains(&first.generation_id.get()));
     assert!(matches!(
         reopened.get_at(snapshot_id, b"versioned"),
         Err(Error::SnapshotUnavailable(_))
@@ -334,25 +346,37 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
 }
 
 #[test]
-fn dbnext_r0_history_prune_rename_failure_preserves_old_sidecar() {
+fn dbnext_r0_history_prune_compaction_failure_preserves_old_sidecar() {
     let root = tempdir().unwrap();
     let path = root.path().join("history-prune-failure.db");
     let mut db = DB::open(&path, Options::for_test()).unwrap();
     db.put(b"versioned", b"one").unwrap();
     db.flush().unwrap();
-    let first_checkpoint = path.join("seerdb.meta.1");
+    let metadata_log = path.join("seerdb.meta.log");
+    let frame_count = |path: &std::path::Path| {
+        let bytes = fs::read(path).unwrap();
+        let mut count = 0usize;
+        let mut cursor = 12usize;
+        while cursor + 16 <= bytes.len() {
+            let payload_len =
+                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 16 + payload_len;
+            count += 1;
+        }
+        count
+    };
     db.put(b"versioned", b"two").unwrap();
     db.flush().unwrap();
-    assert!(first_checkpoint.is_file());
+    let frames_before = frame_count(&metadata_log);
 
     db.inject_atomic_rename_failure();
     assert!(db.prune_history().is_err());
-    assert!(first_checkpoint.is_file());
+    assert_eq!(frame_count(&metadata_log), frames_before);
     assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
 
     let report = db.prune_history().unwrap();
     assert_eq!(report.removed_checkpoints, 0);
-    assert!(first_checkpoint.exists());
+    assert_eq!(frame_count(&metadata_log), frames_before);
 }
 
 #[test]

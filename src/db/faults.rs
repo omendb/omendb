@@ -32,7 +32,8 @@ thread_local! {
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_CATALOG_DELTA_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
-    pub(super) static FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_META_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_META_LOG_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 impl DB {
@@ -99,6 +100,16 @@ impl DB {
         FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.set(true));
     }
 
+    /// Inject one failure at the next metadata log write boundary.
+    pub fn inject_meta_log_write_failure(&self) {
+        FAIL_NEXT_META_LOG_WRITE.with(|failure| failure.set(true));
+    }
+
+    /// Inject one failure at the next metadata log sync boundary.
+    pub fn inject_meta_log_sync_failure(&self) {
+        FAIL_NEXT_META_LOG_SYNC.with(|failure| failure.set(true));
+    }
+
     /// Inject one failure at the next manifest sync boundary.
     pub fn inject_manifest_sync_failure(&self) {
         self.manifest.inject_sync_failure();
@@ -113,13 +124,6 @@ impl DB {
     /// the next user manifest publication.
     pub fn inject_publication_directory_sync_failure(&self) {
         FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.set(true));
-    }
-
-    /// Inject one final directory-sync failure after history pruning removes
-    /// obsolete checkpoint files. The active manifest remains authoritative;
-    /// reopen should accept the pruned or unpruned directory state.
-    pub fn inject_history_prune_directory_sync_failure(&self) {
-        FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC.with(|failure| failure.set(true));
     }
 
     /// Inject one failure after the next manifest becomes authoritative.

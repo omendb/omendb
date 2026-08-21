@@ -120,8 +120,8 @@ impl DB {
             return Ok(HashSet::new());
         }
 
-        let checkpoint = path.join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-        let (pmt, _) = Self::load_meta(&checkpoint)?;
+        let (pmt, _) = DB::load_meta_by_id_path(path, manifest.pmt_checkpoint_id.get())
+            .map(|(pmt, a, _)| (pmt, a))?;
         if !pmt.contains(manifest.root_page_id) {
             return Err(Error::Corruption(format!(
                 "retained snapshot {} names a root missing from its checkpoint",

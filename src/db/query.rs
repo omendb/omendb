@@ -124,10 +124,8 @@ impl DB {
         if manifest.pmt_checkpoint_id.get() == 0 {
             return Ok(PMT::new());
         }
-        let checkpoint = self
-            .path
-            .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-        Self::load_meta(&checkpoint).map(|(pmt, _)| pmt)
+        self.load_meta_by_id(manifest.pmt_checkpoint_id.get())
+            .map(|(pmt, _, _)| pmt)
     }
 
     fn lookup_result_value(

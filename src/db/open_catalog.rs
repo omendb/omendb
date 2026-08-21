@@ -146,10 +146,8 @@ impl DB {
             });
         }
         if current.pmt_checkpoint_id.get() != 0 {
-            let checkpoint_path = paths
-                .path
-                .join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
-            if !checkpoint_path.is_file() {
+            let log_path = DB::metadata_log_path(&paths.path);
+            if !log_path.is_file() {
                 let error = Error::Corruption(format!(
                     "manifest generation {} is missing checkpoint {}",
                     current.generation_id.get(),

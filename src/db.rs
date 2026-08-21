@@ -86,7 +86,7 @@ mod wal_admission;
 mod wal_recovery;
 
 #[cfg(test)]
-use metadata_codec::{MAX_META_DELTA_CHAIN, META_DELTA_MAGIC, META_MAGIC};
+use metadata_codec::MAX_META_DELTA_CHAIN;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use artifact_io::atomic_write_reserved;
@@ -111,9 +111,9 @@ use faults::{
     FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE, FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC,
     FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE, FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE,
     FAIL_NEXT_BLOB_SEGMENT_SHORT_WRITE, FAIL_NEXT_BLOB_SEGMENT_SYNC,
-    FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE, FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC,
-    FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC, FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE,
-    FAIL_NEXT_WAL_SYNC, FAIL_NEXT_WAL_TRUNCATE, FAIL_NEXT_WAL_WRITE,
+    FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE, FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
+    FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE, FAIL_NEXT_WAL_SYNC,
+    FAIL_NEXT_WAL_TRUNCATE, FAIL_NEXT_WAL_WRITE,
 };
 use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
@@ -160,6 +160,7 @@ const DATA_FILE: &str = "seerdb.data";
 const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
+const META_LOG_FILE: &str = "seerdb.meta.log";
 const MANIFEST_FILE: &str = "MANIFEST";
 const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
 const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";

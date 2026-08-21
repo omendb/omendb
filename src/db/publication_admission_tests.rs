@@ -1,5 +1,6 @@
 //! Publication-admission, metadata-delta, and checkpoint recovery tests.
 
+use super::metadata_codec::MetaLogEntry;
 use super::*;
 use std::fs;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -93,13 +94,15 @@ fn test_db_metadata_delta_reopens_and_preserves_parent_checkpoint() {
         );
     }
 
-    let first_checkpoint = path.join("seerdb.meta.1");
-    let second_checkpoint = path.join("seerdb.meta.2");
-    let first_bytes = fs::read(&first_checkpoint).unwrap();
-    let second_bytes = fs::read(&second_checkpoint).unwrap();
-    assert!(first_bytes.starts_with(&META_MAGIC));
-    assert!(second_bytes.starts_with(&META_DELTA_MAGIC));
-    assert!(second_bytes.len() < first_bytes.len());
+    let parsed = DB::read_meta_log(&path).unwrap().expect("metadata log");
+    assert!(matches!(
+        parsed.frames[0].entry,
+        MetaLogEntry::Checkpoint(..)
+    ));
+    assert_eq!(parsed.frames[0].checkpoint_id, 1);
+    assert!(matches!(parsed.frames[1].entry, MetaLogEntry::Delta(_)));
+    assert_eq!(parsed.frames[1].checkpoint_id, 2);
+    assert!(parsed.frames[1].raw.len() < parsed.frames[0].raw.len());
 
     let mut reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(
@@ -112,8 +115,10 @@ fn test_db_metadata_delta_reopens_and_preserves_parent_checkpoint() {
     );
     reopened.release_snapshot(snapshot_id).unwrap();
     reopened.prune_history().unwrap();
-    assert!(first_checkpoint.is_file());
-    assert!(second_checkpoint.is_file());
+    let pruned = DB::read_meta_log(&path).unwrap().unwrap();
+    let retained_ids: Vec<u64> = pruned.frames.iter().map(|f| f.checkpoint_id).collect();
+    assert!(retained_ids.contains(&1));
+    assert!(retained_ids.contains(&2));
 }
 
 #[test]
@@ -127,15 +132,29 @@ fn test_db_metadata_delta_corruption_fails_closed() {
     db.flush().unwrap();
     drop(db);
 
-    let checkpoint = path.join("seerdb.meta.2");
-    let mut bytes = fs::read(&checkpoint).unwrap();
-    assert!(bytes.starts_with(&META_DELTA_MAGIC));
-    let valid_delta = bytes.clone();
-    bytes.push(0xA5);
-    fs::write(&checkpoint, bytes).unwrap();
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut bytes = fs::read(&metadata_log).unwrap();
+    // Locate generation 2's frame payload and corrupt one payload byte so
+    // the frame checksum no longer matches.
+    let mut cursor = 12usize;
+    let mut target = None;
+    while cursor + 16 <= bytes.len() {
+        let payload_len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let frame_id = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+        let end = cursor + 16 + payload_len;
+        if frame_id == 2 {
+            target = Some(cursor + 16 + payload_len / 2);
+            break;
+        }
+        cursor = end;
+    }
+    let corrupt_at = target.expect("generation 2 frame");
+    bytes[corrupt_at] ^= 0xA5;
+    fs::write(&metadata_log, &bytes).unwrap();
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("metadata delta")
+        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 2")
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
@@ -145,12 +164,40 @@ fn test_db_metadata_delta_corruption_fails_closed() {
         })
     ));
 
-    let mut anchorless = valid_delta;
+    // Rewrite generation 2's delta with a zeroed parent while fixing both
+    // the payload checksum and the frame checksum, exercising the bounded
+    // anchorless-delta decode refusal.
+    let mut cursor = 12usize;
+    let mut frame_range = None;
+    while cursor + 16 <= bytes.len() {
+        let payload_len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let frame_id = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+        let end = cursor + 16 + payload_len;
+        if frame_id == 2 {
+            frame_range = Some((cursor, end));
+            break;
+        }
+        cursor = end;
+    }
+    let (frame_start, frame_end) = frame_range.expect("generation 2 frame");
+    let mut anchorless = bytes[frame_start + 16..frame_end].to_vec();
     anchorless[12..20].fill(0);
     let checksum = crc32c::crc32c(&anchorless[..anchorless.len() - 4]);
     let checksum_offset = anchorless.len() - 4;
     anchorless[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
-    fs::write(&checkpoint, anchorless).unwrap();
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&u32::try_from(anchorless.len()).unwrap().to_le_bytes());
+    let mut checksum_input = Vec::with_capacity(8 + anchorless.len());
+    checksum_input.extend_from_slice(&bytes[frame_start + 8..frame_start + 16]);
+    checksum_input.extend_from_slice(&anchorless);
+    frame.extend_from_slice(&crc32c::crc32c(&checksum_input).to_le_bytes());
+    frame.extend_from_slice(&bytes[frame_start + 8..frame_start + 16]);
+    frame.extend_from_slice(&anchorless);
+    let mut rewritten = bytes[..frame_start].to_vec();
+    rewritten.extend_from_slice(&frame);
+    fs::write(&metadata_log, &rewritten).unwrap();
     let error = match DB::open(&path, Options::default()) {
         Ok(_) => panic!("anchorless metadata delta unexpectedly opened"),
         Err(error) => error,
@@ -175,8 +222,13 @@ fn test_db_metadata_delta_chain_consolidates_at_hard_limit() {
         db.flush().unwrap();
     }
     let consolidation_generation = MAX_META_DELTA_CHAIN as u64 + 2;
-    let consolidated = path.join(format!("seerdb.meta.{consolidation_generation}"));
-    assert!(fs::read(&consolidated).unwrap().starts_with(&META_MAGIC));
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    let consolidated = parsed
+        .frames
+        .iter()
+        .find(|frame| frame.checkpoint_id == consolidation_generation)
+        .expect("consolidation frame");
+    assert!(matches!(consolidated.entry, MetaLogEntry::Checkpoint(..)));
     // The inactive slot still names the immediately previous delta
     // frontier. Publish one more generation so that fallback advances
     // beyond the consolidation before pruning the old chain.
@@ -184,7 +236,13 @@ fn test_db_metadata_delta_chain_consolidates_at_hard_limit() {
     db.flush().unwrap();
     let report = db.prune_history().unwrap();
     assert_eq!(report.removed_checkpoints, MAX_META_DELTA_CHAIN as u64 + 1);
-    assert!(consolidated.is_file());
+    let pruned = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(
+        pruned
+            .frames
+            .iter()
+            .any(|frame| frame.checkpoint_id == consolidation_generation)
+    );
     assert_eq!(db.get(b"key").unwrap(), Some(b"value-66".to_vec()));
     db.close().unwrap();
     let reopened = DB::open(&path, Options::default()).unwrap();
@@ -201,19 +259,13 @@ fn test_compaction_after_metadata_delta_admits_relocation_sidecar() {
     db.flush().unwrap();
     db.put(b"key", b"value-2").unwrap();
     db.flush().unwrap();
-    assert!(
-        fs::read(path.join("seerdb.meta.2"))
-            .unwrap()
-            .starts_with(&META_DELTA_MAGIC)
-    );
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(matches!(parsed.frames[1].entry, MetaLogEntry::Delta(_)));
 
     let report = db.compact().unwrap();
     assert_eq!(report.relocated_pages, 1);
-    assert!(
-        fs::read(path.join("seerdb.meta.3"))
-            .unwrap()
-            .starts_with(&META_DELTA_MAGIC)
-    );
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(matches!(parsed.frames[2].entry, MetaLogEntry::Delta(_)));
     assert_eq!(db.get(b"key").unwrap(), Some(b"value-2".to_vec()));
     drop(db);
 

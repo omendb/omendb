@@ -11,7 +11,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use seerdb::{BatchMutation, DB, Options};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::env;
 use std::error::Error;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -44,7 +44,6 @@ struct PhaseDelta {
     physical_page_writes: u64,
     syncs: u64,
     logical_dirty_bytes: u64,
-    mutations: usize,
 }
 
 fn key(index: usize) -> Vec<u8> {
@@ -73,7 +72,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         reopens: 3,
     };
     let mut argv = env::args().skip(1);
-    let mut take =
+    let take =
         |argv: &mut dyn Iterator<Item = String>, name: &str| -> Result<usize, Box<dyn Error>> {
             argv.next()
                 .ok_or_else(|| format!("{name} requires a value").into())
@@ -116,7 +115,10 @@ fn snapshot(
     ))
 }
 
-fn phase_names() -> [(&'static str, fn(&PhaseDelta) -> u64); 11] {
+type PhaseField = fn(&PhaseDelta) -> u64;
+
+#[allow(clippy::type_complexity)]
+fn phase_names() -> [(&'static str, PhaseField); 11] {
     [
         ("candidate_prepare", |d| d.candidate_prepare_ns),
         ("wal_write", |d| d.wal_write_ns),
@@ -174,7 +176,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 BatchMutation::Delete { key } => key.len() as u64,
             })
             .sum();
-        let mutation_count = mutations.len();
 
         let (storage_before, publication_before, timing_before) = snapshot(&db)?;
         let started = Instant::now();
@@ -240,7 +241,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .saturating_sub(storage_before.physical_page_writes),
             syncs: storage_after.syncs.saturating_sub(storage_before.syncs),
             logical_dirty_bytes: logical_dirty,
-            mutations: mutation_count,
         });
         index = end;
     }
@@ -266,7 +266,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into_iter()
         .map(|(name, field)| (name.to_string(), deltas.iter().map(field).sum()))
         .collect();
-    phase_totals.sort_by(|a, b| b.1.cmp(&a.1));
+    phase_totals.sort_by_key(|(_, ns)| std::cmp::Reverse(*ns));
     let phase_sum_ns: u64 = phase_totals.iter().map(|(_, ns)| ns).sum();
 
     let total_page_bytes: u64 = deltas.iter().map(|d| d.page_bytes_written).sum();

@@ -12,10 +12,14 @@ use crate::storage::format::FORMAT_VERSION;
 
 pub(super) const META_MAGIC: [u8; 8] = *b"SEERMET1";
 pub(super) const META_DELTA_MAGIC: [u8; 8] = *b"SEERMDL1";
+pub(super) const META_LOG_MAGIC: [u8; 8] = *b"SEERMLG1";
 const META_DELTA_VERSION: u32 = 1;
 pub(super) const META_DELTA_HEADER_SIZE: usize = 8 + 4 + 8 + 4 + 4 + 4;
 pub(super) const META_DELTA_CHECKSUM_SIZE: usize = 4;
 pub(super) const MAX_META_DELTA_CHAIN: usize = 64;
+pub(super) const META_LOG_HEADER_SIZE: usize = META_LOG_MAGIC.len() + 4;
+/// Frame header: payload length, checksum over ID and payload, checkpoint ID.
+pub(super) const META_LOG_FRAME_HEADER_SIZE: usize = 4 + 4 + 8;
 
 pub(super) struct MetaDelta {
     pub(super) parent_checkpoint_id: u64,
@@ -321,4 +325,124 @@ pub(super) fn encode_delta(
     let checksum = crc32c::crc32c(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
     Ok(buf)
+}
+
+/// One decoded metadata-log frame: a full checkpoint or a delta image.
+pub(super) enum MetaLogEntry {
+    Checkpoint(PMT, PageAllocator),
+    Delta(MetaDelta),
+}
+
+/// One parsed frame with its raw encoded bytes for lossless log compaction.
+pub(super) struct MetaLogFrame {
+    pub(super) checkpoint_id: u64,
+    pub(super) entry: MetaLogEntry,
+    pub(super) raw: Vec<u8>,
+}
+
+/// Decoded valid prefix of a metadata log.
+pub(super) struct ParsedMetaLog {
+    pub(super) frames: Vec<MetaLogFrame>,
+    /// Byte length of the valid frame prefix. Bytes beyond this boundary
+    /// are an abandoned torn tail from a crash during append.
+    pub(super) valid_len: usize,
+    /// Whether the valid prefix reaches the end of the file.
+    pub(super) complete: bool,
+}
+
+pub(super) fn meta_log_header_bytes() -> Vec<u8> {
+    let mut header = Vec::with_capacity(META_LOG_HEADER_SIZE);
+    header.extend_from_slice(&META_LOG_MAGIC);
+    header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header
+}
+
+pub(super) fn encode_meta_log_frame(checkpoint_id: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::InvalidArgument("metadata log frame is too large".into()))?;
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&checkpoint_id.to_le_bytes());
+    let mut checksum_input = Vec::with_capacity(8 + payload.len());
+    checksum_input.extend_from_slice(&id_bytes);
+    checksum_input.extend_from_slice(payload);
+    let checksum = crc32c::crc32c(&checksum_input);
+
+    let mut frame = Vec::with_capacity(META_LOG_FRAME_HEADER_SIZE + payload.len());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&checksum.to_le_bytes());
+    frame.extend_from_slice(&id_bytes);
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+/// Parse the valid prefix of a metadata log.
+///
+/// The file header must be complete and version-valid; corruption there is
+/// unconditional. Frames are parsed until the first incomplete frame,
+/// checksum mismatch, or unknown payload magic, which bounds the valid
+/// prefix exactly like a torn WAL or append tail; anything beyond it is an
+/// abandoned append. A complete frame whose payload fails bounded decoding
+/// is unconditional corruption.
+pub(super) fn parse_meta_log(bytes: &[u8]) -> Result<ParsedMetaLog> {
+    if bytes.len() < META_LOG_HEADER_SIZE {
+        return Err(Error::Corruption("metadata log is truncated".into()));
+    }
+    if bytes[..META_LOG_MAGIC.len()] != META_LOG_MAGIC {
+        return Err(Error::Corruption("invalid metadata log magic".into()));
+    }
+    let version = u32::from_le_bytes(
+        bytes[META_LOG_MAGIC.len()..META_LOG_HEADER_SIZE]
+            .try_into()
+            .map_err(|_| Error::Corruption("metadata log version is truncated".into()))?,
+    );
+    if version != FORMAT_VERSION {
+        return Err(Error::Corruption(format!(
+            "unsupported metadata log format version {version}"
+        )));
+    }
+
+    let mut frames = Vec::new();
+    let mut cursor = META_LOG_HEADER_SIZE;
+    while bytes.len() >= cursor + META_LOG_FRAME_HEADER_SIZE {
+        let header = &bytes[cursor..cursor + META_LOG_FRAME_HEADER_SIZE];
+        let payload_len =
+            u32::from_le_bytes(header[0..4].try_into().expect("fixed slice")) as usize;
+        let expected_checksum = u32::from_le_bytes(header[4..8].try_into().expect("fixed slice"));
+        let checkpoint_id = u64::from_le_bytes(header[8..16].try_into().expect("fixed slice"));
+        let payload_end = cursor
+            .checked_add(META_LOG_FRAME_HEADER_SIZE)
+            .and_then(|offset| offset.checked_add(payload_len))
+            .ok_or(Error::Corruption("metadata log frame overflows".into()))?;
+        if bytes.len() < payload_end {
+            break;
+        }
+        let payload = &bytes[cursor + META_LOG_FRAME_HEADER_SIZE..payload_end];
+        let mut checksum_input = Vec::with_capacity(8 + payload.len());
+        checksum_input.extend_from_slice(&header[8..16]);
+        checksum_input.extend_from_slice(payload);
+        if crc32c::crc32c(&checksum_input) != expected_checksum {
+            break;
+        }
+        let entry = if payload.len() >= META_DELTA_MAGIC.len()
+            && payload[..META_DELTA_MAGIC.len()] == META_DELTA_MAGIC
+        {
+            MetaLogEntry::Delta(decode_delta(payload)?)
+        } else if payload.len() >= META_MAGIC.len() && payload[..META_MAGIC.len()] == META_MAGIC {
+            let (pmt, allocator) = decode_checkpoint(payload)?;
+            MetaLogEntry::Checkpoint(pmt, allocator)
+        } else {
+            break;
+        };
+        frames.push(MetaLogFrame {
+            checkpoint_id,
+            entry,
+            raw: bytes[cursor..payload_end].to_vec(),
+        });
+        cursor = payload_end;
+    }
+    Ok(ParsedMetaLog {
+        complete: cursor == bytes.len(),
+        frames,
+        valid_len: cursor,
+    })
 }

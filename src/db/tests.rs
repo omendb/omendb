@@ -1,5 +1,6 @@
 //! DB coordinator behavior and recovery tests.
 
+use super::metadata_codec::{META_LOG_FRAME_HEADER_SIZE, META_LOG_HEADER_SIZE};
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
 use tempfile::tempdir;
@@ -99,17 +100,11 @@ fn test_db_open_rejects_missing_manifest_artifacts_without_recreating_them() {
     db.put(b"key", b"value").unwrap();
     db.flush().unwrap();
     drop(db);
-    let checkpoint = fs::read_dir(&checkpoint_path)
-        .unwrap()
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_prefix("seerdb.meta."))
-                .and_then(|suffix| suffix.parse::<u64>().ok())
-                .is_some()
-        })
-        .expect("published database has a numbered PMT checkpoint");
+    let checkpoint = DB::metadata_log_path(&checkpoint_path);
+    assert!(
+        checkpoint.is_file(),
+        "published database has a metadata log"
+    );
     fs::remove_file(&checkpoint).unwrap();
 
     let check = DB::check(&checkpoint_path, Options::default());
@@ -506,14 +501,17 @@ fn test_db_rejects_malformed_meta_container() {
         db.flush().unwrap();
     }
 
-    let checkpoint = path.join("seerdb.meta.1");
-    let mut meta = fs::read(&checkpoint).unwrap();
-    meta.push(0xA5);
-    fs::write(&checkpoint, meta).unwrap();
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut meta = fs::read(&metadata_log).unwrap();
+    // Corrupt a byte inside the first frame's payload; the frame checksum
+    // refusal must fail the open closed.
+    let first_frame_payload = META_LOG_HEADER_SIZE + META_LOG_FRAME_HEADER_SIZE;
+    meta[first_frame_payload] ^= 0xA5;
+    fs::write(&metadata_log, &meta).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("checksum")
+        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 1")
     ));
 }
 

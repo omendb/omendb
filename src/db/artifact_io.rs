@@ -13,8 +13,7 @@ use super::{
     FAIL_NEXT_ATOMIC_RENAME, FAIL_NEXT_ATOMIC_SHORT_WRITE, FAIL_NEXT_ATOMIC_TORN_WRITE,
     FAIL_NEXT_BLOB_SEGMENT_CATALOG_AFTER_WRITE, FAIL_NEXT_BLOB_SEGMENT_CATALOG_RENAME,
     FAIL_NEXT_BLOB_SEGMENT_CATALOG_SHORT_WRITE, FAIL_NEXT_BLOB_SEGMENT_CATALOG_SYNC,
-    FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE, FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC,
-    FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
+    FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE, FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
 };
 use crate::space::{preallocate_file, reserve_file};
 use std::fs::{self, File, OpenOptions};
@@ -191,14 +190,6 @@ pub(super) fn sync_publication_directory(path: &Path) -> Result<()> {
     #[cfg(any(test, feature = "fault-injection"))]
     if FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
         return Err(std::io::Error::other("injected publication directory sync failure").into());
-    }
-    sync_directory(path)
-}
-
-pub(super) fn sync_history_prune_directory(path: &Path) -> Result<()> {
-    #[cfg(any(test, feature = "fault-injection"))]
-    if FAIL_NEXT_HISTORY_PRUNE_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
-        return Err(std::io::Error::other("injected history-prune directory sync failure").into());
     }
     sync_directory(path)
 }

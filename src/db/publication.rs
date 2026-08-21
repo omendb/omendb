@@ -117,10 +117,8 @@ impl DB {
         parent_manifest: Manifest,
     ) -> Result<PathBuf> {
         let metadata_started = Instant::now();
-        let checkpoint_path = self
-            .path
-            .join(format!("seerdb.meta.{}", commit.generation_id.get()));
-        let checkpoint_bytes = self.save_generation_meta(&checkpoint_path, parent_manifest)?;
+        let (checkpoint_bytes, meta_log_created) =
+            self.append_generation_meta(commit.generation_id.get(), parent_manifest)?;
         // Keep the legacy filename as a compatibility/debug snapshot. It is
         // never authoritative once a manifest selects a checkpoint. Write it
         // only once so it does not turn every delta publication back into a
@@ -194,6 +192,7 @@ impl DB {
             format_version: FORMAT_VERSION,
         };
         let history_started = Instant::now();
+        let history_file_existed = self.path.join(MANIFEST_HISTORY_FILE).is_file();
         let mut manifest_history = self.manifest_history.clone();
         manifest_history
             .push(manifest)
@@ -215,18 +214,31 @@ impl DB {
             .publication_timing
             .history_write_ns
             .saturating_add(elapsed_nanos(history_started));
-        // The candidate checkpoint, blob image, and manifest history have all
-        // been file-synced. One final directory barrier makes their renamed or
-        // created entries durable before the manifest can select the new
-        // generation. The safety mirror and reuse ledger were already synced
+        // The candidate metadata-log frame, blob image, and manifest history
+        // have all been file-synced. A final directory barrier makes any new
+        // directory entries durable before the manifest can select the new
+        // generation. A delta publication that created no directory entry
+        // skips the barrier: every named artifact already has a durable
+        // directory entry, and the metadata log frame is ordered by its own
+        // file sync. The safety mirror and reuse ledger were already synced
         // before page reuse.
-        let directory_started = Instant::now();
-        let directory_result = sync_publication_directory(&self.path);
-        self.publication_timing.directory_sync_ns = self
-            .publication_timing
-            .directory_sync_ns
-            .saturating_add(elapsed_nanos(directory_started));
-        directory_result?;
+        #[cfg(any(test, feature = "fault-injection"))]
+        if FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
+            return Err(
+                std::io::Error::other("injected publication directory sync failure").into(),
+            );
+        }
+        let directory_barrier_needed =
+            meta_log_created || legacy_meta_bytes > 0 || blob_bytes > 0 || !history_file_existed;
+        if directory_barrier_needed {
+            let directory_started = Instant::now();
+            let directory_result = sync_publication_directory(&self.path);
+            self.publication_timing.directory_sync_ns = self
+                .publication_timing
+                .directory_sync_ns
+                .saturating_add(elapsed_nanos(directory_started));
+            directory_result?;
+        }
         self.manifest_history = manifest_history;
         let manifest_started = Instant::now();
         let manifest_result = self.manifest.publish(manifest);

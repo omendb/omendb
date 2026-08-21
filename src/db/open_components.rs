@@ -133,16 +133,34 @@ fn load_metadata(paths: &OpenPaths, catalog: &OpenCatalog) -> Result<(PMT, PageA
         if current.pmt_checkpoint_id.get() == 0 {
             return Ok((PMT::new(), PageAllocator::new()));
         }
-        let checkpoint_path = paths
-            .path
-            .join(format!("seerdb.meta.{}", current.pmt_checkpoint_id.get()));
-        return DB::load_meta(&checkpoint_path).map_err(|error| {
-            if catalog.check_only {
-                DB::map_checkpoint_check_error(error)
-            } else {
-                error
-            }
-        });
+        let parsed = DB::read_meta_log(&paths.path)?.ok_or_else(|| {
+            Error::Corruption(format!(
+                "manifest generation {} names checkpoint {} but the metadata log is missing",
+                current.generation_id.get(),
+                current.pmt_checkpoint_id.get()
+            ))
+        })?;
+        let resolved =
+            DB::resolve_meta_log(&parsed, current.pmt_checkpoint_id.get()).map_err(|error| {
+                if catalog.check_only {
+                    DB::map_checkpoint_check_error(error)
+                } else {
+                    error
+                }
+            })?;
+        // A torn tail behind the selected frame is an abandoned append from a
+        // crash; a writable open durably removes it before any later append
+        // can land behind the torn boundary.
+        let log_path = DB::metadata_log_path(&paths.path);
+        let log_len = fs::metadata(&log_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if !catalog.read_only && !catalog.check_only && (parsed.valid_len as u64) < log_len {
+            let file = fs::OpenOptions::new().write(true).open(&log_path)?;
+            file.set_len(parsed.valid_len as u64)?;
+            file.sync_all()?;
+        }
+        return Ok((resolved.0, resolved.1));
     }
     if paths.meta.exists() {
         return DB::load_meta(&paths.meta).map_err(|error| {

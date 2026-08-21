@@ -161,10 +161,10 @@ impl DB {
             return Err(error);
         }
         if manifest.pmt_checkpoint_id.get() != 0 {
-            let checkpoint = self
-                .path
-                .join(format!("seerdb.meta.{}", manifest.pmt_checkpoint_id.get()));
-            let (pmt, _) = match Self::load_meta(&checkpoint) {
+            let (pmt, _) = match self
+                .load_meta_by_id(manifest.pmt_checkpoint_id.get())
+                .map(|(pmt, a, _)| (pmt, a))
+            {
                 Ok(meta) => meta,
                 Err(error) => {
                     let _ = fs::remove_file(&retained_blob);
@@ -280,16 +280,16 @@ impl DB {
             if later.pmt_checkpoint_id.get() == 0 {
                 continue;
             }
-            let checkpoint = self
-                .path
-                .join(format!("seerdb.meta.{}", later.pmt_checkpoint_id.get()));
-            let (later_pmt, _) = Self::load_meta(&checkpoint).map_err(|error| {
-                Error::SnapshotUnavailable(format!(
-                    "commit {} cannot establish page liveness through generation {}: {error}",
-                    target.commit_id.get(),
-                    later.generation_id.get()
-                ))
-            })?;
+            let (later_pmt, _) = self
+                .load_meta_by_id(later.pmt_checkpoint_id.get())
+                .map(|(pmt, a, _)| (pmt, a))
+                .map_err(|error| {
+                    Error::SnapshotUnavailable(format!(
+                        "commit {} cannot establish page liveness through generation {}: {error}",
+                        target.commit_id.get(),
+                        later.generation_id.get()
+                    ))
+                })?;
             if later_pmt.iter().any(|(_, mapping)| {
                 target_by_offset
                     .get(&mapping.offset)

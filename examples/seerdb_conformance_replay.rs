@@ -75,7 +75,9 @@ fn decode_hex(value: &str, context: &str) -> AnyResult<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, pair)| {
             let high = hex_digit(pair[0]).ok_or_else(|| {
