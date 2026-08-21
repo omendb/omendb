@@ -349,7 +349,12 @@ impl StorageEngine {
         Arc::make_mut(&mut self.pmt).clear();
         self.btree = btree;
         self.lazy_root = None;
-        self.free_offsets.clear();
+        // The accumulated free-offset list must survive the rebuild: the
+        // candidate tree allocates fresh page IDs with no prior mappings, so
+        // clearing the list here would orphan every free slot above the old
+        // tree and force unbounded data-file growth across repeated
+        // maintenance cycles. The list stays disjoint from the new active
+        // set because those offsets are all assigned at flush time.
         self.next_offset = self.device.size()?;
         Ok(())
     }

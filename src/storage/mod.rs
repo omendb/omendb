@@ -179,6 +179,31 @@ impl StorageEngine {
         self.metrics.snapshot()
     }
 
+    /// Reclamation-state probe for tests and diagnostics: logical page
+    /// count, allocation frontier, and free/pending list lengths.
+    #[cfg(test)]
+    pub(crate) fn reclamation_probe(&self) -> (usize, u64, usize, usize) {
+        (
+            self.btree.node_count(),
+            self.next_offset,
+            self.free_offsets.len(),
+            self.pending_reclaimed_offsets.len(),
+        )
+    }
+
+    /// Protection-set probe for tests: registered protected offsets and
+    /// leased PMTs.
+    #[cfg(test)]
+    pub(crate) fn protection_probe(&self) -> (usize, usize) {
+        (
+            self.protected_offsets
+                .lock()
+                .map(|set| set.len())
+                .unwrap_or(usize::MAX),
+            self.protected_pmts.lock().map(|set| set.len()).unwrap_or(usize::MAX),
+        )
+    }
+
     fn buffer_lock(&self) -> Result<MutexGuard<'_, BufferManager>> {
         self.buffer
             .lock()
@@ -204,3 +229,7 @@ impl StorageEngine {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "churn_probe_tests.rs"]
+mod churn_probe_tests;

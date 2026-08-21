@@ -380,5 +380,9 @@ mod segmented_tests;
 mod publication_admission_tests;
 
 #[cfg(test)]
+#[path = "db/reclamation_growth_tests.rs"]
+mod reclamation_growth_tests;
+
+#[cfg(test)]
 #[path = "db/published_commits_tests.rs"]
 mod published_commits_tests;
