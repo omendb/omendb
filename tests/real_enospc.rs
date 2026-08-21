@@ -60,6 +60,10 @@ mod linux {
                 .expect("CI must provide SEERDB_ENOSPC_ROOT for this ignored test"),
         );
         let path = root.join("db");
+        // A previous run leaves its databases behind; the gate must be
+        // re-runnable against the same mount without manual cleanup.
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::remove_dir_all(root.join("segmented-db"));
 
         let mut options = Options::for_test();
         options.max_wal_bytes = 1024 * 1024;
