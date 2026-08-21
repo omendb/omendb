@@ -342,7 +342,6 @@ impl DB {
             let _ = file.sync_all();
             return Err(std::io::Error::other("injected metadata log torn write failure").into());
         }
-        #[cfg(any(test, feature = "fault-injection"))]
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
