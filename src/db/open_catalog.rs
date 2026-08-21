@@ -6,7 +6,6 @@ pub(super) struct OpenCatalog {
     pub(super) check_only: bool,
     pub(super) lock_file: Option<File>,
     pub(super) current_manifest: Option<Manifest>,
-    pub(super) manifest: ManifestStore,
     pub(super) manifest_history: ManifestHistory,
     pub(super) reuse_ledger: ReuseLedger,
     pub(super) database_id: DatabaseId,
@@ -32,7 +31,7 @@ impl DB {
 
         if mode == OpenMode::Normal
             && paths.path_preexisted
-            && !paths.manifest.is_file()
+            && !paths.meta_log.is_file()
             && !paths.data.is_file()
             && !paths.wal.is_file()
             && !paths.meta.is_file()
@@ -42,14 +41,14 @@ impl DB {
                 paths.path.display()
             )));
         }
-        if check_only && (!paths.manifest.is_file() || !paths.data.is_file()) {
+        if check_only && (!paths.meta_log.is_file() || !paths.data.is_file()) {
             return Err(Error::Check {
                 kind: CheckFailureKind::Target,
                 message: "check target is missing required manifest or data artifacts".into(),
             });
         }
         if archive && !check_only {
-            if !paths.manifest.is_file() || !paths.data.is_file() {
+            if !paths.meta_log.is_file() || !paths.data.is_file() {
                 return Err(Error::Corruption(
                     "read-only archive is missing required artifacts".into(),
                 ));
@@ -72,20 +71,51 @@ impl DB {
             clear_wal_reservation(&paths.path)?;
         }
 
-        let mut manifest = if check_only {
-            ManifestStore::open_read_only(&paths.manifest)
-                .map_err(|error| Self::map_check_error(CheckFailureKind::Manifest, error))?
-        } else {
-            ManifestStore::open(&paths.manifest)?
-        };
-        let current_manifest = manifest.load_latest().map_err(|error| {
+        if check_only && !paths.meta_log.is_file() {
+            return Err(Error::Check {
+                kind: CheckFailureKind::Manifest,
+                message: "metadata log is missing".into(),
+            });
+        }
+        let parsed_meta_log = DB::read_meta_log(&paths.path).map_err(|error| {
             if check_only {
                 Self::map_check_error(CheckFailureKind::Manifest, error)
             } else {
                 error
             }
         })?;
-        Self::validate_selected_artifacts(paths, current_manifest, check_only)?;
+        // A log whose valid prefix contains no publication frames is either
+        // header-only (never published) or corrupt past its header.
+        if let Some(parsed) = parsed_meta_log.as_ref()
+            && parsed.frames.is_empty()
+            && !parsed.complete
+        {
+            return Err(Error::Corruption(
+                "metadata log has no valid publication frames".into(),
+            ));
+        }
+        if paths.data.is_file()
+            && parsed_meta_log
+                .as_ref()
+                .is_none_or(|parsed| parsed.frames.is_empty())
+            && !paths.wal.is_file()
+        {
+            // Page data without any authority frame or WAL must never be
+            // reinterpreted as a fresh database.
+            return Err(Error::Corruption(
+                "data file has no authoritative metadata log or WAL".into(),
+            ));
+        }
+        let current_manifest = match parsed_meta_log.as_ref() {
+            Some(parsed) => DB::select_authority_manifest(parsed).map_err(|error| {
+                if check_only {
+                    Self::map_check_error(CheckFailureKind::Manifest, error)
+                } else {
+                    error
+                }
+            })?,
+            None => None,
+        };
         Self::validate_selected_artifacts(paths, current_manifest, check_only)?;
         if check_only && current_manifest.is_none() {
             return Err(Error::Check {
@@ -96,7 +126,22 @@ impl DB {
 
         let (database_id, history_id, generation_id, commit_id) =
             Self::open_identities(&paths.path, current_manifest)?;
-        let manifest_history = Self::load_manifest_history(paths, current_manifest, read_only)?;
+        // The authority log is the only history source: every valid
+        // publication frame contributes its manifest.
+        let mut manifest_history = parsed_meta_log
+            .as_ref()
+            .map(DB::publication_manifests)
+            .unwrap_or_default()
+            .into_iter()
+            .fold(ManifestHistory::new(), |mut history, manifest| {
+                let _ = history.push(manifest);
+                history
+            });
+        if let Some(current) = current_manifest {
+            manifest_history
+                .reconcile_current(current)
+                .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
+        }
         let mut reuse_ledger = Self::load_reuse_ledger(paths, current_manifest, check_only)?;
         let pruned_reuse_attempts = reuse_ledger.prune_published(&manifest_history);
         if pruned_reuse_attempts > 0 && !read_only && !check_only {
@@ -111,7 +156,6 @@ impl DB {
             read_only,
             check_only,
             lock_file,
-            manifest,
             current_manifest,
             manifest_history,
             reuse_ledger,
@@ -145,21 +189,6 @@ impl DB {
                 error
             });
         }
-        if current.pmt_checkpoint_id.get() != 0 {
-            let log_path = DB::metadata_log_path(&paths.path);
-            if !log_path.is_file() {
-                let error = Error::Corruption(format!(
-                    "manifest generation {} is missing checkpoint {}",
-                    current.generation_id.get(),
-                    current.pmt_checkpoint_id.get()
-                ));
-                return Err(if check_only {
-                    Self::map_check_error(CheckFailureKind::Checkpoint, error)
-                } else {
-                    error
-                });
-            }
-        }
         Ok(())
     }
 
@@ -187,47 +216,6 @@ impl DB {
             GenerationId::new(0),
             CommitId::new(0),
         ))
-    }
-
-    fn load_manifest_history(
-        paths: &OpenPaths,
-        current_manifest: Option<Manifest>,
-        read_only: bool,
-    ) -> Result<ManifestHistory> {
-        let history_path = paths.path.join(MANIFEST_HISTORY_FILE);
-        let existing_bytes = if history_path.exists() {
-            Some(fs::read(&history_path)?)
-        } else {
-            None
-        };
-        let mut history = if let Some(bytes) = existing_bytes.as_ref() {
-            ManifestHistory::from_bytes(bytes)
-                .map_err(|message| Error::Corruption(format!("manifest history {message}")))?
-        } else {
-            ManifestHistory::new()
-        };
-        if current_manifest.is_none() && history.latest().is_some() {
-            return Err(Error::Corruption(
-                "manifest history exists without an authoritative manifest".into(),
-            ));
-        }
-        if let Some(current) = current_manifest {
-            history
-                .reconcile_current(current)
-                .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-            if !read_only {
-                let bytes = history
-                    .to_bytes()
-                    .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-                // Reconciliation usually changes nothing on a clean reopen.
-                // Rewriting an identical image would cost two durability
-                // barriers per open, so persist only when content differs.
-                if existing_bytes.as_deref() != Some(bytes.as_slice()) {
-                    atomic_write(&history_path, &bytes)?;
-                }
-            }
-        }
-        Ok(history)
     }
 
     fn load_reuse_ledger(

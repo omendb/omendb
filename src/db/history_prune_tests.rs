@@ -1,10 +1,10 @@
 //! Manifest fallback, history-prune, and page-reuse safety tests.
 
 use super::*;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use tempfile::tempdir;
 
-use crate::storage::format::MANIFEST_SLOT_SIZE;
+use crate::db::metadata_codec::META_LOG_HEADER_SIZE;
 
 #[test]
 fn test_db_retains_manifest_fallback_before_reusing_pages() {
@@ -18,25 +18,20 @@ fn test_db_retains_manifest_fallback_before_reusing_pages() {
     db.flush().unwrap();
 
     // The next generation can reuse a page from before the current
-    // generation, but only after both manifest slots have been fenced to
-    // the current root. Fail before the new manifest is published.
+    // generation. Fail at the reuse-fencing boundary, before any publication
+    // artifact is written, so generation 3 never becomes durable.
     db.put(b"key", b"value-3").unwrap();
-    db.inject_meta_log_write_failure();
+    db.inject_manifest_mirror_sync_failure();
     assert!(matches!(db.flush(), Err(Error::Io(_))));
     drop(db);
 
-    // Simulate loss of the newest manifest slot. The mirrored fallback
-    // must still name value-2 even though the failed generation reused an
-    // older physical page.
-    let manifest_path = path.join(MANIFEST_FILE);
-    let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
-    manifest_file
-        .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
-        .unwrap();
-    manifest_file
-        .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
-        .unwrap();
-    manifest_file.sync_all().unwrap();
+    // Simulate loss of the newest authority frame: the failed generation
+    // never appended a frame, so the log ends at value-2's generation and a
+    // torn tail must not change that.
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut log = OpenOptions::new().append(true).open(&metadata_log).unwrap();
+    log.write_all(&[0xA5; 64]).unwrap();
+    log.sync_all().unwrap();
 
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
@@ -59,35 +54,18 @@ fn test_db_prune_history_preserves_inactive_manifest_checkpoint() {
     assert!(parsed.frames.iter().any(|frame| frame.checkpoint_id == 1));
     db.close().unwrap();
 
-    // The newest slot is corrupt, so reopen must use the independently
-    // valid older slot whose checkpoint pruning was required to preserve.
-    let manifest_path = path.join(MANIFEST_FILE);
-    let manifest_file = OpenOptions::new().read(true).open(&manifest_path).unwrap();
-    let mut newest = None;
-    for slot in 0..2 {
-        let mut bytes = [0; MANIFEST_SLOT_SIZE];
-        read_exact_at(
-            &manifest_file,
-            (slot * MANIFEST_SLOT_SIZE) as u64,
-            &mut bytes,
-        )
-        .unwrap();
-        if let Some(manifest) = Manifest::from_bytes(&bytes).unwrap()
-            && newest.is_none_or(|(_, current)| manifest.is_newer_than(current))
-        {
-            newest = Some((slot, manifest));
-        }
-    }
-    let newest_slot = newest.expect("published database has a newest manifest").0;
-    drop(manifest_file);
-    let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
-    manifest_file
-        .seek(SeekFrom::Start((newest_slot * MANIFEST_SLOT_SIZE) as u64))
-        .unwrap();
-    manifest_file
-        .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
-        .unwrap();
-    manifest_file.sync_all().unwrap();
+    // Truncate the log to just before its newest frame, simulating loss of
+    // the newest authority. Reopen must fall back to the previous frame,
+    // whose checkpoint chain pruning was required to preserve.
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    let keep_len = META_LOG_HEADER_SIZE
+        + parsed.frames[..parsed.frames.len() - 1]
+            .iter()
+            .map(|frame| frame.raw.len())
+            .sum::<usize>();
+    let file = OpenOptions::new().write(true).open(&metadata_log).unwrap();
+    file.set_len(keep_len as u64).unwrap();
+    file.sync_all().unwrap();
 
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));

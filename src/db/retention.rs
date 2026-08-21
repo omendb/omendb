@@ -47,8 +47,8 @@ impl DB {
         self.check_writable()?;
         self.flush()?;
         let manifest = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         if manifest.commit_id != self.commit_id || manifest.generation_id != self.generation_id {
             return Err(Error::Corruption(

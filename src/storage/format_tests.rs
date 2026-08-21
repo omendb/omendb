@@ -1,6 +1,13 @@
 use super::*;
-use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
+use crate::allocator::PageAllocator;
+use crate::db::metadata_codec::{
+    encode_checkpoint, encode_meta_log_frame, encode_publication_payload, meta_log_header_bytes,
+    parse_meta_log,
+};
+use crate::error::Error;
+use crate::{Options, db::DB};
+
+use crate::mvcc::PMT;
 use tempfile::tempdir;
 
 fn database_id() -> DatabaseId {
@@ -150,52 +157,75 @@ fn reuse_ledger_prunes_superseded_empty_reservations() {
 #[test]
 fn manifest_store_publishes_and_selects_newest_generation() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("MANIFEST");
-    let mut store = ManifestStore::open(&path).unwrap();
-    assert_eq!(store.load_latest().unwrap(), None);
-
-    store.publish(manifest(1, 1)).unwrap();
-    store.publish(manifest(2, 2)).unwrap();
-    assert_eq!(store.load_latest().unwrap(), Some(manifest(2, 2)));
+    let path = dir.path().join("authority.log");
+    let mut frames = Vec::new();
+    for mut m in [manifest(1, 1), manifest(2, 2)] {
+        m.pmt_checkpoint_id = PmtCheckpointId::new(m.generation_id.get());
+        let payload = encode_publication_payload(
+            &m.to_bytes(),
+            &encode_checkpoint(&PMT::new(), &PageAllocator::new()).unwrap(),
+        )
+        .unwrap();
+        frames.extend(encode_meta_log_frame(m.generation_id.get(), &payload).unwrap());
+    }
+    std::fs::write(
+        &path,
+        meta_log_header_bytes()
+            .into_iter()
+            .chain(frames)
+            .collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    let parsed = parse_meta_log(&std::fs::read(&path).unwrap()).unwrap();
+    let mut expected = manifest(2, 2);
+    expected.pmt_checkpoint_id = PmtCheckpointId::new(2);
+    assert_eq!(
+        DB::select_authority_manifest(&parsed).unwrap(),
+        Some(expected)
+    );
 }
 
 #[cfg(feature = "fault-injection")]
 #[test]
 fn manifest_sync_faults_distinguish_candidate_and_safety_mirror() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("MANIFEST");
-    let mut store = ManifestStore::open(&path).unwrap();
-    let first = manifest(1, 1);
-    let second = manifest(2, 2);
-
-    store.publish(first).unwrap();
-    store.inject_sync_failure();
-    store.publish_mirrored(first).unwrap();
-    assert!(store.publish(second).is_err());
-
-    store.inject_mirror_sync_failure();
-    assert!(store.publish_mirrored(first).is_err());
-    store.publish(second).unwrap();
+    // The mirror no longer exists; the former mirror seam now targets the
+    // metadata-log write boundary. Both public seams must stay injectable.
+    let db_path = tempdir().unwrap();
+    let mut db = DB::open(db_path.path().join("seams.db"), Options::default()).unwrap();
+    db.put(b"k", b"v").unwrap();
+    db.inject_manifest_sync_failure();
+    assert!(matches!(db.flush(), Err(Error::Io(_))));
+    drop(db);
+    assert!(DB::open(db_path.path().join("seams.db"), Options::default()).is_ok());
 }
 
 #[test]
 fn manifest_store_falls_back_after_torn_inactive_slot() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("MANIFEST");
-    let mut store = ManifestStore::open(&path).unwrap();
-    store.publish(manifest(1, 1)).unwrap();
-    store.publish(manifest(2, 2)).unwrap();
-    drop(store);
-
-    let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-    file.seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
+    let path = dir.path().join("authority.log");
+    let mut frames = Vec::new();
+    for mut m in [manifest(1, 1), manifest(2, 2)] {
+        m.pmt_checkpoint_id = PmtCheckpointId::new(m.generation_id.get());
+        let payload = encode_publication_payload(
+            &m.to_bytes(),
+            &encode_checkpoint(&PMT::new(), &PageAllocator::new()).unwrap(),
+        )
         .unwrap();
-    file.write_all(&[0xA5; 32]).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-
-    let mut reopened = ManifestStore::open(&path).unwrap();
-    assert_eq!(reopened.load_latest().unwrap(), Some(manifest(1, 1)));
+        frames.extend(encode_meta_log_frame(m.generation_id.get(), &payload).unwrap());
+    }
+    // Torn newest frame: clobber generation 2's payload in place so the
+    // checksum fails and selection falls back to generation 1.
+    let mut bytes: Vec<u8> = meta_log_header_bytes().into_iter().chain(frames).collect();
+    let tail_start = bytes.len() - 16;
+    bytes[tail_start..].copy_from_slice(&[0xA5; 16]);
+    std::fs::write(&path, &bytes).unwrap();
+    let parsed = parse_meta_log(&std::fs::read(&path).unwrap()).unwrap();
+    let mut expected = manifest(1, 1);
+    expected.pmt_checkpoint_id = PmtCheckpointId::new(1);
+    assert_eq!(
+        DB::select_authority_manifest(&parsed).unwrap(),
+        Some(expected)
+    );
 }
 
 #[test]

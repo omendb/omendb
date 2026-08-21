@@ -25,8 +25,7 @@ fn data_file_size_plateaus_under_churn() {
         .collect();
     db.commit_batch(&seed).unwrap();
     db.flush().unwrap();
-    let size_after_seed =
-        fs::metadata(path.join("seerdb.data")).unwrap().len();
+    let size_after_seed = fs::metadata(path.join("seerdb.data")).unwrap().len();
 
     // Churn: overwrite the same region repeatedly.
     for round in 0..20 {
@@ -38,8 +37,7 @@ fn data_file_size_plateaus_under_churn() {
             .collect();
         db.commit_batch(&mutations).unwrap();
     }
-    let size_after_churn =
-        fs::metadata(path.join("seerdb.data")).unwrap().len();
+    let size_after_churn = fs::metadata(path.join("seerdb.data")).unwrap().len();
 
     eprintln!(
         "seed_size={} churn_size={} growth_pages={}",
@@ -68,9 +66,7 @@ fn data_file_size_plateaus_under_scattered_put_delete_soak() {
     let value = vec![0xABu8; 128];
     let key = |index: usize| format!("soak-key-{index:08}").into_bytes();
     let scatter = |round: usize, slot: usize| {
-        ((round as u64 * 16 + slot as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            % 512) as usize
+        ((round as u64 * 16 + slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % 512) as usize
     };
 
     let mut sizes = Vec::new();

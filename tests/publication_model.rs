@@ -21,9 +21,8 @@ use tempfile::{TempDir, tempdir};
 const DATA_FILE: &str = "seerdb.data";
 const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
-const MANIFEST_FILE: &str = "MANIFEST";
-const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
 const META_FILE: &str = "seerdb.meta";
+const META_LOG_FILE_NAME: &str = "seerdb.meta.log";
 const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,8 +31,7 @@ enum Artifact {
     Checkpoints,
     Blob,
     Wal,
-    ManifestHistory,
-    Manifest,
+    AuthorityFrame,
     ReuseLedger,
 }
 
@@ -58,17 +56,15 @@ const PUBLICATION_SCHEDULE: &[PublicationStep] = &[
         expected: ExpectedActive::Old,
     },
     PublicationStep {
-        name: "manifest-mirror",
-        artifacts: &[],
-        expected: ExpectedActive::Old,
-    },
-    PublicationStep {
         name: "data-pages",
         artifacts: &[Artifact::Data],
         expected: ExpectedActive::Old,
     },
+    // The authority log is append-only: a crash during the frame append
+    // leaves either the previous frames alone or a torn tail behind them,
+    // so every prefix up to the durable frame reopens the old root.
     PublicationStep {
-        name: "checkpoints",
+        name: "frame-append-start",
         artifacts: &[Artifact::Data, Artifact::Checkpoints],
         expected: ExpectedActive::Old,
     },
@@ -77,6 +73,9 @@ const PUBLICATION_SCHEDULE: &[PublicationStep] = &[
         artifacts: &[Artifact::Data, Artifact::Checkpoints, Artifact::Blob],
         expected: ExpectedActive::Old,
     },
+    // The WAL commit record is durable but the frame is not: recovery may
+    // discard the uncommitted suffix or replay it into a complete new
+    // generation.
     PublicationStep {
         name: "commit-wal",
         artifacts: &[
@@ -88,25 +87,13 @@ const PUBLICATION_SCHEDULE: &[PublicationStep] = &[
         expected: ExpectedActive::OldOrNew,
     },
     PublicationStep {
-        name: "history-and-wal",
+        name: "authority-frame",
         artifacts: &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
             Artifact::Wal,
-            Artifact::ManifestHistory,
-        ],
-        expected: ExpectedActive::OldOrNew,
-    },
-    PublicationStep {
-        name: "candidate-manifest",
-        artifacts: &[
-            Artifact::Data,
-            Artifact::Checkpoints,
-            Artifact::Blob,
-            Artifact::Wal,
-            Artifact::ManifestHistory,
-            Artifact::Manifest,
+            Artifact::AuthorityFrame,
         ],
         expected: ExpectedActive::New,
     },
@@ -116,8 +103,7 @@ const PUBLICATION_SCHEDULE: &[PublicationStep] = &[
             Artifact::Data,
             Artifact::Checkpoints,
             Artifact::Blob,
-            Artifact::ManifestHistory,
-            Artifact::Manifest,
+            Artifact::AuthorityFrame,
         ],
         expected: ExpectedActive::New,
     },
@@ -148,8 +134,7 @@ fn artifact_names(path: &Path, artifact: Artifact) -> Vec<PathBuf> {
             Artifact::Checkpoints => name == META_FILE || name.starts_with("seerdb.meta."),
             Artifact::Blob => name == BLOB_FILE,
             Artifact::Wal => name == WAL_FILE,
-            Artifact::ManifestHistory => name == MANIFEST_HISTORY_FILE,
-            Artifact::Manifest => name == MANIFEST_FILE,
+            Artifact::AuthorityFrame => name.starts_with("seerdb.meta."),
             Artifact::ReuseLedger => name == REUSE_LEDGER_FILE,
         };
         if matches {
@@ -161,11 +146,27 @@ fn artifact_names(path: &Path, artifact: Artifact) -> Vec<PathBuf> {
 }
 
 fn replace_artifact(materialized: &Path, candidate: &Path, artifact: Artifact) {
+    // Capture the durable prefix length before any file is removed.
+    let old_log_len = fs::metadata(materialized.join(META_LOG_FILE_NAME))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     for path in artifact_names(materialized, artifact) {
         fs::remove_file(path).unwrap();
     }
     for source in artifact_names(candidate, artifact) {
         let name = source.file_name().unwrap();
+        if artifact == Artifact::Checkpoints && name == META_LOG_FILE_NAME {
+            // Model a crash before the new frame landed: only the bytes the
+            // old generation already had are durable.
+            let bytes = fs::read(source).unwrap();
+            assert!(bytes.len() >= old_log_len as usize);
+            fs::write(
+                materialized.join(META_LOG_FILE_NAME),
+                &bytes[..old_log_len as usize],
+            )
+            .unwrap();
+            continue;
+        }
         fs::copy(&source, materialized.join(name)).unwrap();
     }
 }
@@ -297,8 +298,7 @@ fn partial_artifact_cases(candidate: &Path) -> Vec<PartialArtifactCase> {
         Artifact::Checkpoints,
         Artifact::Blob,
         Artifact::Wal,
-        Artifact::ManifestHistory,
-        Artifact::Manifest,
+        Artifact::AuthorityFrame,
         Artifact::ReuseLedger,
     ];
     let mut cases = Vec::new();

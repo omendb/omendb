@@ -8,8 +8,7 @@
 
 use super::metadata_codec::{META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_MAGIC};
 use super::{
-    BLOB_RESERVATION_FILE, DB, Error, MANIFEST_HISTORY_FILE, META_FILE,
-    PUBLICATION_CAPACITY_SAFETY_BYTES, Result,
+    BLOB_RESERVATION_FILE, DB, Error, META_FILE, PUBLICATION_CAPACITY_SAFETY_BYTES, Result,
 };
 use crate::allocator::PageAllocator;
 use crate::blob::BlobManager;
@@ -135,7 +134,7 @@ impl DB {
             .latest()
             .unwrap_or_else(|| self.bootstrap_manifest());
         let (checkpoint_meta_bytes, _) =
-            self.generation_meta_bytes(parent, dirty_page_count as usize)?;
+            self.generation_meta_bytes(parent.pmt_checkpoint_id.get(), dirty_page_count as usize)?;
         let legacy_meta_bytes = if self.path.join(META_FILE).is_file() {
             0
         } else {
@@ -162,14 +161,9 @@ impl DB {
             format_version: FORMAT_VERSION,
         })
         .len() as u64;
-        let history_length = match fs::metadata(self.path.join(MANIFEST_HISTORY_FILE)) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
-                .manifest_history
-                .to_bytes()
-                .map_or(0, |bytes| bytes.len() as u64),
-            Err(error) => return Err(error.into()),
-        };
+        let history_length = fs::metadata(DB::metadata_log_path(&self.path))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let history_bytes = history_length
             .checked_add(history_entry_bytes)
             .ok_or(Error::DiskFull)?;
@@ -208,14 +202,9 @@ impl DB {
             .len() as u64;
         let history_entry_bytes =
             ManifestHistory::entry_bytes(self.bootstrap_manifest()).len() as u64;
-        let history_length = match fs::metadata(self.path.join(MANIFEST_HISTORY_FILE)) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self
-                .manifest_history
-                .to_bytes()
-                .map_or(0, |bytes| bytes.len() as u64),
-            Err(error) => return Err(error.into()),
-        };
+        let history_length = fs::metadata(DB::metadata_log_path(&self.path))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let history_bytes = history_length
             .checked_add(history_entry_bytes)
             .ok_or(Error::DiskFull)?;

@@ -248,8 +248,8 @@ impl DB {
         self.check_writable()?;
         self.flush()?;
         let manifest = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         let snapshot_id = self.register_ephemeral_manifest(manifest)?;
         Ok(BatchTransaction {

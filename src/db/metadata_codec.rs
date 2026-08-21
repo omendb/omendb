@@ -12,8 +12,10 @@ use crate::storage::format::FORMAT_VERSION;
 
 pub(super) const META_MAGIC: [u8; 8] = *b"SEERMET1";
 pub(super) const META_DELTA_MAGIC: [u8; 8] = *b"SEERMDL1";
+pub(super) const META_PUB_MAGIC: [u8; 8] = *b"SEERMPB1";
 pub(super) const META_LOG_MAGIC: [u8; 8] = *b"SEERMLG1";
 const META_DELTA_VERSION: u32 = 1;
+const META_PUB_VERSION: u32 = 1;
 pub(super) const META_DELTA_HEADER_SIZE: usize = 8 + 4 + 8 + 4 + 4 + 4;
 pub(super) const META_DELTA_CHECKSUM_SIZE: usize = 4;
 pub(super) const MAX_META_DELTA_CHAIN: usize = 64;
@@ -21,7 +23,7 @@ pub(super) const META_LOG_HEADER_SIZE: usize = META_LOG_MAGIC.len() + 4;
 /// Frame header: payload length, checksum over ID and payload, checkpoint ID.
 pub(super) const META_LOG_FRAME_HEADER_SIZE: usize = 4 + 4 + 8;
 
-pub(super) struct MetaDelta {
+pub(crate) struct MetaDelta {
     pub(super) parent_checkpoint_id: u64,
     pub(super) updates: Vec<(u64, PageMapping)>,
     pub(super) removals: Vec<u64>,
@@ -247,7 +249,7 @@ pub(super) fn decode_legacy_checkpoint(data: &[u8]) -> Result<(PMT, PageAllocato
     Ok((pmt, allocator))
 }
 
-pub(super) fn encode_checkpoint(pmt: &PMT, allocator: &PageAllocator) -> Result<Vec<u8>> {
+pub(crate) fn encode_checkpoint(pmt: &PMT, allocator: &PageAllocator) -> Result<Vec<u8>> {
     let pmt_bytes = pmt.to_bytes();
     let alloc_bytes = allocator.to_bytes();
 
@@ -327,21 +329,29 @@ pub(super) fn encode_delta(
     Ok(buf)
 }
 
-/// One decoded metadata-log frame: a full checkpoint or a delta image.
-pub(super) enum MetaLogEntry {
+/// One decoded metadata-log frame.
+///
+/// `Publication` frames are the authority records: they carry the published
+/// `Manifest` alongside the checkpoint or delta image that resolves its PMT.
+/// Bare `Checkpoint`/`Delta` frames exist only inside publication payloads.
+pub(crate) enum MetaLogEntry {
+    Publication {
+        manifest: crate::storage::format::Manifest,
+        entry: Box<MetaLogEntry>,
+    },
     Checkpoint(PMT, PageAllocator),
     Delta(MetaDelta),
 }
 
 /// One parsed frame with its raw encoded bytes for lossless log compaction.
-pub(super) struct MetaLogFrame {
+pub(crate) struct MetaLogFrame {
     pub(super) checkpoint_id: u64,
     pub(super) entry: MetaLogEntry,
     pub(super) raw: Vec<u8>,
 }
 
 /// Decoded valid prefix of a metadata log.
-pub(super) struct ParsedMetaLog {
+pub(crate) struct ParsedMetaLog {
     pub(super) frames: Vec<MetaLogFrame>,
     /// Byte length of the valid frame prefix. Bytes beyond this boundary
     /// are an abandoned torn tail from a crash during append.
@@ -350,14 +360,14 @@ pub(super) struct ParsedMetaLog {
     pub(super) complete: bool,
 }
 
-pub(super) fn meta_log_header_bytes() -> Vec<u8> {
+pub(crate) fn meta_log_header_bytes() -> Vec<u8> {
     let mut header = Vec::with_capacity(META_LOG_HEADER_SIZE);
     header.extend_from_slice(&META_LOG_MAGIC);
     header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     header
 }
 
-pub(super) fn encode_meta_log_frame(checkpoint_id: u64, payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn encode_meta_log_frame(checkpoint_id: u64, payload: &[u8]) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| Error::InvalidArgument("metadata log frame is too large".into()))?;
     let mut id_bytes = [0u8; 8];
@@ -375,6 +385,25 @@ pub(super) fn encode_meta_log_frame(checkpoint_id: u64, payload: &[u8]) -> Resul
     Ok(frame)
 }
 
+/// Encode a publication payload: the manifest slot image followed by the
+/// inner checkpoint or delta payload. The frame checksum covers both.
+pub(crate) fn encode_publication_payload(
+    manifest_bytes: &[u8],
+    entry_payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(
+        META_PUB_MAGIC.len() + 4 + 4 + manifest_bytes.len() + entry_payload.len(),
+    );
+    buf.extend_from_slice(&META_PUB_MAGIC);
+    buf.extend_from_slice(&META_PUB_VERSION.to_le_bytes());
+    let manifest_len = u32::try_from(manifest_bytes.len())
+        .map_err(|_| Error::InvalidArgument("manifest image is too large".into()))?;
+    buf.extend_from_slice(&manifest_len.to_le_bytes());
+    buf.extend_from_slice(manifest_bytes);
+    buf.extend_from_slice(entry_payload);
+    Ok(buf)
+}
+
 /// Parse the valid prefix of a metadata log.
 ///
 /// The file header must be complete and version-valid; corruption there is
@@ -383,7 +412,7 @@ pub(super) fn encode_meta_log_frame(checkpoint_id: u64, payload: &[u8]) -> Resul
 /// prefix exactly like a torn WAL or append tail; anything beyond it is an
 /// abandoned append. A complete frame whose payload fails bounded decoding
 /// is unconditional corruption.
-pub(super) fn parse_meta_log(bytes: &[u8]) -> Result<ParsedMetaLog> {
+pub(crate) fn parse_meta_log(bytes: &[u8]) -> Result<ParsedMetaLog> {
     if bytes.len() < META_LOG_HEADER_SIZE {
         return Err(Error::Corruption("metadata log is truncated".into()));
     }
@@ -423,7 +452,62 @@ pub(super) fn parse_meta_log(bytes: &[u8]) -> Result<ParsedMetaLog> {
         if crc32c::crc32c(&checksum_input) != expected_checksum {
             break;
         }
-        let entry = if payload.len() >= META_DELTA_MAGIC.len()
+        let entry = if payload.len() >= META_PUB_MAGIC.len()
+            && payload[..META_PUB_MAGIC.len()] == META_PUB_MAGIC
+        {
+            const PUB_HEADER: usize = META_PUB_MAGIC.len() + 4 + 4;
+            if payload.len() < PUB_HEADER {
+                break;
+            }
+            let version = u32::from_le_bytes(
+                payload[META_PUB_MAGIC.len()..META_PUB_MAGIC.len() + 4]
+                    .try_into()
+                    .expect("fixed slice"),
+            );
+            if version != META_PUB_VERSION {
+                break;
+            }
+            let manifest_len = u32::from_le_bytes(
+                payload[META_PUB_MAGIC.len() + 4..PUB_HEADER]
+                    .try_into()
+                    .expect("fixed slice"),
+            ) as usize;
+            let entry_start = PUB_HEADER
+                .checked_add(manifest_len)
+                .ok_or(Error::Corruption(
+                    "metadata publication frame overflows".into(),
+                ))?;
+            if payload.len() < entry_start {
+                break;
+            }
+            let mut manifest_slot = [0u8; crate::storage::format::MANIFEST_SLOT_SIZE];
+            if payload[PUB_HEADER..entry_start].len() != manifest_slot.len() {
+                break;
+            }
+            manifest_slot.copy_from_slice(&payload[PUB_HEADER..entry_start]);
+            let manifest = crate::storage::format::Manifest::from_bytes(&manifest_slot)
+                .map_err(|_| Error::Corruption("metadata publication manifest is invalid".into()))?
+                .ok_or_else(|| {
+                    Error::Corruption("metadata publication has an empty manifest".into())
+                })?;
+            let entry_payload = &payload[entry_start..];
+            let inner = if entry_payload.len() >= META_DELTA_MAGIC.len()
+                && entry_payload[..META_DELTA_MAGIC.len()] == META_DELTA_MAGIC
+            {
+                MetaLogEntry::Delta(decode_delta(entry_payload)?)
+            } else if entry_payload.len() >= META_MAGIC.len()
+                && entry_payload[..META_MAGIC.len()] == META_MAGIC
+            {
+                let (pmt, allocator) = decode_checkpoint(entry_payload)?;
+                MetaLogEntry::Checkpoint(pmt, allocator)
+            } else {
+                break;
+            };
+            MetaLogEntry::Publication {
+                manifest,
+                entry: Box::new(inner),
+            }
+        } else if payload.len() >= META_DELTA_MAGIC.len()
             && payload[..META_DELTA_MAGIC.len()] == META_DELTA_MAGIC
         {
             MetaLogEntry::Delta(decode_delta(payload)?)

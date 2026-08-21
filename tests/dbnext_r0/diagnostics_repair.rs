@@ -119,9 +119,12 @@ fn dbnext_r0_repair_replays_committed_wal_into_new_location() {
         repaired.get(b"replayed").unwrap(),
         Some(b"value-2".to_vec())
     );
+    // The replayed WAL publishes its authority frame (source generation + 1)
+    // and the forked destination history publishes one more, so the
+    // destination lands exactly two generations past the source root.
     assert_eq!(
         repaired.durability_status().generation_id.get(),
-        current.generation_id.get() + 1
+        current.generation_id.get() + 2
     );
     assert_ne!(
         repaired.durability_status().history_id,

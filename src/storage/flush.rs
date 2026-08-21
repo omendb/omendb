@@ -91,14 +91,6 @@ impl StorageEngine {
                 if let Some(mapping) = self.pmt.get(page_id as u64) {
                     retired_offsets.push(mapping.offset);
                     retired_cache_keys.push(PageCacheKey::new(page_id as u64, mapping.version));
-                } else {
-                    #[cfg(test)]
-                    eprintln!(
-                        "[churn-probe] fresh allocation: page_id={page_id} free_len={} next_offset={}",
-                        self.free_offsets.len(),
-                        self.next_offset
-                    );
-                    let _ = &page_id;
                 }
                 let (offset, reuses_retired_slot) = match self.free_offsets.last() {
                     Some(&offset) => (offset, true),

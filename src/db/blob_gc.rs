@@ -33,11 +33,6 @@ impl DB {
             return Ok(0);
         }
         if self.blobs.has_reclaimable_files() {
-            // Fully-dead file removal changes the active blob image without
-            // publishing a new root. Fence the inactive manifest slot first;
-            // otherwise it could still name records removed below and become
-            // an invalid fallback after a torn newest-slot read.
-            self.mirror_current_manifest()?;
             // Admission must precede removal from the in-memory catalog. The
             // current image is an upper bound for the compacted image, so a
             // successful reservation covers the subsequent atomic publish.
@@ -148,7 +143,6 @@ impl DB {
         *self.engine.btree_mut() = candidate_tree;
         self.blobs = candidate_blobs;
 
-        self.mirror_current_manifest()?;
         self.engine.flush()?;
         self.publish_blob_rewrite_generation()?;
 
@@ -181,27 +175,10 @@ impl DB {
     /// physical generation before its manifest becomes authoritative.
     pub(super) fn publish_blob_rewrite_generation(&mut self) -> Result<()> {
         let current = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
         let generation_id = self.next_generation_id;
-        let (checkpoint_bytes, meta_log_created) =
-            self.append_generation_meta(generation_id.get(), current)?;
-        debug_assert!(
-            !meta_log_created,
-            "maintenance requires a published database"
-        );
-        let meta_path = self.path.join(META_FILE);
-        let legacy_meta_bytes = if meta_path.is_file() {
-            0
-        } else {
-            Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?
-        };
-        self.publication.metadata_bytes_written = self
-            .publication
-            .metadata_bytes_written
-            .saturating_add(checkpoint_bytes)
-            .saturating_add(legacy_meta_bytes);
 
         self.blobs.set_generation(generation_id.get());
         let blob_path = self.path.join(BLOB_FILE);
@@ -236,29 +213,7 @@ impl DB {
             root_page_id: self.engine.btree().root_id() as u64,
             ..current
         };
-        let mut manifest_history = self.manifest_history.clone();
-        manifest_history
-            .push(manifest)
-            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history(manifest)?
-        } else {
-            let bytes = manifest_history
-                .to_bytes()
-                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-            self.persist_manifest_history(&manifest_history)?;
-            bytes.len() as u64
-        };
-        self.publication.history_bytes_written = self
-            .publication
-            .history_bytes_written
-            .saturating_add(history_bytes);
-        self.manifest_history = manifest_history;
-        self.manifest.publish(manifest)?;
-        self.publication.manifest_bytes_written = self
-            .publication
-            .manifest_bytes_written
-            .saturating_add(MANIFEST_SLOT_SIZE as u64);
+        self.publish_authority_frame(manifest)?;
         self.finish_segmented_blob_publication_cleanup()?;
         self.engine.complete_generation();
         self.generation_id = generation_id;

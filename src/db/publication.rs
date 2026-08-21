@@ -42,18 +42,15 @@ impl DB {
         }
         let reuse_offsets = self.engine.pending_reuse_offsets();
         let reused_slots = !reuse_offsets.is_empty();
-        // Retire the older manifest slot before page writes can reuse any
-        // physical versions it names. Append-only generations do not need
-        // this extra sync because the older fallback root names untouched
-        // pages; reused slots must fence that root before page write-back.
-        if reused_slots {
-            let started = Instant::now();
-            let result = self.mirror_current_manifest();
-            self.publication_timing.manifest_mirror_ns = self
-                .publication_timing
-                .manifest_mirror_ns
-                .saturating_add(elapsed_nanos(started));
-            result?;
+        // No safety mirror is required before page reuse: the authority log is
+        // append-only, so recovery falls back to exactly the previous valid
+        // publication frame, whose named offsets are excluded from the free
+        // set by construction. The fault seam keeps covering this boundary.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if reused_slots
+            && super::faults::FAIL_NEXT_REUSE_PUBLICATION.with(|failure| failure.replace(false))
+        {
+            return Err(std::io::Error::other("injected reuse publication sync failure").into());
         }
         // Mutation records have already been written to the WAL by the
         // mutation or batch admission path. The commit envelope is appended
@@ -116,33 +113,6 @@ impl DB {
         recovered_wal_offset: u64,
         parent_manifest: Manifest,
     ) -> Result<PathBuf> {
-        let metadata_started = Instant::now();
-        let (checkpoint_bytes, meta_log_created) =
-            self.append_generation_meta(commit.generation_id.get(), parent_manifest)?;
-        // Keep the legacy filename as a compatibility/debug snapshot. It is
-        // never authoritative once a manifest selects a checkpoint. Write it
-        // only once so it does not turn every delta publication back into a
-        // whole-image metadata write.
-        let meta_path = self.path.join(META_FILE);
-        let legacy_meta_bytes = if meta_path.is_file() {
-            0
-        } else {
-            Self::save_meta_without_directory_sync(
-                &meta_path,
-                self.engine.pmt(),
-                self.engine.allocator(),
-            )?
-        };
-        self.publication.metadata_bytes_written = self
-            .publication
-            .metadata_bytes_written
-            .saturating_add(checkpoint_bytes)
-            .saturating_add(legacy_meta_bytes);
-        self.publication_timing.metadata_write_ns = self
-            .publication_timing
-            .metadata_write_ns
-            .saturating_add(elapsed_nanos(metadata_started));
-
         let blob_started = Instant::now();
         let blob_bytes = if self.blobs.is_segmented() || self.pending_blob_changes {
             self.blobs.set_generation(commit.generation_id.get());
@@ -167,6 +137,8 @@ impl DB {
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
+            // The commit record must be durable before the publication frame
+            // becomes visible: it completes the generation's mutation prefix.
             let offset = fs::metadata(&wal_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
@@ -191,46 +163,31 @@ impl DB {
             digest: commit.digest,
             format_version: FORMAT_VERSION,
         };
-        let history_started = Instant::now();
-        let history_file_existed = self.path.join(MANIFEST_HISTORY_FILE).is_file();
-        let mut manifest_history = self.manifest_history.clone();
-        manifest_history
-            .push(manifest)
-            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history_without_directory_sync(manifest)?
-        } else {
-            let bytes = manifest_history
-                .to_bytes()
-                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-            self.persist_manifest_history_without_directory_sync(&manifest_history)?;
-            bytes.len() as u64
-        };
-        self.publication.history_bytes_written = self
+        let metadata_started = Instant::now();
+        let (checkpoint_bytes, meta_log_created) = self.append_generation_meta(
+            commit.generation_id.get(),
+            parent_manifest.pmt_checkpoint_id.get(),
+            &manifest.to_bytes(),
+        )?;
+        self.publication.metadata_bytes_written = self
             .publication
-            .history_bytes_written
-            .saturating_add(history_bytes);
-        self.publication_timing.history_write_ns = self
+            .metadata_bytes_written
+            .saturating_add(checkpoint_bytes);
+        self.publication_timing.metadata_write_ns = self
             .publication_timing
-            .history_write_ns
-            .saturating_add(elapsed_nanos(history_started));
-        // The candidate metadata-log frame, blob image, and manifest history
-        // have all been file-synced. A final directory barrier makes any new
-        // directory entries durable before the manifest can select the new
-        // generation. A delta publication that created no directory entry
-        // skips the barrier: every named artifact already has a durable
-        // directory entry, and the metadata log frame is ordered by its own
-        // file sync. The safety mirror and reuse ledger were already synced
-        // before page reuse.
+            .metadata_write_ns
+            .saturating_add(elapsed_nanos(metadata_started));
+
+        // The publication frame IS the visibility barrier. A newly created
+        // log file still needs its directory entry made durable before any
+        // later ack; an existing log orders frames by its own file sync.
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC.with(|failure| failure.replace(false)) {
             return Err(
                 std::io::Error::other("injected publication directory sync failure").into(),
             );
         }
-        let directory_barrier_needed =
-            meta_log_created || legacy_meta_bytes > 0 || blob_bytes > 0 || !history_file_existed;
-        if directory_barrier_needed {
+        if meta_log_created {
             let directory_started = Instant::now();
             let directory_result = sync_publication_directory(&self.path);
             self.publication_timing.directory_sync_ns = self
@@ -239,18 +196,11 @@ impl DB {
                 .saturating_add(elapsed_nanos(directory_started));
             directory_result?;
         }
+        let mut manifest_history = self.manifest_history.clone();
+        manifest_history
+            .push(manifest)
+            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         self.manifest_history = manifest_history;
-        let manifest_started = Instant::now();
-        let manifest_result = self.manifest.publish(manifest);
-        self.publication_timing.manifest_write_ns = self
-            .publication_timing
-            .manifest_write_ns
-            .saturating_add(elapsed_nanos(manifest_started));
-        manifest_result?;
-        self.publication.manifest_bytes_written = self
-            .publication
-            .manifest_bytes_written
-            .saturating_add(MANIFEST_SLOT_SIZE as u64);
 
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {

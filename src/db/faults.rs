@@ -33,6 +33,7 @@ thread_local! {
     pub(super) static FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_NEXT_REUSE_PUBLICATION: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
@@ -123,14 +124,16 @@ impl DB {
         FAIL_NEXT_META_LOG_TORN_WRITE.with(|failure| failure.set(true));
     }
 
-    /// Inject one failure at the next manifest sync boundary.
+    /// Inject one failure at the authority-frame sync boundary.
     pub fn inject_manifest_sync_failure(&self) {
-        self.manifest.inject_sync_failure();
+        FAIL_NEXT_META_LOG_SYNC.with(|failure| failure.set(true));
     }
 
-    /// Inject one failure at the safety mirror sync boundary before page reuse.
+    /// Inject one failure before page write-back of a generation that reuses
+    /// physical slots - the reuse-fencing boundary that the former safety
+    /// mirror used to own.
     pub fn inject_manifest_mirror_sync_failure(&self) {
-        self.manifest.inject_mirror_sync_failure();
+        FAIL_NEXT_REUSE_PUBLICATION.with(|failure| failure.set(true));
     }
 
     /// Inject one failure at the coalesced artifact-directory barrier before

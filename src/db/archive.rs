@@ -8,10 +8,10 @@
 
 use super::{
     ARCHIVE_MARKER_FILE, BLOB_DELTA_FILE, BLOB_FILE, BLOB_SEGMENT_PREFIX, DATA_FILE, DB, Error,
-    LOCK_FILE, MANIFEST_FILE, MANIFEST_HISTORY_FILE, META_FILE, Options, REUSE_LEDGER_FILE,
-    RepairAction, RepairReport, RestoreReport, Result, SnapshotReport, WAL_FILE, sync_directory,
+    LOCK_FILE, META_FILE, Options, REUSE_LEDGER_FILE, RepairAction, RepairReport, RestoreReport,
+    Result, SnapshotReport, WAL_FILE, sync_directory,
 };
-use crate::storage::format::{HistoryId, Manifest};
+use crate::storage::format::{GenerationId, HistoryId, Manifest, PmtCheckpointId};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,12 +121,15 @@ impl DB {
             sync_directory(&temporary)?;
 
             let mut restored = DB::open(&temporary, options.clone())?;
+            // Forking the history publishes one new physical generation past
+            // the restored frontier (which reserved IDs may advance beyond
+            // the archive root); the logical root must match the archive's.
+            let forked_from = restored.durability_status().generation_id;
             restored.fork_history()?;
             let restored_report = restored.verify()?;
             if restored_report.durability.database_id != source_report.durability.database_id
-                || restored_report.durability.generation_id
-                    != source_report.durability.generation_id
                 || restored_report.durability.commit_id != source_report.durability.commit_id
+                || restored_report.durability.generation_id.get() <= forked_from.get()
                 || restored_report.verified_pages != source_report.verified_pages
             {
                 return Err(Error::Corruption(
@@ -261,27 +264,35 @@ impl DB {
 
     fn fork_history(&mut self) -> Result<()> {
         self.check_writable()?;
-        let manifest = self
-            .manifest
-            .load_latest()?
+        let current = self
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
         let history_id = HistoryId::new(
-            manifest
+            current
                 .history_id
                 .get()
                 .checked_add(1)
                 .ok_or_else(|| Error::Wal("history ID overflow".into()))?,
         );
+        // The forked history needs a fresh generation so its authority frame
+        // has a unique checkpoint ID in the copied log.
+        let generation_id = self.next_generation_id;
         let forked = Manifest {
             history_id,
-            ..manifest
+            generation_id,
+            pmt_checkpoint_id: PmtCheckpointId::new(generation_id.get()),
+            ..current
         };
-        let mut manifest_history = self.manifest_history.clone();
-        manifest_history.reset(forked);
-        self.persist_manifest_history(&manifest_history)?;
-        self.manifest.publish_replicated(forked)?;
-        self.manifest_history = manifest_history;
+        self.publish_authority_frame(forked)?;
         self.history_id = history_id;
+        self.generation_id = generation_id;
+        self.next_generation_id = GenerationId::new(
+            generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
         Ok(())
     }
 }
@@ -307,9 +318,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
         if name.ends_with(".tmp")
             || name == LOCK_FILE
             || name == ARCHIVE_MARKER_FILE
-            || !(name == MANIFEST_FILE
-                || name == MANIFEST_HISTORY_FILE
-                || name == REUSE_LEDGER_FILE
+            || !(name == REUSE_LEDGER_FILE
                 || name == DATA_FILE
                 || name == BLOB_FILE
                 || name == BLOB_DELTA_FILE

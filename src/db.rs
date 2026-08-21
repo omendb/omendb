@@ -44,7 +44,7 @@ mod lifecycle;
 #[path = "db/metadata.rs"]
 mod metadata;
 #[path = "db/metadata_codec.rs"]
-mod metadata_codec;
+pub(crate) mod metadata_codec;
 mod mutation;
 #[path = "db/open.rs"]
 mod open;
@@ -142,9 +142,8 @@ use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord
 use crate::space::{Device, DeviceOptions};
 use crate::storage::StorageEngine;
 use crate::storage::format::{
-    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId,
-    MANIFEST_SLOT_SIZE, Manifest, ManifestHistory, ManifestStore, PmtCheckpointId, ReuseAttempt,
-    ReuseLedger, SnapshotId,
+    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
+    ManifestHistory, PmtCheckpointId, ReuseAttempt, ReuseLedger, SnapshotId,
 };
 pub(super) use io::{decode_u32, decode_u64, read_exact_at};
 use retention_state::RetentionState;
@@ -161,8 +160,6 @@ const WAL_FILE: &str = "seerdb.wal";
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const META_LOG_FILE: &str = "seerdb.meta.log";
-const MANIFEST_FILE: &str = "MANIFEST";
-const MANIFEST_HISTORY_FILE: &str = "seerdb.manifest-history";
 const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
@@ -201,7 +198,7 @@ pub struct DB {
     /// Durable retained-root registry shared with retained snapshot handles.
     retention: Arc<Mutex<RetentionState>>,
     /// Authoritative root-generation publication store.
-    manifest: ManifestStore,
+
     /// Durable descriptors for historical roots that can be retained later.
     manifest_history: ManifestHistory,
     /// Reuse attempts whose publication outcome may be indeterminate.

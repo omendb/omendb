@@ -11,7 +11,6 @@ pub use manifest_history::ManifestHistory;
 mod reuse_ledger;
 pub use reuse_ledger::{ReuseAttempt, ReuseLedger};
 
-pub use super::manifest_store::ManifestStore;
 pub use super::retention_format::{RetainedRoot, RetentionRegistry};
 
 /// Current durable format version.

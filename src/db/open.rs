@@ -6,7 +6,7 @@ pub(super) struct OpenPaths {
     pub(super) data: PathBuf,
     pub(super) wal: PathBuf,
     pub(super) meta: PathBuf,
-    pub(super) manifest: PathBuf,
+    pub(super) meta_log: PathBuf,
 }
 
 impl OpenPaths {
@@ -47,7 +47,7 @@ impl OpenPaths {
             data: path.join(DATA_FILE),
             wal: path.join(WAL_FILE),
             meta: path.join(META_FILE),
-            manifest: path.join(MANIFEST_FILE),
+            meta_log: path.join(META_LOG_FILE),
             path,
             path_preexisted,
         })
@@ -75,7 +75,6 @@ impl DB {
             blobs: components.blobs,
             vacuum: None,
             retention: catalog.retention,
-            manifest: catalog.manifest,
             manifest_history: catalog.manifest_history,
             reuse_ledger: catalog.reuse_ledger,
             database_id: catalog.database_id,
@@ -101,11 +100,9 @@ impl DB {
             publication_timing: PublicationTimingMetrics::default(),
         };
 
-        if !catalog.check_only
-            && current_manifest.is_none()
-            && !paths.wal.exists()
-            && !paths.meta.exists()
-        {
+        if !catalog.check_only && current_manifest.is_none() && !paths.wal.exists() {
+            // Fresh database: write the generation-0 bootstrap frame so the
+            // log is authoritative from birth.
             let initial = Manifest {
                 database_id: db.database_id,
                 history_id: db.history_id,
@@ -120,9 +117,12 @@ impl DB {
                 digest: 0,
                 format_version: FORMAT_VERSION,
             };
+            let bytes = initial.to_bytes();
+            let (_written, created) = db.append_generation_meta(0, 0, &bytes)?;
+            if created {
+                sync_publication_directory(&db.path)?;
+            }
             db.manifest_history.reset(initial);
-            db.persist_manifest_history(&db.manifest_history)?;
-            db.manifest.publish(initial)?;
         }
 
         if let Some(recovery) = recovery {

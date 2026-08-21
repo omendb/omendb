@@ -4,10 +4,10 @@
 //! The B-tree stores blob pointers (file_id, offset, length) instead of
 //! the actual values.
 
-mod manager;
 mod file;
+mod manager;
 mod record;
 
-pub use manager::{BlobManager, BlobManagerError, DEFAULT_BLOB_THRESHOLD};
 pub use file::BlobFile;
+pub use manager::{BlobManager, BlobManagerError, DEFAULT_BLOB_THRESHOLD};
 pub(crate) use record::BlobRecord;

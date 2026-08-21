@@ -2,10 +2,8 @@
 
 use super::metadata_codec::{META_LOG_FRAME_HEADER_SIZE, META_LOG_HEADER_SIZE};
 use super::*;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use tempfile::tempdir;
-
-use crate::storage::format::MANIFEST_SLOT_SIZE;
 
 #[test]
 fn test_db_open() {
@@ -111,14 +109,14 @@ fn test_db_open_rejects_missing_manifest_artifacts_without_recreating_them() {
     assert!(matches!(
         check,
         Err(Error::Check {
-            kind: CheckFailureKind::Checkpoint,
+            kind: CheckFailureKind::Target,
             ref message
-        }) if message.contains("is missing checkpoint")
+        }) if message.contains("missing required manifest or data artifacts")
     ));
     assert!(matches!(
         DB::open(&checkpoint_path, Options::default()),
         Err(Error::Corruption(message))
-            if message.contains("is missing checkpoint")
+            if message.contains("data file has no authoritative metadata log")
     ));
     assert!(!checkpoint.exists());
 }
@@ -511,7 +509,7 @@ fn test_db_rejects_malformed_meta_container() {
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 1")
+        Err(Error::Corruption(message)) if message.contains("no valid publication frames")
     ));
 }
 
@@ -631,18 +629,13 @@ fn test_db_gc_mirrors_manifest_before_removing_dead_blob_file() {
     db.close().unwrap();
 
     // GC is a maintenance mutation of the blob artifact without a new
-    // logical commit. Losing the newest slot must still reopen the
-    // manifest whose blob image is present, rather than a stale root
-    // whose record was just removed.
-    let manifest_path = path.join(MANIFEST_FILE);
-    let mut manifest_file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
-    manifest_file
-        .seek(SeekFrom::Start(MANIFEST_SLOT_SIZE as u64))
-        .unwrap();
-    manifest_file
-        .write_all(&[0xA5; MANIFEST_SLOT_SIZE])
-        .unwrap();
-    manifest_file.sync_all().unwrap();
+    // logical commit. A torn append tail behind the authority frame must
+    // still reopen the current root, rather than a stale root whose record
+    // was just removed.
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut log = OpenOptions::new().append(true).open(&metadata_log).unwrap();
+    log.write_all(&[0xA5; 64]).unwrap();
+    log.sync_all().unwrap();
 
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"blob").unwrap(), None);

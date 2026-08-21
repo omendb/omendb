@@ -1,7 +1,7 @@
 //! Engine-level reproduction: scattered churn free-list behavior.
 
 use super::*;
-use crate::btree::{BTree, LookupResult, PAGE_SIZE};
+use crate::btree::{BTree, PAGE_SIZE};
 use crate::space::DeviceOptions;
 use tempfile::tempdir;
 
@@ -32,10 +32,7 @@ fn engine_free_list_tracks_scattered_churn() {
     for chunk in 0..32 {
         for slot in 0..16 {
             let index = chunk * 16 + slot;
-            engine
-                .btree_mut()
-                .insert(&key(index), &value)
-                .unwrap();
+            engine.btree_mut().insert(&key(index), &value).unwrap();
         }
         engine.flush().unwrap();
         engine.complete_generation();
@@ -53,8 +50,7 @@ fn engine_free_list_tracks_scattered_churn() {
     // Scattered churn: golden-ratio scatter, even rounds put, odd delete.
     for round in 0..60 {
         for slot in 0..16 {
-            let index = ((round as u64 * 16 + slot as u64)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            let index = ((round as u64 * 16 + slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 % 512) as usize;
             if round % 2 == 0 {
                 engine.btree_mut().upsert(&key(index), &value).unwrap();

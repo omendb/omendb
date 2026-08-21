@@ -180,8 +180,8 @@ impl DB {
         self.check_writable()?;
         let snapshot = self.begin_snapshot()?;
         let manifest = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         // Each owned handle needs its own durable lease. Reusing a commit's
         // existing root here would let releasing one handle unprotect the

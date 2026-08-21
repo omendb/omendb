@@ -451,7 +451,7 @@ fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
 }
 
 #[test]
-fn dbnext_r0_short_and_torn_checkpoint_frames_preserve_prior_generation() {
+fn dbnext_r0_short_and_torn_checkpoint_frames_replay_committed_wal() {
     fn run_case<F>(root: &Path, name: &str, inject: F)
     where
         F: FnOnce(&DB),
@@ -467,12 +467,13 @@ fn dbnext_r0_short_and_torn_checkpoint_frames_preserve_prior_generation() {
         assert!(db.durability_status().write_fenced);
         drop(db);
 
+        // The WAL commit record syncs before the authority frame, so the
+        // failed flush leaves a committed WAL prefix whether or not the
+        // frame bytes reached the file. Reopen replays it into a new
+        // generation instead of falling back to the old one.
         let mut reopened = DB::open(&path, Options::default()).unwrap();
-        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
         assert!(!reopened.durability_status().write_fenced);
-        // The failed generation was never named by a manifest, so whether its
-        // frame reached the file (sync seam) or not (write seam), the old
-        // root stays authoritative and a retry reuses the generation ID.
         reopened.verify().unwrap();
     }
 

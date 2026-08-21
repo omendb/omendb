@@ -47,32 +47,15 @@ impl DB {
 
     /// Publish a PMT relocation without inventing a logical user commit.
     ///
-    /// The caller must have mirrored the current manifest before writing the
-    /// relocated pages. A new generation ID makes the physical checkpoint
-    /// authoritative while preserving commit identity and WAL digest.
+    /// The caller must have written the relocated pages before publishing.
+    /// A new generation ID makes the physical checkpoint authoritative while
+    /// preserving commit identity and WAL digest.
     fn publish_compaction_generation(&mut self) -> Result<()> {
         let current = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
         let generation_id = self.next_generation_id;
-        let (checkpoint_bytes, meta_log_created) =
-            self.append_generation_meta(generation_id.get(), current)?;
-        debug_assert!(
-            !meta_log_created,
-            "maintenance requires a published database"
-        );
-        let meta_path = self.path.join(META_FILE);
-        let legacy_meta_bytes = if meta_path.is_file() {
-            0
-        } else {
-            Self::save_meta(&meta_path, self.engine.pmt(), self.engine.allocator())?
-        };
-        self.publication.metadata_bytes_written = self
-            .publication
-            .metadata_bytes_written
-            .saturating_add(checkpoint_bytes)
-            .saturating_add(legacy_meta_bytes);
 
         if self.blobs.is_segmented() {
             // A compaction generation changes the manifest-selected physical
@@ -94,29 +77,7 @@ impl DB {
             root_page_id: self.engine.btree().root_id() as u64,
             ..current
         };
-        let mut manifest_history = self.manifest_history.clone();
-        manifest_history
-            .push(manifest)
-            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
-        let history_bytes = if self.path.join(MANIFEST_HISTORY_FILE).is_file() {
-            self.append_manifest_history(manifest)?
-        } else {
-            let bytes = manifest_history
-                .to_bytes()
-                .ok_or_else(|| Error::Wal("manifest history is too large".into()))?;
-            self.persist_manifest_history(&manifest_history)?;
-            bytes.len() as u64
-        };
-        self.publication.history_bytes_written = self
-            .publication
-            .history_bytes_written
-            .saturating_add(history_bytes);
-        self.manifest_history = manifest_history;
-        self.manifest.publish(manifest)?;
-        self.publication.manifest_bytes_written = self
-            .publication
-            .manifest_bytes_written
-            .saturating_add(MANIFEST_SLOT_SIZE as u64);
+        self.publish_authority_frame(manifest)?;
 
         #[cfg(any(test, feature = "fault-injection"))]
         if FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.replace(false)) {
@@ -158,10 +119,8 @@ impl DB {
                 };
                 self.preflight_maintenance_capacity(0, metadata_bytes, blob_bytes)?;
             }
-            // Both slots must continue to name the old PMT until all moved
-            // copies are durable. This is the maintenance equivalent of the
-            // normal generation reuse barrier.
-            self.mirror_current_manifest()?;
+            // Relocated interior pages are out-of-place copies; the old PMT
+            // stays authoritative until the relocation frame publishes.
             manifest_replicated = true;
             relocated_pages = match max_relocated_pages {
                 Some(limit) => self.engine.relocate_interior_pages_with_limit(limit)? as u64,

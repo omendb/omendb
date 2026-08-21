@@ -6,14 +6,14 @@
 use super::preallocation::{preallocate_file, reserve_file};
 use crate::btree::node::PAGE_SIZE;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
 #[cfg(not(any(unix, windows)))]
 use std::io::Read;
+use std::io::{self, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
+use std::path::Path;
 #[cfg(any(test, feature = "fault-injection"))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -80,10 +80,7 @@ impl Device {
     }
 
     /// Open an existing device without write permissions.
-    pub fn open_read_only<P: AsRef<Path>>(
-        path: P,
-        options: &DeviceOptions,
-    ) -> io::Result<Self> {
+    pub fn open_read_only<P: AsRef<Path>>(path: P, options: &DeviceOptions) -> io::Result<Self> {
         Self::open_with_mode(path, options, false)
     }
 
@@ -163,7 +160,9 @@ impl Device {
         {
             let mut filled = 0;
             while filled < buf.len() {
-                let count = self.file.read_at(&mut buf[filled..], offset + filled as u64)?;
+                let count = self
+                    .file
+                    .read_at(&mut buf[filled..], offset + filled as u64)?;
                 if count == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -255,8 +254,7 @@ impl Device {
     /// the one-shot disk-full fault used by actual page writes.
     pub fn check_capacity(&self, end: u64) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
-        if end > self.capacity_limit.load(Ordering::Acquire)
-        {
+        if end > self.capacity_limit.load(Ordering::Acquire) {
             return Err(io::Error::from(io::ErrorKind::StorageFull));
         }
         #[cfg(not(any(test, feature = "fault-injection")))]
@@ -303,10 +301,7 @@ impl Device {
     /// ordinary device-sync fault.
     #[cfg(any(test, feature = "fault-injection"))]
     pub fn check_page_range_sync(&self) -> io::Result<()> {
-        if self
-            .fail_next_page_range_sync
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.fail_next_page_range_sync.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected page-generation sync failure"));
         }
         Ok(())

@@ -9,7 +9,6 @@ mod flush;
 pub mod format;
 mod invariants;
 mod lazy_read;
-mod manifest_store;
 mod materialization;
 mod metrics;
 mod page_cache;
@@ -18,7 +17,6 @@ mod reclamation;
 mod retention_format;
 mod verification;
 
-pub use manifest_store::ManifestStore;
 pub use metrics::StorageMetrics;
 pub(crate) use metrics::{durability_syncs, record_durability_sync};
 pub(crate) use read_path::StorageReadView;
@@ -200,7 +198,10 @@ impl StorageEngine {
                 .lock()
                 .map(|set| set.len())
                 .unwrap_or(usize::MAX),
-            self.protected_pmts.lock().map(|set| set.len()).unwrap_or(usize::MAX),
+            self.protected_pmts
+                .lock()
+                .map(|set| set.len())
+                .unwrap_or(usize::MAX),
         )
     }
 

@@ -173,7 +173,6 @@ impl DB {
 
     fn start_vacuum(&mut self) -> Result<()> {
         self.flush()?;
-        self.mirror_current_manifest()?;
         self.engine.ensure_materialized()?;
         let end = vec![u8::MAX; MAX_KEY_SIZE + 1];
         let cursor = self

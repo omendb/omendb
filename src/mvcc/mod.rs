@@ -5,4 +5,4 @@
 
 mod pmt;
 
-pub use pmt::{PageMapping, PMT};
+pub use pmt::{PMT, PageMapping};

@@ -3,7 +3,9 @@
 
 use seerdb::blob::BlobManager;
 use seerdb::recovery::WalRecord;
-use seerdb::storage::format::{CommitId, CommitRecord, FORMAT_VERSION, GenerationId, Manifest};
+use seerdb::storage::format::{
+    CommitId, CommitRecord, FORMAT_VERSION, GenerationId, MANIFEST_SLOT_SIZE, Manifest,
+};
 use seerdb::{
     BatchMutation, BlobStorageMode, CheckFailureKind, DB, Error, Options, RepairAction,
     WalCheckStatus,
@@ -44,21 +46,67 @@ fn assert_model(db: &DB, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
     assert_eq!(db.range(b"key-00", b"key-99").unwrap(), expected_range);
 }
 
+/// Newest publication-frame manifest in the database's authority log.
 fn active_manifest(path: &Path) -> Manifest {
-    let bytes = fs::read(path.join("MANIFEST")).unwrap();
-    bytes
-        .as_chunks::<{ seerdb::storage::format::MANIFEST_SLOT_SIZE }>()
-        .0
-        .iter()
-        .filter_map(|slot| Manifest::from_bytes(slot).unwrap())
-        .reduce(|current, candidate| {
-            if candidate.is_newer_than(current) {
-                candidate
-            } else {
-                current
+    const LOG_HEADER_SIZE: usize = 12;
+    const FRAME_HEADER_SIZE: usize = 16;
+    const PUB_HEADER_SIZE: usize = 16;
+    let bytes = fs::read(path.join("seerdb.meta.log")).unwrap();
+    let mut newest = None;
+    let mut cursor = LOG_HEADER_SIZE;
+    while cursor + FRAME_HEADER_SIZE <= bytes.len() {
+        let payload_len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_end = cursor + FRAME_HEADER_SIZE + payload_len;
+        if payload_end > bytes.len() {
+            break;
+        }
+        let payload = &bytes[cursor + FRAME_HEADER_SIZE..payload_end];
+        // Publication payload: magic(8) version(4) manifest_len(4) slot(..).
+        if payload.len() >= PUB_HEADER_SIZE + MANIFEST_SLOT_SIZE && payload[..8] == *b"SEERMPB1" {
+            let manifest_len = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+            if manifest_len == MANIFEST_SLOT_SIZE {
+                let mut slot = [0u8; MANIFEST_SLOT_SIZE];
+                slot.copy_from_slice(
+                    &payload[PUB_HEADER_SIZE..PUB_HEADER_SIZE + MANIFEST_SLOT_SIZE],
+                );
+                if let Ok(Some(manifest)) = Manifest::from_bytes(&slot)
+                    && newest.is_none_or(|current| manifest.is_newer_than(current))
+                {
+                    newest = Some(manifest);
+                }
             }
-        })
-        .expect("database has an active manifest")
+        }
+        cursor = payload_end;
+    }
+    newest.expect("database has an active manifest")
+}
+
+/// Overwrite the manifest slot image inside every publication frame with a
+/// slot whose format version is one past supported, repairing each frame
+/// checksum so rejection happens at manifest validation, not at the frame.
+fn bump_manifest_format_version_in_every_frame(log: &mut [u8]) {
+    const LOG_HEADER_SIZE: usize = 12;
+    const FRAME_HEADER_SIZE: usize = 16;
+    const VERSION_OFFSET_IN_SLOT: usize = 8;
+    let mut cursor = LOG_HEADER_SIZE;
+    while cursor + FRAME_HEADER_SIZE <= log.len() {
+        let payload_len = u32::from_le_bytes(log[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_end = cursor + FRAME_HEADER_SIZE + payload_len;
+        if payload_end > log.len() {
+            break;
+        }
+        let payload_start = cursor + FRAME_HEADER_SIZE;
+        let payload = &mut log[payload_start..payload_end];
+        if payload.len() >= 16 + MANIFEST_SLOT_SIZE && payload[..8] == *b"SEERMPB1" {
+            let slot_start = 16 + VERSION_OFFSET_IN_SLOT;
+            payload[slot_start..slot_start + 4]
+                .copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+            let checksum = crc32c::crc32c(&log[cursor + 8..payload_end]);
+            log[cursor + 4..cursor + 8].copy_from_slice(&checksum.to_le_bytes());
+        }
+        cursor = payload_end;
+    }
 }
 
 fn wal_digest(record: &WalRecord) -> u32 {
@@ -167,7 +215,11 @@ fn dbnext_r0_seeded_mutations_faults_and_restore() {
         restored.durability_status().commit_id,
         final_status.commit_id
     );
-    assert_eq!(
+    // The fork publishes a fresh physical generation past the archive root
+    // (reserved IDs can advance it further), so only ordering is guaranteed.
+    assert!(
+        restored.durability_status().generation_id > final_status.generation_id,
+        "restored generation {:?} must advance past the archive root {:?}",
         restored.durability_status().generation_id,
         final_status.generation_id
     );
@@ -211,12 +263,10 @@ fn dbnext_r0_rejects_corrupt_manifest() {
         db.flush().unwrap();
     }
 
-    let manifest_path = path.join("MANIFEST");
-    let slot_size = seerdb::storage::format::MANIFEST_SLOT_SIZE;
-    let mut manifest = fs::read(&manifest_path).unwrap();
-    manifest[..slot_size].fill(0xA5);
-    manifest[slot_size..slot_size * 2].fill(0x5A);
-    fs::write(manifest_path, manifest).unwrap();
+    let metadata_log = path.join("seerdb.meta.log");
+    // Clobber the whole authority log: header and frames are unreadable, so
+    // no generation can be selected and the database must fail closed.
+    fs::write(&metadata_log, vec![0xA5u8; 256]).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
@@ -423,19 +473,14 @@ fn dbnext_r0_rejects_future_manifest_version() {
         db.flush().unwrap();
     }
 
-    let manifest_path = path.join("MANIFEST");
-    let slot_size = seerdb::storage::format::MANIFEST_SLOT_SIZE;
-    let mut manifest = fs::read(&manifest_path).unwrap();
-    for slot in manifest.chunks_exact_mut(slot_size) {
-        slot[8..12].copy_from_slice(&(seerdb::storage::format::FORMAT_VERSION + 1).to_le_bytes());
-        let checksum = crc32c::crc32c(&slot[..252]);
-        slot[252..].copy_from_slice(&checksum.to_le_bytes());
-    }
-    fs::write(manifest_path, manifest).unwrap();
+    let metadata_log = path.join("seerdb.meta.log");
+    let mut log = fs::read(&metadata_log).unwrap();
+    bump_manifest_format_version_in_every_frame(&mut log);
+    fs::write(&metadata_log, &log).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(_))
+        Err(Error::Corruption(message)) if message.contains("manifest")
     ));
 }
 
@@ -715,7 +760,7 @@ fn dbnext_r0_rejects_corrupt_blob_artifact() {
 }
 
 #[test]
-fn dbnext_r0_rejects_malformed_checkpoint_container() {
+fn dbnext_r0_rejects_malformed_checkpoint_payload() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-checkpoint.db");
     let repair_path = root.path().join("corrupt-checkpoint-repair.db");
@@ -725,29 +770,40 @@ fn dbnext_r0_rejects_malformed_checkpoint_container() {
         db.flush().unwrap();
     }
 
+    // Damage the inner checkpoint image of the newest publication frame and
+    // repair the frame checksum, so the container looks intact but the
+    // bounded payload decode fails unconditionally instead of falling back.
     let metadata_log = path.join("seerdb.meta.log");
     let mut log = fs::read(&metadata_log).unwrap();
-    let first_payload = 12 + 16;
-    log[first_payload] ^= 0xA5;
+    let mut cursor = 12usize;
+    let mut newest_frame = None;
+    while cursor + 16 <= log.len() {
+        let payload_len = u32::from_le_bytes(log[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_end = cursor + 16 + payload_len;
+        if payload_end > log.len() {
+            break;
+        }
+        newest_frame = Some((cursor, payload_end));
+        cursor = payload_end;
+    }
+    let (frame_start, frame_end) = newest_frame.expect("published database has frames");
+    let last = log[frame_end - 1];
+    log[frame_end - 1] = last.wrapping_add(1);
+    let checksum = crc32c::crc32c(&log[frame_start + 8..frame_end]);
+    log[frame_start + 4..frame_start + 8].copy_from_slice(&checksum.to_le_bytes());
     fs::write(&metadata_log, &log).unwrap();
 
     assert!(matches!(
         DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 1")
+        Err(Error::Corruption(message)) if message.contains("checksum mismatch")
     ));
     assert!(matches!(
         DB::check(&path, Options::default()),
-        Err(Error::Check {
-            kind: CheckFailureKind::Checkpoint,
-            ..
-        })
+        Err(Error::Check { .. })
     ));
     assert!(matches!(
         DB::repair(&path, &repair_path, Options::default()),
-        Err(Error::Check {
-            kind: CheckFailureKind::Checkpoint,
-            ..
-        })
+        Err(Error::Check { .. })
     ));
     assert!(!repair_path.exists());
 }
@@ -774,9 +830,9 @@ fn dbnext_r0_rejects_future_meta_version() {
     assert!(matches!(
         DB::check(&path, Options::default()),
         Err(Error::Check {
-            kind: CheckFailureKind::Format,
-            ..
-        })
+            kind: CheckFailureKind::Manifest,
+            message,
+        }) if message.contains("unsupported metadata log format version")
     ));
 }
 
@@ -791,13 +847,17 @@ fn dbnext_r0_accepts_legacy_meta_checkpoint() {
     }
 
     // The legacy whole-image seerdb.meta fallback remains openable for
-    // databases that predate the manifest-selected metadata log.
+    // databases that predate the manifest-selected metadata log. The inner
+    // checkpoint image of the first publication frame is exactly that file:
+    // publication payload magic(8) version(4) manifest_len(4) slot(256) then
+    // the SEERMET1 checkpoint image including its own trailing checksum.
     let legacy_dir = root.path().join("legacy-meta-fallback.db");
     fs::create_dir(&legacy_dir).unwrap();
     let log = fs::read(path.join("seerdb.meta.log")).unwrap();
     let payload_len = u32::from_le_bytes(log[12..16].try_into().unwrap()) as usize;
-    let payload = log[28..28 + payload_len].to_vec();
-    let legacy_meta = payload[12..payload.len() - 4].to_vec();
+    let payload = &log[28..28 + payload_len];
+    let manifest_len = u32::from_le_bytes(payload[12..16].try_into().unwrap()) as usize;
+    let legacy_meta = payload[16 + manifest_len..].to_vec();
     fs::write(legacy_dir.join("seerdb.meta"), &legacy_meta).unwrap();
 
     let mut reopened = DB::open(&legacy_dir, Options::default()).unwrap();

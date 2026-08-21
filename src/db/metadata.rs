@@ -17,9 +17,9 @@ use super::metadata_codec::{
     MAX_META_DELTA_CHAIN, META_DELTA_CHECKSUM_SIZE, META_DELTA_HEADER_SIZE, META_DELTA_MAGIC,
     META_LOG_FRAME_HEADER_SIZE, META_LOG_HEADER_SIZE, META_MAGIC, MetaLogEntry, ParsedMetaLog,
     decode_checkpoint, decode_legacy_checkpoint, encode_checkpoint, encode_delta,
-    encode_meta_log_frame, meta_log_header_bytes, parse_meta_log,
+    encode_meta_log_frame, encode_publication_payload, meta_log_header_bytes, parse_meta_log,
 };
-use super::{DB, META_LOG_FILE, atomic_write, atomic_write_without_directory_sync};
+use super::{DB, META_LOG_FILE, atomic_write};
 use crate::allocator::PageAllocator;
 use crate::error::{Error, Result};
 use crate::mvcc::{PMT, PageMapping};
@@ -53,35 +53,6 @@ impl DB {
                 decode_legacy_checkpoint(&data)?
             };
         Ok((pmt, allocator, 0))
-    }
-
-    /// Save PMT and allocator to the legacy bootstrap meta file.
-    pub(super) fn save_meta(path: &Path, pmt: &PMT, allocator: &PageAllocator) -> Result<u64> {
-        Self::save_meta_with_directory_sync(path, pmt, allocator, true)
-    }
-
-    pub(super) fn save_meta_without_directory_sync(
-        path: &Path,
-        pmt: &PMT,
-        allocator: &PageAllocator,
-    ) -> Result<u64> {
-        Self::save_meta_with_directory_sync(path, pmt, allocator, false)
-    }
-
-    fn save_meta_with_directory_sync(
-        path: &Path,
-        pmt: &PMT,
-        allocator: &PageAllocator,
-        sync_parent: bool,
-    ) -> Result<u64> {
-        let buf = encode_checkpoint(pmt, allocator)?;
-
-        if sync_parent {
-            atomic_write(path, &buf)?;
-        } else {
-            atomic_write_without_directory_sync(path, &buf)?;
-        }
-        Ok(buf.len() as u64)
     }
 
     /// Return the parsed valid prefix of this database's metadata log.
@@ -124,7 +95,12 @@ impl DB {
                     }
                 ))
             })?;
+            let entry: &MetaLogEntry = match entry {
+                MetaLogEntry::Publication { entry, .. } => entry,
+                other => other,
+            };
             match entry {
+                MetaLogEntry::Publication { .. } => unreachable!("unwrapped above"),
                 MetaLogEntry::Checkpoint(pmt, allocator) => break (pmt.clone(), allocator.clone()),
                 MetaLogEntry::Delta(delta) => {
                     if !visited.insert(delta.parent_checkpoint_id) {
@@ -176,6 +152,11 @@ impl DB {
             .map(|frame| match &frame.entry {
                 MetaLogEntry::Delta(delta) => (frame.checkpoint_id, delta.parent_checkpoint_id),
                 MetaLogEntry::Checkpoint(..) => (frame.checkpoint_id, 0),
+                MetaLogEntry::Publication { entry, .. } => match &**entry {
+                    MetaLogEntry::Delta(delta) => (frame.checkpoint_id, delta.parent_checkpoint_id),
+                    MetaLogEntry::Checkpoint(..) => (frame.checkpoint_id, 0),
+                    MetaLogEntry::Publication { .. } => unreachable!(),
+                },
             })
             .collect();
         let mut ancestors = BTreeSet::new();
@@ -221,18 +202,63 @@ impl DB {
         Self::resolve_meta_log(&parsed, checkpoint_id)
     }
 
-    /// Append the durable checkpoint or delta frame for `checkpoint_id`.
+    /// Select the authority manifest from a parsed metadata log.
     ///
-    /// The frame is fully written and synced before the caller may publish a
-    /// manifest naming this checkpoint; that ordering replaces the per-file
-    /// create plus directory barrier of the per-generation checkpoint files.
-    /// Returns the bytes written and whether this call created the log file
-    /// (the caller must then make the new directory entry durable before the
-    /// manifest barrier).
+    /// Candidates are every valid publication frame, tried newest-first; the
+    /// first whose delta chain resolves wins. A torn or corrupt newest frame
+    /// therefore falls back exactly like the previous two-slot design's
+    /// inactive slot, without a second file.
+    pub(crate) fn select_authority_manifest(parsed: &ParsedMetaLog) -> Result<Option<Manifest>> {
+        let mut candidates: Vec<&Manifest> = parsed
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.entry {
+                MetaLogEntry::Publication { manifest, .. } => Some(manifest),
+                _ => None,
+            })
+            .collect();
+        candidates.sort_by_key(|manifest| {
+            std::cmp::Reverse((manifest.generation_id, manifest.commit_id))
+        });
+        for manifest in candidates {
+            if manifest.pmt_checkpoint_id.get() == 0
+                || Self::resolve_meta_log(parsed, manifest.pmt_checkpoint_id.get()).is_ok()
+            {
+                return Ok(Some(*manifest));
+            }
+        }
+        if parsed.frames.is_empty() {
+            return Ok(None);
+        }
+        Err(Error::Corruption(
+            "metadata log has publication frames but no resolvable checkpoint chain".into(),
+        ))
+    }
+
+    /// Every publication frame's manifest in log order.
+    pub(super) fn publication_manifests(parsed: &ParsedMetaLog) -> Vec<Manifest> {
+        parsed
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.entry {
+                MetaLogEntry::Publication { manifest, .. } => Some(*manifest),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Append the durable publication frame for `checkpoint_id`.
+    ///
+    /// The frame carries the published manifest plus the checkpoint or delta
+    /// image and IS the visibility barrier: once this frame is synced, a
+    /// reopen selects generation `manifest.generation_id` as authority. The
+    /// caller must have synced every page offset the manifest names and the
+    /// WAL commit record before calling.
     pub(super) fn append_generation_meta(
         &self,
         checkpoint_id: u64,
-        parent: Manifest,
+        parent_checkpoint_id: u64,
+        manifest_bytes: &[u8],
     ) -> Result<(u64, bool)> {
         let log_path = Self::metadata_log_path(&self.path);
         let existed = log_path.exists();
@@ -259,7 +285,7 @@ impl DB {
             crate::storage::record_durability_sync();
         }
 
-        let payload = match (parent.pmt_checkpoint_id.get(), parsed.as_ref()) {
+        let entry_payload = match (parent_checkpoint_id, parsed.as_ref()) {
             (0, _) => encode_checkpoint(self.engine.pmt(), self.engine.allocator())?,
             (parent_id, Some(parsed)) => {
                 let (parent_pmt, _, depth) = Self::resolve_meta_log(parsed, parent_id)?;
@@ -280,6 +306,7 @@ impl DB {
                 )));
             }
         };
+        let payload = encode_publication_payload(manifest_bytes, &entry_payload)?;
         let frame = encode_meta_log_frame(checkpoint_id, &payload)?;
 
         #[cfg(any(test, feature = "fault-injection"))]
@@ -315,6 +342,7 @@ impl DB {
             let _ = file.sync_all();
             return Err(std::io::Error::other("injected metadata log torn write failure").into());
         }
+        #[cfg(any(test, feature = "fault-injection"))]
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -333,7 +361,6 @@ impl DB {
         let header_bytes = u64::from(!existed) * META_LOG_HEADER_SIZE as u64;
         Ok((header_bytes + frame.len() as u64, !existed))
     }
-
     /// Rewrite the metadata log keeping only the retained checkpoint IDs.
     ///
     /// Retained sets are ancestor-closed, so keeping exactly the retained
@@ -370,7 +397,7 @@ impl DB {
 
     pub(super) fn generation_meta_bytes(
         &self,
-        parent: Manifest,
+        parent_checkpoint_id: u64,
         dirty_page_count: usize,
     ) -> Result<(u64, bool)> {
         let pmt_bytes = (self.engine.pmt().to_bytes().len() as u64)
@@ -394,13 +421,13 @@ impl DB {
             .and_then(|size| size.checked_add(allocator_bytes))
             .and_then(|size| size.checked_add(frame_overhead))
             .ok_or(Error::DiskFull)?;
-        if parent.pmt_checkpoint_id.get() == 0 {
+        if parent_checkpoint_id == 0 {
             return Ok((full_bytes, true));
         }
 
         let parsed = Self::read_meta_log(&self.path)?
             .ok_or_else(|| Error::Corruption("metadata log is missing".into()))?;
-        let (_, _, depth) = Self::resolve_meta_log(&parsed, parent.pmt_checkpoint_id.get())?;
+        let (_, _, depth) = Self::resolve_meta_log(&parsed, parent_checkpoint_id)?;
         if depth >= MAX_META_DELTA_CHAIN {
             return Ok((full_bytes, true));
         }

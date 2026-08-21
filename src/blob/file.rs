@@ -99,9 +99,7 @@ impl BlobFile {
         let Some(record) = self.records.last() else {
             return false;
         };
-        let expected_offset = self
-            .offset
-            .saturating_sub(record.serialized_size() as u64);
+        let expected_offset = self.offset.saturating_sub(record.serialized_size() as u64);
         if expected_offset != offset
             || record.value.len() != length as usize
             || self.deleted_offsets.contains(&offset)

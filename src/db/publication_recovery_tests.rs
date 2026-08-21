@@ -7,8 +7,6 @@ use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 use tempfile::tempdir;
 
-use crate::storage::format::MANIFEST_SLOT_SIZE;
-
 #[test]
 fn test_db_process_crash_recovery() {
     if let Some(path) = std::env::var_os("SEERDB_CRASH_CHILD_PATH") {
@@ -137,7 +135,7 @@ fn test_db_recovers_committed_wal_prefix_with_torn_suffix() {
     assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
     assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
     assert!(!path.join(WAL_FILE).exists());
-    assert!(path.join(MANIFEST_FILE).exists());
+    assert!(DB::metadata_log_path(&path).is_file());
 }
 
 #[test]
@@ -225,13 +223,10 @@ fn test_db_rejects_when_both_manifest_slots_are_corrupt() {
         db.flush().unwrap();
     }
 
-    let manifest_path = path.join(MANIFEST_FILE);
-    let mut file = OpenOptions::new().write(true).open(&manifest_path).unwrap();
-    for slot in 0..2 {
-        file.seek(SeekFrom::Start((slot * MANIFEST_SLOT_SIZE) as u64))
-            .unwrap();
-        file.write_all(&[0xA5; MANIFEST_SLOT_SIZE]).unwrap();
-    }
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut file = OpenOptions::new().write(true).open(&metadata_log).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0xA5; 16]).unwrap();
     file.sync_all().unwrap();
 
     let result = DB::open(&path, Options::default());
@@ -325,12 +320,14 @@ fn test_db_capacity_preflight_is_retryable_without_reopen() {
 }
 
 #[test]
-fn test_db_discards_wal_after_atomic_rename_failure() {
+fn test_db_discards_wal_after_publication_sync_failure() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
     db.put(b"key", b"value").unwrap();
-    inject_atomic_rename_failure();
+    // Data-phase sync failure: no commit envelope reaches the WAL, so
+    // recovery must discard the whole uncommitted suffix.
+    db.engine.inject_sync_failure();
 
     assert!(matches!(db.flush(), Err(Error::Io(_))));
     assert!(matches!(

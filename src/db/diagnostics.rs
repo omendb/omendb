@@ -138,9 +138,8 @@ impl DB {
 
     fn load_verified_manifest(&mut self) -> std::result::Result<Manifest, VerificationFailure> {
         let manifest = self
-            .manifest
-            .load_latest()
-            .map_err(|error| VerificationFailure::from_error(CheckFailureKind::Manifest, error))?
+            .manifest_history
+            .latest()
             .ok_or_else(|| VerificationFailure {
                 kind: CheckFailureKind::Manifest,
                 message: "database has no valid manifest".into(),
@@ -280,8 +279,8 @@ impl DB {
         }
 
         let current_manifest = self
-            .manifest
-            .load_latest()?
+            .manifest_history
+            .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         let mut pending = Vec::new();
         let mut saw_commit = false;

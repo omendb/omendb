@@ -17,17 +17,21 @@ impl DB {
     pub fn prune_history(&mut self) -> Result<HistoryPruneReport> {
         self.check_writable()?;
         self.flush()?;
-        let recovery_manifests = self.manifest.load_valid_manifests()?;
-        let current = recovery_manifests
+        // The fallback root is the highest valid publication frame below the
+        // authority: a crash reopens there when the newest frame is torn.
+        // Pruning must keep its checkpoint chain resolvable.
+        let recovery_manifests: Vec<Manifest> = self
+            .manifest_history
+            .manifests()
             .iter()
+            .rev()
+            .take(2)
             .copied()
-            .max_by_key(|manifest| (manifest.generation_id, manifest.commit_id))
+            .collect();
+        let current = recovery_manifests
+            .first()
+            .copied()
             .ok_or_else(|| Error::Corruption("database has no valid manifest".into()))?;
-
-        // Both valid slots are recovery roots until a later publication has
-        // mirrored the current manifest. Pruning only from `current` can
-        // delete the checkpoint needed by the inactive fallback slot, turning
-        // a later torn newest-slot recovery into a missing-artifact failure.
         let mut retained = recovery_manifests
             .iter()
             .map(|manifest| manifest.generation_id)
@@ -45,9 +49,6 @@ impl DB {
         drop(state);
 
         let mut history = self.manifest_history.clone();
-        history
-            .reconcile_current(current)
-            .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         let mut retained_checkpoints = BTreeSet::new();
         let mut protected_manifests = recovery_manifests;
         protected_manifests.extend(retained_roots);
@@ -69,10 +70,7 @@ impl DB {
             }
         }
         let removed_manifests = history.prune_to_generations(&retained) as u64;
-        if history != self.manifest_history {
-            self.persist_manifest_history(&history)?;
-            self.manifest_history = history;
-        }
+        self.manifest_history = history;
 
         let (removed_checkpoints, reclaimed_checkpoint_bytes) =
             self.compact_metadata_log(&retained_checkpoints)?;

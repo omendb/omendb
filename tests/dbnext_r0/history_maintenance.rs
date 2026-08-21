@@ -270,7 +270,7 @@ fn dbnext_r0_vacuum_capacity_refusal_is_retryable_before_rebuild() {
 }
 
 #[test]
-fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
+fn dbnext_r0_prunes_unretained_history_by_compacting_the_metadata_log() {
     let root = tempdir().unwrap();
     let path = root.path().join("history-prune.db");
     let mut db = DB::open(&path, Options::for_test()).unwrap();
@@ -318,10 +318,10 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
 
     let report = db.prune_history().unwrap();
     assert_eq!(report.retained_generations, 3);
-    // Both manifest slots and the retained snapshot remain recovery roots.
-    // The current delta checkpoint also depends on its full and delta
-    // ancestors even though the middle logical manifest is unretained.
-    assert_eq!(report.removed_checkpoints, 0);
+    // The retained snapshot and both recovery manifests keep their frames;
+    // only the generation-0 bootstrap checkpoint becomes compactable once
+    // generation 1 publishes a full checkpoint that nothing references.
+    assert_eq!(report.removed_checkpoints, 1);
     assert!(frame_ids().contains(&first.generation_id.get()));
     assert_eq!(
         db.get_at(snapshot_id, b"versioned").unwrap(),
@@ -346,7 +346,7 @@ fn dbnext_r0_prunes_unretained_history_after_atomic_sidecar_publish() {
 }
 
 #[test]
-fn dbnext_r0_history_prune_compaction_failure_preserves_old_sidecar() {
+fn dbnext_r0_history_prune_compaction_failure_preserves_previous_log() {
     let root = tempdir().unwrap();
     let path = root.path().join("history-prune-failure.db");
     let mut db = DB::open(&path, Options::for_test()).unwrap();
@@ -375,8 +375,9 @@ fn dbnext_r0_history_prune_compaction_failure_preserves_old_sidecar() {
     assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
 
     let report = db.prune_history().unwrap();
-    assert_eq!(report.removed_checkpoints, 0);
-    assert_eq!(frame_count(&metadata_log), frames_before);
+    // The retry compacts away the unreferenced generation-0 bootstrap frame.
+    assert_eq!(report.removed_checkpoints, 1);
+    assert_eq!(frame_count(&metadata_log), frames_before - 1);
 }
 
 #[test]

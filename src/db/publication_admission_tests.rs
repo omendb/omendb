@@ -7,8 +7,6 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use tempfile::tempdir;
 
-use crate::storage::format::MANIFEST_SLOT_SIZE;
-
 #[test]
 fn test_db_meta_persistence() {
     let dir = tempdir().unwrap();
@@ -22,7 +20,7 @@ fn test_db_meta_persistence() {
     }
 
     // Meta file should exist.
-    assert!(path.join(META_FILE).exists());
+    assert!(DB::metadata_log_path(&path).is_file());
 }
 
 #[test]
@@ -45,11 +43,8 @@ fn test_db_metrics_attribute_page_work_and_lazy_reads() {
         assert!(metrics.publication.wal_bytes_written > 0);
         assert!(metrics.publication.metadata_bytes_written > 0);
         assert_eq!(metrics.publication.blob_bytes_written, 0);
-        assert!(metrics.publication.history_bytes_written > 0);
-        assert_eq!(
-            metrics.publication.manifest_bytes_written,
-            MANIFEST_SLOT_SIZE as u64
-        );
+        assert_eq!(metrics.publication.history_bytes_written, 0);
+        assert_eq!(metrics.publication.manifest_bytes_written, 0);
     }
 
     let reopened = DB::open(&path, Options::default()).unwrap();
@@ -95,14 +90,31 @@ fn test_db_metadata_delta_reopens_and_preserves_parent_checkpoint() {
     }
 
     let parsed = DB::read_meta_log(&path).unwrap().expect("metadata log");
+    // Frame 0 is the generation-0 bootstrap checkpoint written at open.
+    let entry = |index: usize| match &parsed.frames[index].entry {
+        MetaLogEntry::Publication { entry, .. } => &**entry,
+        other => other,
+    };
+    let first_frame = parsed
+        .frames
+        .iter()
+        .find(|frame| frame.checkpoint_id == 1)
+        .expect("generation 1 frame");
     assert!(matches!(
-        parsed.frames[0].entry,
-        MetaLogEntry::Checkpoint(..)
+        &first_frame.entry,
+        MetaLogEntry::Publication { entry, .. } if matches!(&**entry, MetaLogEntry::Checkpoint(..))
     ));
-    assert_eq!(parsed.frames[0].checkpoint_id, 1);
-    assert!(matches!(parsed.frames[1].entry, MetaLogEntry::Delta(_)));
-    assert_eq!(parsed.frames[1].checkpoint_id, 2);
-    assert!(parsed.frames[1].raw.len() < parsed.frames[0].raw.len());
+    let _ = entry;
+    let second_frame = parsed
+        .frames
+        .iter()
+        .find(|frame| frame.checkpoint_id == 2)
+        .expect("generation 2 frame");
+    assert!(matches!(
+        &second_frame.entry,
+        MetaLogEntry::Publication { entry, .. } if matches!(&**entry, MetaLogEntry::Delta(..))
+    ));
+    assert!(second_frame.raw.len() < first_frame.raw.len());
 
     let mut reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(
@@ -122,7 +134,7 @@ fn test_db_metadata_delta_reopens_and_preserves_parent_checkpoint() {
 }
 
 #[test]
-fn test_db_metadata_delta_corruption_fails_closed() {
+fn test_db_metadata_delta_corruption_falls_back_to_resolvable_root() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("corrupt-metadata-delta.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
@@ -152,17 +164,11 @@ fn test_db_metadata_delta_corruption_fails_closed() {
     let corrupt_at = target.expect("generation 2 frame");
     bytes[corrupt_at] ^= 0xA5;
     fs::write(&metadata_log, &bytes).unwrap();
-    assert!(matches!(
-        DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.contains("metadata checkpoint 2")
-    ));
-    assert!(matches!(
-        DB::check(&path, Options::default()),
-        Err(Error::Check {
-            kind: CheckFailureKind::Checkpoint,
-            ..
-        })
-    ));
+    // The corrupt newest frame no longer hides the database: authority
+    // selection falls back to the previous resolvable publication frame.
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    drop(reopened);
 
     // Rewrite generation 2's delta with a zeroed parent while fixing both
     // the payload checksum and the frame checksum, exercising the bounded
@@ -198,14 +204,15 @@ fn test_db_metadata_delta_corruption_fails_closed() {
     let mut rewritten = bytes[..frame_start].to_vec();
     rewritten.extend_from_slice(&frame);
     fs::write(&metadata_log, &rewritten).unwrap();
-    let error = match DB::open(&path, Options::default()) {
-        Ok(_) => panic!("anchorless metadata delta unexpectedly opened"),
-        Err(error) => error,
+    // The anchorless delta is refused as an authority candidate; selection
+    // falls back to the previous resolvable publication frame.
+    let mut reopened = match DB::open(&path, Options::default()) {
+        Ok(db) => db,
+        Err(error) => panic!("anchorless delta should fall back, not fail: {error:?}"),
     };
-    assert!(
-        matches!(error, Error::Corruption(ref message) if message.contains("no full checkpoint parent")),
-        "{error:?}"
-    );
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    reopened.verify().unwrap();
+    reopened.close().unwrap();
 }
 
 #[test]
@@ -228,14 +235,18 @@ fn test_db_metadata_delta_chain_consolidates_at_hard_limit() {
         .iter()
         .find(|frame| frame.checkpoint_id == consolidation_generation)
         .expect("consolidation frame");
-    assert!(matches!(consolidated.entry, MetaLogEntry::Checkpoint(..)));
+    assert!(matches!(
+        &consolidated.entry,
+        MetaLogEntry::Publication { entry, .. } if matches!(&**entry, MetaLogEntry::Checkpoint(..))
+    ));
     // The inactive slot still names the immediately previous delta
     // frontier. Publish one more generation so that fallback advances
     // beyond the consolidation before pruning the old chain.
     db.put(b"key", b"value-66").unwrap();
     db.flush().unwrap();
     let report = db.prune_history().unwrap();
-    assert_eq!(report.removed_checkpoints, MAX_META_DELTA_CHAIN as u64 + 1);
+    // +1 consolidation boundary, +1 the generation-0 bootstrap frame.
+    assert_eq!(report.removed_checkpoints, MAX_META_DELTA_CHAIN as u64 + 2);
     let pruned = DB::read_meta_log(&path).unwrap().unwrap();
     assert!(
         pruned
@@ -260,12 +271,18 @@ fn test_compaction_after_metadata_delta_admits_relocation_sidecar() {
     db.put(b"key", b"value-2").unwrap();
     db.flush().unwrap();
     let parsed = DB::read_meta_log(&path).unwrap().unwrap();
-    assert!(matches!(parsed.frames[1].entry, MetaLogEntry::Delta(_)));
+    assert!(matches!(
+        &parsed.frames[2].entry,
+        MetaLogEntry::Publication { entry, .. } if matches!(&**entry, MetaLogEntry::Delta(..))
+    ));
 
     let report = db.compact().unwrap();
     assert_eq!(report.relocated_pages, 1);
     let parsed = DB::read_meta_log(&path).unwrap().unwrap();
-    assert!(matches!(parsed.frames[2].entry, MetaLogEntry::Delta(_)));
+    assert!(matches!(
+        &parsed.frames[3].entry,
+        MetaLogEntry::Publication { entry, .. } if matches!(&**entry, MetaLogEntry::Delta(..))
+    ));
     assert_eq!(db.get(b"key").unwrap(), Some(b"value-2".to_vec()));
     drop(db);
 
