@@ -3,7 +3,7 @@
 //! The generated operations and in-memory oracle are the comparison authority.
 //! Backend adapters execute this model but do not define its semantics.
 
-use super::config::{Config, WorkloadKind};
+use super::config::{Config, KeyDistribution, WorkloadKind};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -56,9 +56,51 @@ pub(super) fn initial_state(config: &Config) -> Vec<(Vec<u8>, Vec<u8>)> {
     }
 }
 
+/// Exact Zipf sampler over a fixed key space via cumulative probabilities.
+struct ZipfIndex {
+    cumulative: Vec<f64>,
+}
+
+impl ZipfIndex {
+    fn new(points: usize) -> Self {
+        let theta = 0.99;
+        let mut weights = Vec::with_capacity(points);
+        let mut total = 0.0f64;
+        for rank in 1..=points {
+            let weight = 1.0 / (rank as f64).powf(theta);
+            total += weight;
+            weights.push(total);
+        }
+        for weight in &mut weights {
+            *weight /= total;
+        }
+        Self { cumulative: weights }
+    }
+
+    fn index(&self, draw: f64) -> usize {
+        match self.cumulative.binary_search_by(|p| p.partial_cmp(&draw).unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i,
+            Err(i) => i.min(self.cumulative.len() - 1),
+        }
+    }
+}
+
 pub(super) fn generate_operations(config: &Config) -> Vec<Operation> {
     let mut rng = Rng::new(config.seed);
     let key_space = config.keys.saturating_mul(2).max(1);
+    let zipf = if config.key_distribution == KeyDistribution::Zipf {
+        Some(ZipfIndex::new(config.keys.max(1)))
+    } else {
+        None
+    };
+    // YCSB cells sample keys over config.keys; other workloads keep the
+    // original uniform space.
+    let ycsb_key = |rng: &mut Rng, _operation: usize| -> usize {
+        match &zipf {
+            Some(z) => z.index(f64::from_bits((rng.next() >> 12) | 0x3ff0_0000_0000_0000) - 1.0),
+            None => rng.index(config.keys.max(1)),
+        }
+    };
     let total_operations = config.base_operations.saturating_add(config.operations);
     (0..total_operations)
         .map(|operation| match config.workload {
@@ -83,7 +125,7 @@ pub(super) fn generate_operations(config: &Config) -> Vec<Operation> {
             // YCSB core workloads over a uniform key distribution (the
             // YCSB default Zipfian is not used; label results uniform).
             WorkloadKind::YcsbA => {
-                let index = rng.index(config.keys.max(1));
+                let index = ycsb_key(&mut rng, operation);
                 if rng.next() % 100 < 50 {
                     Operation::Get {
                         key: key_for(index),
@@ -96,7 +138,7 @@ pub(super) fn generate_operations(config: &Config) -> Vec<Operation> {
                 }
             }
             WorkloadKind::YcsbB => {
-                let index = rng.index(config.keys.max(1));
+                let index = ycsb_key(&mut rng, operation);
                 if rng.next() % 100 < 95 {
                     Operation::Get {
                         key: key_for(index),
@@ -109,7 +151,7 @@ pub(super) fn generate_operations(config: &Config) -> Vec<Operation> {
                 }
             }
             WorkloadKind::YcsbC => Operation::Get {
-                key: key_for(rng.index(config.keys.max(1))),
+                key: key_for(ycsb_key(&mut rng, operation)),
             },
             WorkloadKind::Mixed => {
                 let index = rng.index(key_space);

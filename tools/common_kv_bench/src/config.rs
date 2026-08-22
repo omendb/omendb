@@ -78,6 +78,32 @@ impl WorkloadKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KeyDistribution {
+    Uniform,
+    Zipf,
+}
+
+impl KeyDistribution {
+    fn parse(value: &str) -> BenchResult<Self> {
+        match value {
+            "uniform" => Ok(Self::Uniform),
+            "zipf" => Ok(Self::Zipf),
+            _ => Err(format!(
+                "unknown key distribution {value:?}; expected uniform or zipf"
+            )
+            .into()),
+        }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Zipf => "zipf",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DurabilityMode {
     Durable,
     Buffered,
@@ -121,6 +147,7 @@ pub(super) struct Config {
     pub(super) durability: DurabilityMode,
     pub(super) open_existing: bool,
     pub(super) vacuum: bool,
+    pub(super) key_distribution: KeyDistribution,
     pub(super) base_operations: usize,
     pub(super) progress: Option<PathBuf>,
     pub(super) progress_hold: Option<PathBuf>,
@@ -150,6 +177,7 @@ impl Config {
         let mut durability = DurabilityMode::Durable;
         let mut open_existing = false;
         let mut vacuum = false;
+        let mut key_distribution = KeyDistribution::Uniform;
         let mut base_operations = 0;
         let mut progress = None;
         let mut progress_hold = None;
@@ -179,6 +207,7 @@ impl Config {
             match flag.as_str() {
                 "--engine" => engine = EngineKind::parse(value)?,
                 "--workload" => workload = WorkloadKind::parse(value)?,
+                "--key-distribution" => key_distribution = KeyDistribution::parse(value)?,
                 "--path" => path = Some(PathBuf::from(value)),
                 "--output" => output = Some(PathBuf::from(value)),
                 "--trace-output" => trace_output = Some(PathBuf::from(value)),
@@ -261,6 +290,7 @@ impl Config {
             durability,
             open_existing,
             vacuum,
+            key_distribution,
             base_operations,
             progress,
             progress_hold,
@@ -292,6 +322,7 @@ fn print_help() {
          --seed N                 Deterministic trace seed (default 7)\n\
          --durability durable|buffered\n\
          --vacuum                  SeerDB only: reclaim dead pages after workload\n\
+         --key-distribution uniform|zipf\n\
                                   Durability mode (default durable)\n\
          --sync                   Alias for --durability durable\n\n\
          --open-existing          Open an existing database for a mutation phase\n\
