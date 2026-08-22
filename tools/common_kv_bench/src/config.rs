@@ -42,6 +42,9 @@ pub(super) enum WorkloadKind {
     Mixed,
     PointRead,
     RangeRead,
+    YcsbA,
+    YcsbB,
+    YcsbC,
 }
 
 impl WorkloadKind {
@@ -50,9 +53,12 @@ impl WorkloadKind {
             "batch-put" => Ok(Self::BatchPut),
             "mixed" => Ok(Self::Mixed),
             "point-read" => Ok(Self::PointRead),
+            "ycsb-a" => Ok(Self::YcsbA),
+            "ycsb-b" => Ok(Self::YcsbB),
+            "ycsb-c" => Ok(Self::YcsbC),
             "range-read" => Ok(Self::RangeRead),
             _ => Err(format!(
-                "unknown workload {value:?}; expected batch-put, mixed, point-read, or range-read"
+                "unknown workload {value:?}; expected batch-put, mixed, point-read, range-read, ycsb-a, ycsb-b, or ycsb-c"
             )
             .into()),
         }
@@ -64,6 +70,9 @@ impl WorkloadKind {
             Self::Mixed => "mixed",
             Self::PointRead => "point-read",
             Self::RangeRead => "range-read",
+            Self::YcsbA => "ycsb-a",
+            Self::YcsbB => "ycsb-b",
+            Self::YcsbC => "ycsb-c",
         }
     }
 }
@@ -271,7 +280,7 @@ fn print_help() {
     println!(
         "Common ordered-KV comparison harness\n\n\
          --engine seerdb|fjall|rocksdb\n\
-         --workload batch-put|mixed|point-read|range-read\n\
+         --workload batch-put|mixed|point-read|range-read|ycsb-a|ycsb-b|ycsb-c\n\
          --path PATH             Fresh or empty database directory\n\
          --output PATH            Also write the versioned JSON result artifact\n\
          --trace-output PATH      Write the exact versioned generated operation trace\n\

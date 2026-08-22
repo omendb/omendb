@@ -174,6 +174,7 @@ pub(super) fn render_result(result: &RunResult) -> String {
             WorkloadKind::BatchPut => "write-batch",
             WorkloadKind::Mixed => "operation-or-write-batch",
             WorkloadKind::PointRead | WorkloadKind::RangeRead => "operation",
+            WorkloadKind::YcsbA | WorkloadKind::YcsbB | WorkloadKind::YcsbC => "operation",
         },
         result.latency.p50_ns,
         result.latency.p95_ns,

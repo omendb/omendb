@@ -80,6 +80,37 @@ pub(super) fn generate_operations(config: &Config) -> Vec<Operation> {
                     end: key_for(end_index),
                 }
             }
+            // YCSB core workloads over a uniform key distribution (the
+            // YCSB default Zipfian is not used; label results uniform).
+            WorkloadKind::YcsbA => {
+                let index = rng.index(config.keys.max(1));
+                if rng.next() % 100 < 50 {
+                    Operation::Get {
+                        key: key_for(index),
+                    }
+                } else {
+                    Operation::Put {
+                        key: key_for(index),
+                        value: value_for(operation.wrapping_add(config.keys), config.value_bytes),
+                    }
+                }
+            }
+            WorkloadKind::YcsbB => {
+                let index = rng.index(config.keys.max(1));
+                if rng.next() % 100 < 95 {
+                    Operation::Get {
+                        key: key_for(index),
+                    }
+                } else {
+                    Operation::Put {
+                        key: key_for(index),
+                        value: value_for(operation.wrapping_add(config.keys), config.value_bytes),
+                    }
+                }
+            }
+            WorkloadKind::YcsbC => Operation::Get {
+                key: key_for(rng.index(config.keys.max(1))),
+            },
             WorkloadKind::Mixed => {
                 let index = rng.index(key_space);
                 match rng.next() % 100 {
