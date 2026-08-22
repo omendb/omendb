@@ -4,6 +4,12 @@
 //! recovery, only mutation prefixes closed by a valid commit envelope are
 //! replayed.
 //!
+//! Replay is not an acknowledgement guarantee: under the old-or-complete
+//! contract, a complete-but-unacknowledged generation whose commit record
+//! reached the WAL before a publication failure may also surface after
+//! recovery. Callers observe acknowledged state only via the publication
+//! return value, never from replayed content.
+//!
 //! # Sync Policies
 //!
 //! - `SyncAll`: fsync after every commit (safest, slowest)
