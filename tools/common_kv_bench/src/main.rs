@@ -120,6 +120,11 @@ fn main() -> BenchResult<()> {
         .collect::<Vec<_>>();
     let expected_digest = digest(&expected_entries);
     let seer_counters = engine.seer_counters();
+    if config.vacuum {
+        if let Some(pages) = engine.vacuum()? {
+            eprintln!("vacuum reclaimed {pages} logical pages");
+        }
+    }
     engine.close()?;
 
     let disk_bytes = workload::disk_bytes(&config.path)?;

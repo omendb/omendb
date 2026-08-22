@@ -111,6 +111,7 @@ pub(super) struct Config {
     pub(super) seed: u64,
     pub(super) durability: DurabilityMode,
     pub(super) open_existing: bool,
+    pub(super) vacuum: bool,
     pub(super) base_operations: usize,
     pub(super) progress: Option<PathBuf>,
     pub(super) progress_hold: Option<PathBuf>,
@@ -139,6 +140,7 @@ impl Config {
         let mut seed = 7;
         let mut durability = DurabilityMode::Durable;
         let mut open_existing = false;
+        let mut vacuum = false;
         let mut base_operations = 0;
         let mut progress = None;
         let mut progress_hold = None;
@@ -155,6 +157,10 @@ impl Config {
             }
             if flag == "--open-existing" {
                 open_existing = true;
+                continue;
+            }
+            if flag == "--vacuum" {
+                vacuum = true;
                 index += 1;
                 continue;
             }
@@ -245,6 +251,7 @@ impl Config {
             seed,
             durability,
             open_existing,
+            vacuum,
             base_operations,
             progress,
             progress_hold,
@@ -275,6 +282,7 @@ fn print_help() {
          --range-width N          Range width in keys (default 32)\n\
          --seed N                 Deterministic trace seed (default 7)\n\
          --durability durable|buffered\n\
+         --vacuum                  SeerDB only: reclaim dead pages after workload\n\
                                   Durability mode (default durable)\n\
          --sync                   Alias for --durability durable\n\n\
          --open-existing          Open an existing database for a mutation phase\n\

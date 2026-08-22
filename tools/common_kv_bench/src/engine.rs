@@ -372,6 +372,20 @@ impl Engine {
         }
     }
 
+    pub(super) fn vacuum(&mut self) -> BenchResult<Option<u64>> {
+        match self {
+            Self::SeerDb { db, .. } => {
+                let report = db.vacuum()?;
+                Ok(Some(
+                    report
+                        .logical_pages_before
+                        .saturating_sub(report.logical_pages_after),
+                ))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn close(self) -> BenchResult<()> {
         match self {
             Self::SeerDb { mut db, .. } => db.close()?,
