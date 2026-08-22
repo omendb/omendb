@@ -141,11 +141,6 @@ impl DB {
             full_meta_bytes
         };
         let blob_bytes = Self::blob_publication_size(&self.blobs)?;
-        let ledger_bytes = self
-            .reuse_ledger
-            .to_bytes()
-            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?
-            .len() as u64;
         let history_entry_bytes = ManifestHistory::entry_bytes(Manifest {
             database_id: self.database_id,
             history_id: self.history_id,
@@ -172,7 +167,6 @@ impl DB {
             .and_then(|size| size.checked_add(checkpoint_meta_bytes))
             .and_then(|size| size.checked_add(legacy_meta_bytes))
             .and_then(|size| size.checked_add(blob_bytes))
-            .and_then(|size| size.checked_add(ledger_bytes))
             .and_then(|size| size.checked_add(history_bytes))
             .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
             .ok_or(Error::DiskFull)?;
@@ -195,11 +189,6 @@ impl DB {
         metadata_bytes: u64,
         blob_bytes: u64,
     ) -> Result<()> {
-        let ledger_bytes = self
-            .reuse_ledger
-            .to_bytes()
-            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?
-            .len() as u64;
         let history_entry_bytes =
             ManifestHistory::entry_bytes(self.bootstrap_manifest()).len() as u64;
         let history_length = fs::metadata(DB::metadata_log_path(&self.path))
@@ -211,7 +200,6 @@ impl DB {
         let required = data_bytes
             .checked_add(metadata_bytes)
             .and_then(|size| size.checked_add(blob_bytes))
-            .and_then(|size| size.checked_add(ledger_bytes))
             .and_then(|size| size.checked_add(history_bytes))
             .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
             .ok_or(Error::DiskFull)?;

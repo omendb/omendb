@@ -38,6 +38,11 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Set the generation stamped into page headers at the next flush.
+    pub fn set_write_generation(&mut self, generation: u64) {
+        self.write_generation = generation;
+    }
+
     /// Flush all dirty pages to disk.
     ///
     /// Small generations keep staging images resident until the device sync,
@@ -84,6 +89,7 @@ impl StorageEngine {
                 let mut persisted_node = Node::from_bytes(Box::new(page)).ok_or_else(|| {
                     Error::Corruption(format!("invalid node page {page_id} before flush"))
                 })?;
+                persisted_node.set_write_generation(self.write_generation);
                 persisted_node.update_checksum();
 
                 // Every flush creates a new physical version. DB publishes

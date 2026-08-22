@@ -252,21 +252,21 @@ impl DB {
             return Ok(());
         }
 
-        for attempt in self
-            .reuse_ledger
-            .attempts()
-            .iter()
-            .filter(|attempt| attempt.generation_id > target.generation_id)
-        {
-            if attempt
-                .offsets
-                .iter()
-                .any(|offset| target_by_offset.contains_key(offset))
+        // The page header carries the generation whose publication wrote the
+        // durable image, so a rewritten slot is detected directly on the
+        // bytes: any write_generation newer than the target root means the
+        // mapped bytes no longer hold the historical value.
+        for (offset, mapping) in &target_by_offset {
+            if mapping.file_id != 0 {
+                continue;
+            }
+            if self
+                .engine
+                .page_rewritten_after(*offset, target.generation_id.get())?
             {
                 return Err(Error::SnapshotUnavailable(format!(
-                    "commit {} has physical pages reused by an uncertain generation {}",
-                    target.commit_id.get(),
-                    attempt.generation_id.get()
+                    "commit {} has physical pages reused by a later generation",
+                    target.commit_id.get()
                 )));
             }
         }

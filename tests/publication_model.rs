@@ -23,7 +23,6 @@ const BLOB_FILE: &str = "seerdb.blob";
 const WAL_FILE: &str = "seerdb.wal";
 const META_FILE: &str = "seerdb.meta";
 const META_LOG_FILE_NAME: &str = "seerdb.meta.log";
-const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Artifact {
@@ -32,7 +31,6 @@ enum Artifact {
     Blob,
     Wal,
     AuthorityFrame,
-    ReuseLedger,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,7 +133,6 @@ fn artifact_names(path: &Path, artifact: Artifact) -> Vec<PathBuf> {
             Artifact::Blob => name == BLOB_FILE,
             Artifact::Wal => name == WAL_FILE,
             Artifact::AuthorityFrame => name.starts_with("seerdb.meta."),
-            Artifact::ReuseLedger => name == REUSE_LEDGER_FILE,
         };
         if matches {
             names.push(entry.path());
@@ -299,7 +296,6 @@ fn partial_artifact_cases(candidate: &Path) -> Vec<PartialArtifactCase> {
         Artifact::Blob,
         Artifact::Wal,
         Artifact::AuthorityFrame,
-        Artifact::ReuseLedger,
     ];
     let mut cases = Vec::new();
     for artifact in artifacts {
@@ -494,12 +490,10 @@ fn modeled_partial_artifact_schedules_reopen_whole_or_refuse() {
 }
 
 #[test]
-fn modeled_uncertain_reuse_ledger_fails_closed_for_retention() {
+fn modeled_crashed_generation_pages_fail_closed_for_retention() {
     let root = tempdir().unwrap();
     let live = root.path().join("live");
-    let old = root.path().join("old");
     let failed = root.path().join("failed");
-    let materialized = root.path().join("materialized");
 
     let first_commit = {
         let mut db = DB::open(&live, Options::for_test()).unwrap();
@@ -514,8 +508,11 @@ fn modeled_uncertain_reuse_ledger_fails_closed_for_retention() {
             value: b"two".to_vec(),
         }])
         .unwrap();
-        copy_tree(&live, &old);
 
+        // The failed publication reuses the first generation's slots and
+        // stamps the durable page images with generation 3 before dying at
+        // the page-range sync. The crash leaves those bytes in place while
+        // the manifest stays at generation 2.
         db.put(b"versioned", b"three").unwrap();
         db.inject_page_range_sync_failure();
         assert!(db.flush().is_err());
@@ -525,11 +522,9 @@ fn modeled_uncertain_reuse_ledger_fails_closed_for_retention() {
         first.commit_id
     };
 
-    assert!(failed.join(REUSE_LEDGER_FILE).is_file());
-    copy_tree(&old, &materialized);
-    replace_artifact(&materialized, &failed, Artifact::ReuseLedger);
-
-    let mut db = DB::open(&materialized, Options::for_test()).unwrap();
+    // Retention must refuse the historical root: the page headers prove the
+    // mapped slots were rewritten by the crashed generation.
+    let mut db = DB::open(&failed, Options::for_test()).unwrap();
     assert_eq!(db.get(b"versioned").unwrap(), Some(b"two".to_vec()));
     db.verify().unwrap();
     assert!(matches!(

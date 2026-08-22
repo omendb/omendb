@@ -109,6 +109,23 @@ impl StorageEngine {
     /// This is used before creating a late historical retention lease so a
     /// root whose physical pages have already been truncated or reused fails
     /// closed instead of becoming a durable lease to an invalid image.
+    /// Whether the durable page image at `offset` was written by a
+    /// generation newer than `generation` - i.e., the bytes a historical
+    /// root maps here were rewritten by a later publication (published or
+    /// crashed; indistinguishable at this level).
+    pub fn page_rewritten_after(&self, offset: u64, generation: u64) -> Result<bool> {
+        let mut page = [0u8; PAGE_SIZE];
+        self.device.read_page(offset, &mut page)?;
+        let node = Node::from_bytes(Box::new(page))
+            .ok_or_else(|| Error::Corruption(format!("invalid page at offset {offset}")))?;
+        if !node.verify_checksum() {
+            return Err(Error::Corruption(format!(
+                "page checksum mismatch at offset {offset}"
+            )));
+        }
+        Ok(node.write_generation() > generation)
+    }
+
     pub fn verify_tree_at(&self, root_page_id: u64, pmt: &PMT) -> Result<Vec<BlobPointer>> {
         self.verify_tree_with_pmt(pmt, root_page_id)
     }

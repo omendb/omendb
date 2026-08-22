@@ -7,9 +7,6 @@
 #[path = "manifest_history.rs"]
 mod manifest_history;
 pub use manifest_history::ManifestHistory;
-#[path = "reuse_ledger.rs"]
-mod reuse_ledger;
-pub use reuse_ledger::{ReuseAttempt, ReuseLedger};
 
 pub use super::retention_format::{RetainedRoot, RetentionRegistry};
 

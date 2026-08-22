@@ -76,7 +76,6 @@ impl DB {
             vacuum: None,
             retention: catalog.retention,
             manifest_history: catalog.manifest_history,
-            reuse_ledger: catalog.reuse_ledger,
             database_id: catalog.database_id,
             history_id: catalog.history_id,
             generation_id: catalog.generation_id,

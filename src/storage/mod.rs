@@ -63,6 +63,8 @@ pub struct StorageEngine {
     next_offset: u64,
     /// Physical page offsets that are not referenced by the active generation.
     free_offsets: Vec<u64>,
+    /// Generation stamped into page headers at the next flush.
+    write_generation: u64,
     /// Offsets retired by the last flush, pending manifest publication.
     pending_reclaimed_offsets: Vec<u64>,
     /// Cache identities retired by the last flush, pending manifest
@@ -121,6 +123,7 @@ impl StorageEngine {
     ) -> Self {
         let buffer_frames = buffer.stats().total_frames;
         Self {
+            write_generation: 0,
             btree: btree.with_page_allocator(allocator),
             buffer: Mutex::new(buffer),
             parsed_page_cache: Mutex::new(ParsedPageCache::new(buffer_frames)),

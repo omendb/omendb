@@ -8,8 +8,8 @@
 
 use super::{
     ARCHIVE_MARKER_FILE, BLOB_DELTA_FILE, BLOB_FILE, BLOB_SEGMENT_PREFIX, DATA_FILE, DB, Error,
-    LOCK_FILE, META_FILE, Options, REUSE_LEDGER_FILE, RepairAction, RepairReport, RestoreReport,
-    Result, SnapshotReport, WAL_FILE, sync_directory,
+    LOCK_FILE, META_FILE, Options, RepairAction, RepairReport, RestoreReport, Result,
+    SnapshotReport, WAL_FILE, sync_directory,
 };
 use crate::storage::format::{GenerationId, HistoryId, Manifest, PmtCheckpointId};
 use std::fs::{self, File, OpenOptions};
@@ -318,8 +318,7 @@ fn copy_artifacts(source: &Path, destination: &Path, include_wal: bool) -> Resul
         if name.ends_with(".tmp")
             || name == LOCK_FILE
             || name == ARCHIVE_MARKER_FILE
-            || !(name == REUSE_LEDGER_FILE
-                || name == DATA_FILE
+            || !(name == DATA_FILE
                 || name == BLOB_FILE
                 || name == BLOB_DELTA_FILE
                 || name.starts_with(BLOB_SEGMENT_PREFIX)

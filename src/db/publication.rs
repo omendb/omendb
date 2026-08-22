@@ -8,7 +8,6 @@ use super::*;
 
 struct PublicationPreparation {
     parent_manifest: Manifest,
-    reused_slots: bool,
 }
 
 impl DB {
@@ -26,7 +25,7 @@ impl DB {
             recovered_wal_offset,
             preparation.parent_manifest,
         )?;
-        self.finish_generation_publication(commit, preparation.reused_slots, wal_path)
+        self.finish_generation_publication(commit, wal_path)
     }
 
     fn prepare_generation_publication(
@@ -42,6 +41,7 @@ impl DB {
         }
         let reuse_offsets = self.engine.pending_reuse_offsets();
         let reused_slots = !reuse_offsets.is_empty();
+        let _ = reused_slots;
         // No safety mirror is required before page reuse: the authority log is
         // append-only, so recovery falls back to exactly the previous valid
         // publication frame, whose named offsets are excluded from the free
@@ -61,30 +61,19 @@ impl DB {
         // reopens the old root, while a durable commit record is enough to
         // replay the complete generation.
         self.write_wal_to_disk(false)?;
-        self.reuse_ledger
-            .push(ReuseAttempt {
-                commit_id: commit.commit_id,
-                generation_id: commit.generation_id,
-                offsets: reuse_offsets,
-            })
-            .map_err(|message| Error::Corruption(format!("reuse ledger {message}")))?;
 
         let admission_started = Instant::now();
-        let preflight_result = self.preflight_publication_capacity();
+        self.preflight_publication_capacity()?;
         self.publication_timing.admission_ns = self
             .publication_timing
             .admission_ns
             .saturating_add(elapsed_nanos(admission_started));
-        if let Err(error) = preflight_result {
-            self.reuse_ledger.remove_generation(commit.generation_id);
-            return Err(error);
-        }
-        self.persist_reuse_ledger()?;
         self.publication_timing.admission_ns = self
             .publication_timing
             .admission_ns
             .saturating_add(elapsed_nanos(admission_started));
         let flush_started = Instant::now();
+        self.engine.set_write_generation(commit.generation_id.get());
         let flush_result = self.engine.flush_after_reclamation_refresh();
         self.publication_timing.data_flush_ns = self
             .publication_timing
@@ -95,18 +84,11 @@ impl DB {
             // reservation can be removed and the mutation remains retryable.
             // Every other error leaves the reservation durable until reopen
             // proves whether this generation reached manifest history.
-            if matches!(&error, Error::CapacityPreflight)
-                && self.reuse_ledger.remove_generation(commit.generation_id)
-            {
-                self.persist_reuse_ledger()?;
-            }
+            let _ = error;
             return Err(error);
         }
 
-        Ok(PublicationPreparation {
-            parent_manifest,
-            reused_slots,
-        })
+        Ok(PublicationPreparation { parent_manifest })
     }
 
     fn write_generation_artifacts(
@@ -216,24 +198,10 @@ impl DB {
     fn finish_generation_publication(
         &mut self,
         commit: CommitRecord,
-        reused_slots: bool,
         wal_path: PathBuf,
     ) -> Result<()> {
         let cleanup_started = Instant::now();
         self.finish_segmented_blob_publication_cleanup()?;
-
-        let removed_reuse_attempt = self.reuse_ledger.remove_generation(commit.generation_id);
-        let pruned_reuse_attempts = self.reuse_ledger.prune_published(&self.manifest_history);
-        // Once the manifest is durable, a successful reuse attempt is no
-        // longer authoritative. Keep its on-disk ledger entry until the next
-        // publication or reopen when this generation actually reused slots;
-        // both paths reconcile it against manifest history. This avoids one
-        // non-authoritative delete plus directory sync per reused generation.
-        // Keep eager cleanup for empty reservations so a normal append-only
-        // first publication does not leave a misleading ledger artifact.
-        if (removed_reuse_attempt || pruned_reuse_attempts > 0) && !reused_slots {
-            self.persist_reuse_ledger()?;
-        }
 
         self.engine.complete_generation();
 

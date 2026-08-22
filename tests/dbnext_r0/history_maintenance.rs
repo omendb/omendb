@@ -110,13 +110,12 @@ fn dbnext_r0_late_retention_rejects_reuse_after_failed_publication() {
         Err(Error::SnapshotUnavailable(message))
             if message.contains("physical pages reused")
     ));
+    // The abandoned generation died before its WAL commit record synced, so
+    // nothing durable recorded its identity and the retry reuses commit id 3.
     reopened.put(b"versioned", b"four").unwrap();
     reopened.flush().unwrap();
-    assert_eq!(reopened.durability_status().commit_id.get(), 4);
+    assert_eq!(reopened.durability_status().commit_id.get(), 3);
     assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"four".to_vec()));
-    // The abandoned c3 reservation remains until history pruning proves that
-    // no retained root can refer to its possibly overwritten slots.
-    assert!(path.join("seerdb.reuse-ledger").exists());
 }
 
 #[test]
@@ -133,36 +132,12 @@ fn dbnext_r0_ambiguous_new_page_reserves_commit_id() {
 
     let mut reopened = DB::open(&path, Options::for_test()).unwrap();
     assert_eq!(reopened.durability_status().commit_id.get(), 0);
+    // The attempt died before its WAL commit record synced, so the retry
+    // legitimately reuses commit id 1.
     reopened.put(b"versioned", b"two").unwrap();
     reopened.flush().unwrap();
-    assert_eq!(reopened.durability_status().commit_id.get(), 2);
+    assert_eq!(reopened.durability_status().commit_id.get(), 1);
     assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"two".to_vec()));
-    assert!(!path.join("seerdb.reuse-ledger").exists());
-}
-
-#[test]
-fn dbnext_r0_defers_successful_reuse_ledger_cleanup_until_reopen() {
-    let root = tempdir().unwrap();
-    let path = root.path().join("deferred-reuse-ledger-cleanup.db");
-    let mut db = DB::open(&path, Options::for_test()).unwrap();
-
-    db.put(b"versioned", b"one").unwrap();
-    db.flush().unwrap();
-    db.put(b"versioned", b"two").unwrap();
-    db.flush().unwrap();
-    db.put(b"versioned", b"three").unwrap();
-    db.flush().unwrap();
-
-    // The third generation reused the first generation's retired root page.
-    // The ledger remains as a conservative on-disk recovery hint, but the
-    // in-memory ledger is already reconciled after manifest publication.
-    assert!(path.join("seerdb.reuse-ledger").is_file());
-    assert_eq!(db.get(b"versioned").unwrap(), Some(b"three".to_vec()));
-
-    drop(db);
-    let reopened = DB::open(&path, Options::for_test()).unwrap();
-    assert!(!path.join("seerdb.reuse-ledger").exists());
-    assert_eq!(reopened.get(b"versioned").unwrap(), Some(b"three".to_vec()));
 }
 
 #[test]

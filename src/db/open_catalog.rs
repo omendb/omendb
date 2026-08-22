@@ -7,7 +7,6 @@ pub(super) struct OpenCatalog {
     pub(super) lock_file: Option<File>,
     pub(super) current_manifest: Option<Manifest>,
     pub(super) manifest_history: ManifestHistory,
-    pub(super) reuse_ledger: ReuseLedger,
     pub(super) database_id: DatabaseId,
     pub(super) history_id: HistoryId,
     pub(super) generation_id: GenerationId,
@@ -144,13 +143,8 @@ impl DB {
                 .reconcile_current(current)
                 .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         }
-        let mut reuse_ledger = Self::load_reuse_ledger(paths, current_manifest, check_only)?;
-        let pruned_reuse_attempts = reuse_ledger.prune_published(&manifest_history);
-        if pruned_reuse_attempts > 0 && !read_only && !check_only {
-            Self::persist_reuse_ledger_at(&paths.path, &reuse_ledger)?;
-        }
         let (next_commit_id, next_generation_id) =
-            Self::next_open_identities(commit_id, generation_id, &reuse_ledger)?;
+            Self::next_open_identities(commit_id, generation_id)?;
         let open_retention =
             Self::load_retention(paths, database_id, history_id, read_only, check_only)?;
 
@@ -160,7 +154,6 @@ impl DB {
             lock_file,
             current_manifest,
             manifest_history,
-            reuse_ledger,
             database_id,
             history_id,
             generation_id,
@@ -220,69 +213,30 @@ impl DB {
         ))
     }
 
-    fn load_reuse_ledger(
-        paths: &OpenPaths,
-        current_manifest: Option<Manifest>,
-        check_only: bool,
-    ) -> Result<ReuseLedger> {
-        let ledger_path = paths.path.join(REUSE_LEDGER_FILE);
-        let ledger = if ledger_path.is_file() {
-            let bytes = fs::read(&ledger_path)?;
-            ReuseLedger::scan_latest(&bytes).map_err(|message| {
-                let error = Error::Corruption(format!("reuse ledger {message}"));
-                if check_only {
-                    Self::map_check_error(CheckFailureKind::Format, error)
-                } else {
-                    error
-                }
-            })?
-        } else {
-            ReuseLedger::new()
-        };
-        if current_manifest.is_none() && !ledger.attempts().is_empty() {
-            return Err(Error::Corruption(
-                "reuse ledger exists without an authoritative manifest".into(),
-            ));
-        }
-        Ok(ledger)
-    }
-
     fn next_open_identities(
         commit_id: CommitId,
         generation_id: GenerationId,
-        reuse_ledger: &ReuseLedger,
     ) -> Result<(CommitId, GenerationId)> {
-        let mut next_commit_id = CommitId::new(
-            commit_id
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
-        );
-        let mut next_generation_id = GenerationId::new(
-            generation_id
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
-        );
-        for attempt in reuse_ledger.attempts() {
-            let reserved_commit = CommitId::new(
-                attempt
-                    .commit_id
+        // Identities advance monotonically from the authoritative manifest.
+        // A crashed publication that synced its WAL commit record is covered
+        // by recovery (which replays or records that generation before open
+        // completes), so no side ledger is needed to reserve its identity;
+        // attempts that died before the WAL sync left nothing durable and
+        // the ambiguity clause permits their ids to be reused.
+        Ok((
+            CommitId::new(
+                commit_id
                     .get()
                     .checked_add(1)
                     .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
-            );
-            let reserved_generation = GenerationId::new(
-                attempt
-                    .generation_id
+            ),
+            GenerationId::new(
+                generation_id
                     .get()
                     .checked_add(1)
                     .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
-            );
-            next_commit_id = next_commit_id.max(reserved_commit);
-            next_generation_id = next_generation_id.max(reserved_generation);
-        }
-        Ok((next_commit_id, next_generation_id))
+            ),
+        ))
     }
 
     fn load_retention(

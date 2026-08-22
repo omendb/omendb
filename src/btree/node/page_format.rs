@@ -3,7 +3,7 @@
 use super::{Node, PAGE_SIZE};
 
 /// Header size in bytes.
-pub(super) const HEADER_SIZE: usize = 40;
+pub(super) const HEADER_SIZE: usize = 48;
 
 /// Size of each slot entry (offset: u16, key_len: u16).
 pub(super) const SLOT_SIZE: usize = 4;
@@ -12,7 +12,7 @@ pub(super) const SLOT_SIZE: usize = 4;
 pub const BLOB_POINTER_SIZE: usize = 16;
 
 pub(super) const MAGIC: u32 = 0x5345_4552; // "SEER"
-pub(super) const PAGE_VERSION: u32 = 2;
+pub(super) const PAGE_VERSION: u32 = 3;
 
 /// Page type discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +76,11 @@ impl BlobPointer {
     }
 }
 
-/// Fixed-size page header (40 bytes).
+/// Fixed-size page header (48 bytes).
 ///
 /// Layout: magic(4) | version(4) | page_type(4) | count(4) |
-/// free_space(4) | checksum(8) | parent_id(4) | leftmost_child(8)
+/// free_space(4) | checksum(8) | parent_id(4) | leftmost_child(8) |
+/// write_generation(8)
 #[derive(Debug, Clone)]
 pub struct NodeHeader {
     /// Magic number for page identification.
@@ -98,6 +99,10 @@ pub struct NodeHeader {
     pub parent_id: u32,
     /// Leftmost child page ID for internal nodes.
     pub leftmost_child: u64,
+    /// Generation whose publication wrote this page image. Snapshot
+    /// creation compares this against a historical root's generation to
+    /// detect that the mapped bytes were rewritten.
+    pub write_generation: u64,
 }
 
 impl NodeHeader {
@@ -115,6 +120,7 @@ impl NodeHeader {
         buf[20..28].copy_from_slice(&self.checksum.to_le_bytes());
         buf[28..32].copy_from_slice(&self.parent_id.to_le_bytes());
         buf[32..40].copy_from_slice(&self.leftmost_child.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.write_generation.to_le_bytes());
         buf
     }
 
@@ -137,6 +143,9 @@ impl NodeHeader {
         let leftmost_child = u64::from_le_bytes([
             buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
         ]);
+        let write_generation = u64::from_le_bytes([
+            buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
+        ]);
         Self {
             magic,
             version,
@@ -146,6 +155,7 @@ impl NodeHeader {
             checksum,
             parent_id,
             leftmost_child,
+            write_generation,
         }
     }
 
@@ -171,6 +181,7 @@ impl NodeHeader {
             checksum: 0,
             parent_id: 0,
             leftmost_child: 0,
+            write_generation: 0,
         }
     }
 
@@ -348,6 +359,20 @@ impl Node {
     /// Cached parent page ID (0 if root in a fully resident tree).
     pub fn parent_id(&self) -> u32 {
         self.header().parent_id
+    }
+
+    /// Generation whose publication wrote this page image.
+    pub fn write_generation(&self) -> u64 {
+        self.header().write_generation
+    }
+
+    /// Stamp the page with the generation publishing this image. Must be
+    /// called before `update_checksum` so the stamp is covered by the
+    /// checksum.
+    pub fn set_write_generation(&mut self, generation: u64) {
+        let mut header = self.header();
+        header.write_generation = generation;
+        self.set_header(&header);
     }
 
     /// Compute the checksum of the page (excluding the checksum field itself).

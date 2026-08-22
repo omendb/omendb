@@ -212,7 +212,8 @@ fn test_rejects_invalid_slot_bounds() {
     let mut node = Node::new_leaf();
     node.insert(b"key", b"value").unwrap();
     let mut bytes = node.into_bytes();
-    bytes[40..42].copy_from_slice(&1u16.to_le_bytes());
+    // First slot entry lives just past the (48-byte) header.
+    bytes[48..50].copy_from_slice(&1u16.to_le_bytes());
     assert!(Node::from_bytes(bytes).is_none());
 }
 
@@ -274,6 +275,7 @@ fn test_header_roundtrip() {
         checksum: 0xDEAD_BEEF_CAFE_BABE,
         parent_id: 123,
         leftmost_child: 456,
+        write_generation: 789,
     };
     let bytes = header.to_bytes();
     let restored = NodeHeader::from_bytes(&bytes);
@@ -283,6 +285,7 @@ fn test_header_roundtrip() {
     assert_eq!(restored.count, header.count);
     assert_eq!(restored.free_space, header.free_space);
     assert_eq!(restored.checksum, header.checksum);
+    assert_eq!(restored.write_generation, header.write_generation);
     assert_eq!(restored.parent_id, header.parent_id);
     assert_eq!(restored.leftmost_child, header.leftmost_child);
 }

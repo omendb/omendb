@@ -1,16 +1,13 @@
 //! Durable artifact persistence helpers for `DB`.
 //!
-//! This module owns authority-frame publication and reuse-ledger persistence.
+//! This module owns authority-frame publication.
 //! Capacity and reservation policy lives in `capacity.rs`; WAL admission and
 //! journaling live in `wal_admission.rs`. `DB` remains the mutable state
 //! owner and `publication.rs` remains the publication-ordering authority.
 
-use super::artifact_io::{atomic_write_without_fault_injection, sync_directory};
-use super::{DB, Error, REUSE_LEDGER_FILE, Result};
-use crate::storage::format::{Manifest, ReuseLedger};
-use std::fs;
-use std::io::Write;
-use std::path::Path;
+use super::artifact_io::sync_directory;
+use super::{DB, Error, Result};
+use crate::storage::format::Manifest;
 
 impl DB {
     /// Append and sync the authority frame for a maintenance generation.
@@ -36,45 +33,6 @@ impl DB {
             .push(manifest)
             .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         self.manifest_history = history;
-        Ok(())
-    }
-
-    pub(super) fn persist_reuse_ledger(&self) -> Result<()> {
-        Self::persist_reuse_ledger_at(&self.path, &self.reuse_ledger)
-    }
-
-    pub(super) fn persist_reuse_ledger_at(path: &Path, ledger: &ReuseLedger) -> Result<()> {
-        const LEDGER_COMPACTION_THRESHOLD: u64 = 256 * 1024;
-        let ledger_path = path.join(REUSE_LEDGER_FILE);
-        if ledger.attempts().is_empty() {
-            if ledger_path.exists() {
-                fs::remove_file(ledger_path)?;
-                sync_directory(path)?;
-            }
-            return Ok(());
-        }
-        let bytes = ledger
-            .to_bytes()
-            .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?;
-        let existing_len = fs::metadata(&ledger_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if existing_len == 0 {
-            // First creation needs the directory barrier; appends do not.
-            return atomic_write_without_fault_injection(&ledger_path, &bytes);
-        }
-        if existing_len + bytes.len() as u64 > LEDGER_COMPACTION_THRESHOLD {
-            // Append-only history is compacted back to a single envelope so
-            // the file stays bounded under long-running churn.
-            return atomic_write_without_fault_injection(&ledger_path, &bytes);
-        }
-        // Steady state: append one checksummed envelope and sync the file.
-        // Recovery scans for the last valid envelope, so a torn append falls
-        // back to the previous snapshot without a rename or directory sync.
-        let mut file = fs::OpenOptions::new().append(true).open(&ledger_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        crate::storage::record_durability_sync();
         Ok(())
     }
 }

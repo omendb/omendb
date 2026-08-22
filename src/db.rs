@@ -142,7 +142,7 @@ use crate::space::{Device, DeviceOptions};
 use crate::storage::StorageEngine;
 use crate::storage::format::{
     CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestHistory, PmtCheckpointId, ReuseAttempt, ReuseLedger, SnapshotId,
+    ManifestHistory, PmtCheckpointId, SnapshotId,
 };
 pub(super) use io::{decode_u32, decode_u64, read_exact_at};
 use retention_state::RetentionState;
@@ -162,7 +162,6 @@ const WAL_RETENTION_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const META_LOG_FILE: &str = "seerdb.meta.log";
-const REUSE_LEDGER_FILE: &str = "seerdb.reuse-ledger";
 const RETENTION_FILE: &str = "seerdb.retained";
 const LOCK_FILE: &str = "seerdb.lock";
 const ARCHIVE_MARKER_FILE: &str = "seerdb.archive";
@@ -203,8 +202,6 @@ pub struct DB {
 
     /// Durable descriptors for historical roots that can be retained later.
     manifest_history: ManifestHistory,
-    /// Reuse attempts whose publication outcome may be indeterminate.
-    reuse_ledger: ReuseLedger,
     /// Stable database identity.
     database_id: DatabaseId,
     /// Stable logical history identity.

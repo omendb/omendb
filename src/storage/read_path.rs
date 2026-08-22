@@ -67,6 +67,7 @@ impl StorageEngine {
             pmt,
             device,
             next_offset: 0,
+            write_generation: 0,
             free_offsets: Vec::new(),
             pending_reclaimed_offsets: Vec::new(),
             pending_reclaimed_cache_keys: Vec::new(),
