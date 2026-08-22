@@ -129,10 +129,6 @@ mod runner {
                 db.inject_after_manifest_failure();
                 Ok("post-manifest publication")
             }
-            "WalTruncate" => {
-                db.inject_wal_truncate_failure();
-                Ok("WAL retirement")
-            }
             "ShortWrite" => {
                 db.inject_atomic_short_write_failure();
                 Ok("atomic checkpoint short write")

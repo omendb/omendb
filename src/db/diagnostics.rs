@@ -283,7 +283,7 @@ impl DB {
             .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
         let mut pending = Vec::new();
-        let mut saw_commit = false;
+        let mut saw_unpublished_commit = false;
         for record in &records {
             match record.record_type {
                 RecordType::Put => {
@@ -344,20 +344,29 @@ impl DB {
                                 "WAL commit frontier is inconsistent with manifest".into(),
                             ));
                         }
-                        _ => {}
+                        // Published generations are retained by design; only
+                        // commits ahead of the authority would replay. Older
+                        // generations with consistent frontiers are inert.
+                        std::cmp::Ordering::Greater => {
+                            saw_unpublished_commit = true;
+                        }
+                        std::cmp::Ordering::Less => {}
                     }
-                    saw_commit = true;
                     pending.clear();
                 }
                 _ => {}
             }
         }
 
+        // A trailing mutation prefix without a commit envelope is pending
+        // work regardless of published records retained before it.
+        let has_trailing_pending = !pending.is_empty();
         match status {
             ParseStatus::Incomplete => Ok(WalCheckStatus::Incomplete),
             ParseStatus::Complete if records.is_empty() => Ok(WalCheckStatus::Clean),
-            ParseStatus::Complete if saw_commit => Ok(WalCheckStatus::NeedsRecovery),
-            ParseStatus::Complete => Ok(WalCheckStatus::Pending),
+            ParseStatus::Complete if saw_unpublished_commit => Ok(WalCheckStatus::NeedsRecovery),
+            ParseStatus::Complete if has_trailing_pending => Ok(WalCheckStatus::Pending),
+            ParseStatus::Complete => Ok(WalCheckStatus::Clean),
             ParseStatus::Corrupt => unreachable!("corrupt WAL status returned above"),
         }
     }

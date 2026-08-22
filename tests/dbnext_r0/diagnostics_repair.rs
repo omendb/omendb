@@ -42,7 +42,10 @@ fn dbnext_r0_offline_check_is_read_only_and_reports_wal_state() {
     db.flush().unwrap();
     let clean = DB::check(&path, Options::default()).unwrap();
     assert_eq!(clean.wal_status, WalCheckStatus::Clean);
-    assert_eq!(clean.verification.wal_bytes, 0);
+    assert_eq!(
+        clean.verification.wal_bytes,
+        fs::metadata(path.join("seerdb.wal")).unwrap().len()
+    );
 }
 
 #[test]

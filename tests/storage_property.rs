@@ -376,7 +376,7 @@ proptest! {
         new_value in prop::collection::vec(any::<u8>(), 1_025..2_049)
     ) {
         for segmented in [false, true] {
-            for fault in 0u8..15 {
+            for fault in 0u8..14 {
                 let directory = tempdir().unwrap();
                 let path = directory.path().join("publication-property.db");
                 let options = Options {
@@ -423,8 +423,7 @@ proptest! {
                         10 => db.inject_wal_after_write_failure(),
                         11 => db.inject_wal_sync_failure(),
                         12 => db.inject_wal_after_sync_failure(),
-                        13 => db.inject_wal_truncate_failure(),
-                        14 => db.inject_meta_log_sync_failure(),
+                        13 => db.inject_meta_log_sync_failure(),
                         _ => unreachable!(),
                     }
                     assert!(db.flush().is_err());

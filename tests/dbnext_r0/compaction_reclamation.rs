@@ -412,7 +412,7 @@ fn dbnext_r0_manifest_sync_fault_fences_compaction_and_recovers() {
 }
 
 #[test]
-fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
+fn dbnext_r0_post_manifest_fault_recovers_prior_generation() {
     fn run_case<F>(root: &Path, name: &str, inject: F, expect_wal_before_reopen: bool)
     where
         F: FnOnce(&DB),
@@ -429,9 +429,12 @@ fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
         assert_eq!(path.join("seerdb.wal").exists(), expect_wal_before_reopen);
 
         drop(db);
-        let reopened = DB::open(&path, Options::default()).unwrap();
+        let mut reopened = DB::open(&path, Options::default()).unwrap();
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
         assert!(!reopened.durability_status().write_fenced);
+        // Retained WAL is inert after recovery and reclaimed on clean close.
+        assert!(path.join("seerdb.wal").exists());
+        reopened.close().unwrap();
         assert!(!path.join("seerdb.wal").exists());
     }
 
@@ -442,12 +445,8 @@ fn dbnext_r0_post_manifest_and_wal_truncate_faults_recover() {
         DB::inject_after_manifest_failure,
         true,
     );
-    run_case(
-        root.path(),
-        "wal-truncate.db",
-        DB::inject_wal_truncate_failure,
-        false,
-    );
+    // The wal-truncate fault case retired with WAL retention: successful
+    // publications no longer remove the file, so the seam cannot fire here.
 }
 
 #[test]
@@ -529,5 +528,5 @@ fn dbnext_r0_final_write_disk_full_fences_and_recovers_prior_generation() {
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
     assert_eq!(reopened.durability_status().commit_id.get(), 1);
     assert!(!reopened.durability_status().write_fenced);
-    assert_eq!(reopened.verify().unwrap().wal_bytes, 0);
+    assert!(reopened.verify().unwrap().wal_bytes > 0);
 }

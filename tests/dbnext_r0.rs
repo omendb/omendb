@@ -246,7 +246,11 @@ fn dbnext_r0_checkpoint_is_verified_and_idempotent_when_clean() {
 
     let first = db.checkpoint().unwrap();
     assert_eq!(first.durability.commit_id.get(), 1);
-    assert_eq!(first.wal_bytes, 0);
+    // Retained WAL: the checkpoint report reflects the retained log.
+    assert_eq!(
+        first.wal_bytes,
+        fs::metadata(path.join("seerdb.wal")).unwrap().len()
+    );
     let second = db.checkpoint().unwrap();
     assert_eq!(second, first);
     assert_eq!(db.get(b"checkpointed").unwrap(), Some(b"value".to_vec()));
@@ -429,7 +433,8 @@ fn dbnext_r0_wal_mutation_faults_fence_and_recover_prior_state() {
         );
         assert_eq!(reopened.get(b"pending").unwrap(), None);
         assert!(!reopened.durability_status().write_fenced);
-        assert!(!path.join("seerdb.wal").exists());
+        // Retained WAL: inert records stay until clean close.
+        assert!(path.join("seerdb.wal").exists());
     }
 
     let root = tempdir().unwrap();
@@ -664,7 +669,6 @@ fn dbnext_r0_process_crash_publication_matrix() {
             "manifest-mirror-sync" => db.inject_manifest_mirror_sync_failure(),
             "manifest-sync" => db.inject_manifest_sync_failure(),
             "after-manifest" => db.inject_after_manifest_failure(),
-            "wal-truncate" => db.inject_wal_truncate_failure(),
             "final-disk-full" => db.inject_final_write_disk_full(),
             _ => panic!("unknown process crash fault {fault}"),
         }
@@ -688,7 +692,6 @@ fn dbnext_r0_process_crash_publication_matrix() {
         ("manifest-mirror-sync", Expected::Old),
         ("manifest-sync", Expected::Either),
         ("after-manifest", Expected::New),
-        ("wal-truncate", Expected::New),
         ("final-disk-full", Expected::Old),
     ];
     let root = tempdir().unwrap();

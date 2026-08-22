@@ -39,7 +39,8 @@ fn test_db_metrics_attribute_page_work_and_lazy_reads() {
         assert_eq!(metrics.storage.generation_flushes, 1);
         assert_eq!(metrics.storage.syncs, 1);
         assert_eq!(metrics.data_bytes, PAGE_SIZE as u64);
-        assert_eq!(metrics.wal_bytes, 0);
+        // Retained WAL reports the log size instead of resetting to zero.
+        assert!(metrics.wal_bytes > 0);
         assert!(metrics.publication.wal_bytes_written > 0);
         assert!(metrics.publication.metadata_bytes_written > 0);
         assert_eq!(metrics.publication.blob_bytes_written, 0);
@@ -164,6 +165,10 @@ fn test_db_metadata_delta_corruption_falls_back_to_resolvable_root() {
     let corrupt_at = target.expect("generation 2 frame");
     bytes[corrupt_at] ^= 0xA5;
     fs::write(&metadata_log, &bytes).unwrap();
+    // This test exercises pure metadata resolution, so drop the retained
+    // WAL (as a clean close would): otherwise recovery replays generation
+    // 2's commit ahead of the fallen-back frontier.
+    fs::remove_file(path.join(WAL_FILE)).unwrap();
     // The corrupt newest frame no longer hides the database: authority
     // selection falls back to the previous resolvable publication frame.
     let reopened = DB::open(&path, Options::default()).unwrap();
@@ -211,6 +216,45 @@ fn test_db_metadata_delta_corruption_falls_back_to_resolvable_root() {
         Err(error) => panic!("anchorless delta should fall back, not fail: {error:?}"),
     };
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-1".to_vec()));
+    reopened.verify().unwrap();
+    reopened.close().unwrap();
+}
+
+#[test]
+fn test_db_retained_wal_recovers_acked_generation_after_frame_corruption() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("retained-wal-acked-generation.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"key", b"value-1").unwrap();
+    db.flush().unwrap();
+    db.put(b"key", b"value-2").unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    // Corrupt generation 2's frame payload so authority selection falls
+    // back to generation 1. Generation 2's publication was acknowledged and
+    // its WAL commit record is retained ahead of generation 1's frontier,
+    // so recovery replays it instead of losing the acknowledged value.
+    let metadata_log = DB::metadata_log_path(&path);
+    let mut bytes = fs::read(&metadata_log).unwrap();
+    let mut cursor = 12usize;
+    let mut target = None;
+    while cursor + 16 <= bytes.len() {
+        let payload_len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let frame_id = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+        if frame_id == 2 {
+            target = Some(cursor + 16 + payload_len / 2);
+            break;
+        }
+        cursor += 16 + payload_len;
+    }
+    let corrupt_at = target.expect("generation 2 frame");
+    bytes[corrupt_at] ^= 0xA5;
+    fs::write(&metadata_log, &bytes).unwrap();
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"key").unwrap(), Some(b"value-2".to_vec()));
     reopened.verify().unwrap();
     reopened.close().unwrap();
 }
@@ -359,8 +403,12 @@ fn test_db_wal_admission_rejects_before_blob_or_tree_mutation() {
     );
     db.flush().unwrap();
     assert!(!path.join(BLOB_RESERVATION_FILE).exists());
-    assert!(!path.join(WAL_FILE).exists());
-    assert_eq!(db.metrics().unwrap().wal_reserved_bytes, 0);
+    // Retained WAL keeps its reservation across publications.
+    assert!(path.join(WAL_FILE).exists());
+    assert_eq!(
+        db.metrics().unwrap().wal_reserved_bytes,
+        WAL_RESERVATION_SEGMENT_BYTES
+    );
     drop(db);
 
     let reopened = DB::open(&path, Options::for_test()).unwrap();

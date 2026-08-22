@@ -112,8 +112,7 @@ use faults::{
     FAIL_NEXT_BLOB_SEGMENT_CATALOG_TORN_WRITE, FAIL_NEXT_BLOB_SEGMENT_PRUNE_AFTER_REMOVE,
     FAIL_NEXT_BLOB_SEGMENT_SHORT_WRITE, FAIL_NEXT_BLOB_SEGMENT_SYNC,
     FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE, FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
-    FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE, FAIL_NEXT_WAL_SYNC,
-    FAIL_NEXT_WAL_TRUNCATE, FAIL_NEXT_WAL_WRITE,
+    FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE, FAIL_NEXT_WAL_SYNC, FAIL_NEXT_WAL_WRITE,
 };
 use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
@@ -157,6 +156,9 @@ use vacuum::VacuumState;
 /// File names for the database.
 const DATA_FILE: &str = "seerdb.data";
 const WAL_FILE: &str = "seerdb.wal";
+
+/// Retained WAL bytes allowed before a publication reclaims the file.
+const WAL_RETENTION_RECLAIM_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_RESERVATION_FILE: &str = "seerdb.wal.reserve";
 const META_FILE: &str = "seerdb.meta";
 const META_LOG_FILE: &str = "seerdb.meta.log";

@@ -221,13 +221,7 @@ fn dbnext_r0_batch_transaction_faults_require_explicit_recovery() {
         b"after",
         false,
     );
-    run_case(
-        root.path(),
-        "transaction-wal-truncate.db",
-        DB::inject_wal_truncate_failure,
-        b"after",
-        false,
-    );
+    // wal-truncate case retired with WAL retention.
 }
 
 #[test]
@@ -361,12 +355,7 @@ fn dbnext_r0_grouped_batch_transaction_faults_are_atomic() {
         DB::inject_after_manifest_failure,
         RecoveryOutcome::New,
     );
-    run_case(
-        root.path(),
-        "grouped-wal-truncate.db",
-        DB::inject_wal_truncate_failure,
-        RecoveryOutcome::New,
-    );
+    // wal-truncate case retired with WAL retention.
 }
 
 #[test]

@@ -15,7 +15,8 @@ fn dbnext_r0_snapshot_is_verified_and_source_is_unchanged() {
 
     let source_report = source.verify().unwrap();
     assert!(source_report.verified_pages > 0);
-    assert_eq!(source_report.wal_bytes, 0);
+    // Retained WAL: verify reports the retained log instead of zero.
+    assert!(source_report.wal_bytes > 0);
 
     let snapshot = source.snapshot(&snapshot_path).unwrap();
     assert_eq!(snapshot.source, source_report.durability);

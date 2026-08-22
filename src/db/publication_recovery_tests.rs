@@ -39,7 +39,8 @@ fn test_db_process_crash_recovery() {
         Some(b"value-before-crash".to_vec())
     );
     assert_eq!(db.get(b"unpublished").unwrap(), None);
-    assert!(!path.join(WAL_FILE).exists());
+    // Retained WAL: published records stay until clean close.
+    assert!(path.join(WAL_FILE).exists());
 }
 
 #[test]
@@ -134,7 +135,8 @@ fn test_db_recovers_committed_wal_prefix_with_torn_suffix() {
     assert_eq!(db.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     assert_eq!(db.get(b"key2").unwrap(), Some(b"value2".to_vec()));
     assert_eq!(db.get(b"key3").unwrap(), Some(b"value3".to_vec()));
-    assert!(!path.join(WAL_FILE).exists());
+    // Retained WAL: published records stay until clean close.
+    assert!(path.join(WAL_FILE).exists());
     assert!(DB::metadata_log_path(&path).is_file());
 }
 
@@ -338,5 +340,6 @@ fn test_db_discards_wal_after_publication_sync_failure() {
 
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), None);
-    assert!(!path.join(WAL_FILE).exists());
+    // Retained WAL: published records stay until clean close.
+    assert!(path.join(WAL_FILE).exists());
 }

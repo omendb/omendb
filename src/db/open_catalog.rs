@@ -98,10 +98,12 @@ impl DB {
             && parsed_meta_log
                 .as_ref()
                 .is_none_or(|parsed| parsed.frames.is_empty())
-            && !paths.wal.is_file()
         {
-            // Page data without any authority frame or WAL must never be
-            // reinterpreted as a fresh database.
+            // Page data without any authority frame must never be
+            // reinterpreted as a fresh database. A retained WAL does not
+            // substitute for authority: replaying it with no manifest would
+            // resurrect never-published mutations. Every legitimate database
+            // has at least the generation-0 bootstrap frame.
             return Err(Error::Corruption(
                 "data file has no authoritative metadata log or WAL".into(),
             ));

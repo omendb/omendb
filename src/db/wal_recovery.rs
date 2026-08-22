@@ -7,6 +7,40 @@ use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
 use crate::storage::format::Manifest;
 use std::path::Path;
 
+/// Whether the WAL holds any committed generation ahead of the authority,
+/// i.e. content recovery would replay. Retained records at or below the
+/// published generation are inert, so their presence alone must not force
+/// eager materialization on open.
+pub(super) fn wal_has_unpublished_commits(
+    wal_path: &Path,
+    current_manifest: Option<Manifest>,
+) -> Result<bool> {
+    let bytes = std::fs::read(wal_path)?;
+    let (records, status) = WalManager::parse_records_with_status(&bytes);
+    if status == ParseStatus::Corrupt {
+        return Err(Error::Corruption("invalid complete WAL record".into()));
+    }
+    let current_generation = current_manifest
+        .map(|manifest| manifest.generation_id.get())
+        .unwrap_or(0);
+    let current_commit = current_manifest
+        .map(|manifest| manifest.commit_id.get())
+        .unwrap_or(0);
+    for record in &records {
+        if let RecordType::Commit = record.record_type {
+            let commit = record
+                .commit_record()
+                .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+            if commit.generation_id.get() > current_generation
+                && commit.commit_id.get() > current_commit
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Recover a committed WAL prefix and reject corrupt complete records.
 pub(super) fn recover_from_wal(
     wal_path: &Path,
@@ -127,6 +161,27 @@ pub(super) fn recover_from_wal(
         last_commit_offset,
         blob_changed,
     })
+}
+
+/// Remove any torn or zeroed tail so future appends land on a record
+/// boundary. Retention keeps the WAL across publications; without this,
+/// post-crash appends would follow an unparseable partial record.
+pub(super) fn truncate_wal_tail(wal_path: &Path) -> Result<()> {
+    let bytes = std::fs::read(wal_path)?;
+    let (_, status) = WalManager::parse_records_with_status(&bytes);
+    if status != ParseStatus::Incomplete {
+        return Ok(());
+    }
+    let (records, _) = WalManager::parse_records_with_status(&bytes);
+    let mut end = 0u64;
+    for record in &records {
+        end += record.to_bytes().len() as u64;
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(wal_path)?;
+    file.set_len(end)?;
+    file.sync_data()?;
+    crate::storage::record_durability_sync();
+    Ok(())
 }
 
 pub(super) fn extend_digest(current: u32, record: &WalRecord) -> u32 {

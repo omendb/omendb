@@ -15,6 +15,13 @@ impl DB {
         if self.is_open {
             if !self.read_only {
                 self.flush()?;
+                // Clean shutdown reclaims the retained WAL; crash paths leave
+                // it for recovery, which skips or validates published records.
+                let wal_path = self.path.join(WAL_FILE);
+                if wal_path.exists() {
+                    fs::remove_file(&wal_path)?;
+                    sync_directory(&self.path)?;
+                }
             }
             self.is_open = false;
             if let Some(lock_file) = self.lock_file.take() {

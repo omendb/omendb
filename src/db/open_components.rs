@@ -61,10 +61,15 @@ pub(super) fn build(
     } else if !paths.wal.exists() {
         engine.load_from_disk()?;
     }
-    if paths.wal.exists() && !catalog.check_only {
-        engine.ensure_materialized()?;
+    let wal_present = paths.wal.exists();
+    if wal_present && !catalog.check_only {
+        wal_recovery::truncate_wal_tail(&paths.wal)?;
     }
-    let recovery = if paths.wal.exists() && !catalog.check_only {
+    let needs_recovery = wal_present
+        && !catalog.check_only
+        && wal_recovery::wal_has_unpublished_commits(&paths.wal, catalog.current_manifest)?;
+    let recovery = if needs_recovery {
+        engine.ensure_materialized()?;
         Some(wal_recovery::recover_from_wal(
             &paths.wal,
             catalog.current_manifest,

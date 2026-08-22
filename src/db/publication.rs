@@ -234,20 +234,25 @@ impl DB {
 
         self.engine.complete_generation();
 
+        // Retain the WAL across publications: the file's reservation stays
+        // valid, so the next publication skips the reserve-and-directory
+        // barrier entirely. Recovery makes retained records inert (commits at
+        // or below the published generation are skipped or validated against
+        // the manifest), so only unbounded growth needs bounding: once the
+        // retained log passes the reclaim threshold, pay the removal and let
+        // the next admission re-reserve.
         if wal_path.exists() {
-            fs::remove_file(&wal_path)?;
-
-            #[cfg(any(test, feature = "fault-injection"))]
-            if FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.replace(false)) {
-                return Err(std::io::Error::other("injected WAL truncate failure").into());
+            let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            if wal_len >= WAL_RETENTION_RECLAIM_BYTES {
+                fs::remove_file(&wal_path)?;
+                self.wal_reserved_extent = 0;
+                // WAL removal is cleanup after the manifest has selected the
+                // generation. If the directory entry removal is not durable, a
+                // reopen sees the already-published commit and discards the stale
+                // WAL; forcing that non-authoritative deletion would add one
+                // directory sync to every successful publication.
             }
-            // WAL removal is cleanup after the manifest has selected the
-            // generation. If the directory entry removal is not durable, a
-            // reopen sees the already-published commit and discards the stale
-            // WAL; forcing that non-authoritative deletion would add one
-            // directory sync to every successful publication.
         }
-        self.wal_reserved_extent = 0;
         self.publication_timing.cleanup_ns = self
             .publication_timing
             .cleanup_ns

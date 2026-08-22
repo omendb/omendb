@@ -608,10 +608,15 @@ fn test_db_discards_uncommitted_wal_suffix() {
         assert_eq!(db.get(b"key3").unwrap(), None);
     }
 
-    // The uncommitted WAL suffix can be discarded after reopen.
+    // The uncommitted suffix is inert after recovery; the retained file
+    // is reclaimed on clean close.
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.close().unwrap();
+    }
     assert!(
         !path.join(WAL_FILE).exists(),
-        "WAL should be deleted after recovery"
+        "clean close should reclaim the retained WAL"
     );
 }
 
@@ -801,7 +806,8 @@ fn test_db_discards_wal_commit_already_published_by_manifest() {
     assert_eq!(reopened.commit_id, commit_id);
     assert_eq!(reopened.generation_id, generation_id);
     assert_eq!(reopened.metrics().unwrap().storage.generation_flushes, 0);
-    assert!(!path.join(WAL_FILE).exists());
+    // Retained WAL: published records stay until clean close.
+    assert!(path.join(WAL_FILE).exists());
 }
 
 #[test]

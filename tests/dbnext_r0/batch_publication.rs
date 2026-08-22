@@ -44,7 +44,8 @@ fn dbnext_r0_atomic_batch_commit_reopens_inline_and_blob_values() {
         reopened.get(b"tenant/2/inline").unwrap(),
         Some(b"beta".to_vec())
     );
-    assert_eq!(reopened.verify().unwrap().wal_bytes, 0);
+    // Retained WAL: verify reports the retained log instead of zero.
+    assert!(reopened.verify().unwrap().wal_bytes > 0);
 }
 
 #[test]
@@ -115,7 +116,8 @@ fn dbnext_r0_atomic_batch_wal_failure_drops_the_whole_candidate() {
         assert_eq!(reopened.get(b"batch/b").unwrap(), None);
         assert_eq!(reopened.durability_status().commit_id.get(), 0);
         assert!(!reopened.durability_status().write_fenced);
-        assert!(!path.join("seerdb.wal").exists());
+        // Retained WAL: published/unpublished-but-inert records stay until clean close.
+        assert!(path.join("seerdb.wal").exists());
     }
 
     let root = tempdir().unwrap();
@@ -176,7 +178,8 @@ fn dbnext_r0_atomic_batch_post_manifest_failure_recovers_whole_batch() {
     assert_eq!(reopened.get(b"batch/b").unwrap(), Some(b"b".to_vec()));
     assert_eq!(reopened.durability_status().commit_id.get(), 1);
     assert!(!reopened.durability_status().write_fenced);
-    assert!(!path.join("seerdb.wal").exists());
+    // Retained WAL: inert records stay until clean close.
+    assert!(path.join("seerdb.wal").exists());
 }
 
 #[test]

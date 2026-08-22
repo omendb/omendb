@@ -20,9 +20,15 @@ fn test_db_check_is_non_mutating_and_does_not_take_writer_lock() {
 
     db.flush().unwrap();
     let clean = DB::check(&path, Options::default()).unwrap();
+    // Published records stay retained until clean close, so wal_bytes
+    // reports the retained log instead of zero.
     assert_eq!(clean.wal_status, WalCheckStatus::Clean);
-    assert_eq!(clean.verification.wal_bytes, 0);
+    assert_eq!(
+        clean.verification.wal_bytes,
+        fs::metadata(path.join(WAL_FILE)).unwrap().len()
+    );
     db.close().unwrap();
+    assert!(!path.join(WAL_FILE).exists());
 }
 
 #[test]

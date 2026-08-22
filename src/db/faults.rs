@@ -15,7 +15,6 @@ thread_local! {
     pub(super) static FAIL_NEXT_WAL_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_WAL_AFTER_SYNC: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_AFTER_MANIFEST: Cell<bool> = const { Cell::new(false) };
-    pub(super) static FAIL_NEXT_WAL_TRUNCATE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_ATOMIC_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_ATOMIC_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_AFTER_BLOB_REWRITE_IMAGE: Cell<bool> = const { Cell::new(false) };
@@ -145,11 +144,6 @@ impl DB {
     /// Inject one failure after the next manifest becomes authoritative.
     pub fn inject_after_manifest_failure(&self) {
         FAIL_NEXT_AFTER_MANIFEST.with(|failure| failure.set(true));
-    }
-
-    /// Inject one failure after the next WAL file is removed.
-    pub fn inject_wal_truncate_failure(&self) {
-        FAIL_NEXT_WAL_TRUNCATE.with(|failure| failure.set(true));
     }
 
     /// Inject one truncated atomic checkpoint image before manifest publish.
