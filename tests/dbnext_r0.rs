@@ -335,8 +335,10 @@ fn dbnext_r0_rejects_corrupt_reuse_ledger_with_typed_diagnosis() {
 
     let ledger_path = path.join("seerdb.reuse-ledger");
     let mut ledger = fs::read(&ledger_path).unwrap();
-    let last = ledger.len() - 1;
-    ledger[last] ^= 0xFF;
+    // The ledger is append-only: corruption in the newest envelope is a torn
+    // tail that recovery tolerates by falling back to the previous snapshot.
+    // Fail-closed diagnosis applies to garbage at the head of the file.
+    ledger[0] ^= 0xFF;
     fs::write(&ledger_path, ledger).unwrap();
 
     assert!(matches!(

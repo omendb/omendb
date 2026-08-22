@@ -9,6 +9,7 @@ use super::artifact_io::{atomic_write_without_fault_injection, sync_directory};
 use super::{DB, Error, REUSE_LEDGER_FILE, Result};
 use crate::storage::format::{Manifest, ReuseLedger};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 impl DB {
@@ -43,6 +44,7 @@ impl DB {
     }
 
     pub(super) fn persist_reuse_ledger_at(path: &Path, ledger: &ReuseLedger) -> Result<()> {
+        const LEDGER_COMPACTION_THRESHOLD: u64 = 256 * 1024;
         let ledger_path = path.join(REUSE_LEDGER_FILE);
         if ledger.attempts().is_empty() {
             if ledger_path.exists() {
@@ -54,6 +56,25 @@ impl DB {
         let bytes = ledger
             .to_bytes()
             .ok_or_else(|| Error::Wal("reuse ledger is too large".into()))?;
-        atomic_write_without_fault_injection(&ledger_path, &bytes)
+        let existing_len = fs::metadata(&ledger_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if existing_len == 0 {
+            // First creation needs the directory barrier; appends do not.
+            return atomic_write_without_fault_injection(&ledger_path, &bytes);
+        }
+        if existing_len + bytes.len() as u64 > LEDGER_COMPACTION_THRESHOLD {
+            // Append-only history is compacted back to a single envelope so
+            // the file stays bounded under long-running churn.
+            return atomic_write_without_fault_injection(&ledger_path, &bytes);
+        }
+        // Steady state: append one checksummed envelope and sync the file.
+        // Recovery scans for the last valid envelope, so a torn append falls
+        // back to the previous snapshot without a rename or directory sync.
+        let mut file = fs::OpenOptions::new().append(true).open(&ledger_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        crate::storage::record_durability_sync();
+        Ok(())
     }
 }

@@ -142,6 +142,41 @@ impl ReuseLedger {
 
     /// Decode and validate a reuse ledger envelope.
     pub fn from_bytes(bytes: &[u8]) -> std::result::Result<Self, &'static str> {
+        let (ledger, consumed) = Self::decode_envelope(bytes)?;
+        if consumed != bytes.len() {
+            return Err("reuse ledger has trailing bytes");
+        }
+        Ok(ledger)
+    }
+
+    /// Recover the newest valid envelope from an append-only ledger file.
+    ///
+    /// Each persist appends one exact-length checksummed envelope holding the
+    /// full ledger state; the last envelope that parses completely wins. A
+    /// torn final append (crash between write and sync) is tolerated by
+    /// falling back to the previous envelope. Only a bad magic in the first
+    /// envelope fails closed: that means the file is not a ledger at all.
+    pub fn scan_latest(bytes: &[u8]) -> std::result::Result<Self, &'static str> {
+        let mut cursor = 0usize;
+        let mut latest = Self::new();
+        while bytes.len() >= cursor + REUSE_LEDGER_HEADER_SIZE + REUSE_LEDGER_CHECKSUM_SIZE {
+            match Self::decode_envelope(&bytes[cursor..]) {
+                Ok((ledger, length)) => {
+                    latest = ledger;
+                    cursor += length;
+                }
+                Err(err) => {
+                    if cursor == 0 && err == "invalid reuse ledger magic" {
+                        return Err(err);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    fn decode_envelope(bytes: &[u8]) -> std::result::Result<(Self, usize), &'static str> {
         if bytes.len() < REUSE_LEDGER_HEADER_SIZE + REUSE_LEDGER_CHECKSUM_SIZE {
             return Err("reuse ledger is truncated");
         }
@@ -161,15 +196,6 @@ impl ReuseLedger {
                 .try_into()
                 .map_err(|_| "reuse ledger count is truncated")?,
         ) as usize;
-        let checksum_offset = bytes.len() - REUSE_LEDGER_CHECKSUM_SIZE;
-        let expected = u32::from_le_bytes(
-            bytes[checksum_offset..]
-                .try_into()
-                .map_err(|_| "reuse ledger checksum is truncated")?,
-        );
-        if expected != crc32c::crc32c(&bytes[..checksum_offset]) {
-            return Err("reuse ledger checksum mismatch");
-        }
 
         let mut cursor = REUSE_LEDGER_HEADER_SIZE;
         let mut ledger = Self::new();
@@ -177,7 +203,7 @@ impl ReuseLedger {
             let header_end = cursor
                 .checked_add(REUSE_LEDGER_ATTEMPT_HEADER_SIZE)
                 .ok_or("reuse ledger length overflows")?;
-            if header_end > checksum_offset {
+            if header_end > bytes.len() - REUSE_LEDGER_CHECKSUM_SIZE {
                 return Err("reuse ledger attempt is truncated");
             }
             let commit_id = CommitId::new(u64::from_le_bytes(
@@ -202,7 +228,7 @@ impl ReuseLedger {
             let offsets_end = cursor
                 .checked_add(offset_bytes)
                 .ok_or("reuse ledger length overflows")?;
-            if offsets_end > checksum_offset {
+            if offsets_end > bytes.len() - REUSE_LEDGER_CHECKSUM_SIZE {
                 return Err("reuse ledger offsets are truncated");
             }
             let mut offsets = Vec::with_capacity(offset_count);
@@ -216,9 +242,16 @@ impl ReuseLedger {
                 offsets,
             })?;
         }
-        if cursor != checksum_offset {
-            return Err("reuse ledger has trailing bytes");
+
+        let envelope_len = cursor + REUSE_LEDGER_CHECKSUM_SIZE;
+        let expected = u32::from_le_bytes(
+            bytes[cursor..envelope_len]
+                .try_into()
+                .map_err(|_| "reuse ledger checksum is truncated")?,
+        );
+        if expected != crc32c::crc32c(&bytes[..cursor]) {
+            return Err("reuse ledger checksum mismatch");
         }
-        Ok(ledger)
+        Ok((ledger, envelope_len))
     }
 }

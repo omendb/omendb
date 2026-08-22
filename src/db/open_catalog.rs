@@ -226,7 +226,7 @@ impl DB {
         let ledger_path = paths.path.join(REUSE_LEDGER_FILE);
         let ledger = if ledger_path.is_file() {
             let bytes = fs::read(&ledger_path)?;
-            ReuseLedger::from_bytes(&bytes).map_err(|message| {
+            ReuseLedger::scan_latest(&bytes).map_err(|message| {
                 let error = Error::Corruption(format!("reuse ledger {message}"));
                 if check_only {
                     Self::map_check_error(CheckFailureKind::Format, error)
