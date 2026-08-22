@@ -80,7 +80,10 @@ impl DB {
             return Err(error);
         }
         self.persist_reuse_ledger()?;
-
+        self.publication_timing.admission_ns = self
+            .publication_timing
+            .admission_ns
+            .saturating_add(elapsed_nanos(admission_started));
         let flush_started = Instant::now();
         let flush_result = self.engine.flush_after_reclamation_refresh();
         self.publication_timing.data_flush_ns = self
