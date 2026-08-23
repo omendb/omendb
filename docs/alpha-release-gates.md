@@ -59,7 +59,9 @@ passing fixtures and published evidence.
 - [ ] concurrent transaction tests cover read/write, write/write, unique,
       foreign-key, snapshot, cancellation, and admission outcomes;
 - [ ] every durable publication seam has a process-level kill/reopen test;
-- [ ] a versioned on-disk fixture proves the documented open/upgrade policy.
+- [x] a versioned on-disk fixture (`tests/fixtures/format-current/`,
+      regenerated deliberately per format change) proves the documented
+      open/upgrade policy.
 
 ### Durability and operations
 
