@@ -52,7 +52,7 @@ passing fixtures and published evidence.
 - [x] typed and SQL tests pass on both temporary and SeerDB backends;
 - [x] SQL three-valued logic tests cover `NULL`, `IN`, `NOT IN`, `BETWEEN`,
       joins, and `DISTINCT` with pagination;
-- [ ] differential SQL tests compare the overlapping bounded subset with an
+- [x] differential SQL tests compare the overlapping bounded subset with an
       independent SQLite oracle;
 - [ ] property/fuzz tests exercise row encoding, catalog/index maintenance,
       SQL values, and transaction sequences;
