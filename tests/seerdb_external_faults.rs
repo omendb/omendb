@@ -3,10 +3,14 @@ use std::process::Command;
 
 #[cfg(feature = "seerdb-fault-injection")]
 use omendb::FaultPoint;
+#[cfg(feature = "seerdb-fault-injection")]
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, CommitId, DatabaseConfig, DbError, IndexDefinition,
-    IndexId, Key, KvMutation, RelationalBackendConfig, RelationalDatabase, RelationalMutation, Row,
-    SeerKernel, SeerKernelConfig, SeerRelationalStore, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, RelationalMutation, Row,
+    SeerRelationalStore, TableDefinition, TableId, Value,
+};
+use omendb::{
+    CommitId, DatabaseConfig, DbError, KvMutation, RelationalBackendConfig, RelationalDatabase,
+    SeerKernel, SeerKernelConfig,
 };
 use tempfile::tempdir;
 

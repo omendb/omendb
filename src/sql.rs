@@ -412,10 +412,13 @@ fn parse_cache() -> &'static std::sync::Mutex<HashMap<String, Statement>> {
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Wire-tier helpers: only the feature-gated pgwire server consults these.
+#[cfg(feature = "pgwire")]
 pub(super) fn parse_statement(sql: &str) -> Result<Statement> {
     parse_one(sql)
 }
 
+#[cfg(feature = "pgwire")]
 pub(super) fn table_from_join_name(table: &sqlparser::ast::TableWithJoins) -> Result<String> {
     let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
         return Err(unsupported("FROM", "only plain tables are supported"));
@@ -583,6 +586,7 @@ pub(super) fn simple_object_name<'a>(
 /// Tables a statement reads and writes, plus whether it is schema
 /// administration. Used by the wire tier's grant enforcement; embedded
 /// callers are trusted and never consult this.
+#[cfg(feature = "pgwire")]
 pub(super) fn statement_access(
     sql: &str,
 ) -> Result<(
