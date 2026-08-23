@@ -64,8 +64,9 @@ passing fixtures and published evidence.
 ### Durability and operations
 
 - [x] corruption, archive, compaction, and external fault tests exist;
-- [ ] the crash matrix runs from a clean subprocess for create, commit,
-      checkpoint, compaction, archive restore, and reopen;
+- [x] the crash matrix runs from a clean subprocess for create, commit,
+      checkpoint, compaction, archive restore, reopen, and the SQL batch
+      boundary;
 - [ ] `verify`, diagnostics, support bundles, and recovery-required behavior
       have an operator-facing runbook;
 - [ ] recovery tests assert both the durable outcome and the allowed next
@@ -85,6 +86,23 @@ passing fixtures and published evidence.
 - [ ] release CI runs a small regression workload with thresholds and stores
       machine/workload metadata; no absolute cross-machine claim is made from
       one local run.
+
+### Recorded single-client baselines (macOS aarch64, release, batch-size 1)
+
+From `alpha_oltp --rows 512 --operations 1000 --read-percent 80`, one local
+run per backend; these are working baselines for regression tracking, not
+competitive claims:
+
+| backend | throughput | p50 | p95 | p99 | db bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| temporary | 964 ops/s | 13 us | 5.3 ms | 6.1 ms | 85 KB |
+| seer | 249 ops/s | 27 us | 17 ms | 20 ms | 338 KB |
+| sqlite | 68,591 ops/s | 2.3 us | 55 us | 65 us | 16 KB |
+
+At `--batch-size 32` the same Seer workload reaches ~1,631 ops/s (6.5x),
+confirming durable publication as the dominant write cost; SQLite's
+autocommit path remains orders of magnitude ahead and closing that gap is
+the open performance work.
 
 ### Packaging and support
 

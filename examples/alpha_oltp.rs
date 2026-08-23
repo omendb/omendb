@@ -78,6 +78,7 @@ struct RunResult {
     elapsed_nanos: u128,
     latencies_nanos: Vec<u64>,
     final_checksum: i128,
+    database_bytes: u64,
 }
 
 fn main() -> Result<()> {
@@ -96,11 +97,13 @@ fn main() -> Result<()> {
                 RelationalBackendConfig::Temporary(DatabaseConfig {
                     directory: temp.path().join("temporary"),
                 }),
+                temp.path().join("temporary"),
                 workload,
             )?,
             Backend::Seer => run_omendb(
                 Backend::Seer,
                 RelationalBackendConfig::Seer(SeerKernelConfig::new(temp.path().join("seer"))),
+                temp.path().join("seer"),
                 workload,
             )?,
             Backend::Sqlite => run_sqlite(temp.path().join("sqlite.db"), workload)?,
@@ -116,6 +119,7 @@ fn main() -> Result<()> {
 fn run_omendb(
     backend: Backend,
     config: RelationalBackendConfig,
+    database_directory: impl AsRef<Path>,
     workload: Workload,
 ) -> Result<RunResult> {
     let mut database = RelationalDatabase::create(config).context("create OmenDB database")?;
@@ -191,6 +195,7 @@ fn run_omendb(
     }
     let elapsed_nanos = started.elapsed().as_nanos();
     let final_checksum = verify_omendb(&mut database, &expected)?;
+    let database_bytes = directory_size(database_directory);
     database.close().context("close OmenDB benchmark")?;
 
     Ok(RunResult {
@@ -201,11 +206,38 @@ fn run_omendb(
         elapsed_nanos,
         latencies_nanos,
         final_checksum,
+        database_bytes,
     })
 }
 
+fn directory_size(path: impl AsRef<Path>) -> u64 {
+    let path = path.as_ref();
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => return metadata.len(),
+        _ => {}
+    }
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                total += directory_size(entry.path());
+            } else {
+                total += metadata.len();
+            }
+        }
+    }
+    total
+}
+
 fn run_sqlite(path: impl AsRef<Path>, workload: Workload) -> Result<RunResult> {
-    let mut connection = Connection::open(path).context("open SQLite benchmark database")?;
+    if path.as_ref().exists() {
+        std::fs::remove_file(&path).context("remove stale SQLite benchmark file")?;
+    }
+    let mut connection =
+        Connection::open(path.as_ref()).context("open SQLite benchmark database")?;
     connection
         .execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -279,6 +311,10 @@ fn run_sqlite(path: impl AsRef<Path>, workload: Workload) -> Result<RunResult> {
     }
     let elapsed_nanos = started.elapsed().as_nanos();
     let final_checksum = verify_sqlite(&connection, &expected)?;
+    if let Err((connection, error)) = connection.close() {
+        drop(connection);
+        return Err(error).context("close SQLite benchmark");
+    }
 
     Ok(RunResult {
         backend: Backend::Sqlite,
@@ -288,6 +324,7 @@ fn run_sqlite(path: impl AsRef<Path>, workload: Workload) -> Result<RunResult> {
         elapsed_nanos,
         latencies_nanos,
         final_checksum,
+        database_bytes: directory_size(&path),
     })
 }
 
@@ -366,6 +403,11 @@ fn result_json(result: &RunResult) -> serde_json::Value {
         "experiment": "omendb-relational-alpha-oltp-v0",
         "evidence_class": "reproducible_single_client_sql_baseline",
         "competitive_claim": false,
+        "platform": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        },
         "backend": result.backend.label(),
         "rows": result.workload.rows,
         "operations": result.workload.operations,
@@ -379,6 +421,7 @@ fn result_json(result: &RunResult) -> serde_json::Value {
         "elapsed_seconds": elapsed_seconds,
         "throughput_operations_per_second": result.workload.operations as f64 / elapsed_seconds.max(f64::MIN_POSITIVE),
         "final_checksum": result.final_checksum,
+        "database_bytes": result.database_bytes,
         "latency": {
             "p50_seconds": nanos_to_seconds(percentile(&latencies, 50, 100)),
             "p95_seconds": nanos_to_seconds(percentile(&latencies, 95, 100)),
