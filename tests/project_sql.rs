@@ -727,6 +727,34 @@ fn exercise_sql_composite_primary_key(
         database.execute_sql("UPDATE ledger SET tenant_id = 9 WHERE tenant_id = 1"),
         Err(DbError::InvalidState(reason)) if reason.contains("primary key")
     ));
+    let exact = database
+        .execute_sql("SELECT tenant_id, state FROM ledger WHERE tenant_id = 1 AND entry_id = 2")
+        .unwrap_or_else(|error| panic!("{kind:?} exact composite lookup: {error:?}"))
+        .rows;
+    assert_eq!(
+        exact,
+        vec![vec![Value::I64(1), Value::Text("closed".to_owned())]]
+    );
+    let reversed = database
+        .execute_sql("SELECT tenant_id, state FROM ledger WHERE entry_id = 2 AND tenant_id = 1")
+        .expect("reversed composite lookup")
+        .rows;
+    assert_eq!(reversed, exact);
+    let missed = database
+        .execute_sql("SELECT tenant_id FROM ledger WHERE tenant_id = 9 AND entry_id = 9")
+        .expect("composite miss")
+        .rows;
+    assert!(missed.is_empty());
+    let partial_scan = database
+        .execute_sql("SELECT entry_id FROM ledger WHERE tenant_id = 1 ORDER BY entry_id")
+        .expect("partial composite scan")
+        .rows;
+    assert_eq!(partial_scan, vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+    let updated_exact = database
+        .execute_sql("UPDATE ledger SET state = 'flagged' WHERE tenant_id = 2 AND entry_id = 1")
+        .expect("exact composite update")
+        .affected_rows;
+    assert_eq!(updated_exact, 1);
     let rows = database
         .execute_sql("SELECT tenant_id, entry_id, state FROM ledger")
         .expect("select composite rows")

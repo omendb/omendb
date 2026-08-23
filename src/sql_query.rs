@@ -400,44 +400,92 @@ pub(super) fn primary_key_rows(
     let Some(primary_key) = database.catalog().primary_key(table.id) else {
         return Ok(None);
     };
-    if primary_key.len() != 1 {
-        return Ok(None);
-    }
-    let Some(Expr::BinaryOp { left, op, right }) = selection else {
+    let Some(selection) = selection else {
         return Ok(None);
     };
-    if op != &sqlparser::ast::BinaryOperator::Eq {
+
+    // Flatten the predicate into AND-joined column = literal terms. Any
+    // other shape (OR, BETWEEN, IN, subqueries, column-to-column compare,
+    // arithmetic) conservatively falls back to the scan path.
+    let mut terms: Vec<(usize, Value)> = Vec::new();
+    if !collect_pk_equalities(selection, table, params, &mut terms)? {
         return Ok(None);
     }
-    let primary_position = table
-        .columns
-        .iter()
-        .position(|column| column.id == primary_key[0])
-        .ok_or_else(|| DbError::InvalidState("primary-key column is missing".to_owned()))?;
-    let (_column_expression, value_expression) = if column_position(table, left)?
-        == Some(primary_position)
-        && column_position(table, right)?.is_none()
+
+    // Every primary-key column must be covered exactly once; repeated
+    // coverage falls back rather than reasoning about contradiction.
+    if primary_key.len() != terms.len()
+        || !primary_key.iter().all(|column| {
+            terms
+                .iter()
+                .filter(|(position, _)| table.columns[*position].id == *column)
+                .count()
+                == 1
+        })
     {
-        (left, right)
-    } else if column_position(table, right)? == Some(primary_position)
-        && column_position(table, left)?.is_none()
-    {
-        (right, left)
-    } else {
         return Ok(None);
-    };
-    let value = coerce_value(
-        literal_value(value_expression, params)?,
-        &table.columns[primary_position],
-    )?;
-    if matches!(value, Value::Null) {
-        return Ok(Some(Vec::new()));
     }
-    let identity = RowIdentity::new(table.id, vec![primary_key[0]], vec![value])?;
+
+    let mut values = Vec::with_capacity(primary_key.len());
+    for column in primary_key {
+        let position = table
+            .columns
+            .iter()
+            .position(|candidate| candidate.id == *column)
+            .ok_or_else(|| DbError::InvalidState("primary-key column is missing".to_owned()))?;
+        let value = terms
+            .iter()
+            .find(|(term_position, _)| *term_position == position)
+            .map(|(_, value)| value.clone())
+            .expect("coverage check found every primary-key column");
+        if matches!(value, Value::Null) {
+            // col = NULL is UNKNOWN for every row: nothing can match.
+            return Ok(Some(Vec::new()));
+        }
+        values.push(value);
+    }
+    let identity = RowIdentity::new(table.id, primary_key.to_vec(), values)?;
     Ok(transaction
         .get_by_identity(database, table.id, &identity)?
         .map(|row| vec![row])
         .or_else(|| Some(Vec::new())))
+}
+
+/// Collect AND-joined `pk_column = literal` terms. Returns `Ok(false)` when
+/// the predicate contains any shape this fast path does not model.
+fn collect_pk_equalities(
+    expression: &Expr,
+    table: &TableDefinition,
+    params: &[Value],
+    terms: &mut Vec<(usize, Value)>,
+) -> Result<bool> {
+    match expression {
+        Expr::Nested(inner) => collect_pk_equalities(inner, table, params, terms),
+        Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::And => {
+            Ok(collect_pk_equalities(left, table, params, terms)?
+                && collect_pk_equalities(right, table, params, terms)?)
+        }
+        Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::Eq => {
+            let (column_expression, value_expression) = match (
+                column_position(table, left)?,
+                column_position(table, right)?,
+            ) {
+                (Some(position), None) => (left, right),
+                (None, Some(position)) => (right, left),
+                _ => return Ok(false),
+            };
+            let value = coerce_value(
+                literal_value(value_expression, params)?,
+                &table.columns[column_position(table, column_expression)?.expect("matched side")],
+            )?;
+            terms.push((
+                column_position(table, column_expression)?.expect("matched side"),
+                value,
+            ));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
