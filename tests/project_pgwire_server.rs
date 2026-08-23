@@ -342,6 +342,86 @@ fn pgwire_sasl_initial_response_decode_probe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn wire_concurrent_reads_publish_and_read_without_error() {
+    let directory = tempdir().expect("tempdir");
+    let database = seed_database(directory.path());
+    {
+        let mut db = database.write().expect("lock");
+        for id in 2..=200u64 {
+            db.execute_sql(&format!(
+                "INSERT INTO users (id, email) VALUES ({id}, 'user{id}@example.com')"
+            ))
+            .expect("seed rows");
+        }
+    }
+
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
+    let port = addr.port();
+    let connect = move |user: &str| {
+        let dsn = format!("host=127.0.0.1 port={port} user={user}");
+        async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move { connection.await.expect("connection") });
+            client
+        }
+    };
+
+    const READERS: usize = 6;
+    const QUERIES_PER_READER: usize = 40;
+    let mut reader_handles = Vec::new();
+    for reader in 0..READERS {
+        let connect = connect.clone();
+        let handle = tokio::spawn(async move {
+            let client = connect("reader").await;
+            for step in 0..QUERIES_PER_READER {
+                let id = 1 + ((reader * QUERIES_PER_READER + step) % 200) as i64;
+                let rows = client
+                    .query("SELECT email FROM users WHERE id = $1", &[&id])
+                    .await
+                    .unwrap_or_else(|error| panic!("concurrent read id={id}: {error}"));
+                assert_eq!(rows.len(), 1, "id={id}");
+                assert!(!rows[0].get::<_, &str>(0).is_empty());
+            }
+        });
+        reader_handles.push(handle);
+    }
+
+    // One writer publishes blocks while the readers run; neither side may
+    // observe errors or lost visibility.
+    let writer = connect("writer").await;
+    for id in 1000..1020i64 {
+        writer
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO users (id, email) VALUES ({id}, 'w{id}@example.com'); COMMIT;"
+            ))
+            .await
+            .expect("writer block");
+    }
+
+    for handle in reader_handles {
+        handle.await.expect("reader task");
+    }
+
+    // Correctness first: every published write is visible.
+    let verifier = connect("verifier").await;
+    let total = verifier
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .expect("final count");
+    assert_eq!(total.get::<_, i64>(0), 220);
+}
+
+/// Timing gate: concurrent readers must overlap rather than serialize.
+/// The wall-clock ratio is load-sensitive, so this runs explicitly (like
+/// `project_group_commit_gate`), not in default CI where parallel suites
+/// invalidate the baseline comparison.
+#[ignore = "timing gate: run explicitly with --ignored"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn wire_concurrent_reads_scale_while_writes_publish() {
     use std::time::Instant;
 
