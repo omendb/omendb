@@ -48,7 +48,10 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--operations" => {
-                config.operations = args.next().ok_or("--operations requires a value")?.parse()?;
+                config.operations = args
+                    .next()
+                    .ok_or("--operations requires a value")?
+                    .parse()?;
             }
             "--max-group" => {
                 config.max_group = args.next().ok_or("--max-group requires a value")?.parse()?;
@@ -139,7 +142,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut handles = Vec::new();
     for producer in 0..producers {
         let tx = submit_tx.clone();
-        let key_space = config.key_space;
         handles.push(std::thread::spawn(move || {
             for step in 0..per_producer {
                 let range = (producer + step) % 2;
@@ -179,10 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for step in 0..per_producer {
             let range = (producer + step) % 2;
             let index = producer * per_producer + step;
-            expected_state.insert(
-                key(range, index),
-                value(range, index, step),
-            );
+            expected_state.insert(key(range, index), value(range, index, step));
         }
     }
     let reopened = DB::open(&db_path, Options::default())?;

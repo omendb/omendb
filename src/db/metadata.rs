@@ -399,14 +399,14 @@ impl DB {
         parent_checkpoint_id: u64,
         dirty_page_count: usize,
     ) -> Result<(u64, bool)> {
-        let pmt_bytes = (self.engine.pmt().to_bytes().len() as u64)
+        let pmt_bytes = (self.engine.pmt().serialized_len() as u64)
             .checked_add(
                 (dirty_page_count as u64)
                     .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
                     .ok_or(Error::DiskFull)?,
             )
             .ok_or(Error::DiskFull)?;
-        let allocator_bytes = (self.engine.allocator().to_bytes().len() as u64)
+        let allocator_bytes = (self.engine.allocator().serialized_len() as u64)
             .checked_add(
                 (dirty_page_count as u64)
                     .checked_mul(8)
@@ -436,7 +436,7 @@ impl DB {
                     .checked_mul((8 + PageMapping::SERIALIZED_SIZE + 8) as u64)
                     .ok_or(Error::DiskFull)?,
             )
-            .and_then(|size| size.checked_add(self.engine.allocator().to_bytes().len() as u64))
+            .and_then(|size| size.checked_add(self.engine.allocator().serialized_len() as u64))
             .and_then(|size| size.checked_add(frame_overhead))
             .ok_or(Error::DiskFull)?;
         Ok((delta_bytes, false))

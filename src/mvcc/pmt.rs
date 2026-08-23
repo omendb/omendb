@@ -149,6 +149,12 @@ impl PMT {
     /// Serialize all mappings to bytes (for WAL persistence).
     ///
     /// Format: count(u32) followed by count × (page_id:u64, mapping:20 bytes)
+    /// Serialized size without materializing the buffer: O(1) instead of the
+    /// sort-and-copy that [`Self::to_bytes`] performs.
+    pub fn serialized_len(&self) -> usize {
+        4 + self.len() * (8 + PageMapping::SERIALIZED_SIZE)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let count = self.mappings.len() as u32;
         let mut buf = Vec::with_capacity(4 + self.len() * (8 + PageMapping::SERIALIZED_SIZE));

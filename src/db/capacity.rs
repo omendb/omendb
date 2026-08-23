@@ -114,14 +114,14 @@ impl DB {
         let reused_page_count = self.engine.pending_reuse_offsets().len() as u64;
         let new_page_count = dirty_page_count.saturating_sub(reused_page_count);
 
-        let pmt_bytes = (self.engine.pmt().to_bytes().len() as u64)
+        let pmt_bytes = (self.engine.pmt().serialized_len() as u64)
             .checked_add(
                 dirty_page_count
                     .checked_mul((8 + PageMapping::SERIALIZED_SIZE) as u64)
                     .ok_or(Error::DiskFull)?,
             )
             .ok_or(Error::DiskFull)?;
-        let allocator_bytes = (self.engine.allocator().to_bytes().len() as u64)
+        let allocator_bytes = (self.engine.allocator().serialized_len() as u64)
             .checked_add(dirty_page_count.checked_mul(8).ok_or(Error::DiskFull)?)
             .ok_or(Error::DiskFull)?;
         let full_meta_bytes = (META_MAGIC.len() as u64)
@@ -218,7 +218,7 @@ impl DB {
                     .ok_or(Error::DiskFull)?,
             )
             .ok_or(Error::DiskFull)?;
-        let allocator_bytes = candidate.page_allocator().to_bytes().len() as u64;
+        let allocator_bytes = candidate.page_allocator().serialized_len() as u64;
         (META_MAGIC.len() as u64)
             .checked_add(4 + 4 + 4 + 4)
             .and_then(|size| size.checked_add(pmt_bytes))
@@ -246,7 +246,7 @@ impl DB {
         (META_DELTA_HEADER_SIZE as u64)
             .checked_add(update_bytes)
             .and_then(|size| size.checked_add(removal_bytes))
-            .and_then(|size| size.checked_add(allocator.to_bytes().len() as u64))
+            .and_then(|size| size.checked_add(allocator.serialized_len() as u64))
             .and_then(|size| size.checked_add(META_DELTA_CHECKSUM_SIZE as u64))
             .ok_or(Error::DiskFull)
     }

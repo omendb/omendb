@@ -94,6 +94,11 @@ impl PageAllocator {
     }
 
     /// Serialize the allocator state.
+    /// Serialized size without materializing the buffer.
+    pub fn serialized_len(&self) -> usize {
+        12 + self.free_list.len() * 8
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(8 + 4 + self.free_list.len() * 8);
         buf.extend_from_slice(&self.next_id.to_le_bytes());
