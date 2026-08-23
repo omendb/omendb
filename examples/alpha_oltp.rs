@@ -422,6 +422,7 @@ fn result_json(result: &RunResult) -> serde_json::Value {
         "throughput_operations_per_second": result.workload.operations as f64 / elapsed_seconds.max(f64::MIN_POSITIVE),
         "final_checksum": result.final_checksum,
         "database_bytes": result.database_bytes,
+        "peak_rss_kib": peak_rss_kib(),
         "latency": {
             "p50_seconds": nanos_to_seconds(percentile(&latencies, 50, 100)),
             "p95_seconds": nanos_to_seconds(percentile(&latencies, 95, 100)),
@@ -515,6 +516,26 @@ fn percentile(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
 
 fn nanos_to_seconds(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000_000.0
+}
+
+/// Peak resident set size of this process so far, in KiB. Reported as
+/// process-wide max RSS; it bounds the workload's footprint from above and
+/// includes setup/teardown allocations.
+fn peak_rss_kib() -> u64 {
+    let mut usage = std::mem::MaybeUninit::uninit();
+    // SAFETY: rusage is a plain C struct with no invariants on input.
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let rss = usage.ru_maxrss;
+    // macOS reports bytes; Linux reports KiB.
+    if cfg!(target_os = "macos") {
+        (rss / 1024) as u64
+    } else {
+        rss as u64
+    }
 }
 
 #[cfg(test)]
