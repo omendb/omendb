@@ -81,4 +81,4 @@ cargo test --all-features --all-targets
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-SeerDB remains a separate physical storage project. See [`SECURITY.md`](SECURITY.md) for vulnerability reports and [`LICENSE`](LICENSE) for licensing terms.
+SeerDB remains a separate physical storage project. See [`docs/runbook.md`](docs/runbook.md) for operational guidance (health checks, verification, maintenance, and recovery), [`SECURITY.md`](SECURITY.md) for vulnerability reports and [`LICENSE`](LICENSE) for licensing terms.
