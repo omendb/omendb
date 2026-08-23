@@ -1,0 +1,10 @@
+{"seq":1,"kind":"seed_population","accounts_count":60,"entries_count":180}
+{"seq":2,"kind":"oltp_batch","operations":[{"op":"transfer","from":1,"to":2,"amount":50},{"op":"credit","account":3,"amount":100},{"op":"update_status","account":4,"status":"suspended"}]}
+{"seq":3,"kind":"analytical_query","name":"global_totals","query":"SELECT COUNT(*), SUM(balance), AVG(balance), MIN(balance), MAX(balance) FROM accounts"}
+{"seq":4,"kind":"oltp_batch","operations":[{"op":"transfer","from":5,"to":6,"amount":75},{"op":"credit","account":7,"amount":250}]}
+{"seq":5,"kind":"analytical_query","name":"category_breakdown","query":"SELECT category, COUNT(*), SUM(balance) FROM accounts GROUP BY category"}
+{"seq":6,"kind":"oltp_batch","operations":[{"op":"transfer","from":8,"to":9,"amount":120},{"op":"update_status","account":10,"status":"archived"}]}
+{"seq":7,"kind":"analytical_query","name":"status_counts","query":"SELECT status, COUNT(*) FROM accounts GROUP BY status"}
+{"seq":8,"kind":"oltp_batch","operations":[{"op":"credit","account":11,"amount":500},{"op":"credit","account":12,"amount":300}]}
+{"seq":9,"kind":"analytical_query","name":"active_premium_totals","query":"SELECT COUNT(*), SUM(balance) FROM accounts WHERE category = 'premium' AND status = 'active'"}
+{"seq":10,"kind":"checkpoint_and_verify","expect_accounts":60,"expect_entries":180}

@@ -1,0 +1,7 @@
+{"seq":1,"kind":"seed","tenant_id":1,"rows":100,"expect":"state-digest-0"}
+{"seq":2,"kind":"retain","snapshot":"current","name":"r2-snap-1"}
+{"seq":3,"kind":"commit","transaction_id":"r2-t0001","operations":[{"op":"update","document_id":7,"status":"active","owner_id":12},{"op":"update","document_id":8,"status":"archived","owner_id":12}]}
+{"seq":4,"kind":"commit","transaction_id":"r2-t0002","operations":[{"op":"delete","document_id":9},{"op":"update","document_id":7,"status":"review","owner_id":12}]}
+{"seq":5,"kind":"scan","snapshot":"r2-snap-1","expect":"state-digest-0"}
+{"seq":6,"kind":"maintenance","budget":{"max_row_keys":2,"max_index_keys":4},"expect":"bounded-report"}
+{"seq":7,"kind":"release","snapshot":"r2-snap-1"}

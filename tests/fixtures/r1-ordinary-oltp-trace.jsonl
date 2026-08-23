@@ -1,0 +1,6 @@
+{"seq":1,"kind":"commit","tenant_id":1,"transaction_id":"r1-t0001","operations":[{"op":"create_user","user_id":10},{"op":"create_project","project_id":20,"slug":"alpha","owner_id":10},{"op":"add_membership","project_id":20,"user_id":10}]}
+{"seq":2,"kind":"read","tenant_id":1,"transaction_id":"r1-t0002","query":"project_by_slug","slug":"alpha","expect_project_id":20}
+{"seq":3,"kind":"commit","tenant_id":1,"transaction_id":"r1-t0003","operations":[{"op":"create_user","user_id":11},{"op":"add_membership","project_id":20,"user_id":11}]}
+{"seq":4,"kind":"read","tenant_id":2,"transaction_id":"r1-t0004","query":"project_by_slug","slug":"alpha","expect":"not_found"}
+{"seq":5,"kind":"commit","tenant_id":1,"transaction_id":"r1-t0005","operations":[{"op":"rename_project","project_id":20,"slug":"beta"},{"op":"remove_membership","project_id":20,"user_id":11}]}
+{"seq":6,"kind":"backup_verify","name":"r1-snapshot-0001","expect":"same-state-digest"}
