@@ -9,14 +9,14 @@
 use super::*;
 use std::time::Instant;
 
-struct PreparedBatch {
-    records: Vec<WalRecord>,
-    candidate_tree: BTree,
-    candidate_blobs: BlobManager,
-    blob_changed: bool,
-    next_pending_mutations: u64,
-    next_pending_bytes: u64,
-    next_digest: u32,
+pub(super) struct PreparedBatch {
+    pub(super) records: Vec<WalRecord>,
+    pub(super) candidate_tree: BTree,
+    pub(super) candidate_blobs: BlobManager,
+    pub(super) blob_changed: bool,
+    pub(super) next_pending_mutations: u64,
+    pub(super) next_pending_bytes: u64,
+    pub(super) next_digest: u32,
 }
 
 impl DB {
@@ -67,7 +67,7 @@ impl DB {
         self.install_batch(prepared)
     }
 
-    fn prepare_batch(&mut self, mutations: &[BatchMutation]) -> Result<PreparedBatch> {
+    pub(super) fn prepare_batch(&mut self, mutations: &[BatchMutation]) -> Result<PreparedBatch> {
         let candidate_started = Instant::now();
         let mut records = Vec::with_capacity(mutations.len());
         let mut mutation_bytes = 0u64;

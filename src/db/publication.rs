@@ -134,6 +134,21 @@ impl DB {
             recovered_wal_offset
         };
 
+        self.append_envelope_frame(commit, wal_offset, parent_manifest)
+    }
+
+    /// Build the published manifest for `commit`, append its authority frame
+    /// to the metadata log, and record it in manifest history. The frame IS
+    /// the visibility barrier. The caller must already have made every page
+    /// offset the manifest names durable, plus the WAL commit prefix; and the
+    /// engine's active PMT must describe exactly this generation's mappings.
+    pub(super) fn append_envelope_frame(
+        &mut self,
+        commit: CommitRecord,
+        wal_offset: u64,
+        parent_manifest: Manifest,
+    ) -> Result<PathBuf> {
+        let wal_path = self.path.join(WAL_FILE);
         let manifest = Manifest {
             database_id: self.database_id,
             history_id: self.history_id,
@@ -195,7 +210,7 @@ impl DB {
         Ok(wal_path)
     }
 
-    fn finish_generation_publication(
+    pub(super) fn finish_generation_publication(
         &mut self,
         commit: CommitRecord,
         wal_path: PathBuf,

@@ -34,6 +34,10 @@ thread_local! {
     pub(super) static FAIL_NEXT_META_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_REUSE_PUBLICATION: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_SYNC: Cell<bool> = const { Cell::new(false) };
+    /// Fail the next group data sync in a pipelined publication barrier.
+    pub(super) static FAIL_NEXT_GROUP_SYNC: Cell<bool> = const { Cell::new(false) };
+    /// Fail when the Nth remaining frame append fires (1 = next append).
+    pub(super) static FAIL_NEXT_FRAME_APPEND_N: Cell<u32> = const { Cell::new(0) };
     pub(super) static FAIL_NEXT_META_LOG_SHORT_WRITE: Cell<bool> = const { Cell::new(false) };
     pub(super) static FAIL_NEXT_META_LOG_TORN_WRITE: Cell<bool> = const { Cell::new(false) };
 }

@@ -27,6 +27,10 @@ mod compaction;
 mod diagnostics;
 #[path = "db/durability.rs"]
 mod durability;
+mod envelope;
+#[cfg(test)]
+#[path = "db/envelope_tests.rs"]
+mod envelope_tests;
 #[cfg(any(test, feature = "fault-injection"))]
 #[path = "db/faults.rs"]
 mod faults;
@@ -100,6 +104,7 @@ use blob_layout::{
     BLOB_SEGMENT_PREFIX, blob_segment_path, parse_blob_catalog, retained_blob_path,
 };
 use blob_read_view::BlobReadView;
+use envelope::PendingEnvelope;
 #[cfg(test)]
 use faults::inject_atomic_rename_failure;
 #[cfg(any(test, feature = "fault-injection"))]
@@ -230,6 +235,12 @@ pub struct DB {
     wal_reserved_extent: u64,
     /// Digest over pending mutation records.
     pending_digest: u32,
+    /// Envelopes admitted but not yet published by a barrier.
+    pending_envelopes: Vec<PendingEnvelope>,
+    /// Pages dirtied before the current envelope group's first admission.
+    group_carry_pages: Vec<u32>,
+    /// Next admission-order envelope identifier.
+    next_envelope_id: u64,
     /// Whether the pending generation changes the durable blob image/catalog.
     pending_blob_changes: bool,
     /// Whether the database is open.

@@ -89,6 +89,9 @@ impl DB {
             pending_blob_changes: recovery
                 .as_ref()
                 .is_some_and(|summary| summary.blob_changed),
+            pending_envelopes: Vec::new(),
+            group_carry_pages: Vec::new(),
+            next_envelope_id: 0,
             is_open: true,
             write_fenced: false,
             read_only: catalog.read_only,
