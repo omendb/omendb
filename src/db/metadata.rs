@@ -285,8 +285,9 @@ impl DB {
     /// The frame carries the published manifest plus the checkpoint or delta
     /// image and IS the visibility barrier: once this frame is synced, a
     /// reopen selects generation `manifest.generation_id` as authority. The
-    /// caller must have synced every page offset the manifest names and the
-    /// WAL commit record before calling.
+    /// caller must have synced every page offset the manifest names before
+    /// calling; the WAL prefix may remain buffered under the default CoW
+    /// policy.
     pub(super) fn append_generation_meta(
         &mut self,
         checkpoint_id: u64,

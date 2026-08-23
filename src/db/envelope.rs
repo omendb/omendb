@@ -92,8 +92,8 @@ impl DB {
     /// other error may have reached durable media and fences the writer for
     /// recovery, exactly like the single-generation publication path.
     pub fn publication_barrier(&mut self) -> Result<Vec<(u64, DurabilityStatus)>> {
-        // A fenced writer must not retry: stage 2 may have consumed commit IDs
-        // and made a commit record durable, so only reopen may publish again.
+        // A fenced writer must not retry: publication may have reached durable
+        // media or consumed commit IDs, so only reopen may publish again.
         self.check_writable()?;
         if self.pending_envelopes.is_empty() {
             return Ok(Vec::new());
@@ -171,9 +171,10 @@ impl DB {
         }
 
         // Stage 2: ONE commit record covering the cumulative pending
-        // mutation prefix, then ONE WAL sync makes it durable before the
-        // frame becomes visible. The offset is the file length BEFORE the
-        // commit record: buffered mutation records precede it in the file.
+        // mutation prefix. Under the default CoW policy it remains buffered;
+        // the synced authority frame below is the acknowledgement point.
+        // Explicit `sync_writes` still forces the WAL. The offset is the file
+        // length BEFORE the commit record: mutation records precede it.
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = fs::metadata(&wal_path)
             .map(|metadata| metadata.len())
@@ -198,13 +199,13 @@ impl DB {
                 .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
         );
         self.wal.append(&WalRecord::commit(commit));
-        self.write_wal_to_disk(true)?;
+        self.write_wal_to_disk(false)?;
 
         // Stage 3: ONE authority frame. After write_dirty_pages the live PMT
         // describes exactly this generation's mappings, so no checkpoint
         // reconstruction or PMT swap is needed. INVARIANT: the frame is only
         // persisted here, after the data sync staged every referenced page
-        // offset and the WAL sync made the commit record durable.
+        // offset; the WAL may still be buffered under default policy.
         #[cfg(any(test, feature = "fault-injection"))]
         {
             let remaining = super::faults::FAIL_NEXT_FRAME_APPEND_N.with(|count| {

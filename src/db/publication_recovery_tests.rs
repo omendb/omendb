@@ -345,39 +345,24 @@ fn test_db_discards_wal_after_publication_sync_failure() {
 }
 
 #[test]
-fn test_db_recovery_preserves_replayed_generation_identity() {
-    // A generation that synced its WAL commit record but died before its
-    // authority frame is replayed by recovery and REPUBLISHED under its
-    // original commit/generation identity. Later publications must never
-    // reuse that identity: a retained WAL would otherwise hold two distinct
-    // commit records for one (generation, commit) pair.
+fn test_db_default_publication_does_not_force_wal_commit_sync() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("replayed-identity.db");
+    let path = dir.path().join("no-wal-commit-barrier.db");
     let mut db = DB::open(&path, Options::default()).unwrap();
     db.put(b"key", b"one").unwrap();
     db.flush().unwrap();
 
+    // The authority frame is the default CoW acknowledgement point. A fault
+    // at the retired standalone WAL-commit barrier must not reject a valid
+    // publication or fence the writer.
     db.put(b"key", b"two").unwrap();
-    db.inject_wal_after_sync_failure();
-    assert!(matches!(db.flush(), Err(Error::Io(_))));
-    assert!(db.durability_status().write_fenced);
-    drop(db);
+    db.inject_wal_sync_failure();
+    db.flush().unwrap();
+    faults::FAIL_NEXT_WAL_SYNC.with(|failure| failure.set(false));
+    assert_eq!(db.get(b"key").unwrap(), Some(b"two".to_vec()));
+    assert!(!db.durability_status().write_fenced);
+    db.close().unwrap();
 
-    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"two".to_vec()));
-    assert_eq!(reopened.durability_status().commit_id.get(), 2);
-    assert_eq!(reopened.generation_id.get(), 2);
-
-    // The next publication continues past the recovered identity.
-    reopened.put(b"key", b"three").unwrap();
-    reopened.flush().unwrap();
-    assert_eq!(reopened.durability_status().commit_id.get(), 3);
-    assert_eq!(reopened.generation_id.get(), 3);
-    reopened.close().unwrap();
-
-    // The retained WAL now holds the recovered generation's records ahead of
-    // the newer ones; reopen must resolve cleanly against the new authority.
-    let mut final_db = DB::open(&path, Options::default()).unwrap();
-    assert_eq!(final_db.get(b"key").unwrap(), Some(b"three".to_vec()));
-    final_db.close().unwrap();
 }

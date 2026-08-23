@@ -385,6 +385,10 @@ proptest! {
                     } else {
                         BlobStorageMode::WholeImage
                     },
+                    // WAL-sync faults target the explicit sync policy now;
+                    // default CoW publication deliberately has no separate
+                    // commit-record barrier.
+                    sync_writes: matches!(fault, 11 | 12),
                     ..Options::for_test()
                 };
                 let old_value = vec![0xD8; 2_048];

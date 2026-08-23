@@ -62,8 +62,9 @@ impl DB {
                 }
             }
             if should_sync {
-                // The commit boundary and any configured per-mutation policy
-                // force the WAL before dependent page publication.
+                // Explicit sync policy and requested force boundaries make
+                // the WAL durable. The default out-of-place publication keeps
+                // its commit prefix buffered until the authority frame.
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_SYNC.with(|failure| failure.replace(false)) {
                     return Err(std::io::Error::other("injected WAL sync failure").into());

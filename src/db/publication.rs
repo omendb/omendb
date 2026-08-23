@@ -53,13 +53,11 @@ impl DB {
             return Err(std::io::Error::other("injected reuse publication sync failure").into());
         }
         // Mutation records have already been written to the WAL by the
-        // mutation or batch admission path. The commit envelope is appended
-        // and forced only after the new out-of-place pages are durable below.
-        // The manifest remains the visibility barrier, so forcing the
-        // uncommitted mutation prefix before page write-back adds a sync
-        // without strengthening recovery: an incomplete publication still
-        // reopens the old root, while a durable commit record is enough to
-        // replay the complete generation.
+        // mutation or batch admission path. The metadata authority frame is
+        // the visibility barrier. Under the default CoW policy, an unsynced
+        // WAL prefix is sufficient: an incomplete publication reopens the
+        // old root, while any complete WAL prefix that happens to survive can
+        // replay the synced pages. `sync_writes` still forces this prefix.
         self.write_wal_to_disk(false)?;
 
         let admission_started = Instant::now();
@@ -129,13 +127,15 @@ impl DB {
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {
-            // The commit record must be durable before the publication frame
-            // becomes visible: it completes the generation's mutation prefix.
+            // The commit record completes the generation's mutation prefix.
+            // A default CoW publication does not need a separate WAL barrier:
+            // the synced authority frame below is the acknowledgement point.
+            // Explicit `sync_writes` retains the configured WAL sync policy.
             let offset = fs::metadata(&wal_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             self.wal.append(&WalRecord::commit(commit));
-            self.write_wal_to_disk(true)?;
+            self.write_wal_to_disk(false)?;
             offset
         } else {
             recovered_wal_offset
@@ -147,8 +147,9 @@ impl DB {
     /// Build the published manifest for `commit`, append its authority frame
     /// to the metadata log, and record it in manifest history. The frame IS
     /// the visibility barrier. The caller must already have made every page
-    /// offset the manifest names durable, plus the WAL commit prefix; and the
-    /// engine's active PMT must describe exactly this generation's mappings.
+    /// offset the manifest names durable; the WAL prefix may remain buffered
+    /// under the default CoW policy; and the engine's active PMT must describe
+    /// exactly this generation's mappings.
     pub(super) fn append_envelope_frame(
         &mut self,
         commit: CommitRecord,

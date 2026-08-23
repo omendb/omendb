@@ -305,10 +305,10 @@ fn test_group_barrier_has_fixed_sync_budget() {
     db.publication_barrier().unwrap();
     let sync_delta = db.metrics().unwrap().storage.syncs - syncs_before;
     // The data device is synced ONCE for the whole two-envelope group; more
-    // envelopes never increase this number. The full barrier budget is one
-    // data sync + one WAL sync + one metadata-log fsync for the single
-    // authority frame, but the WAL/meta barriers are tracked only by the
-    // process-wide durability_sync_count(), whose global counter cannot be
+    // envelopes never increase this number. Default CoW publication has one
+    // data sync plus one metadata-log fsync; an explicit sync_writes policy
+    // may add WAL syncs. WAL/meta barriers are tracked only by the process-
+    // wide durability_sync_count(), whose global counter cannot be
     // delta-asserted under parallel tests.
     assert_eq!(sync_delta, 1);
 

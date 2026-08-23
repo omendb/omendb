@@ -220,11 +220,11 @@ impl DB {
         generation_id: GenerationId,
     ) -> Result<(CommitId, GenerationId)> {
         // Identities advance monotonically from the authoritative manifest.
-        // A crashed publication that synced its WAL commit record is covered
-        // by recovery (which replays or records that generation before open
-        // completes), so no side ledger is needed to reserve its identity;
-        // attempts that died before the WAL sync left nothing durable and
-        // the ambiguity clause permits their ids to be reused.
+        // If a crashed publication leaves a complete WAL commit prefix, open
+        // recovery replays or records that generation before completing. The
+        // default CoW path does not promise that prefix is durable, so an
+        // attempt with neither a surviving WAL prefix nor an authority frame
+        // may legitimately reuse its identity under the ambiguity clause.
         Ok((
             CommitId::new(
                 commit_id
