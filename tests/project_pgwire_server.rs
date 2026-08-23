@@ -360,24 +360,22 @@ async fn wire_concurrent_reads_publish_and_read_without_error() {
             .await
             .expect("spawn server");
     let port = addr.port();
-    let connect = move |user: &str| {
+
+    async fn connect_client(port: u16, user: &str) -> tokio_postgres::Client {
         let dsn = format!("host=127.0.0.1 port={port} user={user}");
-        async move {
-            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                .await
-                .expect("connect");
-            tokio::spawn(async move { connection.await.expect("connection") });
-            client
-        }
-    };
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move { connection.await.expect("connection") });
+        client
+    }
 
     const READERS: usize = 6;
     const QUERIES_PER_READER: usize = 40;
     let mut reader_handles = Vec::new();
     for reader in 0..READERS {
-        let connect = connect.clone();
         let handle = tokio::spawn(async move {
-            let client = connect("reader").await;
+            let client = connect_client(port, "reader").await;
             for step in 0..QUERIES_PER_READER {
                 let id = 1 + ((reader * QUERIES_PER_READER + step) % 200) as i64;
                 let rows = client
@@ -393,7 +391,7 @@ async fn wire_concurrent_reads_publish_and_read_without_error() {
 
     // One writer publishes blocks while the readers run; neither side may
     // observe errors or lost visibility.
-    let writer = connect("writer").await;
+    let writer = connect_client(port, "writer").await;
     for id in 1000..1020i64 {
         writer
             .batch_execute(&format!(
@@ -408,7 +406,7 @@ async fn wire_concurrent_reads_publish_and_read_without_error() {
     }
 
     // Correctness first: every published write is visible.
-    let verifier = connect("verifier").await;
+    let verifier = connect_client(port, "verifier").await;
     let total = verifier
         .query_one("SELECT count(*) FROM users", &[])
         .await
