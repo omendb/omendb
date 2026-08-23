@@ -139,7 +139,7 @@ fn randomized_trace(database: &mut RelationalDatabase, connection: &Connection) 
             0 => {
                 let id = next_id;
                 next_id += 1;
-                let state = if next_random(&mut random) % 2 == 0 {
+                let state = if next_random(&mut random).is_multiple_of(2) {
                     "'generated'"
                 } else {
                     "NULL"
@@ -157,7 +157,7 @@ fn randomized_trace(database: &mut RelationalDatabase, connection: &Connection) 
             }
             1 if !live.is_empty() => {
                 let id = live_value(&live, &mut random);
-                let state = if next_random(&mut random) % 2 == 0 {
+                let state = if next_random(&mut random).is_multiple_of(2) {
                     "'updated'"
                 } else {
                     "NULL"

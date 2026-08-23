@@ -100,6 +100,30 @@ fn exercise_session_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Ve
             .collect::<Vec<_>>(),
         vec![1, 1]
     );
+    let first_params = [Value::I64(110), Value::I64(1)];
+    let second_params = [Value::I64(40), Value::I64(2)];
+    let parameterized_batch = session
+        .execute_sql_batch_with_params(
+            &control,
+            &[
+                (
+                    "UPDATE accounts SET balance = $1 WHERE id = $2",
+                    &first_params,
+                ),
+                (
+                    "UPDATE accounts SET balance = $1 WHERE id = $2",
+                    &second_params,
+                ),
+            ],
+        )
+        .expect("parameterized batch SQL transaction");
+    assert_eq!(
+        parameterized_batch
+            .iter()
+            .map(|result| result.affected_rows)
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
     let oversized = vec!["SELECT 1"; omendb::RELATIONAL_SQL_BATCH_LIMIT + 1];
     assert!(matches!(
         session.execute_sql_batch(&control, &oversized),

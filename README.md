@@ -46,8 +46,9 @@ supports the tested subset of schema changes, `SELECT`, `INSERT`, `UPDATE`,
 syntax returns `DbError::SqlUnsupported`; use the typed API when you need
 control over transaction, snapshot, or backend behavior.
 
-Each direct SQL write is one transaction. Use `execute_sql_batch` or a typed
-transaction with `RelationalDatabaseTransaction::execute_sql_with_params` when
+Each direct SQL write is one transaction. Use `execute_sql_batch` (or its
+parameterized variant) or a typed transaction with
+`RelationalDatabaseTransaction::execute_sql_with_params` when
 several statements should share one atomic and durable publication. The
 reproducible baseline is available with:
 

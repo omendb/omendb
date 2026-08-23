@@ -805,6 +805,30 @@ impl RelationalDatabaseSession {
         .map(|(results, _)| results)
     }
 
+    /// Execute parameterized SQL statements in one atomic transaction.
+    pub fn execute_sql_batch_with_params(
+        &self,
+        control: &OperationControl,
+        statements: &[(&str, &[Value])],
+    ) -> Result<Vec<crate::SqlResult>> {
+        if statements.len() > crate::RELATIONAL_SQL_BATCH_LIMIT {
+            return Err(DbError::ResourceLimitExceeded(format!(
+                "SQL batch has {} statements; limit is {}",
+                statements.len(),
+                crate::RELATIONAL_SQL_BATCH_LIMIT
+            )));
+        }
+        self.transaction(control, |database, transaction| {
+            statements
+                .iter()
+                .map(|(statement, params)| {
+                    transaction.execute_sql_with_params(database, statement, params)
+                })
+                .collect()
+        })
+        .map(|(results, _)| results)
+    }
+
     /// Execute an analytical query with chunked morsel scanning, grouping,
     /// and memory budget protection under a shared read permit.
     pub fn query_analytical(

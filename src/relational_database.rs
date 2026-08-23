@@ -1446,6 +1446,29 @@ impl RelationalDatabase {
         .map(|(results, _)| results)
     }
 
+    /// Execute parameterized SQL statements in one atomic transaction.
+    pub fn execute_sql_batch_with_params(
+        &mut self,
+        statements: &[(&str, &[crate::Value])],
+    ) -> Result<Vec<crate::SqlResult>> {
+        if statements.len() > RELATIONAL_SQL_BATCH_LIMIT {
+            return Err(DbError::ResourceLimitExceeded(format!(
+                "SQL batch has {} statements; limit is {}",
+                statements.len(),
+                RELATIONAL_SQL_BATCH_LIMIT
+            )));
+        }
+        self.transaction(|database, transaction| {
+            statements
+                .iter()
+                .map(|(statement, params)| {
+                    transaction.execute_sql_with_params(database, statement, params)
+                })
+                .collect()
+        })
+        .map(|(results, _)| results)
+    }
+
     /// Infer each positional parameter's expected column type from the
     /// statement context (single-table scope). Positions context cannot
     /// determine report `None`.
