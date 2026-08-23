@@ -2,7 +2,7 @@
 
 OmenDB is an embedded relational database built around [SeerDB](https://github.com/omendb/seerdb). It provides typed rows, transactions, catalog and index management, retained snapshots, bounded embedded SQL, sessions, and two selectable storage backends.
 
-> **Developer preview:** APIs, persistence formats, supported platforms, and performance are subject to change. PostgreSQL wire support is experimental and feature-gated.
+> **Developer preview:** This tree is targeting a relational `0.1.0-alpha.1` release, but it is not alpha-ready yet. APIs, persistence formats, supported platforms, and performance are subject to change. PostgreSQL wire support is experimental and feature-gated. See [`docs/alpha-release-gates.md`](docs/alpha-release-gates.md) for the release contract.
 
 ## Quick start
 

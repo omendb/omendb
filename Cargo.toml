@@ -1,6 +1,6 @@
 [package]
 name = "omendb"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 description = "Embedded relational database built around SeerDB"
 license = "AGPL-3.0-only"
@@ -25,6 +25,14 @@ sha2 = "0.11.0"
 sqlparser = { version = "0.62.0", default-features = false, features = ["recursive-protection", "std", "visitor"] }
 thiserror = "2.0.18"
 tokio = { version = "1.53.1", features = ["net", "rt-multi-thread", "time", "io-util", "sync"], optional = true }
+
+[[example]]
+name = "concurrency_stress"
+required-features = ["pgwire"]
+
+[[example]]
+name = "pgwire_serve"
+required-features = ["pgwire"]
 
 [dev-dependencies]
 bytes = "1"

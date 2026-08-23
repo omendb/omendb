@@ -5,6 +5,7 @@
 //! full measurement harness lives in examples/concurrency_stress.rs;
 //! this test keeps the invariant enforced in CI at smoke scale.
 
+#![cfg(feature = "pgwire")]
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::{Arc, RwLock};
