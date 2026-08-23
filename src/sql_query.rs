@@ -470,8 +470,8 @@ fn collect_pk_equalities(
                 column_position(table, left)?,
                 column_position(table, right)?,
             ) {
-                (Some(position), None) => (left, right),
-                (None, Some(position)) => (right, left),
+                (Some(_), None) => (left, right),
+                (None, Some(_)) => (right, left),
                 _ => return Ok(false),
             };
             let value = coerce_value(
