@@ -74,10 +74,12 @@ passing fixtures and published evidence.
 ### Performance
 
 - [ ] a reproducible SQLite OLTP workload reports schema, row count, read /
-      write mix, transaction size, concurrency, seed, build profile, platform,
-      filesystem, p50/p95/p99 latency, throughput, memory, and database size;
+      write mix, transaction size (`--batch-size`), concurrency, seed, build
+      profile, platform, filesystem, p50/p95/p99 latency, throughput, memory,
+      and database size;
 - [ ] the same workload runs against both OmenDB backends and SQLite without
-      changing semantics;
+      changing semantics; batch-size 1 and representative bounded batches are
+      reported separately because durability and rollback boundaries differ;
 - [ ] CPU, allocation, WAL, fsync, and compaction profiles identify the
       measured bottleneck before an optimization is accepted;
 - [ ] release CI runs a small regression workload with thresholds and stores

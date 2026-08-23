@@ -84,6 +84,28 @@ fn exercise_session_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Ve
     assert_eq!(transaction_rows, vec![vec![Value::I64(1), Value::I64(110)]]);
     assert!(transaction_commit > created.commit.expect("schema commit"));
 
+    let batch = session
+        .execute_sql_batch(
+            &control,
+            &[
+                "UPDATE accounts SET balance = 110 WHERE id = 1",
+                "UPDATE accounts SET balance = 40 WHERE id = 2",
+            ],
+        )
+        .expect("batch SQL transaction");
+    assert_eq!(
+        batch
+            .iter()
+            .map(|result| result.affected_rows)
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    let oversized = vec!["SELECT 1"; omendb::RELATIONAL_SQL_BATCH_LIMIT + 1];
+    assert!(matches!(
+        session.execute_sql_batch(&control, &oversized),
+        Err(omendb::DbError::ResourceLimitExceeded(_))
+    ));
+
     let rows = session
         .execute_sql(
             &control,

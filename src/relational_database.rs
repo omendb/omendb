@@ -428,6 +428,9 @@ pub const RELATIONAL_SUPPORT_BUNDLE_VERSION: u16 = 2;
 /// Maximum number of in-memory events retained by one database handle.
 pub const RELATIONAL_EVENT_HISTORY_LIMIT: usize = 128;
 
+/// Maximum number of statements in one SQL batch transaction.
+pub const RELATIONAL_SQL_BATCH_LIMIT: usize = 1_024;
+
 /// A read-only, redacted support snapshot for one selected backend.
 ///
 /// This bundle does not run integrity verification or repair. The diagnostic
@@ -1418,6 +1421,29 @@ impl RelationalDatabase {
         params: &[crate::Value],
     ) -> Result<crate::SqlResult> {
         crate::sql::execute_with_params(self, sql, params)
+    }
+
+    /// Execute several bounded SQL statements in one atomic transaction.
+    ///
+    /// The batch is the durability and rollback boundary: SeerDB can publish
+    /// all staged writes in one physical envelope. Schema statements and
+    /// transaction-control SQL remain refused inside the batch; use the
+    /// direct schema methods and typed transaction lifecycle for those.
+    pub fn execute_sql_batch(&mut self, statements: &[&str]) -> Result<Vec<crate::SqlResult>> {
+        if statements.len() > RELATIONAL_SQL_BATCH_LIMIT {
+            return Err(DbError::ResourceLimitExceeded(format!(
+                "SQL batch has {} statements; limit is {}",
+                statements.len(),
+                RELATIONAL_SQL_BATCH_LIMIT
+            )));
+        }
+        self.transaction(|database, transaction| {
+            statements
+                .iter()
+                .map(|statement| transaction.execute_sql(database, statement))
+                .collect()
+        })
+        .map(|(results, _)| results)
     }
 
     /// Infer each positional parameter's expected column type from the

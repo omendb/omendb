@@ -46,6 +46,19 @@ supports the tested subset of schema changes, `SELECT`, `INSERT`, `UPDATE`,
 syntax returns `DbError::SqlUnsupported`; use the typed API when you need
 control over transaction, snapshot, or backend behavior.
 
+Each direct SQL write is one transaction. Use `execute_sql_batch` or a typed
+transaction with `RelationalDatabaseTransaction::execute_sql_with_params` when
+several statements should share one atomic and durable publication. The
+reproducible baseline is available with:
+
+```bash
+cargo run --release --example alpha_oltp -- \
+  --backend all --rows 512 --operations 1000 --batch-size 1
+```
+
+The baseline reports workload metadata and latency but makes no competitive
+performance claim; `--batch-size` measures the explicit transaction trade-off.
+
 ## PostgreSQL wire example
 
 Run the exploratory wire server with:

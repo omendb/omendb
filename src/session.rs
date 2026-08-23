@@ -779,6 +779,32 @@ impl RelationalDatabaseSession {
         })
     }
 
+    /// Execute several bounded SQL statements in one atomic transaction.
+    ///
+    /// Use the transaction SQL method when statements need parameters; this
+    /// convenience method is for literal statements and one durability
+    /// boundary.
+    pub fn execute_sql_batch(
+        &self,
+        control: &OperationControl,
+        statements: &[&str],
+    ) -> Result<Vec<crate::SqlResult>> {
+        if statements.len() > crate::RELATIONAL_SQL_BATCH_LIMIT {
+            return Err(DbError::ResourceLimitExceeded(format!(
+                "SQL batch has {} statements; limit is {}",
+                statements.len(),
+                crate::RELATIONAL_SQL_BATCH_LIMIT
+            )));
+        }
+        self.transaction(control, |database, transaction| {
+            statements
+                .iter()
+                .map(|statement| transaction.execute_sql(database, statement))
+                .collect()
+        })
+        .map(|(results, _)| results)
+    }
+
     /// Execute an analytical query with chunked morsel scanning, grouping,
     /// and memory budget protection under a shared read permit.
     pub fn query_analytical(
