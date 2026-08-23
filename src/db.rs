@@ -287,6 +287,12 @@ impl DB {
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
         self.check_maintenance_idle()?;
+        // A staged envelope group owns the pending prefix; publishing it
+        // through this legacy path would ack stale envelopes and split the
+        // group across two generations.
+        if !self.pending_envelopes.is_empty() {
+            return self.publication_barrier().map(|_| ());
+        }
         if self.pending_mutations == 0 {
             return Ok(());
         }

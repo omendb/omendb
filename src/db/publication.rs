@@ -101,13 +101,24 @@ impl DB {
         let blob_started = Instant::now();
         let blob_bytes = if self.blobs.is_segmented() || self.pending_blob_changes {
             self.blobs.set_generation(commit.generation_id.get());
-            if self.blobs.is_segmented() {
+            let bytes = if self.blobs.is_segmented() {
                 self.write_blob_segments()?
             } else {
                 let blob_path = self.path.join(BLOB_FILE);
                 let blob_image = self.blobs.to_bytes();
                 self.write_blob_image_without_directory_sync(&blob_path, &blob_image)?
-            }
+            };
+            // The blob artifact's directory entry must be durable before any
+            // frame can name this generation: an established database's
+            // meta.log creation no longer forces it implicitly.
+            let directory_started = Instant::now();
+            let directory_result = sync_publication_directory(&self.path);
+            self.publication_timing.directory_sync_ns = self
+                .publication_timing
+                .directory_sync_ns
+                .saturating_add(elapsed_nanos(directory_started));
+            directory_result?;
+            bytes
         } else {
             0
         };
@@ -119,16 +130,6 @@ impl DB {
             .publication_timing
             .blob_write_ns
             .saturating_add(elapsed_nanos(blob_started));
-        // The blob artifact's directory entry must be durable before any
-        // frame can name this generation: an established database's meta.log
-        // creation no longer forces it implicitly.
-        let directory_started = Instant::now();
-        let directory_result = sync_publication_directory(&self.path);
-        self.publication_timing.directory_sync_ns = self
-            .publication_timing
-            .directory_sync_ns
-            .saturating_add(elapsed_nanos(directory_started));
-        directory_result?;
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {

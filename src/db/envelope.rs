@@ -92,6 +92,9 @@ impl DB {
     /// other error may have reached durable media and fences the writer for
     /// recovery, exactly like the single-generation publication path.
     pub fn publication_barrier(&mut self) -> Result<Vec<(u64, DurabilityStatus)>> {
+        // A fenced writer must not retry: stage 2 may have consumed commit IDs
+        // and made a commit record durable, so only reopen may publish again.
+        self.check_writable()?;
         if self.pending_envelopes.is_empty() {
             return Ok(Vec::new());
         }

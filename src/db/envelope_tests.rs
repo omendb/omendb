@@ -324,3 +324,50 @@ fn test_group_barrier_has_fixed_sync_budget() {
         "barrier cost is independent of envelope count"
     );
 }
+
+#[test]
+fn test_fenced_barrier_rejects_retry() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fenced.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    let expected = db.commit_id;
+    db.admit_batch(expected, &mutations(&[(b"a", b"1")]))
+        .unwrap();
+
+    // A post-commit failure fences the writer; the barrier must then refuse
+    // retries instead of appending a second commit for the same prefix.
+    faults::FAIL_NEXT_FRAME_APPEND_N.with(|count| count.set(1));
+    assert!(db.publication_barrier().is_err());
+    let error = db
+        .publication_barrier()
+        .expect_err("fenced writer must not retry");
+    assert!(!matches!(error, Error::CapacityPreflight));
+
+    // Reopen clears the fence; recovery republishes the durable group.
+    drop(db);
+    let db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+}
+
+#[test]
+fn test_flush_publishes_staged_envelope_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("flush_group.db");
+
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        let expected = db.commit_id;
+        db.admit_batch(expected, &mutations(&[(b"a", b"1")]))
+            .unwrap();
+        db.admit_batch(expected, &mutations(&[(b"b", b"2")]))
+            .unwrap();
+        // Generic flush must route the staged group through its barrier
+        // instead of publishing the prefix on a parallel legacy path.
+        db.flush().unwrap();
+        assert!(db.pending_envelopes.is_empty());
+    }
+
+    let db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+}
