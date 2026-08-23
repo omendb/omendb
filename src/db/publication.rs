@@ -68,10 +68,6 @@ impl DB {
             .publication_timing
             .admission_ns
             .saturating_add(elapsed_nanos(admission_started));
-        self.publication_timing.admission_ns = self
-            .publication_timing
-            .admission_ns
-            .saturating_add(elapsed_nanos(admission_started));
         let flush_started = Instant::now();
         self.engine.set_write_generation(commit.generation_id.get());
         let flush_result = self.engine.flush_after_reclamation_refresh();
