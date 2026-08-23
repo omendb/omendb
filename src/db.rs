@@ -119,6 +119,8 @@ use faults::{
     FAIL_NEXT_BLOB_SEGMENT_TORN_WRITE, FAIL_NEXT_PUBLICATION_DIRECTORY_SYNC,
     FAIL_NEXT_WAL_AFTER_SYNC, FAIL_NEXT_WAL_AFTER_WRITE, FAIL_NEXT_WAL_SYNC, FAIL_NEXT_WAL_WRITE,
 };
+use metadata::MetaFrontier;
+use metadata_codec::ParsedMetaLog;
 use mutation::{Mutation, apply as apply_mutation, require_blob_deletion};
 use wal_recovery::{
     decode_delete_payload, decode_put_payload, digest_records, extend_digest,
@@ -204,6 +206,11 @@ pub struct DB {
     /// Durable retained-root registry shared with retained snapshot handles.
     retention: Arc<Mutex<RetentionState>>,
     /// Authoritative root-generation publication store.
+    ///
+    /// This is a derived cache of the latest resolved metadata checkpoint;
+    /// `seerdb.meta.log` remains authoritative and this value is cleared
+    /// whenever metadata I/O has an uncertain outcome.
+    meta_frontier: Option<MetaFrontier>,
 
     /// Durable descriptors for historical roots that can be retained later.
     manifest_history: ManifestHistory,

@@ -73,6 +73,7 @@ impl DB {
             engine: components.engine,
             wal: components.wal,
             blobs: components.blobs,
+            meta_frontier: components.meta_frontier,
             vacuum: None,
             retention: catalog.retention,
             manifest_history: catalog.manifest_history,

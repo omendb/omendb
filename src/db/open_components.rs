@@ -14,6 +14,7 @@ pub(super) struct OpenComponents {
     pub(super) wal: WalManager,
     pub(super) blobs: BlobManager,
     pub(super) recovery: Option<RecoverySummary>,
+    pub(super) meta_frontier: Option<MetaFrontier>,
 }
 
 pub(super) fn build(
@@ -41,7 +42,7 @@ pub(super) fn build(
     let recovered_blob_bytes =
         DB::recover_blob_rewrite_backup(&paths.path, catalog.current_manifest, catalog.read_only)?;
     let mut blobs = load_blobs(paths, options, catalog, recovered_blob_bytes)?;
-    let (pmt, allocator) = load_metadata(paths, catalog)?;
+    let (pmt, allocator, meta_frontier) = load_metadata(paths, catalog)?;
     let mut engine = StorageEngine::new_with_protected_offsets(
         BTree::new(),
         buffer,
@@ -84,6 +85,7 @@ pub(super) fn build(
         wal,
         blobs,
         recovery,
+        meta_frontier,
     })
 }
 
@@ -133,12 +135,12 @@ fn load_blobs(
     Ok(blobs)
 }
 
-fn load_metadata(paths: &OpenPaths, catalog: &OpenCatalog) -> Result<(PMT, PageAllocator)> {
+fn load_metadata(
+    paths: &OpenPaths,
+    catalog: &OpenCatalog,
+) -> Result<(PMT, PageAllocator, Option<MetaFrontier>)> {
     if let Some(current) = catalog.current_manifest {
-        if current.pmt_checkpoint_id.get() == 0 {
-            return Ok((PMT::new(), PageAllocator::new()));
-        }
-        let parsed = DB::read_meta_log(&paths.path)?.ok_or_else(|| {
+        let parsed = catalog.parsed_meta_log.as_ref().ok_or_else(|| {
             Error::Corruption(format!(
                 "manifest generation {} names checkpoint {} but the metadata log is missing",
                 current.generation_id.get(),
@@ -146,7 +148,7 @@ fn load_metadata(paths: &OpenPaths, catalog: &OpenCatalog) -> Result<(PMT, PageA
             ))
         })?;
         let resolved =
-            DB::resolve_meta_log(&parsed, current.pmt_checkpoint_id.get()).map_err(|error| {
+            DB::resolve_meta_log(parsed, current.pmt_checkpoint_id.get()).map_err(|error| {
                 if catalog.check_only {
                     DB::map_checkpoint_check_error(error)
                 } else {
@@ -165,16 +167,25 @@ fn load_metadata(paths: &OpenPaths, catalog: &OpenCatalog) -> Result<(PMT, PageA
             file.set_len(parsed.valid_len as u64)?;
             file.sync_all()?;
         }
-        return Ok((resolved.0, resolved.1));
+        let (pmt, allocator, depth) = resolved;
+        let frontier = MetaFrontier::new(
+            current.pmt_checkpoint_id.get(),
+            pmt.clone(),
+            allocator.clone(),
+            depth,
+            parsed.valid_len as u64,
+        );
+        return Ok((pmt, allocator, Some(frontier)));
     }
     if paths.meta.exists() {
-        return DB::load_meta(&paths.meta).map_err(|error| {
+        let (pmt, allocator) = DB::load_meta(&paths.meta).map_err(|error| {
             if catalog.check_only {
                 DB::map_checkpoint_check_error(error)
             } else {
                 error
             }
-        });
+        })?;
+        return Ok((pmt, allocator, None));
     }
-    Ok((PMT::new(), PageAllocator::new()))
+    Ok((PMT::new(), PageAllocator::new(), None))
 }

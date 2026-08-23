@@ -29,6 +29,39 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Derived, handle-local view of the latest resolved metadata checkpoint.
+///
+/// The metadata log remains the sole durable authority. This cache is valid
+/// only while the log length still matches `log_len`; it is cleared before
+/// any operation whose append or replacement outcome can be uncertain and is
+/// rebuilt after the corresponding file sync succeeds.
+#[derive(Clone)]
+pub(super) struct MetaFrontier {
+    pub(super) checkpoint_id: u64,
+    pub(super) pmt: PMT,
+    pub(super) allocator: PageAllocator,
+    pub(super) depth: usize,
+    pub(super) log_len: u64,
+}
+
+impl MetaFrontier {
+    pub(super) fn new(
+        checkpoint_id: u64,
+        pmt: PMT,
+        allocator: PageAllocator,
+        depth: usize,
+        log_len: u64,
+    ) -> Self {
+        Self {
+            checkpoint_id,
+            pmt,
+            allocator,
+            depth,
+            log_len,
+        }
+    }
+}
+
 impl DB {
     /// Load PMT and allocator from the legacy bootstrap meta file.
     pub(super) fn load_meta(path: &Path) -> Result<(PMT, PageAllocator)> {
@@ -255,24 +288,42 @@ impl DB {
     /// caller must have synced every page offset the manifest names and the
     /// WAL commit record before calling.
     pub(super) fn append_generation_meta(
-        &self,
+        &mut self,
         checkpoint_id: u64,
         parent_checkpoint_id: u64,
         manifest_bytes: &[u8],
     ) -> Result<(u64, bool)> {
         let log_path = Self::metadata_log_path(&self.path);
         let existed = log_path.exists();
-        let bytes = if existed {
-            fs::read(&log_path)?
+        let on_disk_len = if existed {
+            fs::metadata(&log_path)?.len()
         } else {
-            Vec::new()
+            0
         };
-        let parsed = if existed {
-            Some(parse_meta_log(&bytes)?)
+        let cached_parent = self
+            .meta_frontier
+            .as_ref()
+            .filter(|frontier| {
+                frontier.checkpoint_id == parent_checkpoint_id && frontier.log_len == on_disk_len
+            })
+            .map(|frontier| {
+                (
+                    frontier.pmt.clone(),
+                    frontier.allocator.clone(),
+                    frontier.depth,
+                )
+            });
+        // A metadata append, including a failed sync, can leave an uncertain
+        // tail. Do not retain a derived view across that boundary.
+        self.meta_frontier = None;
+
+        let bytes = if cached_parent.is_none() && existed {
+            Some(fs::read(&log_path)?)
         } else {
             None
         };
-        if let Some(parsed) = &parsed
+        let parsed = bytes.as_deref().map(parse_meta_log).transpose()?;
+        if let (Some(parsed), Some(bytes)) = (&parsed, bytes.as_ref())
             && parsed.valid_len < bytes.len()
         {
             // An abandoned torn tail from a crash during append must be
@@ -285,26 +336,43 @@ impl DB {
             crate::storage::record_durability_sync();
         }
 
-        let entry_payload = match (parent_checkpoint_id, parsed.as_ref()) {
-            (0, _) => encode_checkpoint(self.engine.pmt(), self.engine.allocator())?,
-            (parent_id, Some(parsed)) => {
-                let (parent_pmt, _, depth) = Self::resolve_meta_log(parsed, parent_id)?;
-                if depth >= MAX_META_DELTA_CHAIN {
-                    encode_checkpoint(self.engine.pmt(), self.engine.allocator())?
-                } else {
-                    encode_delta(
-                        parent_id,
-                        &parent_pmt,
-                        self.engine.pmt(),
-                        self.engine.allocator(),
-                    )?
-                }
-            }
-            (parent_id, None) => {
-                return Err(Error::Corruption(format!(
-                    "metadata log is missing parent checkpoint {parent_id}"
-                )));
-            }
+        let cached_parent = if parent_checkpoint_id == 0 || cached_parent.is_some() {
+            cached_parent
+        } else {
+            let parsed = parsed.as_ref().ok_or_else(|| {
+                Error::Corruption(format!(
+                    "metadata log is missing parent checkpoint {parent_checkpoint_id}"
+                ))
+            })?;
+            Some(Self::resolve_meta_log(parsed, parent_checkpoint_id)?)
+        };
+        let (entry_payload, parent_depth) = if parent_checkpoint_id == 0 {
+            (
+                encode_checkpoint(self.engine.pmt(), self.engine.allocator())?,
+                MAX_META_DELTA_CHAIN,
+            )
+        } else {
+            let (parent_pmt, _parent_allocator, depth) = cached_parent.ok_or_else(|| {
+                Error::Corruption(format!(
+                    "metadata log is missing parent checkpoint {parent_checkpoint_id}"
+                ))
+            })?;
+            let payload = if depth >= MAX_META_DELTA_CHAIN {
+                encode_checkpoint(self.engine.pmt(), self.engine.allocator())?
+            } else {
+                encode_delta(
+                    parent_checkpoint_id,
+                    &parent_pmt,
+                    self.engine.pmt(),
+                    self.engine.allocator(),
+                )?
+            };
+            (payload, depth)
+        };
+        let next_depth = if parent_checkpoint_id == 0 || parent_depth >= MAX_META_DELTA_CHAIN {
+            0
+        } else {
+            parent_depth + 1
         };
         let payload = encode_publication_payload(manifest_bytes, &entry_payload)?;
         let frame = encode_meta_log_frame(checkpoint_id, &payload)?;
@@ -358,6 +426,20 @@ impl DB {
         crate::storage::record_durability_sync();
 
         let header_bytes = u64::from(!existed) * META_LOG_HEADER_SIZE as u64;
+        let prefix_len = if existed {
+            parsed
+                .as_ref()
+                .map_or(on_disk_len, |parsed| parsed.valid_len as u64)
+        } else {
+            META_LOG_HEADER_SIZE as u64
+        };
+        self.meta_frontier = Some(MetaFrontier::new(
+            checkpoint_id,
+            self.engine.pmt().clone(),
+            self.engine.allocator().clone(),
+            next_depth,
+            prefix_len + frame.len() as u64,
+        ));
         Ok((header_bytes + frame.len() as u64, !existed))
     }
     /// Rewrite the metadata log keeping only the retained checkpoint IDs.
@@ -365,7 +447,7 @@ impl DB {
     /// Retained sets are ancestor-closed, so keeping exactly the retained
     /// frames preserves every retained delta chain. Returns the number of
     /// dropped frames and the bytes they occupied.
-    pub(super) fn compact_metadata_log(&self, retained: &BTreeSet<u64>) -> Result<(u64, u64)> {
+    pub(super) fn compact_metadata_log(&mut self, retained: &BTreeSet<u64>) -> Result<(u64, u64)> {
         let Some(parsed) = Self::read_meta_log(&self.path)? else {
             return Ok((0, 0));
         };
@@ -390,12 +472,45 @@ impl DB {
                 bytes.extend_from_slice(&frame.raw);
             }
         }
+        // Atomic replacement invalidates both the old byte-length identity and
+        // the resolved PMT view, even when the replacement later fails.
+        self.meta_frontier = None;
         atomic_write(&Self::metadata_log_path(&self.path), &bytes)?;
         Ok((removed_frames, reclaimed_bytes))
     }
 
+    fn ensure_meta_frontier(&mut self, checkpoint_id: u64) -> Result<usize> {
+        let log_path = Self::metadata_log_path(&self.path);
+        let on_disk_len = fs::metadata(&log_path)?.len();
+        if let Some(frontier) = self.meta_frontier.as_ref()
+            && frontier.checkpoint_id == checkpoint_id
+            && frontier.log_len == on_disk_len
+        {
+            return Ok(frontier.depth);
+        }
+
+        self.meta_frontier = None;
+        let bytes = fs::read(&log_path)?;
+        let parsed = parse_meta_log(&bytes)?;
+        if parsed.valid_len < bytes.len() {
+            let file = OpenOptions::new().write(true).open(&log_path)?;
+            file.set_len(parsed.valid_len as u64)?;
+            file.sync_all()?;
+            crate::storage::record_durability_sync();
+        }
+        let (pmt, allocator, depth) = Self::resolve_meta_log(&parsed, checkpoint_id)?;
+        self.meta_frontier = Some(MetaFrontier::new(
+            checkpoint_id,
+            pmt,
+            allocator,
+            depth,
+            parsed.valid_len as u64,
+        ));
+        Ok(depth)
+    }
+
     pub(super) fn generation_meta_bytes(
-        &self,
+        &mut self,
         parent_checkpoint_id: u64,
         dirty_page_count: usize,
     ) -> Result<(u64, bool)> {
@@ -424,9 +539,7 @@ impl DB {
             return Ok((full_bytes, true));
         }
 
-        let parsed = Self::read_meta_log(&self.path)?
-            .ok_or_else(|| Error::Corruption("metadata log is missing".into()))?;
-        let (_, _, depth) = Self::resolve_meta_log(&parsed, parent_checkpoint_id)?;
+        let depth = self.ensure_meta_frontier(parent_checkpoint_id)?;
         if depth >= MAX_META_DELTA_CHAIN {
             return Ok((full_bytes, true));
         }

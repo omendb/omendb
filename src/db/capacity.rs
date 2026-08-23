@@ -103,7 +103,7 @@ impl DB {
     /// footprint is checked first. This is a conservative same-filesystem
     /// guard; a concurrent external consumer can still force the final
     /// write-time DiskFull/recovery path.
-    pub(super) fn preflight_publication_capacity(&self) -> Result<()> {
+    pub(super) fn preflight_publication_capacity(&mut self) -> Result<()> {
         let dirty_page_count = self
             .engine
             .btree()
