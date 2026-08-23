@@ -345,6 +345,41 @@ fn test_db_discards_wal_after_publication_sync_failure() {
 }
 
 #[test]
+fn test_db_reconciles_wal_suffix_after_authority() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-suffix-reconciliation.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"stable", b"one").unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    // A crash after mutation bytes and a torn commit write leaves both a
+    // complete uncommitted mutation and an incomplete record suffix.
+    let wal_path = path.join(WAL_FILE);
+    let orphan = WalRecord::put(b"orphan", b"discard-me").to_bytes();
+    let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+    wal.write_all(&orphan).unwrap();
+    wal.write_all(&[0xA5, 0x5A, 0x01]).unwrap();
+    drop(wal);
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"orphan").unwrap(), None);
+    reopened.put(b"stable", b"two").unwrap();
+    reopened.flush().unwrap();
+    drop(reopened);
+
+    // A corrupt suffix after a valid authority frame is non-authoritative.
+    let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+    wal.write_all(&[5, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    drop(wal);
+    let report = DB::check(&path, Options::default()).unwrap();
+    assert_eq!(report.wal_status, WalCheckStatus::Incomplete);
+
+    let final_db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(final_db.get(b"stable").unwrap(), Some(b"two".to_vec()));
+}
+
+#[test]
 fn test_db_default_publication_does_not_force_wal_commit_sync() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("no-wal-commit-barrier.db");

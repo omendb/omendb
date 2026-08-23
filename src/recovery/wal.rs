@@ -1,8 +1,10 @@
 //! Buffered WAL manager.
 //!
-//! The WAL is durable before page generations are published. On crash
-//! recovery, only mutation prefixes closed by a valid commit envelope are
-//! replayed.
+//! WAL mutation records are written before page generations are published;
+//! under the default out-of-place policy they may remain buffered while the
+//! data pages and metadata authority frame establish the durable generation.
+//! Explicit sync policy can force them earlier. On crash recovery, only
+//! mutation prefixes closed by a valid commit envelope are replayed.
 //!
 //! Replay is not an acknowledgement guarantee: under the old-or-complete
 //! contract, a complete-but-unacknowledged generation whose commit record

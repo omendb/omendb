@@ -7,6 +7,121 @@ use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
 use crate::storage::format::Manifest;
 use std::path::Path;
 
+pub(super) struct WalAnalysis {
+    pub(super) status: ParseStatus,
+    pub(super) last_commit_end: usize,
+    pub(super) has_unpublished_commit: bool,
+}
+
+fn is_mutation(record: &WalRecord) -> bool {
+    matches!(
+        record.record_type,
+        RecordType::Put | RecordType::Delete | RecordType::PutV2 | RecordType::DeleteV2
+    )
+}
+
+/// Analyze the complete-record prefix and validate every commit envelope
+/// against its preceding mutation records and the selected authority.
+pub(super) fn analyze_wal_bytes(
+    bytes: &[u8],
+    current_manifest: Option<Manifest>,
+) -> Result<WalAnalysis> {
+    let (records, status) = WalManager::parse_records_with_status(bytes);
+    let mut pending = Vec::new();
+    let mut last_commit_end = 0usize;
+    let mut has_unpublished_commit = false;
+    let mut offset = 0usize;
+
+    for record in &records {
+        let record_len = record.to_bytes().len();
+        offset = offset
+            .checked_add(record_len)
+            .ok_or_else(|| Error::Corruption("WAL record offset overflow".into()))?;
+        if is_mutation(record) {
+            pending.push(record);
+            continue;
+        }
+        if let RecordType::Commit = record.record_type {
+            let commit = record
+                .commit_record()
+                .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+            if commit.mutation_count != pending.len() as u64
+                || commit.digest != digest_records(&pending)
+            {
+                return Err(Error::Corruption(
+                    "WAL commit does not match its mutation prefix".into(),
+                ));
+            }
+
+            if let Some(current) = current_manifest {
+                match commit.generation_id.get().cmp(&current.generation_id.get()) {
+                    std::cmp::Ordering::Less => {
+                        if commit.commit_id.get() > current.commit_id.get() {
+                            return Err(Error::Corruption(
+                                "WAL commit frontier is inconsistent with manifest".into(),
+                            ));
+                        }
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if commit.commit_id != current.commit_id
+                            || commit.root_page_id != current.root_page_id
+                            || commit.mutation_count != current.mutation_count
+                            || commit.digest != current.digest
+                        {
+                            return Err(Error::Corruption(
+                                "WAL commit disagrees with authoritative manifest".into(),
+                            ));
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if commit.commit_id <= current.commit_id {
+                            return Err(Error::Corruption(
+                                "WAL commit frontier is inconsistent with manifest".into(),
+                            ));
+                        }
+                        has_unpublished_commit = true;
+                    }
+                }
+            } else if commit.generation_id.get() > 0 || commit.commit_id.get() > 0 {
+                has_unpublished_commit = true;
+            }
+            pending.clear();
+            last_commit_end = offset;
+        }
+    }
+
+    Ok(WalAnalysis {
+        status,
+        last_commit_end,
+        has_unpublished_commit,
+    })
+}
+
+/// Reconcile a retained WAL before a writable open appends to it.
+///
+/// The metadata authority frame is authoritative for generations at or below
+/// the selected manifest. A corrupt or torn suffix is therefore disposable
+/// once a valid authority exists; a complete valid commit ahead of authority
+/// remains through its commit boundary for recovery. Trailing mutation records
+/// without a commit are always discarded so they cannot poison the next
+/// generation's mutation-count or digest prefix.
+pub(super) fn reconcile_wal(wal_path: &Path, current_manifest: Option<Manifest>) -> Result<()> {
+    let bytes = std::fs::read(wal_path)?;
+    let analysis = analyze_wal_bytes(&bytes, current_manifest)?;
+    if analysis.status == ParseStatus::Corrupt && current_manifest.is_none() {
+        return Err(Error::Corruption("invalid complete WAL record".into()));
+    }
+    let keep_len = analysis.last_commit_end;
+    if keep_len >= bytes.len() {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(wal_path)?;
+    file.set_len(keep_len as u64)?;
+    file.sync_data()?;
+    crate::storage::record_durability_sync();
+    Ok(())
+}
+
 /// Whether the WAL holds any committed generation ahead of the authority,
 /// i.e. content recovery would replay. Retained records at or below the
 /// published generation are inert, so their presence alone must not force
@@ -16,29 +131,11 @@ pub(super) fn wal_has_unpublished_commits(
     current_manifest: Option<Manifest>,
 ) -> Result<bool> {
     let bytes = std::fs::read(wal_path)?;
-    let (records, status) = WalManager::parse_records_with_status(&bytes);
-    if status == ParseStatus::Corrupt {
+    let analysis = analyze_wal_bytes(&bytes, current_manifest)?;
+    if analysis.status == ParseStatus::Corrupt && current_manifest.is_none() {
         return Err(Error::Corruption("invalid complete WAL record".into()));
     }
-    let current_generation = current_manifest
-        .map(|manifest| manifest.generation_id.get())
-        .unwrap_or(0);
-    let current_commit = current_manifest
-        .map(|manifest| manifest.commit_id.get())
-        .unwrap_or(0);
-    for record in &records {
-        if let RecordType::Commit = record.record_type {
-            let commit = record
-                .commit_record()
-                .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
-            if commit.generation_id.get() > current_generation
-                && commit.commit_id.get() > current_commit
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    Ok(analysis.has_unpublished_commit)
 }
 
 /// Recover a committed WAL prefix and reject corrupt complete records.
@@ -161,27 +258,6 @@ pub(super) fn recover_from_wal(
         last_commit_offset,
         blob_changed,
     })
-}
-
-/// Remove any torn or zeroed tail so future appends land on a record
-/// boundary. Retention keeps the WAL across publications; without this,
-/// post-crash appends would follow an unparseable partial record.
-pub(super) fn truncate_wal_tail(wal_path: &Path) -> Result<()> {
-    let bytes = std::fs::read(wal_path)?;
-    let (_, status) = WalManager::parse_records_with_status(&bytes);
-    if status != ParseStatus::Incomplete {
-        return Ok(());
-    }
-    let (records, _) = WalManager::parse_records_with_status(&bytes);
-    let mut end = 0u64;
-    for record in &records {
-        end += record.to_bytes().len() as u64;
-    }
-    let file = std::fs::OpenOptions::new().write(true).open(wal_path)?;
-    file.set_len(end)?;
-    file.sync_data()?;
-    crate::storage::record_durability_sync();
-    Ok(())
 }
 
 pub(super) fn extend_digest(current: u32, record: &WalRecord) -> u32 {

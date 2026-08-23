@@ -64,7 +64,7 @@ pub(super) fn build(
     }
     let wal_present = paths.wal.exists();
     if wal_present && !catalog.check_only {
-        wal_recovery::truncate_wal_tail(&paths.wal)?;
+        wal_recovery::reconcile_wal(&paths.wal, catalog.current_manifest)?;
     }
     let needs_recovery = wal_present
         && !catalog.check_only

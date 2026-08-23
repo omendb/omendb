@@ -294,7 +294,7 @@ fn dbnext_r0_rejects_corrupt_manifest() {
 }
 
 #[test]
-fn dbnext_r0_rejects_corrupt_wal_with_typed_diagnosis() {
+fn dbnext_r0_reconciles_corrupt_wal_suffix_after_authority() {
     let root = tempdir().unwrap();
     let path = root.path().join("corrupt-wal.db");
     {
@@ -308,17 +308,13 @@ fn dbnext_r0_rejects_corrupt_wal_with_typed_diagnosis() {
     wal[last] ^= 0xFF;
     fs::write(path.join("seerdb.wal"), wal).unwrap();
 
-    assert!(matches!(
-        DB::open(&path, Options::default()),
-        Err(Error::Corruption(message)) if message.to_ascii_lowercase().contains("wal")
-    ));
-    assert!(matches!(
-        DB::check(&path, Options::default()),
-        Err(Error::Check {
-            kind: CheckFailureKind::Wal,
-            ..
-        })
-    ));
+    let check = DB::check(&path, Options::default()).unwrap();
+    assert_eq!(check.wal_status, WalCheckStatus::Incomplete);
+    let opened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(opened.get(b"stable").unwrap(), Some(b"value".to_vec()));
+    drop(opened);
+    let check = DB::check(&path, Options::default()).unwrap();
+    assert_eq!(check.wal_status, WalCheckStatus::Clean);
 }
 
 #[test]

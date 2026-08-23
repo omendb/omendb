@@ -251,7 +251,25 @@ impl DB {
             VerificationFailure::from_error(CheckFailureKind::Wal, error.into())
         })?;
         let (_, status) = WalManager::parse_records_with_status(&bytes);
-        if status == ParseStatus::Corrupt || (!self.check_only && status != ParseStatus::Complete) {
+        if status == ParseStatus::Corrupt {
+            // Once a valid authority frame exists, an unsynced WAL suffix is
+            // non-authoritative. Validate the complete prefix/frontier, but
+            // let writable open reconcile the corrupt suffix and let check
+            // report the authoritative database instead of rejecting it.
+            if let Some(current) = self.manifest_history.latest() {
+                super::wal_recovery::analyze_wal_bytes(&bytes, Some(current)).map_err(|error| {
+                    VerificationFailure::from_error(CheckFailureKind::Wal, error)
+                })?;
+                return Ok(bytes.len() as u64);
+            }
+        }
+        if !self.check_only && status != ParseStatus::Complete {
+            return Err(VerificationFailure {
+                kind: CheckFailureKind::Wal,
+                message: format!("WAL integrity status is {status:?}"),
+            });
+        }
+        if status == ParseStatus::Corrupt {
             return Err(VerificationFailure {
                 kind: CheckFailureKind::Wal,
                 message: format!("WAL integrity status is {status:?}"),
@@ -272,16 +290,20 @@ impl DB {
         }
 
         let (records, status) = WalManager::parse_records_with_status(&bytes);
-        if status == ParseStatus::Corrupt {
-            return Err(Error::Corruption(
-                "offline check found a corrupt WAL record".into(),
-            ));
-        }
 
         let current_manifest = self
             .manifest_history
             .latest()
             .ok_or_else(|| Error::Corruption("database has no valid manifest generation".into()))?;
+        if status == ParseStatus::Corrupt {
+            let analysis = super::wal_recovery::analyze_wal_bytes(&bytes, Some(current_manifest))?;
+            return Ok(if analysis.has_unpublished_commit {
+                WalCheckStatus::NeedsRecovery
+            } else {
+                WalCheckStatus::Incomplete
+            });
+        }
+
         let mut pending = Vec::new();
         let mut saw_unpublished_commit = false;
         for record in &records {
