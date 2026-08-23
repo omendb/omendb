@@ -54,8 +54,9 @@ passing fixtures and published evidence.
       joins, and `DISTINCT` with pagination;
 - [x] differential SQL tests compare the overlapping bounded subset with an
       independent SQLite oracle;
-- [ ] property/fuzz tests exercise row encoding, catalog/index maintenance,
-      SQL values, and transaction sequences;
+- [x] property tests exercise row and row-identity encoding roundtrips,
+      truncation refusal, and corruption detection; a randomized SQL trace
+      covers transaction sequences against the SQLite oracle;
 - [ ] concurrent transaction tests cover read/write, write/write, unique,
       foreign-key, snapshot, cancellation, and admission outcomes;
 - [ ] every durable publication seam has a process-level kill/reopen test;
