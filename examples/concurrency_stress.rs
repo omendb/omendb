@@ -89,14 +89,16 @@ struct ClientStats {
 fn is_certifier_retry(error: &tokio_postgres::Error) -> bool {
     matches!(
         error.code(),
-        Some(&SqlState::T_R_SERIALIZATION_FAILURE)
-            | Some(&SqlState::IN_FAILED_SQL_TRANSACTION)
+        Some(&SqlState::T_R_SERIALIZATION_FAILURE) | Some(&SqlState::IN_FAILED_SQL_TRANSACTION)
     )
 }
 
 async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=stress dbname=stress", addr.port()),
+        &format!(
+            "host=127.0.0.1 port={} user=stress dbname=stress",
+            addr.port()
+        ),
         NoTls,
     )
     .await
@@ -124,7 +126,9 @@ async fn run_client(addr: std::net::SocketAddr, config: Config, seed: u64) -> Cl
                 .await
                 .expect("read");
             stats.reads += 1;
-            stats.latencies_us.push(started.elapsed().as_micros() as u64);
+            stats
+                .latencies_us
+                .push(started.elapsed().as_micros() as u64);
             continue;
         }
         let mut committed = false;
@@ -147,7 +151,10 @@ async fn run_client(addr: std::net::SocketAddr, config: Config, seed: u64) -> Cl
             {
                 if is_certifier_retry(&error) && attempt < 199 {
                     stats.retries += 1;
-                    tokio::time::sleep(Duration::from_millis((attempt as u64) + 1).min(Duration::from_millis(20))).await;
+                    tokio::time::sleep(
+                        Duration::from_millis((attempt as u64) + 1).min(Duration::from_millis(20)),
+                    )
+                    .await;
                     continue;
                 }
                 panic!("rmw update failed terminally: {error}");
@@ -160,7 +167,10 @@ async fn run_client(addr: std::net::SocketAddr, config: Config, seed: u64) -> Cl
                 }
                 Err(error) if is_certifier_retry(&error) && attempt < 199 => {
                     stats.retries += 1;
-                    tokio::time::sleep(Duration::from_millis((attempt as u64) + 1).min(Duration::from_millis(20))).await;
+                    tokio::time::sleep(
+                        Duration::from_millis((attempt as u64) + 1).min(Duration::from_millis(20)),
+                    )
+                    .await;
                 }
                 Err(error) => panic!("commit failed terminally: {error}"),
             }
@@ -168,7 +178,9 @@ async fn run_client(addr: std::net::SocketAddr, config: Config, seed: u64) -> Cl
         if !committed {
             stats.exhausted += 1;
         }
-        stats.latencies_us.push(started.elapsed().as_micros() as u64);
+        stats
+            .latencies_us
+            .push(started.elapsed().as_micros() as u64);
     }
     stats
 }
@@ -184,11 +196,10 @@ fn percentile(sorted: &[u64], fraction: f64) -> u64 {
 async fn main() -> anyhow::Result<()> {
     let config = parse_args();
     let directory = tempfile::tempdir()?;
-    let mut database = RelationalDatabase::create(RelationalBackendConfig::Temporary(
-        DatabaseConfig {
+    let mut database =
+        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
             directory: directory.path().to_path_buf(),
-        },
-    ))?;
+        }))?;
     database.create_table(TableDefinition {
         id: TableId(9),
         name: "counters".to_owned(),

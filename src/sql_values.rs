@@ -115,18 +115,14 @@ pub(super) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
     let value = match (&value, column.data_type) {
         (Value::I64(inner), ColumnType::U64) if *inner >= 0 => {
             Value::U64(u64::try_from(*inner).map_err(|_| {
-                DbError::InvalidState(format!(
-                    "value does not satisfy SQL column {}",
-                    column.name
-                ))
+                DbError::InvalidState(format!("value does not satisfy SQL column {}", column.name))
             })?)
         }
-        (Value::U64(inner), ColumnType::I64) => Value::I64(i64::try_from(*inner).map_err(|_| {
-            DbError::InvalidState(format!(
-                "value does not satisfy SQL column {}",
-                column.name
-            ))
-        })?),
+        (Value::U64(inner), ColumnType::I64) => {
+            Value::I64(i64::try_from(*inner).map_err(|_| {
+                DbError::InvalidState(format!("value does not satisfy SQL column {}", column.name))
+            })?)
+        }
         _ => value,
     };
     let valid = matches!(

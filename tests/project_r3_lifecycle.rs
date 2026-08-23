@@ -125,7 +125,9 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
     let mut database = RelationalDatabase::create(db_config.clone()).expect("create database");
 
     // 1. Seed initial schema and data
-    database.create_table(orders_table()).expect("create orders table");
+    database
+        .create_table(orders_table())
+        .expect("create orders table");
     database
         .create_index(IndexDefinition {
             id: ORDER_STATUS_INDEX,
@@ -152,18 +154,16 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
         })
         .expect("seed initial orders");
 
-    let pre_cutover_lease = database.retain(seed_commit).expect("retain pre-cutover snapshot");
+    let pre_cutover_lease = database
+        .retain(seed_commit)
+        .expect("retain pre-cutover snapshot");
     let initial_digest = digest_database(&database, seed_commit);
 
     // 2. Active traffic (updates & reads)
     let (_, traffic_commit) = database
         .transaction(|db, tx| {
             for tenant in 1..=num_tenants {
-                tx.update(
-                    db,
-                    ORDERS_TABLE,
-                    order_row(tenant, 1, "processing", 150),
-                )?;
+                tx.update(db, ORDERS_TABLE, order_row(tenant, 1, "processing", 150))?;
             }
             Ok(())
         })
@@ -190,7 +190,10 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
         .expect("get historical row")
         .expect("historical row exists");
     assert_eq!(historical_row.values.len(), 4);
-    assert_eq!(historical_row.values.get(2), Some(&Value::Text("pending".to_owned())));
+    assert_eq!(
+        historical_row.values.get(2),
+        Some(&Value::Text("pending".to_owned()))
+    );
 
     // Current reader sees 5 columns with Value::Null for un-backfilled rows
     let current_row = database
@@ -245,7 +248,9 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
 
     // 6. Schema cutover verification
     let cutover_commit = database.commit_id();
-    let post_cutover_lease = database.retain(cutover_commit).expect("retain post-cutover");
+    let post_cutover_lease = database
+        .retain(cutover_commit)
+        .expect("retain post-cutover");
 
     let high_priority_orders = database
         .index_get(
@@ -268,8 +273,9 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
         )
         .expect("capture selected snapshots");
 
-    let archive = RelationalArchive::from_capture(capture, RelationalArchiveMode::RetainedSnapshots)
-        .expect("create archive");
+    let archive =
+        RelationalArchive::from_capture(capture, RelationalArchiveMode::RetainedSnapshots)
+            .expect("create archive");
     archive.write(&archive_path).expect("write archive");
 
     // 8. Restore into fresh database (clone/restore qualification)
@@ -302,7 +308,10 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
             &[Value::U64(1), Value::Text("high".to_owned())],
         )
         .expect("query restored index");
-    assert_eq!(restored_high_priority.len(), (orders_per_tenant / 5) as usize);
+    assert_eq!(
+        restored_high_priority.len(),
+        (orders_per_tenant / 5) as usize
+    );
 
     restored_db.verify().expect("verify restored database");
     restored_db.close().expect("close restored clone");
@@ -311,8 +320,12 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
     let pre_cutover_digest_now = digest_database(&database, seed_commit);
     assert_eq!(pre_cutover_digest_now, initial_digest);
 
-    database.release(pre_cutover_lease).expect("release pre-cutover");
-    database.release(post_cutover_lease).expect("release post-cutover");
+    database
+        .release(pre_cutover_lease)
+        .expect("release pre-cutover");
+    database
+        .release(post_cutover_lease)
+        .expect("release post-cutover");
     database.verify().expect("verify source database");
     database.checkpoint().expect("checkpoint source");
     database.close().expect("close source database");
@@ -320,7 +333,10 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
     // Reopen source and verify integrity
     let mut reopened_db = RelationalDatabase::open(db_config).expect("reopen source");
     assert_eq!(reopened_db.commit_id(), cutover_commit);
-    assert_eq!(digest_database(&reopened_db, cutover_commit), cutover_digest);
+    assert_eq!(
+        digest_database(&reopened_db, cutover_commit),
+        cutover_digest
+    );
     reopened_db.verify().expect("verify reopened source");
     reopened_db.close().expect("close reopened source");
 }
@@ -334,8 +350,5 @@ fn public_facade_replays_r3_operational_lifecycle_across_selected_backends() {
     );
 
     let seer = tempdir().expect("seer directory");
-    exercise_r3_operational_lifecycle(
-        RelationalBackendKind::Seer,
-        &seer.path().join("seer"),
-    );
+    exercise_r3_operational_lifecycle(RelationalBackendKind::Seer, &seer.path().join("seer"));
 }

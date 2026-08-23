@@ -61,7 +61,7 @@ fn main() -> Result<()> {
             max_in_flight: workers,
             overload_policy: OverloadPolicy::default(),
         },
-    demotion_after: None,
+        demotion_after: None,
     })?;
     let mut rng = seed;
     let mut running = vec![None; workers];

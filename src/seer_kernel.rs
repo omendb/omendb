@@ -214,11 +214,7 @@ impl SeerKernel {
     /// Shared access is safe: the kernel's internal `Mutex<DB>` serializes
     /// durable publication, so concurrent callers overlap only their waiting,
     /// never the publication itself.
-    pub fn commit(
-        &self,
-        expected: CommitId,
-        mutations: &[KvMutation],
-    ) -> Result<CommitOutcome> {
+    pub fn commit(&self, expected: CommitId, mutations: &[KvMutation]) -> Result<CommitOutcome> {
         let mutations = mutations
             .iter()
             .map(|mutation| match mutation {

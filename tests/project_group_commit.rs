@@ -217,7 +217,12 @@ fn group_commit_attempt_dedups_resubmission_on_seer() {
 
     // The original row stands; no duplicate publication ran.
     let row = session
-        .get(&control, USERS_TABLE, session.commit_id(&control).expect("commit id"), Key::new(USERS_TABLE.0, 1))
+        .get(
+            &control,
+            USERS_TABLE,
+            session.commit_id(&control).expect("commit id"),
+            Key::new(USERS_TABLE.0, 1),
+        )
         .expect("get")
         .expect("row exists");
     assert_eq!(row.values[1], Value::U64(100));

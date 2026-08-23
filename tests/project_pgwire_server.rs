@@ -5,20 +5,19 @@
 use std::sync::{Arc, RwLock};
 
 use omendb::pgwire_server;
-use tokio_postgres::error::SqlState;
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, RelationalBackendConfig,
     RelationalDatabase, TableDefinition, TableId,
 };
 use tempfile::tempdir;
+use tokio_postgres::error::SqlState;
 
 fn seed_database(directory: &std::path::Path) -> Arc<RwLock<RelationalDatabase>> {
-    let mut database = RelationalDatabase::create(RelationalBackendConfig::Temporary(
-        DatabaseConfig {
+    let mut database =
+        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
             directory: directory.to_path_buf(),
-        },
-    ))
-    .expect("create database");
+        }))
+        .expect("create database");
     database
         .create_table(TableDefinition {
             id: TableId(7),
@@ -50,16 +49,20 @@ async fn wire_client_selects_seeds_and_reads_typed_rows() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
 
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=spike dbname=spike",
+            addr.port()
+        ),
+        tokio_postgres::NoTls,
     )
     .await
-    .expect("spawn server");
-
-    let (client, connection) = tokio_postgres::connect(&format!("host=127.0.0.1 port={} user=spike dbname=spike", addr.port()), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
+    .expect("connect");
     tokio::spawn(async move { connection.await.expect("connection") });
 
     let one = client.query_one("SELECT 1", &[]).await.expect("SELECT 1");
@@ -93,15 +96,15 @@ async fn wire_client_selects_seeds_and_reads_typed_rows() {
 async fn wire_client_gets_clean_error_for_unsupported_sql() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
-    let (addr, _server) = pgwire_server::spawn(
-        database,
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
+    let (addr, _server) = pgwire_server::spawn(database, "127.0.0.1:0".parse().expect("addr"))
+        .await
+        .expect("spawn server");
 
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=spike dbname=spike", addr.port()),
+        &format!(
+            "host=127.0.0.1 port={} user=spike dbname=spike",
+            addr.port()
+        ),
         tokio_postgres::NoTls,
     )
     .await
@@ -129,12 +132,10 @@ async fn wire_client_gets_clean_error_for_unsupported_sql() {
 }
 
 async fn wire_client(database: Arc<RwLock<RelationalDatabase>>) -> tokio_postgres::Client {
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
     let (client, connection) = tokio_postgres::connect(
         &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
         tokio_postgres::NoTls,
@@ -152,10 +153,7 @@ async fn wire_transaction_block_rollback_discards_writes() {
     let client = wire_client(database.clone()).await;
 
     // Simple-protocol block: BEGIN, write, ROLLBACK - nothing durable.
-    client
-        .batch_execute("BEGIN")
-        .await
-        .expect("begin");
+    client.batch_execute("BEGIN").await.expect("begin");
     client
         .batch_execute("INSERT INTO users (id, email) VALUES (10, 'tx@example.com')")
         .await
@@ -206,7 +204,10 @@ async fn wire_transaction_block_commit_persists_and_crosses_connections() {
     {
         let transaction = writer.transaction().await.expect("begin second");
         transaction
-            .execute("INSERT INTO users (id, email) VALUES ($1, $2)", &[&12i64, &"dropped@example.com"])
+            .execute(
+                "INSERT INTO users (id, email) VALUES ($1, $2)",
+                &[&12i64, &"dropped@example.com"],
+            )
             .await
             .expect("second in-block insert");
     } // dropped here -> implicit rollback
@@ -214,7 +215,11 @@ async fn wire_transaction_block_commit_persists_and_crosses_connections() {
         .query_one("SELECT count(*) FROM users", &[])
         .await
         .expect("count after drop");
-    assert_eq!(after.get::<_, i64>(0), 2, "seed + committed 11; dropped 12 gone");
+    assert_eq!(
+        after.get::<_, i64>(0),
+        2,
+        "seed + committed 11; dropped 12 gone"
+    );
 }
 
 #[tokio::test]
@@ -264,12 +269,10 @@ async fn wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password() {
     )
     .expect("provision user");
 
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
     let dsn = |user: &str, password: &str| {
         format!(
             "host=127.0.0.1 port={} user={user} password={password}",
@@ -291,8 +294,7 @@ async fn wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password() {
 
     // Wrong password and unknown user both fail with 28P01.
     for (user, password) in [("alice", "wrong"), ("mallory", "wonderland")] {
-        let error = match tokio_postgres::connect(&dsn(user, password), tokio_postgres::NoTls)
-            .await
+        let error = match tokio_postgres::connect(&dsn(user, password), tokio_postgres::NoTls).await
         {
             Err(error) => error,
             Ok(_) => panic!("must reject {user}"),
@@ -355,20 +357,17 @@ async fn wire_concurrent_reads_scale_while_writes_publish() {
         }
     }
 
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
     let port = addr.port();
     let connect = move |user: &str| {
         let dsn = format!("host=127.0.0.1 port={port} user={user}");
         async move {
-            let (client, connection) =
-                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                    .await
-                    .expect("connect");
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
             tokio::spawn(async move { connection.await.expect("connection") });
             client
         }
@@ -428,12 +427,11 @@ async fn wire_concurrent_reads_scale_while_writes_publish() {
         }
         eprintln!("writer20={:.3}s", writer_started.elapsed().as_secs_f64());
 
-        let read_elapsed: Vec<std::time::Duration> =
-            futures::future::join_all(reader_handles)
-                .await
-                .into_iter()
-                .map(|r| r.expect("reader task"))
-                .collect();
+        let read_elapsed: Vec<std::time::Duration> = futures::future::join_all(reader_handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("reader task"))
+            .collect();
 
         let max_reader = read_elapsed.iter().max().expect("readers").as_secs_f64();
         eprintln!(
@@ -497,28 +495,47 @@ async fn wire_seeded_ids_visible_serially() {
 fn facade_sequential_autocommit_inserts_all_visible() {
     let directory = tempdir().expect("tempdir");
     let database = std::sync::Arc::new(std::sync::RwLock::new(
-        RelationalDatabase::create(RelationalBackendConfig::Temporary(
-            omendb::DatabaseConfig { directory: directory.path().to_path_buf() },
-        ))
+        RelationalDatabase::create(RelationalBackendConfig::Temporary(omendb::DatabaseConfig {
+            directory: directory.path().to_path_buf(),
+        }))
         .expect("create"),
     ));
     let database = &mut *database.write().expect("lock");
-    database.create_table(TableDefinition {
-        id: TableId(7),
-        name: "users".to_owned(),
-        columns: vec![
-            ColumnDefinition { id: ColumnId(1), name: "id".to_owned(), data_type: ColumnType::U64, nullable: false },
-            ColumnDefinition { id: ColumnId(2), name: "email".to_owned(), data_type: ColumnType::Text, nullable: false },
-        ],
-    })
-    .expect("create table");
+    database
+        .create_table(TableDefinition {
+            id: TableId(7),
+            name: "users".to_owned(),
+            columns: vec![
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "email".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+        })
+        .expect("create table");
     for id in 1..=10u64 {
         database
-            .execute_sql(&format!("INSERT INTO users (id, email) VALUES ({id}, 'u{id}@x.com')"))
+            .execute_sql(&format!(
+                "INSERT INTO users (id, email) VALUES ({id}, 'u{id}@x.com')"
+            ))
             .expect("insert");
     }
-    let result = database.execute_sql("SELECT count(*) FROM users").expect("count");
-    assert_eq!(result.rows[0][0], omendb::Value::U64(10), "all 10 rows visible");
+    let result = database
+        .execute_sql("SELECT count(*) FROM users")
+        .expect("count");
+    assert_eq!(
+        result.rows[0][0],
+        omendb::Value::U64(10),
+        "all 10 rows visible"
+    );
     // Now publish a second schema change, like serve() bootstrapping
     // pgwire_auth after user data exists.
     database
@@ -526,12 +543,24 @@ fn facade_sequential_autocommit_inserts_all_visible() {
             id: TableId(u64::MAX - 1),
             name: "pgwire_auth".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(u16::MAX - 1), name: "username".to_owned(), data_type: ColumnType::Text, nullable: false },
-                ColumnDefinition { id: ColumnId(u16::MAX), name: "secret".to_owned(), data_type: ColumnType::Bytes, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(u16::MAX - 1),
+                    name: "username".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(u16::MAX),
+                    name: "secret".to_owned(),
+                    data_type: ColumnType::Bytes,
+                    nullable: false,
+                },
             ],
         })
         .expect("create auth table");
-    let result = database.execute_sql("SELECT count(*) FROM users").expect("count after DDL");
+    let result = database
+        .execute_sql("SELECT count(*) FROM users")
+        .expect("count after DDL");
     assert_eq!(
         result.rows[0][0],
         omendb::Value::U64(10),
@@ -551,9 +580,24 @@ async fn wire_inner_join_matches_and_filters() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -569,7 +613,10 @@ async fn wire_inner_join_matches_and_filters() {
 
     // Unfiltered join: alice has two orders, bob one.
     let rows = client
-        .query("SELECT * FROM users JOIN orders ON users.id = orders.user_id", &[])
+        .query(
+            "SELECT * FROM users JOIN orders ON users.id = orders.user_id",
+            &[],
+        )
         .await
         .expect("join query");
     assert_eq!(rows.len(), 3, "expected 3 joined rows");
@@ -590,7 +637,10 @@ async fn wire_inner_join_matches_and_filters() {
         .await
         .expect("filtered join");
     assert_eq!(filtered.len(), 2);
-    assert_eq!(filtered[0].get::<_, &str>("users.email"), "alice@example.com");
+    assert_eq!(
+        filtered[0].get::<_, &str>("users.email"),
+        "alice@example.com"
+    );
 
     // Join key with no match contributes nothing.
     let empty = client
@@ -647,9 +697,24 @@ async fn wire_inner_join_projection_alias_order_by() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -673,7 +738,11 @@ async fn wire_inner_join_projection_alias_order_by() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].columns()[0].name(), "who");
     assert_eq!(rows[0].columns()[1].name(), "item");
-    assert_eq!(rows[0].get::<_, &str>(1), "lamp", "ORDER BY order_id DESC first");
+    assert_eq!(
+        rows[0].get::<_, &str>(1),
+        "lamp",
+        "ORDER BY order_id DESC first"
+    );
 
     // Unqualified unique column resolves; literal projects.
     let filtered = client
@@ -700,9 +769,24 @@ async fn wire_three_way_join() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -710,9 +794,24 @@ async fn wire_three_way_join() {
             id: TableId(10),
             name: "shipments".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "shipment_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "carrier".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "shipment_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "carrier".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create shipments");
@@ -756,9 +855,24 @@ async fn wire_join_aggregates() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "amount".to_owned(), data_type: ColumnType::U64, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "amount".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -804,9 +918,24 @@ async fn wire_non_equi_join() {
             id: TableId(11),
             name: "ranges".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "range_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "low".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "high".to_owned(), data_type: ColumnType::U64, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "range_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "low".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "high".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
             ],
         })
         .expect("create ranges");
@@ -843,9 +972,24 @@ async fn wire_join_group_by() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "amount".to_owned(), data_type: ColumnType::U64, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "amount".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -909,9 +1053,24 @@ async fn wire_join_order_by_qualified_and_ambiguous() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -949,15 +1108,32 @@ async fn wire_left_outer_join_null_extension() {
     let database = seed_database(directory.path());
     {
         let mut db = database.write().expect("lock");
-        db.execute_sql("INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')")
-            .expect("seed more users");
+        db.execute_sql(
+            "INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')",
+        )
+        .expect("seed more users");
         db.create_table(TableDefinition {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -982,7 +1158,10 @@ async fn wire_left_outer_join_null_extension() {
     assert_eq!(rows[0].get::<_, &str>(0), "alice@example.com");
     assert_eq!(rows[0].get::<_, &str>(1), "book");
     assert_eq!(rows[2].get::<_, &str>(0), "carol@example.com");
-    assert!(rows[2].try_get::<_, &str>(1).is_err(), "item is NULL for carol");
+    assert!(
+        rows[2].try_get::<_, &str>(1).is_err(),
+        "item is NULL for carol"
+    );
 
     // Bare JOIN spelling of LEFT OUTER also parses.
     let bare = client
@@ -1005,9 +1184,24 @@ async fn wire_using_and_natural_joins() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1021,8 +1215,18 @@ async fn wire_using_and_natural_joins() {
             id: TableId(10),
             name: "order_items".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "price".to_owned(), data_type: ColumnType::U64, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "price".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
             ],
         })
         .expect("create order_items");
@@ -1090,9 +1294,24 @@ async fn wire_right_and_full_outer_joins() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1118,7 +1337,10 @@ async fn wire_right_and_full_outer_joins() {
     assert_eq!(rows[0].get::<_, &str>(0), "alice@example.com");
     let ghost = &rows[1]; // item sort: book, ghost, lamp
     assert_eq!(ghost.get::<_, &str>(1), "ghost");
-    assert!(ghost.try_get::<_, &str>(0).is_err(), "ghost order has NULL email");
+    assert!(
+        ghost.try_get::<_, &str>(0).is_err(),
+        "ghost order has NULL email"
+    );
 
     // FULL OUTER: both unmatched users and unmatched orders survive.
     let full = client
@@ -1128,7 +1350,11 @@ async fn wire_right_and_full_outer_joins() {
         )
         .await
         .expect("full outer join");
-    assert_eq!(full.len(), 4, "alice + bob + carol(null item) + ghost(null email)");
+    assert_eq!(
+        full.len(),
+        4,
+        "alice + bob + carol(null item) + ghost(null email)"
+    );
 }
 
 #[tokio::test]
@@ -1143,8 +1369,18 @@ async fn wire_cross_join_pairs_everything() {
             id: TableId(8),
             name: "colors".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "color_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "name".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "color_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "name".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create colors");
@@ -1157,7 +1393,10 @@ async fn wire_cross_join_pairs_everything() {
     }
     let client = wire_client(database.clone()).await;
     let rows = client
-        .query("SELECT email, name FROM users CROSS JOIN colors ORDER BY color_id", &[])
+        .query(
+            "SELECT email, name FROM users CROSS JOIN colors ORDER BY color_id",
+            &[],
+        )
         .await
         .expect("cross join");
     assert_eq!(rows.len(), 6, "2 users x 3 colors");
@@ -1176,7 +1415,10 @@ async fn wire_update_delete_accept_table_alias() {
     let client = wire_client(database.clone()).await;
 
     let updated = client
-        .execute("UPDATE users u SET email = $1 WHERE u.id = $2", &[&"robert@example.com", &2i64])
+        .execute(
+            "UPDATE users u SET email = $1 WHERE u.id = $2",
+            &[&"robert@example.com", &2i64],
+        )
         .await
         .expect("aliased update");
     assert_eq!(updated, 1);
@@ -1238,8 +1480,10 @@ async fn wire_update_delete_returning() {
     let database = seed_database(directory.path());
     {
         let mut db = database.write().expect("lock");
-        db.execute_sql("INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')")
-            .expect("seed users");
+        db.execute_sql(
+            "INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')",
+        )
+        .expect("seed users");
     }
     let client = wire_client(database.clone()).await;
 
@@ -1257,10 +1501,7 @@ async fn wire_update_delete_returning() {
 
     // DELETE RETURNING shows the removed rows.
     let removed = client
-        .query(
-            "DELETE FROM users WHERE id >= 2 RETURNING *",
-            &[],
-        )
+        .query("DELETE FROM users WHERE id >= 2 RETURNING *", &[])
         .await
         .expect("delete returning");
     assert_eq!(removed.len(), 2);
@@ -1286,9 +1527,24 @@ async fn wire_distinct_single_table_and_join() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1342,8 +1598,18 @@ async fn wire_update_from_cross_table() {
             id: TableId(8),
             name: "tiers".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "tier".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "tier".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create tiers");
@@ -1385,15 +1651,27 @@ async fn wire_delete_using_cross_table() {
     let database = seed_database(directory.path());
     {
         let mut db = database.write().expect("lock");
-        db.execute_sql("INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')")
-            .expect("seed users");
+        db.execute_sql(
+            "INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')",
+        )
+        .expect("seed users");
         // A ban list decides which users to purge.
         db.create_table(TableDefinition {
             id: TableId(8),
             name: "banned".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "reason".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "reason".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create banned");
@@ -1454,9 +1732,24 @@ async fn wire_in_list_and_between_predicates() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1506,15 +1799,32 @@ async fn wire_in_subquery() {
     let database = seed_database(directory.path());
     {
         let mut db = database.write().expect("lock");
-        db.execute_sql("INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')")
-            .expect("seed users");
+        db.execute_sql(
+            "INSERT INTO users (id, email) VALUES (2, 'bob@example.com'), (3, 'carol@example.com')",
+        )
+        .expect("seed users");
         db.create_table(TableDefinition {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1573,9 +1883,24 @@ async fn wire_exists_subquery() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1628,9 +1953,24 @@ async fn wire_scalar_subquery_projection() {
             id: TableId(8),
             name: "orders".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "order_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "item".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "order_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "item".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create orders");
@@ -1654,7 +1994,11 @@ async fn wire_scalar_subquery_projection() {
     assert_eq!(rows.len(), 2);
     let names: Vec<&str> = rows[0].columns().iter().map(|c| c.name()).collect();
     assert_eq!(names, vec!["email", "order_total"]);
-    assert_eq!(rows[0].get::<_, i64>(1), 2, "count resolves once for every row");
+    assert_eq!(
+        rows[0].get::<_, i64>(1),
+        2,
+        "count resolves once for every row"
+    );
 
     // Multi-row scalars refuse.
     let multi = client
@@ -1721,8 +2065,18 @@ async fn wire_insert_select() {
             id: TableId(8),
             name: "archived_users".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "email".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "email".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create archive");
@@ -1765,9 +2119,24 @@ async fn wire_projection_arithmetic() {
             id: TableId(8),
             name: "line_items".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "item_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "quantity".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(3), name: "unit_price".to_owned(), data_type: ColumnType::U64, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "item_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "quantity".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(3),
+                    name: "unit_price".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
             ],
         })
         .expect("create line_items");
@@ -1825,10 +2194,7 @@ async fn wire_constants_beside_aggregates() {
     // A constant is group-invariant: it projects beside aggregates
     // without GROUP BY.
     let row = client
-        .query_one(
-            "SELECT count(*), 'snapshot' AS label FROM users",
-            &[],
-        )
+        .query_one("SELECT count(*), 'snapshot' AS label FROM users", &[])
         .await
         .expect("constant beside global aggregate");
     assert_eq!(row.get::<_, i64>(0), 2);
@@ -1865,10 +2231,7 @@ async fn wire_set_operations() {
     assert_eq!(union.len(), 1);
 
     let all = client
-        .query(
-            "SELECT id FROM users UNION ALL SELECT id FROM users",
-            &[],
-        )
+        .query("SELECT id FROM users UNION ALL SELECT id FROM users", &[])
         .await
         .expect("union all");
     assert_eq!(all.len(), 2);
@@ -1913,8 +2276,18 @@ async fn wire_update_from_returning_post_update_values() {
             id: TableId(8),
             name: "tiers".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "user_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "tier".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "user_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "tier".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create tiers");
@@ -1945,12 +2318,10 @@ async fn wire_trust_mode_refuses_non_loopback_listener() {
     let database = seed_database(directory.path());
     // No users provisioned -> trust mode -> non-loopback bind must refuse.
     // spawn() binds successfully; the refusal surfaces when serve runs.
-    let (_addr, handle) = pgwire_server::spawn(
-        database.clone(),
-        "0.0.0.0:0".parse().expect("addr"),
-    )
-    .await
-    .expect("bind succeeds");
+    let (_addr, handle) =
+        pgwire_server::spawn(database.clone(), "0.0.0.0:0".parse().expect("addr"))
+            .await
+            .expect("bind succeeds");
     let outcome = handle
         .await
         .expect("server task completes")
@@ -1969,21 +2340,30 @@ async fn wire_auth_failure_delays_repeat_attempts() {
         "wonderland",
     )
     .expect("provision user");
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
-    let bad_dsn = format!("host=127.0.0.1 port={} user=alice password=wrong", addr.port());
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
+    let bad_dsn = format!(
+        "host=127.0.0.1 port={} user=alice password=wrong",
+        addr.port()
+    );
 
     // First failure is immediate; the second carries the base delay.
     let first_started = std::time::Instant::now();
-    assert!(tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls).await.is_err());
+    assert!(
+        tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls)
+            .await
+            .is_err()
+    );
     let first_elapsed = first_started.elapsed();
 
     let second_started = std::time::Instant::now();
-    assert!(tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls).await.is_err());
+    assert!(
+        tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls)
+            .await
+            .is_err()
+    );
     let second_elapsed = second_started.elapsed();
 
     assert!(
@@ -1993,11 +2373,13 @@ async fn wire_auth_failure_delays_repeat_attempts() {
 
     // The correct password still works after failures (delay applies to
     // the failed exchange only, and counters do not lock the account).
-    let good_dsn = format!("host=127.0.0.1 port={} user=alice password=wonderland", addr.port());
-    let (client, connection) =
-        tokio_postgres::connect(&good_dsn, tokio_postgres::NoTls)
-            .await
-            .expect("good credentials still authenticate");
+    let good_dsn = format!(
+        "host=127.0.0.1 port={} user=alice password=wonderland",
+        addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&good_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("good credentials still authenticate");
     tokio::spawn(async move { connection.await.expect("connection") });
     client
         .query_one("SELECT 1", &[])
@@ -2019,8 +2401,18 @@ async fn wire_grant_enforcement_reader_writer_admin() {
             id: TableId(8),
             name: "notes".to_owned(),
             columns: vec![
-                ColumnDefinition { id: ColumnId(1), name: "note_id".to_owned(), data_type: ColumnType::U64, nullable: false },
-                ColumnDefinition { id: ColumnId(2), name: "body".to_owned(), data_type: ColumnType::Text, nullable: false },
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "note_id".to_owned(),
+                    data_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "body".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: false,
+                },
             ],
         })
         .expect("create notes");
@@ -2033,20 +2425,20 @@ async fn wire_grant_enforcement_reader_writer_admin() {
             .expect("grant writer admin");
     }
 
-    let (addr, _server) = pgwire_server::spawn(
-        database.clone(),
-        "127.0.0.1:0".parse().expect("addr"),
-    )
-    .await
-    .expect("spawn server");
+    let (addr, _server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
     let dsn = |user: &str, password: &str| {
-        format!("host=127.0.0.1 port={} user={user} password={password}", addr.port())
+        format!(
+            "host=127.0.0.1 port={} user={user} password={password}",
+            addr.port()
+        )
     };
     let connect = |user: &str, password: &str| {
         let dsn = dsn(user, password);
         async move {
-            let (client, connection) =
-                tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await?;
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await?;
             tokio::spawn(async move { connection.await.expect("connection") });
             Ok::<_, tokio_postgres::Error>(client)
         }
@@ -2068,7 +2460,10 @@ async fn wire_grant_enforcement_reader_writer_admin() {
     // Writer-admin: INSERT allowed, DDL allowed.
     let writer = connect("writer", "wpass").await.expect("writer connect");
     writer
-        .execute("INSERT INTO notes (note_id, body) VALUES (3, 'from writer')", &[])
+        .execute(
+            "INSERT INTO notes (note_id, body) VALUES (3, 'from writer')",
+            &[],
+        )
         .await
         .expect("writer insert granted");
     writer

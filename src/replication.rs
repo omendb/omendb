@@ -7,8 +7,8 @@
 //! - Replicas track commit and byte lag.
 //! - Standby replicas can be promoted to independent writable primaries upon failover.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::{
@@ -232,8 +232,7 @@ impl StandbyReplica {
     pub fn database_mut(&mut self) -> Result<&mut RelationalDatabase> {
         if self.role == ReplicationRole::Standby {
             return Err(DbError::InvalidState(
-                "cannot obtain mutable handle on standby replica; promote replica first"
-                    .to_owned(),
+                "cannot obtain mutable handle on standby replica; promote replica first".to_owned(),
             ));
         }
         Ok(&mut self.database)
@@ -300,7 +299,12 @@ impl StandbyReplica {
                     }
                 }
                 for fk in catalog.foreign_keys() {
-                    if self.database.catalog().foreign_keys().all(|f| f.id != fk.id) {
+                    if self
+                        .database
+                        .catalog()
+                        .foreign_keys()
+                        .all(|f| f.id != fk.id)
+                    {
                         let _ = self.database.create_foreign_key(fk.clone());
                     }
                 }
@@ -313,7 +317,9 @@ impl StandbyReplica {
                         let table_val = u64::from_be_bytes(key.0[..8].try_into().unwrap());
                         let table_id = TableId(table_val);
                         if let Ok(row) = crate::relational::decode_row(*key, value) {
-                            if let Ok(Some(_)) = self.database.get(table_id, self.database.head(), *key) {
+                            if let Ok(Some(_)) =
+                                self.database.get(table_id, self.database.head(), *key)
+                            {
                                 let _ = self.database.update(table_id, row);
                             } else {
                                 let _ = self.database.insert(table_id, row);

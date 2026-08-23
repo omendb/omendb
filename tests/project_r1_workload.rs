@@ -17,8 +17,7 @@ use support::{
 };
 
 const EXPECTED_R1_DIGEST: &str = "d8b2f8f31a865c4f2af7214dd6b21ebae5023de495338e5f4e810e76e96c027d";
-const R1_TRACE: &str =
-    include_str!("fixtures/r1-ordinary-oltp-trace.jsonl");
+const R1_TRACE: &str = include_str!("fixtures/r1-ordinary-oltp-trace.jsonl");
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct Model {

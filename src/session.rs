@@ -1179,9 +1179,7 @@ impl RelationalDatabaseSession {
                 .group_commit
                 .submit_and_await(&self.database, control, transaction)
             {
-                Ok(commit) => {
-                    return Ok(TransactionAttemptOutcome::Applied { value, commit })
-                }
+                Ok(commit) => return Ok(TransactionAttemptOutcome::Applied { value, commit }),
                 Err(error)
                     if error.transaction_class() == TransactionErrorClass::SerializationRetry =>
                 {

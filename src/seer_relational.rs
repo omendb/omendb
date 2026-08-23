@@ -8,15 +8,16 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
-use std::sync::Mutex;
 use std::fs;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::attempt::{digest_kv_mutations, encode_record, seer_key};
 use crate::relational::{
     Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, LogicalVerification,
     RelationalMutation, RelationalSchemaDefinition, RelationalSnapshot,
@@ -31,7 +32,6 @@ use crate::{
     AttemptRecord, CommitId, DbError, IndexId, Key, KvMutation, Result, SeerDurabilityStatus,
     SeerKernel, SeerKernelConfig, SnapshotIdentity, StorageIdentity, TransactionAttemptId,
 };
-use crate::attempt::{digest_kv_mutations, encode_record, seer_key};
 
 const CATALOG_KEY: &[u8] = b"\x00omendb/catalog/v1";
 const ROW_NAMESPACE: u8 = 0x10;
@@ -1123,7 +1123,10 @@ impl SeerRelationalStore {
         mutations: &[RelationalMutation],
     ) -> CommittedWriteEntry {
         let mut entry = CommittedWriteEntry::default();
-        for identity in mutation_identities(catalog, mutations).into_iter().flatten() {
+        for identity in mutation_identities(catalog, mutations)
+            .into_iter()
+            .flatten()
+        {
             entry.tables.insert(identity.0);
             entry.identities.insert(identity);
         }
@@ -1148,12 +1151,18 @@ impl SeerRelationalStore {
 
     #[cfg(test)]
     fn set_committed_window_limit(&self, limit: usize) {
-        self.committed_writes.lock().expect("committed writes poisoned").limit = limit;
+        self.committed_writes
+            .lock()
+            .expect("committed writes poisoned")
+            .limit = limit;
     }
 
     fn record_committed_writes(&self, commit: CommitId, mut entry: CommittedWriteEntry) {
         entry.commit = commit.0;
-        let mut committed = self.committed_writes.lock().expect("committed writes poisoned");
+        let mut committed = self
+            .committed_writes
+            .lock()
+            .expect("committed writes poisoned");
         committed.entries.push_back(entry);
         while committed.entries.len() > committed.limit {
             committed.entries.pop_front();
@@ -1171,7 +1180,10 @@ impl SeerRelationalStore {
         &self,
         snapshot: CommitId,
     ) -> Option<std::sync::MutexGuard<'_, CommittedWrites>> {
-        let committed = self.committed_writes.lock().expect("committed writes poisoned");
+        let committed = self
+            .committed_writes
+            .lock()
+            .expect("committed writes poisoned");
         let first = committed.entries.front()?.commit;
         if first > snapshot.0 + 1 {
             return None;
@@ -1207,13 +1219,22 @@ impl SeerRelationalStore {
             .iter()
             .skip_while(|entry| entry.commit <= snapshot.0)
         {
-            if write_identities.iter().any(|id| entry.identities.contains(id)) {
+            if write_identities
+                .iter()
+                .any(|id| entry.identities.contains(id))
+            {
                 return false;
             }
-            if write_uniques.iter().any(|value| entry.uniques.contains(value)) {
+            if write_uniques
+                .iter()
+                .any(|value| entry.uniques.contains(value))
+            {
                 return false;
             }
-            if point_reads.iter().any(|read| entry.identities.contains(read)) {
+            if point_reads
+                .iter()
+                .any(|read| entry.identities.contains(read))
+            {
                 return false;
             }
             if table_reads.iter().any(|table| entry.tables.contains(table)) {
@@ -1467,14 +1488,28 @@ impl SeerRelationalStore {
                 let a = &batched[i];
                 let b = &batched[j];
                 let writes_tables = |member: &BatchMember| {
-                    member.write_identities.iter().map(|(table, _)| *table).collect::<BTreeSet<_>>()
+                    member
+                        .write_identities
+                        .iter()
+                        .map(|(table, _)| *table)
+                        .collect::<BTreeSet<_>>()
                 };
                 let b_writes_tables = writes_tables(b);
                 let a_writes_tables = writes_tables(a);
-                let b_reads_a_writes = a.read_point.iter().any(|read| b.write_identities.contains(read))
-                    || a.read_tables.iter().any(|table| b_writes_tables.contains(table));
-                let a_reads_b_writes = b.read_point.iter().any(|read| a.write_identities.contains(read))
-                    || b.read_tables.iter().any(|table| a_writes_tables.contains(table));
+                let b_reads_a_writes = a
+                    .read_point
+                    .iter()
+                    .any(|read| b.write_identities.contains(read))
+                    || a.read_tables
+                        .iter()
+                        .any(|table| b_writes_tables.contains(table));
+                let a_reads_b_writes = b
+                    .read_point
+                    .iter()
+                    .any(|read| a.write_identities.contains(read))
+                    || b.read_tables
+                        .iter()
+                        .any(|table| a_writes_tables.contains(table));
                 if b_reads_a_writes && a_reads_b_writes {
                     cycle_rejected.insert(j);
                 }
@@ -1499,11 +1534,9 @@ impl SeerRelationalStore {
         if batched.len() == 1 && batched[0].snapshot == current {
             let member = batched.remove(0);
             results[member.index] = Some(match member.attempt {
-                Some(attempt) => self.commit_transaction_with_attempt(
-                    current,
-                    &member.mutations,
-                    attempt,
-                ),
+                Some(attempt) => {
+                    self.commit_transaction_with_attempt(current, &member.mutations, attempt)
+                }
                 None => self.commit_transaction(current, &member.mutations),
             });
         } else if !batched.is_empty() {
@@ -1515,32 +1548,27 @@ impl SeerRelationalStore {
                 window_entry
                     .identities
                     .extend(member.write_identities.iter().cloned());
-                window_entry.uniques.extend(member.write_uniques.iter().cloned());
+                window_entry
+                    .uniques
+                    .extend(member.write_uniques.iter().cloned());
                 window_entry
                     .tables
                     .extend(member.write_identities.iter().map(|(table, _)| *table));
             }
-            let mut validated: Vec<(
-                usize,
-                Vec<KvMutation>,
-                Option<TransactionAttemptId>,
-            )> = Vec::with_capacity(batched.len());
+            let mut validated: Vec<(usize, Vec<KvMutation>, Option<TransactionAttemptId>)> =
+                Vec::with_capacity(batched.len());
             for member in batched {
                 match self.build_batch(current, &member.mutations) {
-                    Ok(batch) => {
-                        validated.push((member.index, batch, member.attempt))
-                    }
+                    Ok(batch) => validated.push((member.index, batch, member.attempt)),
                     Err(error) => results[member.index] = Some(Err(error)),
                 }
             }
             if !validated.is_empty() {
                 let combined = (|| -> Result<CommitId> {
-                    let commit = CommitId(
-                        current
-                            .0
-                            .checked_add(1)
-                            .ok_or_else(|| DbError::InvalidState("commit ID exhausted".to_owned()))?,
-                    );
+                    let commit =
+                        CommitId(current.0.checked_add(1).ok_or_else(|| {
+                            DbError::InvalidState("commit ID exhausted".to_owned())
+                        })?);
                     let mut mutations = Vec::new();
                     for (_, batch, _) in &validated {
                         mutations.extend(batch.iter().cloned());
@@ -2361,7 +2389,10 @@ impl SeerRelationalTransaction {
         // legacy key cannot name; a point read by legacy key on such a table
         // conservatively reads the whole table for conflict detection.
         if catalog.primary_key(table).is_some() {
-            self.table_reads.lock().expect("read set poisoned").insert(table);
+            self.table_reads
+                .lock()
+                .expect("read set poisoned")
+                .insert(table);
         }
         let mut row = store
             .kernel
@@ -2459,7 +2490,10 @@ impl SeerRelationalTransaction {
         let view = self.read_view()?;
         let catalog = self.catalog_at_view(store, view)?;
         let definition = catalog.table(table)?;
-        self.table_reads.lock().expect("read set poisoned").insert(table);
+        self.table_reads
+            .lock()
+            .expect("read set poisoned")
+            .insert(table);
         let (start, end) = row_range(table);
         let mut rows = BTreeMap::<Vec<u8>, Row>::new();
         for (key, bytes) in store
@@ -2532,7 +2566,10 @@ impl SeerRelationalTransaction {
         let catalog = self.catalog_at_view(store, view)?;
         let definition = SeerRelationalStore::index_definition(&catalog, table, index)?;
         let table_definition = catalog.table(table)?;
-        self.table_reads.lock().expect("read set poisoned").insert(table);
+        self.table_reads
+            .lock()
+            .expect("read set poisoned")
+            .insert(table);
         let start_values = start
             .map(|values| index_values_key(table_definition, definition, values))
             .transpose()?;
@@ -2714,8 +2751,16 @@ impl SeerRelationalTransaction {
     #[must_use]
     pub fn into_prepared(mut self) -> PreparedSeerTransaction {
         self.read_view.take();
-        let point_reads = self.point_reads.get_mut().expect("read set poisoned").clone();
-        let table_reads = self.table_reads.get_mut().expect("read set poisoned").clone();
+        let point_reads = self
+            .point_reads
+            .get_mut()
+            .expect("read set poisoned")
+            .clone();
+        let table_reads = self
+            .table_reads
+            .get_mut()
+            .expect("read set poisoned")
+            .clone();
         PreparedSeerTransaction {
             snapshot: self.snapshot,
             mutations: std::mem::take(&mut self.mutations),
@@ -2758,8 +2803,7 @@ impl SeerRelationalTransaction {
             self.read_view.take();
             return Ok(snapshot);
         }
-        let commit =
-            store.commit_transaction_with_attempt(self.snapshot, &self.mutations, attempt);
+        let commit = store.commit_transaction_with_attempt(self.snapshot, &self.mutations, attempt);
         self.read_view.take();
         commit
     }
@@ -3267,7 +3311,10 @@ mod tests {
             .get(TableId(7), store.commit_id(), Key::new(7, 1))
             .expect("read")
             .expect("winner row");
-        assert_eq!(stored.values[0], Value::Text("winner@example.com".to_owned()));
+        assert_eq!(
+            stored.values[0],
+            Value::Text("winner@example.com".to_owned())
+        );
 
         // A transaction prepared before another publication is stale at
         // coalesced commit time.
@@ -3288,7 +3335,10 @@ mod tests {
         // stale members conflict (see
         // coalesced_publication_conflicts_stale_snapshots_overlapping_the_window).
         let results = store.commit_transactions_coalesced(vec![stale.into_prepared()]);
-        assert!(results[0].is_ok(), "unaffected stale member commits: {results:?}");
+        assert!(
+            results[0].is_ok(),
+            "unaffected stale member commits: {results:?}"
+        );
     }
 
     #[test]
@@ -3321,10 +3371,8 @@ mod tests {
             .update(&store, TableId(7), row(2, "seed2", 250))
             .expect("update row 2");
 
-        let results = store.commit_transactions_coalesced(vec![
-            cycle_a.into_prepared(),
-            cycle_b.into_prepared(),
-        ]);
+        let results = store
+            .commit_transactions_coalesced(vec![cycle_a.into_prepared(), cycle_b.into_prepared()]);
         assert!(results[0].is_ok(), "first member commits: {results:?}");
         assert!(
             matches!(&results[1], Err(DbError::SerializationConflict { .. })),
@@ -3345,10 +3393,8 @@ mod tests {
             .update(&store, TableId(7), row(4, "seed4", 400))
             .expect("update row 4");
 
-        let results = store.commit_transactions_coalesced(vec![
-            writer.into_prepared(),
-            reader.into_prepared(),
-        ]);
+        let results = store
+            .commit_transactions_coalesced(vec![writer.into_prepared(), reader.into_prepared()]);
         assert!(
             results.iter().all(Result::is_ok),
             "single-direction dependency must commit: {results:?}"
@@ -3389,10 +3435,8 @@ mod tests {
             .update(&store, TableId(7), row(3, "seed3", 300))
             .expect("update row 3");
 
-        let results = store.commit_transactions_coalesced(vec![
-            stale.into_prepared(),
-            fresh.into_prepared(),
-        ]);
+        let results =
+            store.commit_transactions_coalesced(vec![stale.into_prepared(), fresh.into_prepared()]);
         assert!(
             results.iter().all(Result::is_ok),
             "certified stale member must commit: {results:?}"
@@ -3415,10 +3459,7 @@ mod tests {
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
         let mut store = SeerRelationalStore::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
-        assert_eq!(
-            store.create_index(index()).expect("index"),
-            CommitId(2)
-        );
+        assert_eq!(store.create_index(index()).expect("index"), CommitId(2));
         for id in 1..=3u64 {
             let mut seed = store.begin().expect("begin");
             seed.insert(&store, TableId(7), row(id, &format!("seed{id}"), 100))
@@ -3456,7 +3497,11 @@ mod tests {
             reader.into_prepared(),
             unique.into_prepared(),
         ]);
-        for (name, result) in [("write-write", &results[0]), ("read-write", &results[1]), ("unique", &results[2])] {
+        for (name, result) in [
+            ("write-write", &results[0]),
+            ("read-write", &results[1]),
+            ("unique", &results[2]),
+        ] {
             assert!(
                 matches!(result, Err(DbError::SerializationConflict { .. })),
                 "{name} overlap must conflict: {results:?}"

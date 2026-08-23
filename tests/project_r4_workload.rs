@@ -12,8 +12,7 @@ use tempfile::tempdir;
 const ACCOUNTS_TABLE: TableId = TableId(301);
 const LEDGER_TABLE: TableId = TableId(302);
 
-const R4_TRACE: &str =
-    include_str!("fixtures/r4-analytical-oltp-trace.jsonl");
+const R4_TRACE: &str = include_str!("fixtures/r4-analytical-oltp-trace.jsonl");
 
 fn backend_config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
     match kind {
@@ -162,13 +161,20 @@ struct Operation {
 }
 
 fn install_r4_schema(database: &mut RelationalDatabase) {
-    database.create_table(accounts_schema()).expect("create accounts");
-    database.create_table(ledger_schema()).expect("create ledger");
+    database
+        .create_table(accounts_schema())
+        .expect("create accounts");
+    database
+        .create_table(ledger_schema())
+        .expect("create ledger");
 }
 
 #[test]
 fn public_facade_replays_r4_analytical_workload_across_backends() {
-    for backend_kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for backend_kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("db");
         let config = backend_config(backend_kind, &db_path);
@@ -298,10 +304,14 @@ fn public_facade_replays_r4_analytical_workload_across_backends() {
                     match event.name.as_deref().unwrap_or_default() {
                         "global_totals" => {
                             let expected_count = oracle.accounts.len() as u64;
-                            let expected_sum: u64 = oracle.accounts.values().map(|a| a.balance).sum();
-                            let expected_min = oracle.accounts.values().map(|a| a.balance).min().unwrap();
-                            let expected_max = oracle.accounts.values().map(|a| a.balance).max().unwrap();
-                            let expected_avg = (expected_sum as f64 / expected_count as f64).round() as i64;
+                            let expected_sum: u64 =
+                                oracle.accounts.values().map(|a| a.balance).sum();
+                            let expected_min =
+                                oracle.accounts.values().map(|a| a.balance).min().unwrap();
+                            let expected_max =
+                                oracle.accounts.values().map(|a| a.balance).max().unwrap();
+                            let expected_avg =
+                                (expected_sum as f64 / expected_count as f64).round() as i64;
 
                             assert_eq!(sql_res.rows.len(), 1);
                             assert_eq!(sql_res.rows[0][0], Value::U64(expected_count));
@@ -313,7 +323,8 @@ fn public_facade_replays_r4_analytical_workload_across_backends() {
                         "category_breakdown" => {
                             let mut oracle_cats: BTreeMap<String, (u64, u64)> = BTreeMap::new();
                             for acc in oracle.accounts.values() {
-                                let entry = oracle_cats.entry(acc.category.clone()).or_insert((0, 0));
+                                let entry =
+                                    oracle_cats.entry(acc.category.clone()).or_insert((0, 0));
                                 entry.0 += 1;
                                 entry.1 += acc.balance;
                             }
@@ -321,7 +332,8 @@ fn public_facade_replays_r4_analytical_workload_across_backends() {
                             assert_eq!(sql_res.rows.len(), oracle_cats.len());
                             for row in &sql_res.rows {
                                 if let Value::Text(cat) = &row[0] {
-                                    let (exp_count, exp_sum) = oracle_cats.get(cat).expect("known category");
+                                    let (exp_count, exp_sum) =
+                                        oracle_cats.get(cat).expect("known category");
                                     assert_eq!(row[1], Value::U64(*exp_count));
                                     assert_eq!(row[2], Value::U64(*exp_sum));
                                 } else {

@@ -61,7 +61,10 @@ fn account_row(id: u64, balance: u64, status: &str) -> Row {
 
 #[test]
 fn public_facade_replays_r5_replication_and_failover_across_backends() {
-    for backend_kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for backend_kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let dir = tempdir().expect("tempdir");
         let primary_dir = dir.path().join("primary");
         let replica1_dir = dir.path().join("replica1");
@@ -72,7 +75,9 @@ fn public_facade_replays_r5_replication_and_failover_across_backends() {
         let replica2_cfg = backend_config(backend_kind, &replica2_dir);
 
         let mut primary = RelationalDatabase::open(primary_cfg).expect("open primary");
-        primary.create_table(accounts_schema()).expect("create table");
+        primary
+            .create_table(accounts_schema())
+            .expect("create table");
 
         let mut replica1 = StandbyReplica::open(replica1_cfg).expect("open replica1");
         let mut replica2 = StandbyReplica::open(replica2_cfg).expect("open replica2");
@@ -155,13 +160,15 @@ fn public_facade_replays_r5_replication_and_failover_across_backends() {
             .expect("mutate on promoted");
 
         // Stream from newly promoted Primary to Replica 2
-        let stream_from_promoted =
-            promoted_db.open_replication_stream(replica2.lag_report(promoted_db.head()).replica_commit);
+        let stream_from_promoted = promoted_db
+            .open_replication_stream(replica2.lag_report(promoted_db.head()).replica_commit);
         if let Some(batch) = stream_from_promoted
             .next_batch(promoted_db, 100)
             .expect("stream from promoted")
         {
-            replica2.apply_batch(&batch).expect("apply to rep2 from new primary");
+            replica2
+                .apply_batch(&batch)
+                .expect("apply to rep2 from new primary");
         }
 
         assert_eq!(replica2.lag_report(promoted_db.head()).commits_behind, 0);

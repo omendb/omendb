@@ -1,11 +1,10 @@
 use std::path::Path;
 
 use omendb::{
-    OverloadPolicy,
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, IndexDefinition, IndexId, Key,
-    RelationalBackendConfig, RelationalBackendKind, RelationalCompactionBudget, RelationalDatabase,
-    Row, SeerKernelConfig, TableDefinition, TableId, Value,
-    GovernorConfig, Reactor, ReactorConfig, WorkClass,
+    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, GovernorConfig, IndexDefinition,
+    IndexId, Key, OverloadPolicy, Reactor, ReactorConfig, RelationalBackendConfig,
+    RelationalBackendKind, RelationalCompactionBudget, RelationalDatabase, Row, SeerKernelConfig,
+    TableDefinition, TableId, Value, WorkClass,
 };
 use tempfile::tempdir;
 
@@ -91,8 +90,12 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
     let db_config = config(kind, directory);
     let mut database = RelationalDatabase::create(db_config.clone()).expect("create database");
 
-    database.create_table(inventory_table()).expect("create inventory");
-    database.create_table(orders_table()).expect("create orders");
+    database
+        .create_table(inventory_table())
+        .expect("create inventory");
+    database
+        .create_table(orders_table())
+        .expect("create orders");
     database
         .create_index(IndexDefinition {
             id: ORDER_STATUS_INDEX,
@@ -105,8 +108,12 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
     // Initial seed
     let initial_items = 20;
     for i in 1..=initial_items {
-        database.insert(INVENTORY_TABLE, inventory_row(i, 1000)).expect("seed inventory");
-        database.insert(ORDERS_TABLE, order_row(i, "pending")).expect("seed order");
+        database
+            .insert(INVENTORY_TABLE, inventory_row(i, 1000))
+            .expect("seed inventory");
+        database
+            .insert(ORDERS_TABLE, order_row(i, "pending"))
+            .expect("seed order");
     }
 
     let workers = 4;
@@ -119,7 +126,7 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
             max_in_flight: workers,
             overload_policy: OverloadPolicy::default(),
         },
-    demotion_after: None,
+        demotion_after: None,
     })
     .expect("create reactor");
 
@@ -161,10 +168,7 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
         if i % 6 == 0
             && let Ok(reclaim_id) = reactor.submit(WorkClass::Reclaim, 4, Some(now + 30))
         {
-            task_map.insert(
-                reclaim_id,
-                DatabaseTask::ReclaimCompaction { units: 5 },
-            );
+            task_map.insert(reclaim_id, DatabaseTask::ReclaimCompaction { units: 5 });
         }
 
         // 4. Schema modification
@@ -189,20 +193,31 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                 DatabaseTask::OltpUpdate { item_id, decrement } => {
                     let key = Key::new(INVENTORY_TABLE.0, item_id);
                     let commit = database.commit_id();
-                    let existing = database.get(INVENTORY_TABLE, commit, key).expect("get item").expect("item exists");
+                    let existing = database
+                        .get(INVENTORY_TABLE, commit, key)
+                        .expect("get item")
+                        .expect("item exists");
                     let current_qty = match existing.values.get(1) {
                         Some(Value::U64(q)) => *q,
                         _ => 0,
                     };
                     database
-                        .update(INVENTORY_TABLE, inventory_row(item_id, current_qty.saturating_sub(decrement)))
+                        .update(
+                            INVENTORY_TABLE,
+                            inventory_row(item_id, current_qty.saturating_sub(decrement)),
+                        )
                         .expect("update inventory");
                     completed_oltp += 1;
                 }
                 DatabaseTask::ScanOrders { status } => {
                     let commit = database.commit_id();
                     let matching = database
-                        .index_get(ORDERS_TABLE, commit, ORDER_STATUS_INDEX, &[Value::Text(status)])
+                        .index_get(
+                            ORDERS_TABLE,
+                            commit,
+                            ORDER_STATUS_INDEX,
+                            &[Value::Text(status)],
+                        )
                         .expect("index get orders");
                     assert!(!matching.is_empty());
                     completed_scans += 1;
@@ -246,20 +261,31 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                 DatabaseTask::OltpUpdate { item_id, decrement } => {
                     let key = Key::new(INVENTORY_TABLE.0, item_id);
                     let commit = database.commit_id();
-                    let existing = database.get(INVENTORY_TABLE, commit, key).expect("get item").expect("item exists");
+                    let existing = database
+                        .get(INVENTORY_TABLE, commit, key)
+                        .expect("get item")
+                        .expect("item exists");
                     let current_qty = match existing.values.get(1) {
                         Some(Value::U64(q)) => *q,
                         _ => 0,
                     };
                     database
-                        .update(INVENTORY_TABLE, inventory_row(item_id, current_qty.saturating_sub(decrement)))
+                        .update(
+                            INVENTORY_TABLE,
+                            inventory_row(item_id, current_qty.saturating_sub(decrement)),
+                        )
                         .expect("update inventory");
                     completed_oltp += 1;
                 }
                 DatabaseTask::ScanOrders { status } => {
                     let commit = database.commit_id();
                     let matching = database
-                        .index_get(ORDERS_TABLE, commit, ORDER_STATUS_INDEX, &[Value::Text(status)])
+                        .index_get(
+                            ORDERS_TABLE,
+                            commit,
+                            ORDER_STATUS_INDEX,
+                            &[Value::Text(status)],
+                        )
                         .expect("index get orders");
                     assert!(!matching.is_empty());
                     completed_scans += 1;
@@ -276,13 +302,13 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                             .add_nullable_column(
                                 ORDERS_TABLE,
                                 ColumnDefinition {
-                                id: ColumnId(3),
-                                name: "notes".to_owned(),
-                                data_type: ColumnType::Text,
-                                nullable: true,
-                            },
-                        )
-                        .expect("add notes column");
+                                    id: ColumnId(3),
+                                    name: "notes".to_owned(),
+                                    data_type: ColumnType::Text,
+                                    nullable: true,
+                                },
+                            )
+                            .expect("add notes column");
                         schema_added = true;
                     }
                 }
@@ -325,8 +351,5 @@ fn mixed_reactor_governor_executes_database_workload_across_backends() {
     );
 
     let seer = tempdir().expect("seer directory");
-    exercise_governed_database_workload(
-        RelationalBackendKind::Seer,
-        &seer.path().join("seer"),
-    );
+    exercise_governed_database_workload(RelationalBackendKind::Seer, &seer.path().join("seer"));
 }

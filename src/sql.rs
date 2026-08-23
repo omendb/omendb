@@ -189,23 +189,18 @@ pub(crate) fn describe_parameters(
     match &statement {
         Statement::Insert(insert) => {
             let table_name = match &insert.table {
-                sqlparser::ast::TableObject::TableName(name) => {
-                    simple_object_name(name, "table")?
-                }
+                sqlparser::ast::TableObject::TableName(name) => simple_object_name(name, "table")?,
                 _ => return Ok(Vec::new()),
             };
             let table = find_table(database.catalog(), table_name)?;
-            let positions =
-                write::insert_positions(table, &insert.columns).unwrap_or_else(|_| (0..table.columns.len()).collect());
+            let positions = write::insert_positions(table, &insert.columns)
+                .unwrap_or_else(|_| (0..table.columns.len()).collect());
             if let Some(source_query) = insert.source.as_deref()
                 && let sqlparser::ast::SetExpr::Values(values) = source_query.body.as_ref()
             {
                 for row in &values.rows {
                     for (expression, position) in row.iter().zip(&positions) {
-                        inferred.observe_expression(
-                            expression,
-                            column_type_at(table, *position),
-                        );
+                        inferred.observe_expression(expression, column_type_at(table, *position));
                     }
                 }
             }
@@ -341,15 +336,15 @@ impl ParameterInference {
                 let resolve = |factor: &sqlparser::ast::TableFactor| -> Option<&TableDefinition> {
                     match factor {
                         sqlparser::ast::TableFactor::Table { name, .. } => {
-                            find_table(database.catalog(), simple_object_name(name, "table").ok()?).ok()
+                            find_table(database.catalog(), simple_object_name(name, "table").ok()?)
+                                .ok()
                         }
                         _ => None,
                     }
                 };
-                let (Some(left), Some(right)) = (
-                    resolve(&from.relation),
-                    resolve(&from.joins[0].relation),
-                ) else {
+                let (Some(left), Some(right)) =
+                    (resolve(&from.relation), resolve(&from.joins[0].relation))
+                else {
                     return;
                 };
                 joined_scope = TableDefinition {
@@ -370,9 +365,11 @@ impl ParameterInference {
             self.walk_predicate(selection, table);
         }
         // LIMIT/OFFSET parameters are non-negative integers.
-        if let Some(
-            sqlparser::ast::LimitClause::LimitOffset { limit, offset, limit_by },
-        ) = &query.limit_clause
+        if let Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) = &query.limit_clause
             && limit_by.is_empty()
         {
             let offset_exprs = offset.iter().map(|offset| &offset.value);
@@ -392,10 +389,7 @@ impl ParameterInference {
     }
 }
 
-fn identifier_type(
-    expression: &Expr,
-    table: Option<&TableDefinition>,
-) -> Option<ColumnType> {
+fn identifier_type(expression: &Expr, table: Option<&TableDefinition>) -> Option<ColumnType> {
     let name = match expression {
         Expr::Identifier(identifier) => identifier.value.as_str(),
         Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
@@ -422,9 +416,7 @@ pub(super) fn parse_statement(sql: &str) -> Result<Statement> {
     parse_one(sql)
 }
 
-pub(super) fn table_from_join_name(
-    table: &sqlparser::ast::TableWithJoins,
-) -> Result<String> {
+pub(super) fn table_from_join_name(table: &sqlparser::ast::TableWithJoins) -> Result<String> {
     let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
         return Err(unsupported("FROM", "only plain tables are supported"));
     };
@@ -570,7 +562,9 @@ pub(super) fn simple_object_name<'a>(
     match name.0.len() {
         1 => {}
         2 => {
-            let schema = name.0[0].as_ident().map(|identifier| identifier.value.as_str());
+            let schema = name.0[0]
+                .as_ident()
+                .map(|identifier| identifier.value.as_str());
             if schema != Some("public") {
                 return Err(unsupported(
                     kind,
@@ -591,7 +585,11 @@ pub(super) fn simple_object_name<'a>(
 /// callers are trusted and never consult this.
 pub(super) fn statement_access(
     sql: &str,
-) -> Result<(std::collections::BTreeSet<String>, std::collections::BTreeSet<String>, bool)> {
+) -> Result<(
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+    bool,
+)> {
     use sqlparser::ast::{
         Expr as SqlExpr, SetExpr as SqlSetExpr, Statement as SqlStatement,
         TableObject as SqlTableObject,
@@ -615,14 +613,15 @@ pub(super) fn statement_access(
                 collect_query_tables(subquery, read);
             }
             SqlExpr::Exists { subquery, .. } => collect_query_tables(subquery, read),
-            SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
-                collect_expr_tables(inner, read)
-            }
+            SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => collect_expr_tables(inner, read),
             _ => {}
         }
     }
 
-    fn collect_query_tables(query: &sqlparser::ast::Query, read: &mut std::collections::BTreeSet<String>) {
+    fn collect_query_tables(
+        query: &sqlparser::ast::Query,
+        read: &mut std::collections::BTreeSet<String>,
+    ) {
         collect_setexpr_tables(&query.body, read);
         if let Some(selection) = query_body_selection(&query.body)
             && let Some(where_clause) = &selection.selection
@@ -720,7 +719,8 @@ pub(super) fn statement_access(
         }
         SqlStatement::Delete(delete) => {
             let tables = match &delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(tables) | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
             };
             for item in tables {
                 collect_factor_tables(&item.relation, &mut write);

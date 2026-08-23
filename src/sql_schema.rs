@@ -283,10 +283,16 @@ pub(super) fn execute_create_table(
     let mut table_id = user_tables_max
         .checked_add(1)
         .ok_or_else(|| DbError::InvalidState("no SQL table ID is available".to_owned()))?;
-    while database.catalog().tables().any(|table| table.id.0 == table_id) {
+    while database
+        .catalog()
+        .tables()
+        .any(|table| table.id.0 == table_id)
+    {
         table_id += 1;
         if table_id >= SYSTEM_TABLE_ID_FLOOR {
-            return Err(DbError::InvalidState("no SQL table ID is available".to_owned()));
+            return Err(DbError::InvalidState(
+                "no SQL table ID is available".to_owned(),
+            ));
         }
     }
     let mut table = TableDefinition {

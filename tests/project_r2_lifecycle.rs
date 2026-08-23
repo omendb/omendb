@@ -27,8 +27,7 @@ const CHURN_ROWS: u64 = 256;
 const CHURN_BATCHES: usize = 100;
 const CHURN_BATCH_SIZE: usize = 100;
 const CHURN_REOPEN_INTERVAL: usize = 10;
-const R2_TRACE: &str =
-    include_str!("fixtures/r2-update-lifecycle-trace.jsonl");
+const R2_TRACE: &str = include_str!("fixtures/r2-update-lifecycle-trace.jsonl");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Document {

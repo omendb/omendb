@@ -229,11 +229,20 @@ fn validated_parallel_preparation_detects_range_phantom_conflicts() {
 
     let mut tx1 = database.begin().expect("begin tx1");
     let rows = tx1.scan(&database, TABLE, 100).expect("scan rows");
-    let total: u64 = rows.iter().map(|r| match r.values[2] { Value::U64(v) => v, _ => 0 }).sum();
-    tx1.insert(&database, TABLE, item_row(99, "summary", total)).expect("stage insert");
+    let total: u64 = rows
+        .iter()
+        .map(|r| match r.values[2] {
+            Value::U64(v) => v,
+            _ => 0,
+        })
+        .sum();
+    tx1.insert(&database, TABLE, item_row(99, "summary", total))
+        .expect("stage insert");
 
     // Concurrently, an intervening commit inserts row 15 inside the scanned range
-    database.insert(TABLE, item_row(15, "active", 150)).expect("intervening insert");
+    database
+        .insert(TABLE, item_row(15, "active", 150))
+        .expect("intervening insert");
 
     // Tx1 attempts to commit with precise validation; it must detect the range phantom conflict
     let res1 = tx1.commit_validated(&mut database);
@@ -268,11 +277,21 @@ fn validated_parallel_preparation_detects_secondary_index_phantom_conflicts() {
 
     // Tx1 reads secondary index
     let mut tx1 = database.begin().expect("begin tx1");
-    let rows = tx1.index_get(&database, TABLE, INDEX_STATUS, &[Value::Text("pending".to_owned())]).expect("index get");
-    tx1.insert(&database, TABLE, item_row(99, "summary", rows.len() as u64)).expect("stage insert");
+    let rows = tx1
+        .index_get(
+            &database,
+            TABLE,
+            INDEX_STATUS,
+            &[Value::Text("pending".to_owned())],
+        )
+        .expect("index get");
+    tx1.insert(&database, TABLE, item_row(99, "summary", rows.len() as u64))
+        .expect("stage insert");
 
     // Intervening transaction inserts a new row with status="pending"
-    database.insert(TABLE, item_row(2, "pending", 20)).expect("intervening insert");
+    database
+        .insert(TABLE, item_row(2, "pending", 20))
+        .expect("intervening insert");
 
     // Tx1 attempts to commit with precise validation; it must detect the index modification
     let res1 = tx1.commit_validated(&mut database);

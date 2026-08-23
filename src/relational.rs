@@ -2009,8 +2009,7 @@ impl RelationalStore {
                 }
             }
             RelationalMutation::Delete { table, primary } => {
-                let previous =
-                    self.stage_delete_raw(catalog, transaction, table, primary)?;
+                let previous = self.stage_delete_raw(catalog, transaction, table, primary)?;
                 self.expand_referential_actions(catalog, transaction, table, &previous)?;
             }
             RelationalMutation::DeleteRow { table, row } => {
@@ -2106,10 +2105,7 @@ impl RelationalStore {
                     referenced_definition,
                     &foreign_key.referenced_columns,
                 )?;
-                if required
-                    .iter()
-                    .any(|value| matches!(value, Value::Null))
-                {
+                if required.iter().any(|value| matches!(value, Value::Null)) {
                     continue;
                 }
                 let (start, end) = table_range(foreign_key.table);
@@ -2132,11 +2128,7 @@ impl RelationalStore {
                         ReferentialAction::SetNull => {
                             let mut updated = child.clone();
                             for column in &foreign_key.columns {
-                                updated.set_value(
-                                    child_definition,
-                                    *column,
-                                    Value::Null,
-                                )?;
+                                updated.set_value(child_definition, *column, Value::Null)?;
                             }
                             self.stage_mutation(
                                 catalog,
@@ -2741,7 +2733,12 @@ impl RelationalTransaction {
             transaction,
             catalog,
         } = self;
-        store.commit_transaction_validated_with_attempt(transaction, &catalog, attempt, &mut NoFaults)
+        store.commit_transaction_validated_with_attempt(
+            transaction,
+            &catalog,
+            attempt,
+            &mut NoFaults,
+        )
     }
 }
 
@@ -4002,10 +3999,10 @@ impl<'a> CatalogCursor<'a> {
 mod tests {
     use super::{
         Catalog, ColumnDefinition, ColumnId, ColumnType, ConstraintId, ConstraintTiming,
-        ForeignKeyDefinition, ReferentialAction,
-        IndexDefinition, NamedIndexDefinition, RelationalMutation, RelationalSchemaDefinition,
-        RelationalStore, Row, SchemaChange, SchemaJobState, TableDefinition, TableId, Value,
-        decode_catalog, encode_catalog, row_prefix, row_storage_key, table_range,
+        ForeignKeyDefinition, IndexDefinition, NamedIndexDefinition, ReferentialAction,
+        RelationalMutation, RelationalSchemaDefinition, RelationalStore, Row, SchemaChange,
+        SchemaJobState, TableDefinition, TableId, Value, decode_catalog, encode_catalog,
+        row_prefix, row_storage_key, table_range,
     };
     use crate::RowIdentity;
     use crate::fault::{FailOnce, FaultPoint, NoFaults};

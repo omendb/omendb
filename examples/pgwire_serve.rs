@@ -19,11 +19,10 @@ use omendb::{
 fn main() -> anyhow::Result<()> {
     let port: u16 = std::env::args().nth(1).unwrap_or_default().parse()?;
     let directory = tempfile::tempdir()?;
-    let mut database = RelationalDatabase::create(RelationalBackendConfig::Temporary(
-        DatabaseConfig {
+    let mut database =
+        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
             directory: directory.path().to_path_buf(),
-        },
-    ))?;
+        }))?;
     database.create_table(TableDefinition {
         id: TableId(7),
         name: "users".to_owned(),
@@ -63,8 +62,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn tokio_net_listener(
-    port: u16,
-) -> std::io::Result<tokio::net::TcpListener> {
+async fn tokio_net_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::bind(("127.0.0.1", port)).await
 }

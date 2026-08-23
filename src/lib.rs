@@ -44,11 +44,10 @@ pub use morsel::{
 pub use packed::{PACKED_PAGE_BYTES, PackBudget, PackReport, PackedPage, PackedRange, pack_sorted};
 pub use relational::{
     Catalog, ColumnDefinition, ColumnId, ColumnType, ConstraintId, ConstraintTiming,
-    ForeignKeyDefinition, ReferentialAction,
-    IndexDefinition, NamedForeignKeyDefinition, NamedIndexDefinition, RelationalMutation,
-    RelationalSchemaDefinition, RelationalSnapshot, RelationalSnapshotCaptureOptions,
-    RelationalSnapshotTable, RelationalStore, RelationalTransaction, Row, TableDefinition, TableId,
-    Value, decode_row, encode_row,
+    ForeignKeyDefinition, IndexDefinition, NamedForeignKeyDefinition, NamedIndexDefinition,
+    ReferentialAction, RelationalMutation, RelationalSchemaDefinition, RelationalSnapshot,
+    RelationalSnapshotCaptureOptions, RelationalSnapshotTable, RelationalStore,
+    RelationalTransaction, Row, TableDefinition, TableId, Value, decode_row, encode_row,
 };
 pub use relational_database::{
     CancellationToken, OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT,
@@ -70,8 +69,8 @@ pub use replication::{
 };
 pub use row_identity::RowIdentity;
 pub use runtime::{
-    Dispatch, GovernorConfig, GovernorError, GovernorStats, OverloadPolicy, Reactor,
-    ReactorConfig, ReactorError, ResourceGovernor, WorkClass, WorkId, WorkItem, WorkerId,
+    Dispatch, GovernorConfig, GovernorError, GovernorStats, OverloadPolicy, Reactor, ReactorConfig,
+    ReactorError, ResourceGovernor, WorkClass, WorkId, WorkItem, WorkerId,
 };
 pub use seer_kernel::{
     CommitOutcome, KvMutation, SeerDurabilityStatus, SeerKernel, SeerKernelConfig,
@@ -269,9 +268,7 @@ impl DbError {
             | Self::MigrationPublished { .. } => TransactionErrorClass::ReopenRequired,
             Self::UniqueViolation { .. }
             | Self::ForeignKeyViolation { .. }
-            | Self::CascadeDepthExceeded { .. } => {
-                TransactionErrorClass::ConstraintViolation
-            }
+            | Self::CascadeDepthExceeded { .. } => TransactionErrorClass::ConstraintViolation,
             Self::SnapshotUnavailable(_) | Self::StorageSnapshotUnavailable { .. } => {
                 TransactionErrorClass::SnapshotUnavailable
             }

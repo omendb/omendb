@@ -190,14 +190,18 @@ impl SerializableCertifier {
 
             // 1. Write-Write conflicts: did both transactions write or delete the same key?
             for key in candidate.point_writes.keys() {
-                if entry.spec.point_writes.contains_key(key) || entry.spec.point_deletes.contains(key) {
+                if entry.spec.point_writes.contains_key(key)
+                    || entry.spec.point_deletes.contains(key)
+                {
                     self.metrics.conflicts += 1;
                     self.metrics.write_write_conflicts += 1;
                     return Err(CertificationConflict::WriteWrite { key: *key });
                 }
             }
             for key in &candidate.point_deletes {
-                if entry.spec.point_writes.contains_key(key) || entry.spec.point_deletes.contains(key) {
+                if entry.spec.point_writes.contains_key(key)
+                    || entry.spec.point_deletes.contains(key)
+                {
                     self.metrics.conflicts += 1;
                     self.metrics.write_write_conflicts += 1;
                     return Err(CertificationConflict::WriteWrite { key: *key });
@@ -206,7 +210,9 @@ impl SerializableCertifier {
 
             // 2. Read-Write anti-dependencies: candidate read a point key that earlier committed tx modified
             for key in &candidate.point_reads {
-                if entry.spec.point_writes.contains_key(key) || entry.spec.point_deletes.contains(key) {
+                if entry.spec.point_writes.contains_key(key)
+                    || entry.spec.point_deletes.contains(key)
+                {
                     self.metrics.conflicts += 1;
                     self.metrics.read_write_conflicts += 1;
                     return Err(CertificationConflict::ReadWriteAntiDependency { key: *key });
@@ -230,14 +236,22 @@ impl SerializableCertifier {
             }
 
             // 4. Catalog conflict
-            for key in candidate.catalog_writes.keys().chain(&candidate.catalog_deletes) {
-                if entry.spec.catalog_writes.contains_key(key) || entry.spec.catalog_deletes.contains(key) {
+            for key in candidate
+                .catalog_writes
+                .keys()
+                .chain(&candidate.catalog_deletes)
+            {
+                if entry.spec.catalog_writes.contains_key(key)
+                    || entry.spec.catalog_deletes.contains(key)
+                {
                     self.metrics.conflicts += 1;
                     return Err(CertificationConflict::CatalogConflict { key: *key });
                 }
             }
             for key in &candidate.catalog_reads {
-                if entry.spec.catalog_writes.contains_key(key) || entry.spec.catalog_deletes.contains(key) {
+                if entry.spec.catalog_writes.contains_key(key)
+                    || entry.spec.catalog_deletes.contains(key)
+                {
                     self.metrics.conflicts += 1;
                     return Err(CertificationConflict::CatalogConflict { key: *key });
                 }
@@ -245,7 +259,12 @@ impl SerializableCertifier {
 
             // 5. Range read phantom checks
             for range in &candidate.range_reads {
-                for key in entry.spec.point_writes.keys().chain(&entry.spec.point_deletes) {
+                for key in entry
+                    .spec
+                    .point_writes
+                    .keys()
+                    .chain(&entry.spec.point_deletes)
+                {
                     if range.contains(key) {
                         self.metrics.conflicts += 1;
                         self.metrics.range_conflicts += 1;
@@ -268,7 +287,11 @@ impl SerializableCertifier {
         // Check write-write overlap first
         for entry in &self.committed {
             if entry.commit > candidate.snapshot {
-                for key in candidate.point_writes.keys().chain(&candidate.point_deletes) {
+                for key in candidate
+                    .point_writes
+                    .keys()
+                    .chain(&candidate.point_deletes)
+                {
                     if entry.spec.point_writes.contains_key(key)
                         || entry.spec.point_deletes.contains(key)
                     {
@@ -289,10 +312,12 @@ impl SerializableCertifier {
         for (i, left) in self.committed.iter().enumerate() {
             for right in self.committed.iter().skip(i + 1) {
                 // Dependency: left read a key that right modified later (left -> right)
-                if has_rw_antidependency(&left.spec, &right.spec, right.commit > left.spec.snapshot) {
+                if has_rw_antidependency(&left.spec, &right.spec, right.commit > left.spec.snapshot)
+                {
                     edges.insert((left.spec.id, right.spec.id));
                 }
-                if has_rw_antidependency(&right.spec, &left.spec, left.commit > right.spec.snapshot) {
+                if has_rw_antidependency(&right.spec, &left.spec, left.commit > right.spec.snapshot)
+                {
                     edges.insert((right.spec.id, left.spec.id));
                 }
             }
@@ -306,7 +331,8 @@ impl SerializableCertifier {
             }
         }
 
-        self.metrics.max_dependency_edges = self.metrics.max_dependency_edges.max(edges.len() as u64);
+        self.metrics.max_dependency_edges =
+            self.metrics.max_dependency_edges.max(edges.len() as u64);
 
         if has_dependency_cycle(&nodes, &edges) {
             self.metrics.conflicts += 1;
@@ -333,7 +359,8 @@ impl SerializableCertifier {
 
     /// Prune committed history older than the oldest active snapshot lease.
     pub fn prune_retained(&mut self, oldest_active_snapshot: CommitId) {
-        self.committed.retain(|entry| entry.commit >= oldest_active_snapshot);
+        self.committed
+            .retain(|entry| entry.commit >= oldest_active_snapshot);
     }
 }
 

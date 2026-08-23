@@ -159,9 +159,7 @@ enum Op {
 
 fn open_session(directory: &std::path::Path) -> RelationalDatabaseSession {
     let config = RelationalDatabaseConfig {
-        backend: RelationalBackendConfig::Seer(omendb::SeerKernelConfig::new(
-            directory.to_owned(),
-        )),
+        backend: RelationalBackendConfig::Seer(omendb::SeerKernelConfig::new(directory.to_owned())),
         session: RelationalSessionConfig {
             max_in_flight: WORKERS * 2,
             admission_timeout: Duration::from_secs(120),
@@ -180,16 +178,12 @@ fn open_session(directory: &std::path::Path) -> RelationalDatabaseSession {
             .transaction(&control, |db, tx| {
                 tx.insert(db, ACCOUNTS_TABLE, account_row(id, INITIAL_BALANCE))
             })
-            .expect("seed account")
-            ;
+            .expect("seed account");
     }
     session
 }
 
-fn run_mode(
-    group_commit: bool,
-    stats: &mut Vec<Duration>,
-) -> (BTreeMap<u64, u64>, u64, Duration) {
+fn run_mode(group_commit: bool, stats: &mut Vec<Duration>) -> (BTreeMap<u64, u64>, u64, Duration) {
     let dir = tempdir().expect("tempdir");
     let session = Arc::new(open_session(&dir.path().join("seerdb")));
     let started = Instant::now();
@@ -295,7 +289,14 @@ fn run_mode(
         hasher.update(balance.to_le_bytes());
     }
     let _ = group_commit;
-    (balances, hasher.finalize().iter().fold(0u64, |acc, b| acc ^ u64::from(*b)), elapsed)
+    (
+        balances,
+        hasher
+            .finalize()
+            .iter()
+            .fold(0u64, |acc, b| acc ^ u64::from(*b)),
+        elapsed,
+    )
 }
 
 fn transfer(
@@ -334,8 +335,16 @@ fn transfer(
     let mut new_to = to_row;
     new_to.values[1] = Value::U64(to_balance + amount);
     tx.update(db, ACCOUNTS_TABLE, new_to)?;
-    tx.insert(db, EVENTS_TABLE, event_row(event, from_id, -(amount as i64)))?;
-    tx.insert(db, EVENTS_TABLE, event_row(event + 1_000_000, to_id, amount as i64))?;
+    tx.insert(
+        db,
+        EVENTS_TABLE,
+        event_row(event, from_id, -(amount as i64)),
+    )?;
+    tx.insert(
+        db,
+        EVENTS_TABLE,
+        event_row(event + 1_000_000, to_id, amount as i64),
+    )?;
     Ok(())
 }
 
@@ -353,8 +362,7 @@ fn group_commit_matched_durability_contended_trace() {
         run_mode(false, &mut per_commit_stats);
 
     let mut group_commit_stats = Vec::new();
-    let (group_balances, group_digest, group_elapsed) =
-        run_mode(true, &mut group_commit_stats);
+    let (group_balances, group_digest, group_elapsed) = run_mode(true, &mut group_commit_stats);
 
     // Matched-durability gate: identical verified state from both paths.
     assert_eq!(per_commit_digest, group_digest, "state digests diverged");
@@ -375,8 +383,5 @@ fn group_commit_matched_durability_contended_trace() {
     }
     let per_commit_tps = ops as f64 / per_commit_elapsed.as_secs_f64();
     let group_tps = ops as f64 / group_elapsed.as_secs_f64();
-    println!(
-        "group-commit speedup: {:.2}x",
-        group_tps / per_commit_tps
-    );
+    println!("group-commit speedup: {:.2}x", group_tps / per_commit_tps);
 }

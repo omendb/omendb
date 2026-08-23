@@ -49,15 +49,14 @@ fn row(table: TableId, id: u64, parent: Option<u64>) -> Row {
     }
 }
 
-
 fn setup(kind: RelationalBackendKind) -> (tempfile::TempDir, RelationalDatabase) {
     let directory = tempdir().expect("tempdir");
     let config = match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(
-            omendb::DatabaseConfig {
+        RelationalBackendKind::Temporary => {
+            RelationalBackendConfig::Temporary(omendb::DatabaseConfig {
                 directory: directory.path().join("db"),
-            },
-        ),
+            })
+        }
         RelationalBackendKind::Seer => RelationalBackendConfig::Seer(
             omendb::SeerKernelConfig::new(directory.path().join("db")),
         ),
@@ -85,7 +84,12 @@ fn setup(kind: RelationalBackendKind) -> (tempfile::TempDir, RelationalDatabase)
     (directory, database)
 }
 
-fn fk(id: u64, child: TableId, parent: TableId, on_delete: omendb::ReferentialAction) -> ForeignKeyDefinition {
+fn fk(
+    id: u64,
+    child: TableId,
+    parent: TableId,
+    on_delete: omendb::ReferentialAction,
+) -> ForeignKeyDefinition {
     ForeignKeyDefinition {
         id: ConstraintId(id),
         table: child,
@@ -111,11 +115,19 @@ fn seed(database: &mut RelationalDatabase) {
 
 #[test]
 fn restrict_still_rejects_parent_delete_on_both_backends() {
-    for kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let (_dir, mut database) = setup(kind);
         seed(&mut database);
         database
-            .create_foreign_key(fk(1, CHILDREN, PARENTS, omendb::ReferentialAction::Restrict))
+            .create_foreign_key(fk(
+                1,
+                CHILDREN,
+                PARENTS,
+                omendb::ReferentialAction::Restrict,
+            ))
             .expect("restrict fk");
         assert!(matches!(
             database.delete(PARENTS, key_of(PARENTS, 1)),
@@ -132,16 +144,14 @@ fn restrict_still_rejects_parent_delete_on_both_backends() {
 
 #[test]
 fn cascade_deletes_children_and_descendants_on_both_backends() {
-    for kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let (_dir, mut database) = setup(kind);
         seed(&mut database);
         database
-            .create_foreign_key(fk(
-                1,
-                CHILDREN,
-                PARENTS,
-                omendb::ReferentialAction::Cascade,
-            ))
+            .create_foreign_key(fk(1, CHILDREN, PARENTS, omendb::ReferentialAction::Cascade))
             .expect("cascade fk");
         database
             .create_foreign_key(fk(
@@ -151,10 +161,22 @@ fn cascade_deletes_children_and_descendants_on_both_backends() {
                 omendb::ReferentialAction::Cascade,
             ))
             .expect("cascade fk chain");
-        database.delete(PARENTS, key_of(PARENTS, 1)).expect("delete");
+        database
+            .delete(PARENTS, key_of(PARENTS, 1))
+            .expect("delete");
         let commit = database.commit_id();
-        assert!(database.scan(PARENTS, commit, 10).expect("parents").is_empty());
-        assert!(database.scan(CHILDREN, commit, 10).expect("children").is_empty());
+        assert!(
+            database
+                .scan(PARENTS, commit, 10)
+                .expect("parents")
+                .is_empty()
+        );
+        assert!(
+            database
+                .scan(CHILDREN, commit, 10)
+                .expect("children")
+                .is_empty()
+        );
         assert!(
             database
                 .scan(GRANDCHILDREN, commit, 10)
@@ -166,7 +188,10 @@ fn cascade_deletes_children_and_descendants_on_both_backends() {
 
 #[test]
 fn set_null_preserves_child_and_clears_reference_on_both_backends() {
-    for kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let (_dir, mut database) = setup(kind);
         seed(&mut database);
         // Grandchildren's link column is nullable; children's is not.
@@ -207,16 +232,14 @@ fn set_null_activation_refuses_non_nullable_fk_column() {
 
 #[test]
 fn staged_cascade_resolves_when_transaction_reinserts_the_child() {
-    for kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let (_dir, mut database) = setup(kind);
         seed(&mut database);
         database
-            .create_foreign_key(fk(
-                1,
-                CHILDREN,
-                PARENTS,
-                omendb::ReferentialAction::Cascade,
-            ))
+            .create_foreign_key(fk(1, CHILDREN, PARENTS, omendb::ReferentialAction::Cascade))
             .expect("cascade fk");
         let (_, _commit) = database
             .transaction(|database, transaction| {
@@ -230,20 +253,38 @@ fn staged_cascade_resolves_when_transaction_reinserts_the_child() {
             })
             .expect("transaction with staged cascade resolves");
         let commit = database.commit_id();
-        assert!(database.scan(PARENTS, commit, 10).expect("parents").is_empty());
-        assert!(database.scan(CHILDREN, commit, 10).expect("children").is_empty());
+        assert!(
+            database
+                .scan(PARENTS, commit, 10)
+                .expect("parents")
+                .is_empty()
+        );
+        assert!(
+            database
+                .scan(CHILDREN, commit, 10)
+                .expect("children")
+                .is_empty()
+        );
         // Only the CHILDREN->PARENTS cascade exists here; grandchild 21 keeps
         // its (now dangling) reference because no constraint governs it.
         assert_eq!(
-            database.scan(GRANDCHILDREN, commit, 10).expect("grandchildren"),
-            vec![row(GRANDCHILDREN, 21, Some(11)), row(GRANDCHILDREN, 31, None)]
+            database
+                .scan(GRANDCHILDREN, commit, 10)
+                .expect("grandchildren"),
+            vec![
+                row(GRANDCHILDREN, 21, Some(11)),
+                row(GRANDCHILDREN, 31, None)
+            ]
         );
     }
 }
 
 #[test]
 fn cascade_depth_bound_rejects_deeper_than_max_chains() {
-    for kind in [RelationalBackendKind::Temporary, RelationalBackendKind::Seer] {
+    for kind in [
+        RelationalBackendKind::Temporary,
+        RelationalBackendKind::Seer,
+    ] {
         let (_dir, mut database) = setup(kind);
         // Self-referential chain on one table: row N references N-1.
         const CHAIN: TableId = TableId(70);
@@ -303,7 +344,10 @@ fn cascade_depth_bound_rejects_deeper_than_max_chains() {
         ));
         assert_eq!(database.commit_id(), before);
         assert_eq!(
-            database.scan(CHAIN, before, usize::MAX).expect("chain intact").len(),
+            database
+                .scan(CHAIN, before, usize::MAX)
+                .expect("chain intact")
+                .len(),
             70
         );
     }

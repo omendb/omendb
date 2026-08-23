@@ -153,9 +153,7 @@ impl GroupCommitPipeline {
             // wait begin together, and one same-snapshot batch is worth
             // more than several single-transaction publications.
             if self.config.max_batch_delay_micros > 0 {
-                std::thread::sleep(Duration::from_micros(
-                    self.config.max_batch_delay_micros,
-                ));
+                std::thread::sleep(Duration::from_micros(self.config.max_batch_delay_micros));
             }
             self.flush_loop(database, control);
         }
@@ -239,14 +237,16 @@ impl GroupCommitPipeline {
                     for (sender, outcome) in senders.into_iter().zip(outcomes) {
                         let _ = sender.send(outcome);
                     }
-                    self.total_committed.fetch_add(committed as u64, Ordering::Relaxed);
+                    self.total_committed
+                        .fetch_add(committed as u64, Ordering::Relaxed);
                     self.total_rejected
                         .fetch_add((senders_len - committed) as u64, Ordering::Relaxed);
                     if committed > 0 {
                         // Only a batch that published at least one durable
                         // transaction counts as a publication.
                         self.total_publications.fetch_add(1, Ordering::Relaxed);
-                        self.max_observed_batch_size.fetch_max(committed, Ordering::Relaxed);
+                        self.max_observed_batch_size
+                            .fetch_max(committed, Ordering::Relaxed);
                     }
                 }
                 None => {
@@ -313,11 +313,19 @@ mod tests {
         // submit path itself does not need database access.
         let leader_transaction = {
             let guard = db_lock.read().unwrap();
-            guard.as_ref().unwrap().begin_with_control(&control).unwrap()
+            guard
+                .as_ref()
+                .unwrap()
+                .begin_with_control(&control)
+                .unwrap()
         };
         let follower_transaction = {
             let guard = db_lock.read().unwrap();
-            guard.as_ref().unwrap().begin_with_control(&control).unwrap()
+            guard
+                .as_ref()
+                .unwrap()
+                .begin_with_control(&control)
+                .unwrap()
         };
 
         // Hold the exclusive guard so the leader blocks after selecting its
@@ -349,7 +357,10 @@ mod tests {
 
         drop(held_guard);
         let leader_result = leader.join().unwrap();
-        assert!(leader_result.is_ok(), "leader must publish: {leader_result:?}");
+        assert!(
+            leader_result.is_ok(),
+            "leader must publish: {leader_result:?}"
+        );
         let follower_result = follower.join().unwrap();
         assert!(
             matches!(follower_result, Err(DbError::DeadlineExceeded)),
@@ -373,7 +384,11 @@ mod tests {
 
         let transaction = {
             let guard = db_lock.read().unwrap();
-            guard.as_ref().unwrap().begin_with_control(&control).unwrap()
+            guard
+                .as_ref()
+                .unwrap()
+                .begin_with_control(&control)
+                .unwrap()
         };
 
         let result = pipeline.submit_and_await(&db_lock, &control, transaction);

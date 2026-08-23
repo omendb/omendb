@@ -8,8 +8,8 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::relational::{
@@ -1448,7 +1448,10 @@ impl RelationalDatabase {
 
     /// Open a replication stream from this primary database starting after `from_commit`.
     #[must_use]
-    pub fn open_replication_stream(&self, from_commit: CommitId) -> crate::replication::ReplicationStream {
+    pub fn open_replication_stream(
+        &self,
+        from_commit: CommitId,
+    ) -> crate::replication::ReplicationStream {
         crate::replication::ReplicationStream::new(from_commit)
     }
 

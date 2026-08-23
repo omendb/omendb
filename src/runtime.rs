@@ -293,8 +293,7 @@ impl ResourceGovernor {
                 'queues: for queue in &mut self.queues {
                     for (position, candidate) in queue.iter().enumerate() {
                         if candidate.id == victim {
-                            let item =
-                                queue.remove(position).expect("queue position exists");
+                            let item = queue.remove(position).expect("queue position exists");
                             found = Some(item);
                             break 'queues;
                         }
@@ -544,8 +543,8 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use super::{
-        GovernorConfig, GovernorError, Reactor, ReactorConfig, ReactorError, ResourceGovernor,
-        OverloadPolicy, WorkClass,
+        GovernorConfig, GovernorError, OverloadPolicy, Reactor, ReactorConfig, ReactorError,
+        ResourceGovernor, WorkClass,
     };
 
     #[test]
@@ -776,12 +775,18 @@ mod tests {
     #[test]
     fn terminate_largest_admits_arrival_and_names_victims() {
         let mut governor = ResourceGovernor::new(terminate_config()).expect("config");
-        let big_scan = governor.submit(WorkClass::Scan, 10, None).expect("big scan");
-        let small_scan = governor.submit(WorkClass::Scan, 3, None).expect("small scan");
+        let big_scan = governor
+            .submit(WorkClass::Scan, 10, None)
+            .expect("big scan");
+        let small_scan = governor
+            .submit(WorkClass::Scan, 3, None)
+            .expect("small scan");
 
         // Capacity 16, accounted 13: an 8-cost arrival needs 5 freed. The
         // 10-cost scan is the largest terminable consumer, so it goes.
-        let arrival = governor.submit(WorkClass::Schema, 8, None).expect("admitted");
+        let arrival = governor
+            .submit(WorkClass::Schema, 8, None)
+            .expect("admitted");
         let terminated = governor.take_terminated();
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, big_scan);
@@ -831,7 +836,9 @@ mod tests {
         })
         .expect("config");
         governor.submit(WorkClass::Scan, 10, None).expect("fill");
-        governor.submit(WorkClass::Scan, 5, None).expect("fill more");
+        governor
+            .submit(WorkClass::Scan, 5, None)
+            .expect("fill more");
         assert!(matches!(
             governor.submit(WorkClass::Scan, 8, None),
             Err(GovernorError::CapacityExhausted)
@@ -842,9 +849,13 @@ mod tests {
     #[test]
     fn queued_items_are_terminable_too() {
         let mut governor = ResourceGovernor::new(terminate_config()).expect("config");
-        let queued = governor.submit(WorkClass::Scan, 12, None).expect("queued scan");
+        let queued = governor
+            .submit(WorkClass::Scan, 12, None)
+            .expect("queued scan");
         // Nothing polled it, so it sits in the queue and still holds cost.
-        let arrival = governor.submit(WorkClass::Reclaim, 10, None).expect("admitted");
+        let arrival = governor
+            .submit(WorkClass::Reclaim, 10, None)
+            .expect("admitted");
         let terminated = governor.take_terminated();
         assert_eq!(terminated.len(), 1);
         assert_eq!(terminated[0].id, queued);
@@ -858,65 +869,67 @@ mod tests {
 mod demotion_tests {
     use super::*;
 
-#[test]
-fn long_running_scan_is_demoted_behind_queued_oltp() {
-    let mut reactor = Reactor::new(ReactorConfig {
-        workers: 1,
-        governor: GovernorConfig {
-            capacity: 8,
-            protected_reserve: 2,
-            max_queue_per_class: 4,
-            max_in_flight: 4,
-            overload_policy: OverloadPolicy::default(),
-        },
-        demotion_after: Some(5),
-    })
-    .expect("reactor");
+    #[test]
+    fn long_running_scan_is_demoted_behind_queued_oltp() {
+        let mut reactor = Reactor::new(ReactorConfig {
+            workers: 1,
+            governor: GovernorConfig {
+                capacity: 8,
+                protected_reserve: 2,
+                max_queue_per_class: 4,
+                max_in_flight: 4,
+                overload_policy: OverloadPolicy::default(),
+            },
+            demotion_after: Some(5),
+        })
+        .expect("reactor");
 
-    let scan = reactor.submit(WorkClass::Scan, 2, None).expect("scan submit");
-    let dispatches = reactor.dispatch_batch(10);
-    assert_eq!(dispatches.len(), 1);
-    assert_eq!(dispatches[0].work.class, WorkClass::Scan);
+        let scan = reactor
+            .submit(WorkClass::Scan, 2, None)
+            .expect("scan submit");
+        let dispatches = reactor.dispatch_batch(10);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].work.class, WorkClass::Scan);
 
-    // OlTp arrives while the scan is still in flight past its threshold.
-    let oltp = reactor
-        .submit(WorkClass::OlTp, 1, None)
-        .expect("oltp submit");
-    let preempted = reactor.preempt_long_running(20);
-    assert_eq!(preempted.len(), 1);
-    assert_eq!(preempted[0].0, WorkerId(0));
-    assert_eq!(preempted[0].1.id, scan);
+        // OlTp arrives while the scan is still in flight past its threshold.
+        let oltp = reactor
+            .submit(WorkClass::OlTp, 1, None)
+            .expect("oltp submit");
+        let preempted = reactor.preempt_long_running(20);
+        assert_eq!(preempted.len(), 1);
+        assert_eq!(preempted[0].0, WorkerId(0));
+        assert_eq!(preempted[0].1.id, scan);
 
-    // The freed worker dispatches the OlTp first; the scan's remainder
-    // waits at the rear of its queue.
-    let next = reactor.dispatch(21).expect("dispatch after preemption");
-    assert_eq!(next.work.id, oltp);
-    assert_eq!(next.work.class, WorkClass::OlTp);
+        // The freed worker dispatches the OlTp first; the scan's remainder
+        // waits at the rear of its queue.
+        let next = reactor.dispatch(21).expect("dispatch after preemption");
+        assert_eq!(next.work.id, oltp);
+        assert_eq!(next.work.class, WorkClass::OlTp);
 
-    reactor.complete(next.worker).expect("complete oltp");
-    let resumed = reactor.dispatch(22).expect("scan resumes");
-    assert_eq!(resumed.work.id, scan, "scan requeues and finishes");
-}
+        reactor.complete(next.worker).expect("complete oltp");
+        let resumed = reactor.dispatch(22).expect("scan resumes");
+        assert_eq!(resumed.work.id, scan, "scan requeues and finishes");
+    }
 
-#[test]
-fn oltp_and_wal_are_never_demoted() {
-    let mut reactor = Reactor::new(ReactorConfig {
-        workers: 2,
-        governor: GovernorConfig {
-            capacity: 8,
-            protected_reserve: 2,
-            max_queue_per_class: 4,
-            max_in_flight: 4,
-            overload_policy: OverloadPolicy::default(),
-        },
-        demotion_after: Some(1),
-    })
-    .expect("reactor");
-    reactor.submit(WorkClass::OlTp, 1, None).expect("submit");
-    reactor.submit(WorkClass::Wal, 1, None).expect("submit");
-    let dispatches = reactor.dispatch_batch(100);
-    assert_eq!(dispatches.len(), 2);
-    // Both far exceed the threshold but durability classes hold their workers.
-    assert!(reactor.preempt_long_running(1000).is_empty());
-}
+    #[test]
+    fn oltp_and_wal_are_never_demoted() {
+        let mut reactor = Reactor::new(ReactorConfig {
+            workers: 2,
+            governor: GovernorConfig {
+                capacity: 8,
+                protected_reserve: 2,
+                max_queue_per_class: 4,
+                max_in_flight: 4,
+                overload_policy: OverloadPolicy::default(),
+            },
+            demotion_after: Some(1),
+        })
+        .expect("reactor");
+        reactor.submit(WorkClass::OlTp, 1, None).expect("submit");
+        reactor.submit(WorkClass::Wal, 1, None).expect("submit");
+        let dispatches = reactor.dispatch_batch(100);
+        assert_eq!(dispatches.len(), 2);
+        // Both far exceed the threshold but durability classes hold their workers.
+        assert!(reactor.preempt_long_running(1000).is_empty());
+    }
 }

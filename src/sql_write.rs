@@ -4,11 +4,11 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, SqlColumn,
-    SqlResult, TableDefinition, Value,
+    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, SqlColumn, SqlResult,
+    TableDefinition, Value,
 };
 
-use super::query::{join_predicate, row_matches, ResolvedSubqueries};
+use super::query::{ResolvedSubqueries, join_predicate, row_matches};
 use super::{
     column_position_by_name, find_table, simple_object_name, unsupported,
     values::{coerce_value, literal_value, sql_primary_key},
@@ -92,8 +92,7 @@ pub(super) fn execute_insert(
             }
         }
         SetExpr::Select(_) => {
-            let result =
-                super::query::execute_query(database, transaction, source, params)?;
+            let result = super::query::execute_query(database, transaction, source, params)?;
             if result.columns.len() != target_positions.len() {
                 return Err(DbError::InvalidState(format!(
                     "INSERT SELECT yields {} columns but {} were targeted",
@@ -113,7 +112,7 @@ pub(super) fn execute_insert(
             return Err(unsupported(
                 "INSERT",
                 "the source must be VALUES rows or a SELECT",
-            ))
+            ));
         }
     }
 
@@ -168,10 +167,7 @@ fn returning_plan(
                     .iter()
                     .position(|column| column.name == identifier.value)
                     .ok_or_else(|| {
-                        DbError::InvalidState(format!(
-                            "column {} does not exist",
-                            identifier.value
-                        ))
+                        DbError::InvalidState(format!("column {} does not exist", identifier.value))
                     })?;
                 columns.push(SqlColumn {
                     name: identifier.value.clone(),
@@ -182,7 +178,7 @@ fn returning_plan(
                 return Err(unsupported(
                     "RETURNING",
                     "only column names or * are supported",
-                ))
+                ));
             }
         }
     }
@@ -263,7 +259,10 @@ pub(super) fn execute_update(
                     )?;
                     if let Some((_, positions)) = &returning_plan {
                         returned_rows.push(
-                            positions.iter().map(|p| updated.values[*p].clone()).collect(),
+                            positions
+                                .iter()
+                                .map(|p| updated.values[*p].clone())
+                                .collect(),
                         );
                     }
                     affected += 1;
@@ -272,7 +271,13 @@ pub(super) fn execute_update(
             }
             continue;
         }
-        if !row_matches(update.selection.as_ref(), &row, table, params, &ResolvedSubqueries::new())? {
+        if !row_matches(
+            update.selection.as_ref(),
+            &row,
+            table,
+            params,
+            &ResolvedSubqueries::new(),
+        )? {
             continue;
         }
         let mut updated = row.clone();
@@ -301,7 +306,12 @@ pub(super) fn execute_update(
             ));
         }
         if let Some((_, positions)) = &returning_plan {
-            returned_rows.push(positions.iter().map(|p| updated.values[*p].clone()).collect());
+            returned_rows.push(
+                positions
+                    .iter()
+                    .map(|p| updated.values[*p].clone())
+                    .collect(),
+            );
         }
         transaction.update(database, table.id, updated)?;
         affected += 1;
@@ -445,7 +455,13 @@ pub(super) fn execute_delete(
             affected += 1;
             continue;
         }
-        if !row_matches(delete.selection.as_ref(), &row, table, params, &ResolvedSubqueries::new())? {
+        if !row_matches(
+            delete.selection.as_ref(),
+            &row,
+            table,
+            params,
+            &ResolvedSubqueries::new(),
+        )? {
             continue;
         }
         if let Some((_, positions)) = &returning_plan {
@@ -479,7 +495,10 @@ fn update_assignments<'a>(
         .collect()
 }
 
-pub(super) fn insert_positions(table: &TableDefinition, columns: &[ObjectName]) -> Result<Vec<usize>> {
+pub(super) fn insert_positions(
+    table: &TableDefinition,
+    columns: &[ObjectName],
+) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..table.columns.len()).collect());
     }

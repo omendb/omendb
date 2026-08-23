@@ -12,18 +12,17 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt};use pgwire::api::auth::sasl::scram::{
-    gen_salted_password, random_nonce, ScramAuth,
-};
+use futures::{StreamExt, stream};
 use pgwire::api::auth::sasl::SASLAuthStartupHandler;
+use pgwire::api::auth::sasl::scram::{ScramAuth, gen_salted_password, random_nonce};
 use pgwire::api::auth::{
     AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
 };
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 
@@ -58,26 +57,25 @@ pub type SharedDatabase = Arc<RwLock<RelationalDatabase>>;
 fn read_lock(
     database: &SharedDatabase,
 ) -> PgWireResult<std::sync::RwLockReadGuard<'_, RelationalDatabase>> {
-    database.read().map_err(|_| {
-        pg_error("XX000", "database lock poisoned".to_owned())
-    })
+    database
+        .read()
+        .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
 }
 
 fn write_lock(
     database: &SharedDatabase,
 ) -> PgWireResult<std::sync::RwLockWriteGuard<'_, RelationalDatabase>> {
-    database.write().map_err(|_| {
-        pg_error("XX000", "database lock poisoned".to_owned())
-    })
+    database
+        .write()
+        .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
 }
 
 /// Serve PostgreSQL wire clients on an already-bound listener until the
 /// listener errors. Each connection runs against `database` with trust auth.
 pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::Result<()> {
     let auth_table_present = {
-        let mut database = write_lock(&database).map_err(|err| {
-            std::io::Error::other(err.to_string())
-        })?;
+        let mut database =
+            write_lock(&database).map_err(|err| std::io::Error::other(err.to_string()))?;
         if !database
             .catalog()
             .tables()
@@ -91,10 +89,11 @@ pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::
     };
     let _ = auth_table_present;
     let has_users = {
-        let database = read_lock(&database).map_err(|err| {
-            std::io::Error::other(err.to_string())
-        })?;
-        let mut transaction = database.begin().map_err(|err| std::io::Error::other(err.to_string()))?;
+        let database =
+            read_lock(&database).map_err(|err| std::io::Error::other(err.to_string()))?;
+        let mut transaction = database
+            .begin()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
         let result = transaction
             .execute_sql(&database, "SELECT username FROM pgwire_auth")
             .map_err(|err| std::io::Error::other(err.to_string()));
@@ -144,7 +143,10 @@ pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::
 pub async fn spawn(
     database: SharedDatabase,
     bind_addr: std::net::SocketAddr,
-) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>)> {
+) -> std::io::Result<(
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(serve(database, listener));
@@ -232,7 +234,10 @@ pub fn provision_wire_grant(
     }
     database.execute_sql_with_params(
         "DELETE FROM pgwire_grants WHERE role = $1 AND table_name = $2",
-        &[Value::Text(role.to_owned()), Value::Text(table_name.to_owned())],
+        &[
+            Value::Text(role.to_owned()),
+            Value::Text(table_name.to_owned()),
+        ],
     )?;
     database.execute_sql_with_params(
         "INSERT INTO pgwire_grants (role, table_name, can_read, can_write) VALUES ($1, $2, $3, $4)",
@@ -253,7 +258,11 @@ pub fn provision_wire_user(
     username: &str,
     password: &str,
 ) -> Result<(), DbError> {
-    if !database.catalog().tables().any(|table| table.name == AUTH_TABLE) {
+    if !database
+        .catalog()
+        .tables()
+        .any(|table| table.name == AUTH_TABLE)
+    {
         database.create_table(auth_table_definition())?;
     }
     // Fixed-width salt so the storage layout (salt || salted password)
@@ -279,12 +288,8 @@ impl std::fmt::Debug for WireAuthSource {
     }
 }
 
-
 fn invalid_login() -> PgWireError {
-    pg_error(
-        "28P01",
-        "password authentication failed".to_owned(),
-    )
+    pg_error("28P01", "password authentication failed".to_owned())
 }
 
 #[async_trait]
@@ -370,11 +375,7 @@ impl StartupHandler for StartupMode {
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: pgwire::api::ClientInfo
-            + futures::Sink<PgWireBackendMessage>
-            + Unpin
-            + Send
-            + Sync,
+        C: pgwire::api::ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
         Self: Sync,
@@ -431,9 +432,7 @@ impl PgWireServerHandlers for HandlerFactory {
         self.handler.clone()
     }
 
-    fn extended_query_handler(
-        &self,
-    ) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
+    fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
         self.handler.clone()
     }
 
@@ -442,9 +441,9 @@ impl PgWireServerHandlers for HandlerFactory {
             Some(components) => {
                 let components = (**components).clone();
                 StartupMode::Scram(
-                    SASLAuthStartupHandler::new(Arc::new(
-                        DefaultServerParameterProvider::default(),
-                    ))
+                    SASLAuthStartupHandler::new(
+                        Arc::new(DefaultServerParameterProvider::default()),
+                    )
                     .with_scram(ScramAuth::new(components.auth_source)),
                     components.identities,
                     components.failure_delays,
@@ -524,10 +523,7 @@ impl pgwire::api::stmt::QueryParser for PlaceholderParser {
         })
     }
 
-    fn get_parameter_types(
-        &self,
-        stmt: &ParsedStatement,
-    ) -> PgWireResult<Vec<Type>> {
+    fn get_parameter_types(&self, stmt: &ParsedStatement) -> PgWireResult<Vec<Type>> {
         Ok((0..ParsedStatement::placeholder_count(&stmt.sql))
             .map(|index| {
                 stmt.parameter_types
@@ -589,11 +585,12 @@ fn pg_error(code: &str, message: String) -> PgWireError {
 fn map_db_error(error: crate::DbError) -> PgWireError {
     let (code, message) = match &error {
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
-        crate::DbError::ForeignKeyViolation { .. } | crate::DbError::CascadeDepthExceeded { .. } => {
-            ("23503", error.to_string())
-        }
+        crate::DbError::ForeignKeyViolation { .. }
+        | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
         crate::DbError::SerializationConflict { .. } => ("40001", error.to_string()),
-        crate::DbError::SqlUnsupported { .. } => ("0A000", format!("feature not supported: {error}")),
+        crate::DbError::SqlUnsupported { .. } => {
+            ("0A000", format!("feature not supported: {error}"))
+        }
         _ => ("XX000", error.to_string()),
     };
     pg_error(code, message)
@@ -601,10 +598,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
 
 /// Encode one logical value. Native types let pgwire's `ToSqlText` honor the
 /// negotiated column format (text or binary) instead of forcing text.
-fn encode_value(
-    encoder: &mut DataRowEncoder,
-    value: &Value,
-) -> PgWireResult<()> {
+fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&Option::<String>::None),
         Value::Bool(inner) => encoder.encode_field(inner),
@@ -722,21 +716,15 @@ fn decode_parameter(
             Type::BOOL => Value::Bool(!raw.is_empty() && raw[0] != 0),
             Type::INT2 => match <[u8; 2]>::try_from(raw.as_ref()) {
                 Ok(inner) => Value::I64(i64::from(i16::from_be_bytes(inner))),
-                Err(_) => {
-                    return Err(pg_error("22P02", "malformed int2 parameter".to_owned()))
-                }
+                Err(_) => return Err(pg_error("22P02", "malformed int2 parameter".to_owned())),
             },
             Type::INT4 => match <[u8; 4]>::try_from(raw.as_ref()) {
                 Ok(inner) => Value::I64(i64::from(i32::from_be_bytes(inner))),
-                Err(_) => {
-                    return Err(pg_error("22P02", "malformed int4 parameter".to_owned()))
-                }
+                Err(_) => return Err(pg_error("22P02", "malformed int4 parameter".to_owned())),
             },
             Type::INT8 => match <[u8; 8]>::try_from(raw.as_ref()) {
                 Ok(inner) => Value::I64(i64::from_be_bytes(inner)),
-                Err(_) => {
-                    return Err(pg_error("22P02", "malformed int8 parameter".to_owned()))
-                }
+                Err(_) => return Err(pg_error("22P02", "malformed int8 parameter".to_owned())),
             },
             Type::BYTEA => Value::Bytes(raw.to_vec()),
             _ => Value::Text(String::from_utf8_lossy(raw).into_owned()),
@@ -751,7 +739,7 @@ fn decode_parameter(
                 return Err(pg_error(
                     "22P02",
                     format!("invalid integer parameter: {text}"),
-                ))
+                ));
             }
         },
         Type::BYTEA => Value::Bytes(text.into_bytes()),
@@ -792,20 +780,16 @@ fn transaction_command(statement: &str) -> Option<TransactionCommand> {
 impl OmenDbHandler {
     fn lock_transactions(
         &self,
-    ) -> PgWireResult<
-        std::sync::MutexGuard<'_, HashMap<std::net::SocketAddr, TransactionBlock>>,
-    > {
-        self.transactions.lock().map_err(|_| {
-            pg_error("XX000", "transaction table poisoned".to_owned())
-        })
+    ) -> PgWireResult<std::sync::MutexGuard<'_, HashMap<std::net::SocketAddr, TransactionBlock>>>
+    {
+        self.transactions
+            .lock()
+            .map_err(|_| pg_error("XX000", "transaction table poisoned".to_owned()))
     }
 
     /// Abort transaction blocks orphaned by disconnected clients. Cheap
     /// scan amortized over handled statements; stale blocks hold no locks.
-    fn reap_idle_blocks(
-        &self,
-        blocks: &mut HashMap<std::net::SocketAddr, TransactionBlock>,
-    ) {
+    fn reap_idle_blocks(&self, blocks: &mut HashMap<std::net::SocketAddr, TransactionBlock>) {
         blocks.retain(|_, block| block.last_used.elapsed() < TX_IDLE_TIMEOUT);
     }
 
@@ -862,9 +846,7 @@ impl OmenDbHandler {
                 drop(blocks);
                 // begin() only needs &self: opening a block takes no write
                 // access and publishes nothing.
-                let transaction = read_lock(&self.database)?
-                    .begin()
-                    .map_err(map_db_error)?;
+                let transaction = read_lock(&self.database)?.begin().map_err(map_db_error)?;
                 let mut blocks = self.lock_transactions()?;
                 blocks.insert(
                     client_addr,
@@ -891,7 +873,10 @@ impl OmenDbHandler {
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
                 let mut database = write_lock(&self.database)?;
-                block.transaction.commit(&mut database).map_err(map_db_error)?;
+                block
+                    .transaction
+                    .commit(&mut database)
+                    .map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
             Some(TransactionCommand::Rollback) => {
@@ -906,10 +891,7 @@ impl OmenDbHandler {
             }
             None => {
                 // Membership check under the lock; execution outside it.
-                let in_block = {
-                    self.lock_transactions()?
-                        .contains_key(&client_addr)
-                };
+                let in_block = { self.lock_transactions()?.contains_key(&client_addr) };
                 if !in_block {
                     return self.run_autocommit(sql, params, format);
                 }
@@ -933,8 +915,9 @@ impl OmenDbHandler {
                 // COMMIT under the write lock, so execution only needs
                 // shared access.
                 let database = read_lock(&self.database)?;
-                let outcome =
-                    block.transaction.execute_sql_with_params(&database, sql, params);
+                let outcome = block
+                    .transaction
+                    .execute_sql_with_params(&database, sql, params);
                 drop(database);
                 let response = match outcome {
                     Ok(result) => Ok(encode_response_with_format(result, format)),
@@ -955,11 +938,7 @@ impl OmenDbHandler {
     /// access. The wildcard table "*" with can_write is schema
     /// administration (DDL). Trust-mode connections carry no identity
     /// and are loopback-only.
-    fn enforce_grants(
-        &self,
-        client_addr: std::net::SocketAddr,
-        sql: &str,
-    ) -> PgWireResult<()> {
+    fn enforce_grants(&self, client_addr: std::net::SocketAddr, sql: &str) -> PgWireResult<()> {
         let Some(role) = self
             .identities
             .lock()
@@ -1011,9 +990,7 @@ impl OmenDbHandler {
         if requires_admin {
             return Err(pg_error(
                 "42501",
-                format!(
-                    "permission denied: role {role} lacks schema administration grant"
-                ),
+                format!("permission denied: role {role} lacks schema administration grant"),
             ));
         }
         for table in &write_tables {
@@ -1022,8 +999,10 @@ impl OmenDbHandler {
                 _ => {
                     return Err(pg_error(
                         "42501",
-                        format!("permission denied for table {table}: role {role} lacks write grant"),
-                    ))
+                        format!(
+                            "permission denied for table {table}: role {role} lacks write grant"
+                        ),
+                    ));
                 }
             }
         }
@@ -1036,8 +1015,10 @@ impl OmenDbHandler {
                 _ => {
                     return Err(pg_error(
                         "42501",
-                        format!("permission denied for table {table}: role {role} lacks read grant"),
-                    ))
+                        format!(
+                            "permission denied for table {table}: role {role} lacks read grant"
+                        ),
+                    ));
                 }
             }
         }
@@ -1058,7 +1039,10 @@ impl OmenDbHandler {
             let mut transaction = database.begin().map_err(map_db_error)?;
             let result = transaction.execute_sql_with_params(&database, sql, params);
             drop(transaction);
-            return Ok(encode_response_with_format(result.map_err(map_db_error)?, format));
+            return Ok(encode_response_with_format(
+                result.map_err(map_db_error)?,
+                format,
+            ));
         }
         let mut database = write_lock(&self.database)?;
         Ok(encode_response_with_format(
@@ -1140,8 +1124,7 @@ impl OmenDbHandler {
         }
         let database = read_lock(&self.database)?;
         let mut transaction = database.begin().map_err(map_db_error)?;
-        let result =
-            transaction.execute_sql_with_params(&database, sql, &probe_params);
+        let result = transaction.execute_sql_with_params(&database, sql, &probe_params);
         drop(transaction);
         let result = result.map_err(map_db_error)?;
         let sample = result.rows.first();
@@ -1251,16 +1234,15 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
     {
         let parameter_types = self.resolved_parameter_types(&statement.statement);
         let resolved = self.resolved_parameter_types(&statement.statement);
-        let fields = Arc::try_unwrap(
-            self.describe_schema(
-                &statement.statement.sql,
-                &resolved,
-                &pgwire::api::portal::Format::UnifiedBinary,
-            )?,
-        )
+        let fields = Arc::try_unwrap(self.describe_schema(
+            &statement.statement.sql,
+            &resolved,
+            &pgwire::api::portal::Format::UnifiedBinary,
+        )?)
         .unwrap_or_default();
         Ok(pgwire::api::results::DescribeStatementResponse::new(
-            parameter_types, fields,
+            parameter_types,
+            fields,
         ))
     }
 
@@ -1273,13 +1255,11 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let resolved = self.resolved_parameter_types(&portal.statement.statement);
-        let fields = Arc::try_unwrap(
-            self.describe_schema(
-                &portal.statement.statement.sql,
-                &resolved,
-                &portal.result_column_format,
-            )?,
-        )
+        let fields = Arc::try_unwrap(self.describe_schema(
+            &portal.statement.statement.sql,
+            &resolved,
+            &portal.result_column_format,
+        )?)
         .unwrap_or_default();
         Ok(pgwire::api::results::DescribePortalResponse::new(fields))
     }

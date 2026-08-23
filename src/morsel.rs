@@ -73,7 +73,8 @@ impl MorselScanner {
         control.check()?;
 
         // Scan from the database using limit and offset logic
-        let scanned = transaction.scan(database, self.table, self.current_offset + self.morsel_size)?;
+        let scanned =
+            transaction.scan(database, self.table, self.current_offset + self.morsel_size)?;
         let chunk: Vec<Row> = scanned.into_iter().skip(self.current_offset).collect();
 
         if chunk.is_empty() {
@@ -305,7 +306,12 @@ impl AnalyticalQuery {
     }
 
     #[must_use]
-    pub fn with_aggregate(mut self, kind: AggregateKind, column: Option<ColumnId>, alias: impl Into<String>) -> Self {
+    pub fn with_aggregate(
+        mut self,
+        kind: AggregateKind,
+        column: Option<ColumnId>,
+        alias: impl Into<String>,
+    ) -> Self {
         self.aggregates.push(AggregateSpec {
             kind,
             column,

@@ -15,7 +15,7 @@ use omendb::{
     ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, RelationalBackendConfig,
     RelationalDatabase, TableDefinition, TableId,
 };
-use tokio_postgres::{error::SqlState, NoTls};
+use tokio_postgres::{NoTls, error::SqlState};
 
 const CLIENTS: u64 = 4;
 const KEYS: u64 = 4;
@@ -42,7 +42,10 @@ fn retryable(error: &tokio_postgres::Error) -> bool {
 
 async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=stress dbname=stress", addr.port()),
+        &format!(
+            "host=127.0.0.1 port={} user=stress dbname=stress",
+            addr.port()
+        ),
         NoTls,
     )
     .await
@@ -54,12 +57,11 @@ async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrent_rmw_transactions_never_lose_updates() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let mut database = RelationalDatabase::create(RelationalBackendConfig::Temporary(
-        DatabaseConfig {
+    let mut database =
+        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
             directory: directory.path().to_path_buf(),
-        },
-    ))
-    .expect("database");
+        }))
+        .expect("database");
     database
         .create_table(TableDefinition {
             id: TableId(9),
@@ -82,11 +84,15 @@ async fn concurrent_rmw_transactions_never_lose_updates() {
         .expect("create counters");
     for key in 0..KEYS {
         database
-            .execute_sql(&format!("INSERT INTO counters (id, value) VALUES ({key}, 0)"))
+            .execute_sql(&format!(
+                "INSERT INTO counters (id, value) VALUES ({key}, 0)"
+            ))
             .expect("seed counter");
     }
     let shared: Arc<RwLock<RelationalDatabase>> = Arc::new(RwLock::new(database));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     let server = tokio::spawn(pgwire_server::serve(Arc::clone(&shared), listener));
 
@@ -100,7 +106,10 @@ async fn concurrent_rmw_transactions_never_lose_updates() {
     }
 
     let mut db = shared.write().expect("lock");
-    let rows = db.execute_sql("SELECT id, value FROM counters").expect("sum").rows;
+    let rows = db
+        .execute_sql("SELECT id, value FROM counters")
+        .expect("sum")
+        .rows;
     drop(db);
     let sum: u64 = rows
         .iter()

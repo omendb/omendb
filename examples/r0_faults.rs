@@ -7,8 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const DEFAULT_SCHEDULE: &str =
-    "examples/fixtures/r0-failure-schedule.jsonl";
+const DEFAULT_SCHEDULE: &str = "examples/fixtures/r0-failure-schedule.jsonl";
 
 #[derive(Debug, Deserialize)]
 struct FailureCase {
