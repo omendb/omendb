@@ -7,10 +7,21 @@
 
 use super::{StorageEngine, capacity_preflight_error};
 use crate::btree::{BTree, Node, PAGE_SIZE};
+use crate::buffer::Writeback;
 use crate::buffer::{GuardAccess, PageCacheKey};
 use crate::error::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Page writes admitted by [`StorageEngine::write_dirty_pages`] but not yet
+/// made durable. `sync_data` owns the barrier that publishes them and the
+/// buffer/reclamation completion that must follow it.
+pub(crate) struct StagedFlush {
+    writebacks: Vec<Writeback>,
+    rekeys: Vec<(PageCacheKey, PageCacheKey)>,
+    retired_offsets: Vec<u64>,
+    retired_cache_keys: Vec<PageCacheKey>,
+}
 
 impl StorageEngine {
     /// Admit the new data extent required by a logical rebuild before the
@@ -63,7 +74,7 @@ impl StorageEngine {
     /// Flush after the caller has already refreshed the reclamation view and
     /// made a reuse decision from it. Keeping this boundary explicit avoids
     /// a second full data-file scan in the durable publication path.
-    pub(crate) fn flush_after_reclamation_refresh(&mut self) -> Result<()> {
+    pub(crate) fn write_dirty_pages(&mut self) -> Result<StagedFlush> {
         // The bootstrap path rewrites the complete logical tree into a new
         // physical generation. It is coarse, but preserves the out-of-place
         // invariant needed by manifest publication.
@@ -73,11 +84,13 @@ impl StorageEngine {
             let buffer = self.buffer_lock()?;
             dirty_page_ids.len() > buffer.capacity()
         };
-        let mut retired_offsets = Vec::new();
-        let mut retired_cache_keys = Vec::new();
         let pending_capacity = usize::from(!stream_writebacks) * dirty_page_ids.len();
-        let mut pending_writebacks = Vec::with_capacity(pending_capacity);
-        let mut pending_rekeys = Vec::with_capacity(pending_capacity);
+        let mut staged = StagedFlush {
+            writebacks: Vec::with_capacity(pending_capacity),
+            rekeys: Vec::with_capacity(pending_capacity),
+            retired_offsets: Vec::new(),
+            retired_cache_keys: Vec::new(),
+        };
 
         for page_id in dirty_page_ids {
             let node = self.btree.node(page_id);
@@ -95,8 +108,10 @@ impl StorageEngine {
                 // Every flush creates a new physical version. DB publishes
                 // the resulting PMT only after all data is durable.
                 if let Some(mapping) = self.pmt.get(page_id as u64) {
-                    retired_offsets.push(mapping.offset);
-                    retired_cache_keys.push(PageCacheKey::new(page_id as u64, mapping.version));
+                    staged.retired_offsets.push(mapping.offset);
+                    staged
+                        .retired_cache_keys
+                        .push(PageCacheKey::new(page_id as u64, mapping.version));
                 }
                 let (offset, reuses_retired_slot) = match self.free_offsets.last() {
                     Some(&offset) => (offset, true),
@@ -121,7 +136,7 @@ impl StorageEngine {
                     let mut buffer = self.buffer_lock()?;
                     buffer.discard_writeback(writeback)?;
                 } else {
-                    pending_writebacks.push(writeback);
+                    staged.writebacks.push(writeback);
                 }
                 self.metrics
                     .physical_page_writes
@@ -141,11 +156,21 @@ impl StorageEngine {
                     .ok_or_else(|| Error::Corruption("PMT insertion was lost".into()))?
                     .version;
                 if !stream_writebacks {
-                    pending_rekeys.push((pending_key, PageCacheKey::new(page_id as u64, version)));
+                    staged
+                        .rekeys
+                        .push((pending_key, PageCacheKey::new(page_id as u64, version)));
                 }
             }
         }
 
+        Ok(staged)
+    }
+
+    /// Make staged page writes durable with one data-device barrier, then
+    /// complete buffer writebacks, rekeys, and reclamation hand-off. Splitting
+    /// this from [`Self::write_dirty_pages`] lets a pipelined publication
+    /// cover several envelopes' writes under one sync.
+    pub(crate) fn sync_data(&mut self, mut staged: StagedFlush) -> Result<()> {
         // Sync to ensure data is persisted.
         #[cfg(any(test, feature = "fault-injection"))]
         self.device.check_page_range_sync()?;
@@ -153,10 +178,10 @@ impl StorageEngine {
         crate::storage::record_durability_sync();
         {
             let mut buffer = self.buffer_lock()?;
-            for writeback in pending_writebacks {
+            for writeback in staged.writebacks.drain(..) {
                 buffer.complete_writeback(writeback)?;
             }
-            for (from, to) in pending_rekeys {
+            for (from, to) in staged.rekeys.drain(..) {
                 buffer.rekey(from, to);
             }
         }
@@ -164,10 +189,18 @@ impl StorageEngine {
         self.metrics
             .generation_flushes
             .fetch_add(1, Ordering::Relaxed);
-        self.pending_reclaimed_offsets = retired_offsets;
-        self.pending_reclaimed_cache_keys = retired_cache_keys;
+        self.pending_reclaimed_offsets = std::mem::take(&mut staged.retired_offsets);
+        self.pending_reclaimed_cache_keys = std::mem::take(&mut staged.retired_cache_keys);
 
         Ok(())
+    }
+
+    /// Flush after the caller has already refreshed the reclamation view and
+    /// made a reuse decision from it. Keeping this boundary explicit avoids
+    /// a second full data-file scan in the durable publication path.
+    pub(crate) fn flush_after_reclamation_refresh(&mut self) -> Result<()> {
+        let staged = self.write_dirty_pages()?;
+        self.sync_data(staged)
     }
 
     /// Admit the full generation before beginning any physical page writes.
