@@ -4,6 +4,7 @@
 //! is an independent semantic oracle here; the test compares result columns,
 //! values, and affected-row counts on both OmenDB backends.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -129,6 +130,82 @@ fn compare_command(
     Ok(())
 }
 
+fn randomized_trace(database: &mut RelationalDatabase, connection: &Connection) -> Result<()> {
+    let mut live = BTreeSet::from([1_i64, 2, 3]);
+    let mut next_id = 10_i64;
+    let mut random = 0xA11C_E5E1_u64;
+    for operation in 0..64 {
+        match next_random(&mut random) % 4 {
+            0 => {
+                let id = next_id;
+                next_id += 1;
+                let state = if next_random(&mut random) % 2 == 0 {
+                    "'generated'"
+                } else {
+                    "NULL"
+                };
+                compare_command(
+                    database,
+                    connection,
+                    &format!(
+                        "INSERT INTO accounts VALUES ({id}, {}, {state})",
+                        operation as i64 + 200
+                    ),
+                    &[],
+                )?;
+                live.insert(id);
+            }
+            1 if !live.is_empty() => {
+                let id = live_value(&live, &mut random);
+                let state = if next_random(&mut random) % 2 == 0 {
+                    "'updated'"
+                } else {
+                    "NULL"
+                };
+                compare_command(
+                    database,
+                    connection,
+                    &format!(
+                        "UPDATE accounts SET balance = {}, state = {state} WHERE id = {id}",
+                        operation as i64 + 500
+                    ),
+                    &[],
+                )?;
+            }
+            2 if !live.is_empty() => {
+                let id = live_value(&live, &mut random);
+                compare_command(
+                    database,
+                    connection,
+                    &format!("DELETE FROM accounts WHERE id = {id}"),
+                    &[],
+                )?;
+                live.remove(&id);
+            }
+            _ => {}
+        }
+        compare_query(
+            database,
+            connection,
+            "SELECT id, balance, state FROM accounts ORDER BY id",
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn live_value(live: &BTreeSet<i64>, random: &mut u64) -> i64 {
+    let position = (next_random(random) as usize) % live.len();
+    *live.iter().nth(position).expect("position is in live set")
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 7;
+    *state ^= *state >> 9;
+    *state ^= *state << 8;
+    *state
+}
+
 fn exercise(kind: RelationalBackendKind) -> Result<()> {
     let directory = tempdir().context("create oracle directory")?;
     let sqlite_path = directory.path().join("oracle.sqlite");
@@ -213,6 +290,7 @@ fn exercise(kind: RelationalBackendKind) -> Result<()> {
         "SELECT id, balance FROM accounts ORDER BY id",
         &[],
     )?;
+    randomized_trace(&mut database, &connection)?;
 
     database.close().context("close OmenDB oracle subject")?;
     let mut reopened = RelationalDatabase::open(config(kind, &directory.path().join("omendb")))
