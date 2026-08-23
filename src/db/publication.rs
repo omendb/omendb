@@ -119,6 +119,16 @@ impl DB {
             .publication_timing
             .blob_write_ns
             .saturating_add(elapsed_nanos(blob_started));
+        // The blob artifact's directory entry must be durable before any
+        // frame can name this generation: an established database's meta.log
+        // creation no longer forces it implicitly.
+        let directory_started = Instant::now();
+        let directory_result = sync_publication_directory(&self.path);
+        self.publication_timing.directory_sync_ns = self
+            .publication_timing
+            .directory_sync_ns
+            .saturating_add(elapsed_nanos(directory_started));
+        directory_result?;
 
         let wal_path = self.path.join(WAL_FILE);
         let wal_offset = if append_commit {

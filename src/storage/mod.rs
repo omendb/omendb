@@ -157,18 +157,6 @@ impl StorageEngine {
         self.pmt.as_ref()
     }
 
-    /// Swap the active PMT, returning the previous instance. The pipelined
-    /// publication barrier uses this to encode per-envelope checkpoints
-    /// without materializing intermediate page states on the write path.
-    pub(crate) fn swap_pmt(&mut self, replacement: Arc<PMT>) -> Arc<PMT> {
-        std::mem::replace(&mut self.pmt, replacement)
-    }
-
-    /// Clone the active PMT handle without deep-copying its contents.
-    pub(crate) fn clone_pmt_arc(&self) -> Arc<PMT> {
-        self.pmt.clone()
-    }
-
     /// Get a reference to the allocator.
     pub fn allocator(&self) -> &PageAllocator {
         self.btree.page_allocator()

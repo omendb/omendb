@@ -237,8 +237,6 @@ pub struct DB {
     pending_digest: u32,
     /// Envelopes admitted but not yet published by a barrier.
     pending_envelopes: Vec<PendingEnvelope>,
-    /// Pages dirtied before the current envelope group's first admission.
-    group_carry_pages: Vec<u32>,
     /// Next admission-order envelope identifier.
     next_envelope_id: u64,
     /// Whether the pending generation changes the durable blob image/catalog.

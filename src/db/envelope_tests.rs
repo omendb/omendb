@@ -1,5 +1,5 @@
-//! Pipelined publication tests: admit/barrier envelopes, coalesced barriers,
-//! and per-envelope checkpoint resolution after reopen.
+//! Pipelined publication tests: admit/barrier envelopes, coalesced
+//! one-generation-per-group barriers, failure restoration, and reopen.
 
 use super::metadata_codec::MetaLogEntry;
 use super::*;
@@ -42,10 +42,14 @@ fn test_admit_batch_then_barrier_publishes_group() {
 
     assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
     assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    // One group publishes ONE generation: both envelopes ack with the same
+    // post-publication status and a single commit advances the frontier.
     let status = results[0].1;
+    assert_eq!(results[1].1.commit_id, status.commit_id);
+    assert_eq!(results[1].1.generation_id, status.generation_id);
     assert!(!status.write_fenced);
     assert_eq!(status.pending_mutations, 0);
-    assert!(status.commit_id.get() >= 2);
+    assert_eq!(status.commit_id.get(), 1);
 }
 
 #[test]
@@ -114,58 +118,209 @@ fn test_crash_before_barrier_recovers_previous_generation() {
 }
 
 #[test]
-fn test_intermediate_checkpoint_resolves_its_own_generation() {
+fn test_barrier_publishes_one_generation_for_the_group() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("checkpoints.db");
+    let path = dir.path().join("single-generation.db");
 
-    let generation_a;
     {
         let mut db = DB::open(&path, Options::default()).unwrap();
-        db.put(b"shared", b"before").unwrap();
+        db.put(b"base", b"before").unwrap();
+        db.flush().unwrap();
+        let generation_before = db.durability_status().generation_id;
         let expected = db.commit_id;
-        let envelope = db
-            .admit_batch(expected, &mutations(&[(b"only-a", b"1")]))
+        db.admit_batch(expected, &mutations(&[(b"only-a", b"1")]))
             .unwrap();
-        generation_a = envelope.commit.generation_id;
-        // Envelope B rewrites the SAME key so its page mapping differs.
+        // Envelope B rewrites the SAME key; the group must still publish as
+        // ONE generation, so exactly one frame appears past the base.
         db.admit_batch(
             expected,
             &mutations(&[(b"shared", b"after"), (b"only-b", b"2")]),
         )
         .unwrap();
         db.publication_barrier().unwrap();
+
+        let parsed = DB::read_meta_log(&path).unwrap().expect("meta log");
+        let new_frames = parsed
+            .frames
+            .iter()
+            .filter(|frame| match &frame.entry {
+                MetaLogEntry::Publication { manifest, .. } => {
+                    manifest.generation_id.get() > generation_before.get()
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(new_frames, 1, "one group publishes exactly one frame");
     }
 
-    // The intermediate checkpoint for generation A must resolve to A's own
-    // page mappings, not the final PMT that covers both envelopes.
-    let parsed = DB::read_meta_log(&path).unwrap().expect("meta log");
-    let manifest_a = parsed
-        .frames
+    // The single group checkpoint resolves to the final mappings and the
+    // reopened database serves every admitted mutation.
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.get(b"base").unwrap().as_deref(),
+        Some(&b"before"[..])
+    );
+    assert_eq!(
+        reopened.get(b"shared").unwrap().as_deref(),
+        Some(&b"after"[..])
+    );
+    assert_eq!(reopened.get(b"only-a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(reopened.get(b"only-b").unwrap().as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn test_failed_barrier_restores_envelopes_in_order() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("restore.db");
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"base", b"0").unwrap();
+    db.flush().unwrap();
+
+    let expected = db.commit_id;
+    let envelope_a = db
+        .admit_batch(expected, &mutations(&[(b"a", b"1")]))
+        .unwrap();
+    let envelope_b = db
+        .admit_batch(expected, &mutations(&[(b"b", b"2")]))
+        .unwrap();
+
+    // A real capacity refusal (ENOSPC mid-publication) is hard to trigger
+    // deterministically; FAIL_NEXT_GROUP_SYNC fails the barrier at the same
+    // stage-1 boundary. The injected IO error fences like any non-preflight
+    // failure, while a genuine Error::CapacityPreflight leaves the writer
+    // unfenced and retryable - clear the fence here to model that case.
+    super::faults::FAIL_NEXT_GROUP_SYNC.with(|failure| failure.set(true));
+    assert!(db.publication_barrier().is_err());
+    assert!(db.durability_status().write_fenced);
+    // Every staged envelope re-enters the pending list in admission order,
+    // so a later barrier republishes the whole group.
+    let restored: Vec<u64> = db
+        .pending_envelopes
         .iter()
-        .filter_map(|frame| match &frame.entry {
-            MetaLogEntry::Publication { manifest, .. } => Some(manifest),
-            _ => None,
-        })
-        .find(|manifest| manifest.generation_id == generation_a)
-        .expect("intermediate frame retained")
-        .to_owned();
-    let (pmt_a, _, _) =
-        DB::resolve_meta_log(&parsed, manifest_a.pmt_checkpoint_id.get()).expect("resolve A");
+        .map(|envelope| envelope.envelope_id)
+        .collect();
+    assert_eq!(
+        restored,
+        vec![envelope_a.envelope_id, envelope_b.envelope_id]
+    );
+
+    db.write_fenced = false;
+    let results = db.publication_barrier().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, envelope_a.envelope_id);
+    assert_eq!(results[1].0, envelope_b.envelope_id);
+    assert!(!db.durability_status().write_fenced);
+    assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+
+    drop(db);
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(reopened.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(reopened.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn test_frame_append_failure_fences_and_recovery_republishes_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("frame-failure.db");
+
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"durable", b"yes").unwrap();
+        db.flush().unwrap();
+        let expected = db.commit_id;
+        db.admit_batch(expected, &mutations(&[(b"lost-a", b"1")]))
+            .unwrap();
+        db.admit_batch(expected, &mutations(&[(b"lost-b", b"2")]))
+            .unwrap();
+        // Fail the single group frame append. Stage ordering puts the WAL
+        // commit sync BEFORE the frame, so the group is fully durable and
+        // reopen must recover it by replaying the committed prefix.
+        super::faults::FAIL_NEXT_FRAME_APPEND_N.with(|count| count.set(1));
+        assert!(db.publication_barrier().is_err());
+        assert!(db.durability_status().write_fenced);
+    }
 
     let reopened = DB::open(&path, Options::default()).unwrap();
-    let final_pmt = reopened.engine.pmt();
-    // The root page was rewritten between the two generations; the
-    // intermediate checkpoint must NOT carry the final mapping.
-    let root = manifest_a.root_page_id as u32;
-    if final_pmt.get(root as u64).is_some() && pmt_a.get(root as u64).is_some() {
-        // Both mappings exist; the versions must match the base lineage, not
-        // silently alias the final offset unless the page was never rewritten.
-        let (final_mapping, base_mapping) = (
-            final_pmt.get(root as u64).unwrap(),
-            pmt_a.get(root as u64).unwrap(),
-        );
-        if final_mapping.offset != base_mapping.offset {
-            panic!("intermediate checkpoint aliases the final PMT mapping");
-        }
+    assert_eq!(
+        reopened.get(b"durable").unwrap().as_deref(),
+        Some(&b"yes"[..])
+    );
+    assert_eq!(reopened.get(b"lost-a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(reopened.get(b"lost-b").unwrap().as_deref(), Some(&b"2"[..]));
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn test_pre_commit_failure_keeps_previous_generation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pre-commit-failure.db");
+
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"durable", b"yes").unwrap();
+        db.flush().unwrap();
+        let expected = db.commit_id;
+        db.admit_batch(expected, &mutations(&[(b"lost-a", b"1")]))
+            .unwrap();
+        db.admit_batch(expected, &mutations(&[(b"lost-b", b"2")]))
+            .unwrap();
+        // Fail the group's WAL write before any group bytes reach the file
+        // (stage 1's unsynced prefix write consumes nothing else - the
+        // default SyncPolicy::None skips its sync). No commit record ever
+        // becomes durable, so reopen must select the PREVIOUS generation and
+        // discard the unpublished mutation prefix.
+        super::faults::FAIL_NEXT_WAL_WRITE.with(|failure| failure.set(true));
+        assert!(db.publication_barrier().is_err());
+        assert!(db.durability_status().write_fenced);
     }
+
+    let reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.get(b"durable").unwrap().as_deref(),
+        Some(&b"yes"[..])
+    );
+    assert_eq!(reopened.get(b"lost-a").unwrap(), None);
+    assert_eq!(reopened.get(b"lost-b").unwrap(), None);
+    assert!(!reopened.durability_status().write_fenced);
+}
+
+#[test]
+fn test_group_barrier_has_fixed_sync_budget() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sync-budget.db");
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.put(b"base", b"0").unwrap();
+    db.flush().unwrap();
+
+    let expected = db.commit_id;
+    db.admit_batch(expected, &mutations(&[(b"a", b"1")]))
+        .unwrap();
+    db.admit_batch(expected, &mutations(&[(b"b", b"2")]))
+        .unwrap();
+
+    let syncs_before = db.metrics().unwrap().storage.syncs;
+    db.publication_barrier().unwrap();
+    let sync_delta = db.metrics().unwrap().storage.syncs - syncs_before;
+    // The data device is synced ONCE for the whole two-envelope group; more
+    // envelopes never increase this number. The full barrier budget is one
+    // data sync + one WAL sync + one metadata-log fsync for the single
+    // authority frame, but the WAL/meta barriers are tracked only by the
+    // process-wide durability_sync_count(), whose global counter cannot be
+    // delta-asserted under parallel tests.
+    assert_eq!(sync_delta, 1);
+
+    // A second, single-envelope group costs the same one data sync.
+    let expected = db.commit_id;
+    db.admit_batch(expected, &mutations(&[(b"c", b"3")]))
+        .unwrap();
+    let syncs_before = db.metrics().unwrap().storage.syncs;
+    db.publication_barrier().unwrap();
+    assert_eq!(
+        db.metrics().unwrap().storage.syncs - syncs_before,
+        1,
+        "barrier cost is independent of envelope count"
+    );
 }
