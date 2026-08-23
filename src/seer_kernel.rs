@@ -222,7 +222,6 @@ impl SeerKernel {
     /// durable publication, so concurrent callers overlap only their waiting,
     /// never the publication itself.
     pub fn commit(&self, expected: CommitId, mutations: &[KvMutation]) -> Result<CommitOutcome> {
-        self.invalidate_current_view()?;
         let mutations = mutations
             .iter()
             .map(|mutation| match mutation {
@@ -235,6 +234,9 @@ impl SeerKernel {
             .collect::<Vec<_>>();
         let (status, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
+            // Invalidate under the DB lock: cache stores also hold this
+            // lock, so a stale view can never outlive a completed commit.
+            self.invalidate_current_view()?;
             let status = db.commit_batch_at(seer_commit(expected), &mutations);
             let fenced = db.durability_status().write_fenced;
             (status, fenced)
@@ -494,8 +496,37 @@ impl SeerKernel {
     }
 
     pub(crate) fn begin_current_read_view(&self) -> Result<Arc<ReadView>> {
-        let expected = self.commit_id();
-        self.current_read_view(expected)
+        // The cache is invalidated before every publication and maintenance
+        // transition, so a resident view always matches the live frontier.
+        if let Some(view) = self
+            .current_view
+            .lock()
+            .map_err(|_| DbError::InvalidState("current read-view cache is poisoned".into()))?
+            .as_ref()
+            .cloned()
+        {
+            return Ok(view);
+        }
+
+        // Cache miss: observe the frontier and create the view under one
+        // DB-lock acquisition. Splitting these across acquisitions races a
+        // concurrent publisher between the two steps and fails valid
+        // transaction begins with a spurious snapshot mismatch. The cache
+        // store stays inside the same acquisition: invalidations also run
+        // under this lock, so a stored view can never outlive a completed
+        // publication.
+        let mut db = self.db.lock().map_err(|_| database_lock_error())?;
+        let view = Arc::new(
+            db.begin_read_view()
+                .map_err(|error| map_storage_error("begin read view", error, false))?,
+        );
+        *self
+            .current_view
+            .lock()
+            .map_err(|_| DbError::InvalidState("current read-view cache is poisoned".into()))? =
+            Some(Arc::clone(&view));
+        drop(db);
+        Ok(view)
     }
 
     pub fn scan(
@@ -637,9 +668,9 @@ impl SeerKernel {
     }
 
     pub(crate) fn checkpoint_with_status(&mut self) -> Result<SeerCheckpointReport> {
-        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
+            self.invalidate_current_view()?;
             let result = db.checkpoint();
             let fenced = db.durability_status().write_fenced;
             (result, fenced)
@@ -689,9 +720,9 @@ impl SeerKernel {
     }
 
     pub(crate) fn compact_with_status(&mut self) -> Result<SeerCompactionReport> {
-        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
+            self.invalidate_current_view()?;
             let result = db.compact();
             let fenced = db.durability_status().write_fenced;
             (result, fenced)
@@ -716,9 +747,9 @@ impl SeerKernel {
         &mut self,
         max_relocated_pages: usize,
     ) -> Result<SeerCompactionReport> {
-        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
+            self.invalidate_current_view()?;
             let result = db.compact_with_limit(max_relocated_pages);
             let fenced = db.durability_status().write_fenced;
             (result, fenced)
