@@ -5,6 +5,23 @@ This runbook covers the operational surface of one `RelationalDatabase` or
 maintenance, and recovery after an ambiguous durable write. It describes the
 alpha contract only; behavior may change between prereleases.
 
+## Platform and filesystem assumptions
+
+OmenDB's durability contract relies on standard POSIX durability semantics:
+`fsync`/`fdatasync` on file descriptors plus directory-entry syncs after
+artifact creation. It is tested on APFS (macOS) and ext4 (Linux) through CI
+and local runs.
+
+- Network filesystems (NFS, SMB), FUSE layers, and block devices that ignore
+  sync requests void the crash contract; do not place a database directory
+  there.
+- Multiple processes must not share one database directory; SeerDB enforces
+  a writer lock per directory and the Temporary backend expects exclusive
+  ownership.
+- Case-insensitive filesystems work, but artifact names are lowercase and
+  fixed; renaming or hand-editing files inside the directory is unsupported
+  and will be refused as corruption on open.
+
 ## Health checks
 
 `status()` returns backend-neutral lifecycle state without I/O:

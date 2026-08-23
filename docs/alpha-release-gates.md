@@ -86,9 +86,9 @@ passing fixtures and published evidence.
       reported separately because durability and rollback boundaries differ;
 - [ ] CPU, allocation, WAL, fsync, and compaction profiles identify the
       measured bottleneck before an optimization is accepted;
-- [ ] release CI runs a small regression workload with thresholds and stores
-      machine/workload metadata; no absolute cross-machine claim is made from
-      one local run.
+- [x] release CI runs a small regression workload with thresholds and stores
+      machine/workload metadata (`perf-smoke` job); no absolute cross-machine
+      claim is made from one local run.
 
 ### Recorded single-client baselines (macOS aarch64, release, batch-size 1)
 
@@ -111,7 +111,8 @@ the open performance work.
 
 - [x] stable Rust and the documented MSRV (1.89, pinned in CI) pass format,
       tests, clippy, and package checks;
-- [ ] supported platform and filesystem assumptions are documented;
+- [x] supported platform and filesystem assumptions are documented
+      (`docs/runbook.md`);
 - [ ] `cargo package --list` contains only intended files;
 - [ ] `cargo publish --dry-run` succeeds for SeerDB first and OmenDB second;
 - [ ] README, API docs, changelog, license, and security policy describe the

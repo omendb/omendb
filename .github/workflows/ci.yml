@@ -50,3 +50,41 @@ jobs:
           restore-keys: ${{ runner.os }}-msrv-
       - run: cargo check --locked --all-features --all-targets
       - run: cargo test --locked --all-features --all-targets
+
+  perf-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-perf-
+      # Smoke, not a benchmark: catches gross throughput collapses (for
+      # example an accidental per-read fsync) while making no absolute
+      # performance claim across runners. The floor is orders of magnitude
+      # below any healthy run.
+      - name: Build release baseline
+        run: cargo build --release --example alpha_oltp
+      - name: Run bounded workload
+        run: |
+          target/release/examples/alpha_oltp \
+            --backend temporary --rows 64 --operations 256 > smoke.json
+          THROUGHPUT=$(python3 -c "import json; print(json.load(open('smoke.json'))['throughput_operations_per_second'])")
+          echo "throughput: ${THROUGHPUT} ops/s"
+          python3 -c "exit(0 if ${THROUGHPUT} > 50 else 1)" || {
+            echo "PERF SMOKE FAILED: throughput ${THROUGHPUT} ops/s is below the 50 ops/s regression floor"
+            exit 1
+          }
+      - name: Record workload metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-smoke-results
+          path: smoke.json
+          if-no-files-found: ignore
