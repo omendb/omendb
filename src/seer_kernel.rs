@@ -160,9 +160,10 @@ impl Drop for LeaseRegistry {
 pub struct SeerKernel {
     db: Arc<Mutex<DB>>,
     leases: Arc<Mutex<LeaseRegistry>>,
-    /// Weak so an idle kernel does not keep a physical reclamation lease
-    /// alive. Overlapping readers share the same generation-bound view.
-    current_view: Mutex<Option<Weak<ReadView>>>,
+    /// Strong cache for the current generation-bound view. The cache is
+    /// invalidated before publication and reclamation so it cannot pin an old
+    /// physical root across a state transition.
+    current_view: Mutex<Option<Arc<ReadView>>>,
     next_lease_token: u64,
 }
 
@@ -187,7 +188,13 @@ impl SeerKernel {
     /// physical handle releases durable snapshot roots while the database is
     /// still available; the consumed kernel cannot be used after this call.
     pub fn close(self) -> Result<()> {
-        let SeerKernel { db, leases, .. } = self;
+        let SeerKernel {
+            db,
+            leases,
+            current_view,
+            ..
+        } = self;
+        drop(current_view);
         drop(leases);
         let mut db = db.lock().map_err(|_| database_lock_error())?;
         let result = db.close();
@@ -215,6 +222,7 @@ impl SeerKernel {
     /// durable publication, so concurrent callers overlap only their waiting,
     /// never the publication itself.
     pub fn commit(&self, expected: CommitId, mutations: &[KvMutation]) -> Result<CommitOutcome> {
+        self.invalidate_current_view()?;
         let mutations = mutations
             .iter()
             .map(|mutation| match mutation {
@@ -629,6 +637,7 @@ impl SeerKernel {
     }
 
     pub(crate) fn checkpoint_with_status(&mut self) -> Result<SeerCheckpointReport> {
+        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
             let result = db.checkpoint();
@@ -680,6 +689,7 @@ impl SeerKernel {
     }
 
     pub(crate) fn compact_with_status(&mut self) -> Result<SeerCompactionReport> {
+        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
             let result = db.compact();
@@ -706,6 +716,7 @@ impl SeerKernel {
         &mut self,
         max_relocated_pages: usize,
     ) -> Result<SeerCompactionReport> {
+        self.invalidate_current_view()?;
         let (result, fenced) = {
             let mut db = self.db.lock().map_err(|_| database_lock_error())?;
             let result = db.compact_with_limit(max_relocated_pages);
@@ -828,14 +839,22 @@ impl SeerKernel {
             })
     }
 
+    fn invalidate_current_view(&self) -> Result<()> {
+        self.current_view
+            .lock()
+            .map_err(|_| DbError::InvalidState("current read-view cache is poisoned".into()))?
+            .take();
+        Ok(())
+    }
+
     fn current_read_view(&self, expected: CommitId) -> Result<Arc<ReadView>> {
         if let Some(view) = self
             .current_view
             .lock()
             .map_err(|_| DbError::InvalidState("current read-view cache is poisoned".into()))?
             .as_ref()
-            .and_then(Weak::upgrade)
-            && view.commit_id().get() == expected.0
+            .filter(|view| view.commit_id().get() == expected.0)
+            .cloned()
         {
             return Ok(view);
         }
@@ -859,7 +878,7 @@ impl SeerKernel {
             .current_view
             .lock()
             .map_err(|_| DbError::InvalidState("current read-view cache is poisoned".into()))? =
-            Some(Arc::downgrade(&view));
+            Some(Arc::clone(&view));
         Ok(view)
     }
 }
@@ -1402,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn current_read_view_cache_shares_live_views_without_idle_pin() {
+    fn current_read_view_cache_shares_views_until_invalidation() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
         let kernel = SeerKernel::create(&config).expect("create SeerKernel");
@@ -1439,7 +1458,7 @@ mod tests {
             .clone();
         drop(first);
         drop(second);
-        assert!(cached.upgrade().is_none());
+        assert!(Arc::strong_count(&cached) >= 2);
 
         kernel
             .commit(
@@ -1454,6 +1473,14 @@ mod tests {
             kernel.get(CommitId(2), b"key").expect("new current read"),
             Some(b"next".to_vec())
         );
+        let current = kernel
+            .current_view
+            .lock()
+            .expect("current view cache")
+            .as_ref()
+            .expect("new cached current view")
+            .clone();
+        assert!(!Arc::ptr_eq(&cached, &current));
     }
 
     #[test]

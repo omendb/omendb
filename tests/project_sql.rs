@@ -40,6 +40,24 @@ fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>
         .expect("insert rows");
     assert_eq!(inserted.affected_rows, 3);
 
+    let before_batch = database.commit_id();
+    assert!(
+        database
+            .execute_sql_batch(&[
+                "UPDATE accounts SET balance = 101 WHERE id = 1",
+                "INSERT INTO accounts VALUES (1, 1, 'duplicate')",
+            ])
+            .is_err()
+    );
+    assert_eq!(database.commit_id(), before_batch);
+    assert_eq!(
+        database
+            .execute_sql("SELECT balance FROM accounts WHERE id = 1")
+            .expect("rolled-back batch read")
+            .rows,
+        vec![vec![Value::I64(100)]]
+    );
+
     let index = database
         .execute_sql("CREATE INDEX accounts_state_idx ON accounts (state)")
         .expect("create named index");

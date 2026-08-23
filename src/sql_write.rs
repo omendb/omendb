@@ -231,7 +231,20 @@ pub(super) fn execute_update(
         ));
     }
 
-    let rows = transaction.scan(database, table.id, usize::MAX)?;
+    let rows = if from_scope.is_none() {
+        match super::query::primary_key_rows(
+            database,
+            transaction,
+            table,
+            update.selection.as_ref(),
+            params,
+        )? {
+            Some(rows) => rows,
+            None => transaction.scan(database, table.id, usize::MAX)?,
+        }
+    } else {
+        transaction.scan(database, table.id, usize::MAX)?
+    };
     let mut affected = 0;
     let mut returned_rows: Vec<Vec<Value>> = Vec::new();
     for row in rows {
@@ -424,7 +437,20 @@ pub(super) fn execute_delete(
             "DELETE USING requires a WHERE clause referencing the source table",
         ));
     }
-    let rows = transaction.scan(database, table.id, usize::MAX)?;
+    let rows = if using_scope.is_none() {
+        match super::query::primary_key_rows(
+            database,
+            transaction,
+            table,
+            delete.selection.as_ref(),
+            params,
+        )? {
+            Some(rows) => rows,
+            None => transaction.scan(database, table.id, usize::MAX)?,
+        }
+    } else {
+        transaction.scan(database, table.id, usize::MAX)?
+    };
     let mut affected = 0;
     let mut returned_rows: Vec<Vec<Value>> = Vec::new();
     for row in rows {

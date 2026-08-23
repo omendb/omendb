@@ -6,11 +6,11 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, SqlColumn, SqlResult,
-    TableDefinition, Value,
+    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, RowIdentity,
+    SqlColumn, SqlResult, TableDefinition, Value,
 };
 
-use super::values::literal_value;
+use super::values::{coerce_value, literal_value};
 use super::{column_position, find_table, simple_object_name, table_from_join, unsupported};
 
 pub(super) fn execute_query(
@@ -86,7 +86,16 @@ pub(super) fn execute_query(
         return Ok(SqlResult::rows(projection.columns, Vec::new()));
     }
     let subqueries = resolve_subqueries(database, transaction, select.selection.as_ref(), params)?;
-    let rows = transaction.scan(database, table.id, usize::MAX)?;
+    let rows = match primary_key_rows(
+        database,
+        transaction,
+        table,
+        select.selection.as_ref(),
+        params,
+    )? {
+        Some(rows) => rows,
+        None => transaction.scan(database, table.id, usize::MAX)?,
+    };
     let required_rows = offset.saturating_add(limit);
     let can_stop_after_window = order.is_empty() && select.distinct.is_none();
     let mut matching_rows = Vec::new();
@@ -381,6 +390,56 @@ fn resolve_scalar_subqueries(
 
 /// DISTINCT deduplicates projected rows preserving first-seen order
 /// (PostgreSQL applies DISTINCT after projection, before LIMIT).
+pub(super) fn primary_key_rows(
+    database: &RelationalDatabase,
+    transaction: &mut RelationalDatabaseTransaction,
+    table: &TableDefinition,
+    selection: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Vec<Row>>> {
+    let Some(primary_key) = database.catalog().primary_key(table.id) else {
+        return Ok(None);
+    };
+    if primary_key.len() != 1 {
+        return Ok(None);
+    }
+    let Some(Expr::BinaryOp { left, op, right }) = selection else {
+        return Ok(None);
+    };
+    if op != &sqlparser::ast::BinaryOperator::Eq {
+        return Ok(None);
+    }
+    let primary_position = table
+        .columns
+        .iter()
+        .position(|column| column.id == primary_key[0])
+        .ok_or_else(|| DbError::InvalidState("primary-key column is missing".to_owned()))?;
+    let (_column_expression, value_expression) = if column_position(table, left)?
+        == Some(primary_position)
+        && column_position(table, right)?.is_none()
+    {
+        (left, right)
+    } else if column_position(table, right)? == Some(primary_position)
+        && column_position(table, left)?.is_none()
+    {
+        (right, left)
+    } else {
+        return Ok(None);
+    };
+    let value = coerce_value(
+        literal_value(value_expression, params)?,
+        &table.columns[primary_position],
+    )?;
+    if matches!(value, Value::Null) {
+        return Ok(Some(Vec::new()));
+    }
+    let identity = RowIdentity::new(table.id, vec![primary_key[0]], vec![value])?;
+    Ok(transaction
+        .get_by_identity(database, table.id, &identity)?
+        .map(|row| vec![row])
+        .or_else(|| Some(Vec::new())))
+}
+
 fn apply_distinct(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     let mut seen = std::collections::HashSet::new();
     let mut unique = Vec::with_capacity(rows.len());
