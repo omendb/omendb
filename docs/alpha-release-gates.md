@@ -69,8 +69,8 @@ passing fixtures and published evidence.
 - [x] the crash matrix runs from a clean subprocess for create, commit,
       checkpoint, compaction, archive restore, reopen, and the SQL batch
       boundary;
-- [ ] `verify`, diagnostics, support bundles, and recovery-required behavior
-      have an operator-facing runbook;
+- [x] `verify`, diagnostics, support bundles, and recovery-required behavior
+      have an operator-facing runbook (`docs/runbook.md`);
 - [ ] recovery tests assert both the durable outcome and the allowed next
       operation, not only that reopening succeeds.
 
@@ -108,8 +108,8 @@ the open performance work.
 
 ### Packaging and support
 
-- [ ] stable Rust and the documented MSRV pass format, tests, clippy, and
-      package checks;
+- [x] stable Rust and the documented MSRV (1.89, pinned in CI) pass format,
+      tests, clippy, and package checks;
 - [ ] supported platform and filesystem assumptions are documented;
 - [ ] `cargo package --list` contains only intended files;
 - [ ] `cargo publish --dry-run` succeeds for SeerDB first and OmenDB second;
