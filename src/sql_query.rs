@@ -88,6 +88,7 @@ pub(super) fn execute_query(
     let subqueries = resolve_subqueries(database, transaction, select.selection.as_ref(), params)?;
     let rows = transaction.scan(database, table.id, usize::MAX)?;
     let required_rows = offset.saturating_add(limit);
+    let can_stop_after_window = order.is_empty() && select.distinct.is_none();
     let mut matching_rows = Vec::new();
     for row in rows {
         if let Some(selection) = &select.selection
@@ -96,7 +97,7 @@ pub(super) fn execute_query(
             continue;
         }
         matching_rows.push(row);
-        if order.is_empty() && matching_rows.len() >= required_rows {
+        if can_stop_after_window && matching_rows.len() >= required_rows {
             break;
         }
     }
@@ -104,17 +105,20 @@ pub(super) fn execute_query(
         validate_order_rows(&matching_rows, table, &order)?;
         matching_rows.sort_by(|left, right| compare_rows(left, right, &order));
     }
-    let result_rows = matching_rows
+    let projected_rows = matching_rows
+        .into_iter()
+        .map(|row| project_row(&projection, &row))
+        .collect::<Result<Vec<_>>>()?;
+    let projected_rows = if select.distinct.is_some() {
+        apply_distinct(projected_rows)
+    } else {
+        projected_rows
+    };
+    let result_rows = projected_rows
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|row| project_row(&projection, &row))
-        .collect::<Result<Vec<_>>>()?;
-    let result_rows = if select.distinct.is_some() {
-        apply_distinct(result_rows)
-    } else {
-        result_rows
-    };
+        .collect();
     Ok(SqlResult::rows(projection.columns, result_rows))
 }
 
@@ -2058,15 +2062,16 @@ pub(super) fn join_predicate(
             negated,
         } => {
             let candidate = combined_value(expr, combined, columns)?;
-            let mut hit = list.iter().any(|item| {
-                literal_value(item, params).is_ok_and(|value| {
-                    compare_joined(candidate.clone(), value, &BinaryOperator::Eq)
-                })
-            });
-            if *negated {
-                hit = !hit;
-            }
-            Ok(hit)
+            let values = list
+                .iter()
+                .map(|item| literal_value(item, params))
+                .collect::<Result<Vec<_>>>()?;
+            let hit = membership_truth(&candidate, values);
+            Ok(if *negated {
+                hit.not() == Truth::True
+            } else {
+                hit == Truth::True
+            })
         }
         Expr::Between {
             expr,
@@ -2099,22 +2104,25 @@ fn combined_value(expression: &Expr, combined: &[Value], columns: &[SqlColumn]) 
 }
 
 fn compare_joined(left: Value, right: Value, op: &BinaryOperator) -> bool {
-    let ordering = match (&left, &right) {
-        (Value::U64(l), Value::U64(r)) => l.cmp(r),
-        (Value::I64(l), Value::I64(r)) => l.cmp(r),
-        (Value::Text(l), Value::Text(r)) => l.cmp(r),
-        (Value::U64(l), Value::I64(r)) if *r >= 0 => l.cmp(&(*r as u64)),
-        (Value::I64(l), Value::U64(r)) if *l >= 0 => (*l as u64).cmp(r),
-        _ => return op == &BinaryOperator::Eq && left == right,
-    };
-    match op {
-        BinaryOperator::Eq => ordering == Ordering::Equal,
-        BinaryOperator::NotEq => ordering != Ordering::Equal,
-        BinaryOperator::Lt => ordering == Ordering::Less,
-        BinaryOperator::LtEq => ordering != Ordering::Greater,
-        BinaryOperator::Gt => ordering == Ordering::Greater,
-        BinaryOperator::GtEq => ordering != Ordering::Less,
-        _ => false,
+    compare_values(&left, &right, op) == Truth::True
+}
+
+fn membership_truth<I>(candidate: &Value, values: I) -> Truth
+where
+    I: IntoIterator<Item = Value>,
+{
+    let mut unknown = false;
+    for value in values {
+        match compare_values(candidate, &value, &BinaryOperator::Eq) {
+            Truth::True => return Truth::True,
+            Truth::Unknown => unknown = true,
+            Truth::False => {}
+        }
+    }
+    if unknown {
+        Truth::Unknown
+    } else {
+        Truth::False
     }
 }
 
@@ -2171,13 +2179,7 @@ fn predicate(
                 DbError::InvalidState("subquery was not resolved before evaluation".to_owned())
             })?;
             let candidate = eval_expression(expr, row, table, params)?;
-            let mut hit = Truth::False;
-            for value in candidates {
-                if compare_joined(candidate.clone(), value.clone(), &BinaryOperator::Eq) {
-                    hit = Truth::True;
-                    break;
-                }
-            }
+            let hit = membership_truth(&candidate, candidates.iter().cloned());
             Ok(if *negated { hit.not() } else { hit })
         }
         Expr::InList {
@@ -2185,15 +2187,12 @@ fn predicate(
             list,
             negated,
         } => {
-            let mut hit = Truth::False;
-            for item in list {
-                if compare_predicate(&BinaryOperator::Eq, expr, item, row, table, params)?
-                    == Truth::True
-                {
-                    hit = Truth::True;
-                    break;
-                }
-            }
+            let candidate = eval_expression(expr, row, table, params)?;
+            let values = list
+                .iter()
+                .map(|item| literal_value(item, params))
+                .collect::<Result<Vec<_>>>()?;
+            let hit = membership_truth(&candidate, values);
             Ok(if *negated { hit.not() } else { hit })
         }
         Expr::Between {
@@ -2261,8 +2260,12 @@ fn compare_predicate(
 ) -> Result<Truth> {
     let left = eval_expression(left, row, table, params)?;
     let right = eval_expression(right, row, table, params)?;
-    let Some(ordering) = value_cmp(&left, &right) else {
-        return Ok(Truth::Unknown);
+    Ok(compare_values(&left, &right, operator))
+}
+
+fn compare_values(left: &Value, right: &Value, operator: &BinaryOperator) -> Truth {
+    let Some(ordering) = value_cmp(left, right) else {
+        return Truth::Unknown;
     };
     let matched = match operator {
         BinaryOperator::Eq => ordering.is_eq(),
@@ -2271,9 +2274,9 @@ fn compare_predicate(
         BinaryOperator::Lt => ordering.is_lt(),
         BinaryOperator::GtEq => !ordering.is_lt(),
         BinaryOperator::LtEq => !ordering.is_gt(),
-        _ => unreachable!("comparison operator was checked above"),
+        _ => return Truth::Unknown,
     };
-    Ok(if matched { Truth::True } else { Truth::False })
+    if matched { Truth::True } else { Truth::False }
 }
 
 fn eval_expression(

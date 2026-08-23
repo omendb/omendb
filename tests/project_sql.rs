@@ -131,6 +131,48 @@ fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>
     );
     assert_eq!(
         database
+            .execute_sql("SELECT DISTINCT state FROM accounts LIMIT 2")
+            .expect("distinct values before limit")
+            .rows,
+        vec![
+            vec![Value::Text("open".to_owned())],
+            vec![Value::Text("closed".to_owned())],
+        ]
+    );
+    assert_eq!(
+        database
+            .execute_sql("SELECT DISTINCT state FROM accounts LIMIT 2 OFFSET 1")
+            .expect("distinct values with offset")
+            .rows,
+        vec![vec![Value::Text("closed".to_owned())]],
+    );
+    assert_eq!(
+        database
+            .execute_sql("SELECT id FROM accounts WHERE state IN (NULL, 'open') ORDER BY id")
+            .expect("IN preserves SQL NULL semantics")
+            .rows,
+        vec![
+            vec![Value::I64(1)],
+            vec![Value::I64(2)],
+            vec![Value::I64(4)]
+        ],
+    );
+    assert_eq!(
+        database
+            .execute_sql("SELECT id FROM accounts WHERE state NOT IN (NULL, 'open')")
+            .expect("NOT IN preserves SQL NULL semantics")
+            .rows,
+        Vec::<Vec<Value>>::new(),
+    );
+    assert_eq!(
+        database
+            .execute_sql("SELECT id FROM accounts WHERE state NOT IN ('open')")
+            .expect("NOT IN without NULL")
+            .rows,
+        vec![vec![Value::I64(3)]],
+    );
+    assert_eq!(
+        database
             .execute_sql("SELECT id FROM accounts ORDER BY state ASC LIMIT 4")
             .expect("stable ordering tie-breaker")
             .rows,
