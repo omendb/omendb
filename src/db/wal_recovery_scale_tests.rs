@@ -2,7 +2,7 @@
 //! cadence that bounds reopen cost (tk-x9ez / tk-gy55 prerequisite).
 
 use super::wal_recovery::{digest_records, recover_from_wal};
-use crate::recovery::WalRecord;
+use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
 use crate::storage::format::{CommitId, CommitRecord, GenerationId};
 use std::time::Instant;
 
@@ -63,4 +63,59 @@ fn measure_recover_from_wal_scaling() {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+#[test]
+#[ignore]
+fn measure_replay_cost_breakdown() {
+    let generations = 2000;
+    let ops_per_gen = 16;
+    let ops = generations * ops_per_gen;
+
+    // Parse + CRC only.
+    let wal_bytes = synthetic_committed_wal(generations, ops_per_gen);
+    let start = Instant::now();
+    let (records, status) = WalManager::parse_records_with_status(&wal_bytes);
+    assert_eq!(status, ParseStatus::Complete);
+    let parse = start.elapsed();
+
+    // Parse + digest verification per commit envelope.
+    let start = Instant::now();
+    let mut pending: Vec<&WalRecord> = Vec::new();
+    let mut digest_ns_total = 0u128;
+    for record in &records {
+        match record.record_type {
+            RecordType::Commit => {
+                let d = digest_records(&pending);
+                pending.clear();
+                let _ = d;
+            }
+            _ => pending.push(record),
+        }
+        digest_ns_total = start.elapsed().as_nanos();
+    }
+    let parse_digest = start.elapsed();
+    let _ = digest_ns_total;
+
+    // Full replay (parse + digest + tree apply), from the scaling test.
+    let dir = std::env::temp_dir().join(format!("seerdb-replay-breakdown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wal_path = dir.join("seerdb.wal");
+    std::fs::write(&wal_path, &wal_bytes).unwrap();
+    let mut btree = super::BTree::new();
+    let mut blobs = super::BlobManager::new();
+    let start = Instant::now();
+    recover_from_wal(&wal_path, None, &mut btree, &mut blobs).unwrap();
+    let full = start.elapsed();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    println!(
+        "ops={ops} parse_us={:.0} ({:.3}/op) parse+digest_us={:.0} ({:.3}/op) full_replay_us={:.0} ({:.3}/op)",
+        parse.as_secs_f64() * 1e6,
+        parse.as_secs_f64() * 1e6 / ops as f64,
+        parse_digest.as_secs_f64() * 1e6,
+        parse_digest.as_secs_f64() * 1e6 / ops as f64,
+        full.as_secs_f64() * 1e6,
+        full.as_secs_f64() * 1e6 / ops as f64,
+    );
 }
