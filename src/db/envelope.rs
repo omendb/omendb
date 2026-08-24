@@ -117,6 +117,12 @@ impl DB {
             }
             return Err(error);
         }
+        if self.options.wal_first_commits && self.materialize_bound_reached() {
+            // The bound exists to cap crash-recovery replay; materialize now
+            // rather than letting unframed state accumulate further. A failed
+            // materialization fences through the normal flush path.
+            self.flush()?;
+        }
         Ok(envelopes
             .iter()
             .map(|envelope| (envelope.envelope_id, self.durability_status()))
@@ -244,6 +250,13 @@ impl DB {
     /// disk as the ack point. Pages and the authority frame move to
     /// materialization (flush/checkpoint/close); recovery replays the
     /// synced prefix ahead of authority via the Greater branch.
+    /// Whether unmaterialized WAL bytes crossed the automatic
+    /// materialization bound that caps crash-recovery replay work.
+    pub(super) fn materialize_bound_reached(&self) -> bool {
+        let bound = self.options.wal_materialize_bytes;
+        bound != 0 && self.unframed_wal_bytes >= bound
+    }
+
     pub(super) fn publish_envelope_group_wal_first(&mut self) -> Result<()> {
         let generation = self.next_generation_id;
         self.write_group_blob_artifacts(generation)?;
@@ -273,6 +286,10 @@ impl DB {
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
+        self.unframed_wal_bytes = self
+            .unframed_wal_bytes
+            .saturating_add(self.pending_wal_bytes)
+            .saturating_add(WAL_COMMIT_RECORD_BYTES);
         self.pending_mutations = 0;
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;

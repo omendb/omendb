@@ -191,6 +191,9 @@ impl DB {
                 self.write_fenced = true;
                 return Err(error);
             }
+            if self.materialize_bound_reached() {
+                self.flush()?;
+            }
             return Ok(self.durability_status());
         }
         self.flush()?;

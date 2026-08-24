@@ -113,6 +113,13 @@ impl DB {
     /// check/repair tooling and pre-snapshot validation.
     pub fn verify(&mut self) -> Result<VerificationReport> {
         self.check_readable()?;
+        // Verification checks durable pages against the authority frame.
+        // WAL-first commits lead that frame until materialized, so name the
+        // current state first; flush is a no-op when everything is framed.
+        // Read-only and check-only handles have nothing to materialize.
+        if self.options.wal_first_commits && !self.read_only && !self.check_only {
+            self.flush()?;
+        }
         self.verify_inner()
             .map_err(|failure| Error::Corruption(failure.message))
     }

@@ -93,6 +93,7 @@ impl DB {
                 .is_some_and(|summary| summary.blob_changed),
             pending_blob_frame: false,
             unframed_commits: false,
+            unframed_wal_bytes: 0,
             pending_envelopes: Vec::new(),
             next_envelope_id: 0,
             is_open: true,

@@ -53,6 +53,13 @@ pub struct Options {
     /// (they were never durable without flush under default CoW policy);
     /// only envelope-group barriers gain the cheaper ack path.
     pub wal_first_commits: bool,
+
+    /// Unmaterialized WAL bytes tolerated before an automatic synchronous
+    /// materialization bounds crash-recovery replay work. Only meaningful
+    /// with `wal_first_commits`. Replay costs ~20 us/op CPU, so 2 MiB keeps
+    /// reopen under ~500 ms of replay at current throughput. Default:
+    /// 2 MiB; 0 disables automatic materialization.
+    pub wal_materialize_bytes: u64,
 }
 
 impl Default for Options {
@@ -65,6 +72,7 @@ impl Default for Options {
             sync_writes: false,
             max_wal_bytes: 64 * 1024 * 1024,
             wal_first_commits: false,
+            wal_materialize_bytes: 2 * 1024 * 1024,
         }
     }
 }

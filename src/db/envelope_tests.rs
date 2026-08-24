@@ -531,3 +531,98 @@ fn test_wal_first_disabled_matches_default_behavior() {
     db.verify().unwrap();
     db.close().unwrap();
 }
+
+#[test]
+fn test_wal_first_auto_materializes_at_bound() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-bound.db");
+    let options = Options {
+        wal_first_commits: true,
+        // Each batch is ~2.7 KB of WAL; the bound crosses after two batches.
+        wal_materialize_bytes: 4 * 1024,
+        ..wal_first_options()
+    };
+    let mut db = DB::open(&path, options).unwrap();
+    for batch in 0..6 {
+        let mutations: Vec<BatchMutation> = (0..4)
+            .map(|op| BatchMutation::Put {
+                key: format!("bound{batch}-op{op}").into_bytes(),
+                value: format!("value-{batch}-{op}").into_bytes(),
+            })
+            .collect();
+        db.commit_batch(&mutations).unwrap();
+        // The bound forces periodic materialization: the published manifest
+        // frontier must advance without any explicit flush call.
+        let status = db.durability_status();
+        assert_eq!(status.pending_mutations, 0);
+        assert!(!status.write_fenced);
+    }
+    db.verify().unwrap();
+
+    // Every acked batch survives a crash-style exit: materialization kept
+    // the unframed window bounded, and recovery covers the remainder.
+    drop(db);
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    for batch in 0..6 {
+        for op in 0..4 {
+            let key = format!("bound{batch}-op{op}");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().as_deref(),
+                Some(format!("value-{batch}-{op}").as_bytes())
+            );
+        }
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_zero_bound_disables_auto_materialization() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-nobound.db");
+    let options = Options {
+        wal_first_commits: true,
+        wal_materialize_bytes: 0,
+        ..wal_first_options()
+    };
+    let mut db = DB::open(&path, options).unwrap();
+    for batch in 0..10 {
+        let mutations: Vec<BatchMutation> = (0..4)
+            .map(|op| BatchMutation::Put {
+                key: format!("nob{batch}-op{op}").into_bytes(),
+                value: format!("value-{batch}-{op}").into_bytes(),
+            })
+            .collect();
+        db.commit_batch(&mutations).unwrap();
+    }
+    // With the bound disabled no publication frame may appear behind the
+    // caller's back: only the bootstrap generation-0 frame exists.
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(parsed.frames.iter().all(|frame| match &frame.entry {
+        MetaLogEntry::Publication { manifest, .. } => {
+            manifest.generation_id == GenerationId::new(0)
+        }
+        _ => true,
+    }));
+    db.flush().unwrap();
+    let parsed = DB::read_meta_log(&path).unwrap().unwrap();
+    assert!(parsed.frames.iter().any(|frame| match &frame.entry {
+        MetaLogEntry::Publication { manifest, .. } => {
+            manifest.generation_id > GenerationId::new(0)
+        }
+        _ => false,
+    }));
+    db.verify().unwrap();
+    db.close().unwrap();
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    for batch in 0..10 {
+        for op in 0..4 {
+            let key = format!("nob{batch}-op{op}");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().as_deref(),
+                Some(format!("value-{batch}-{op}").as_bytes())
+            );
+        }
+    }
+    db.close().unwrap();
+}

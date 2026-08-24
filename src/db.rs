@@ -258,6 +258,9 @@ pub struct DB {
     pending_blob_frame: bool,
     /// At least one soft-barrier commit is ahead of the last authority frame.
     unframed_commits: bool,
+    /// WAL bytes acked by soft barriers that no authority frame names yet.
+    /// Bounded by `Options::wal_materialize_bytes` to bound replay work.
+    unframed_wal_bytes: u64,
     /// Whether the database is open.
     is_open: bool,
     /// Whether a failed publication fenced this writer until reopen.

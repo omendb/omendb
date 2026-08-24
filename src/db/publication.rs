@@ -279,6 +279,7 @@ impl DB {
         self.pending_blob_changes = false;
         self.pending_blob_frame = false;
         self.unframed_commits = false;
+        self.unframed_wal_bytes = 0;
         Ok(())
     }
 }
