@@ -127,7 +127,7 @@ fn test_barrier_publishes_one_generation_for_the_group() {
         let mut db = DB::open(&path, Options::default()).unwrap();
         db.put(b"base", b"before").unwrap();
         db.flush().unwrap();
-        let generation_before = db.durability_status().generation_id;
+        let generation_before = db.durability_status().generation_id.get();
         let expected = db.commit_id;
         db.admit_batch(expected, &mutations(&[(b"only-a", b"1")]))
             .unwrap();
@@ -146,7 +146,7 @@ fn test_barrier_publishes_one_generation_for_the_group() {
             .iter()
             .filter(|frame| match &frame.entry {
                 MetaLogEntry::Publication { manifest, .. } => {
-                    manifest.generation_id.get() > generation_before.get()
+                    manifest.generation_id.get() > generation_before
                 }
                 _ => false,
             })
@@ -739,5 +739,61 @@ fn test_wal_first_materialization_failure_preserves_acked_commits() {
         assert_eq!(value, b"value".to_vec());
     }
     db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+#[ignore]
+fn probe_wal_first_blob_image_freshness() {
+    // Mirrors the failing property-test sequence: initial blob put, then
+    // transaction commit/abort cycles with periodic close/reopen, checking
+    // the generation recorded inside the on-disk blob image after each step.
+    fn disk_blob_generation(path: &std::path::Path) -> Option<u64> {
+        let bytes = std::fs::read(path.join(BLOB_FILE)).ok()?;
+        if bytes.len() < 28 {
+            return Some(0);
+        }
+        let raw = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
+        Some(raw)
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("blob-freshness.db");
+    let options = Options {
+        wal_first_commits: true,
+        ..Options::default()
+    };
+    let mut db = DB::open(&path, options.clone()).unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"blob0".to_vec(),
+        value: vec![0xB6; 2048],
+    }])
+    .unwrap();
+    println!(
+        "after initial blob put: disk_gen={:?} db_gen={}",
+        disk_blob_generation(&path),
+        db.durability_status().generation_id.get()
+    );
+
+    for index in 0..6usize {
+        let mut tx = db.begin_batch_transaction().unwrap();
+        tx.put(&format!("tx{index}").into_bytes(), b"v").unwrap();
+        if index % 2 == 0 {
+            tx.commit(&mut db).unwrap();
+        } else {
+            tx.abort().unwrap();
+        }
+        println!(
+            "after tx{index} ({}): disk_gen={:?} db_gen={}",
+            if index % 2 == 0 { "commit" } else { "abort" },
+            disk_blob_generation(&path),
+            db.durability_status().generation_id.get()
+        );
+        if index % 4 == 3 {
+            db.verify().unwrap();
+            db.close().unwrap();
+            db = DB::open(&path, options.clone()).unwrap();
+        }
+    }
     db.close().unwrap();
 }
