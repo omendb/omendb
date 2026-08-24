@@ -621,6 +621,40 @@ fn test_db_discards_uncommitted_wal_suffix() {
 }
 
 #[test]
+fn test_db_reclaims_retained_wal_mid_session_at_threshold() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-reclaim-mid-session.db");
+    let payload = vec![0x5Au8; 16384];
+    {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        // Each admitted record is ~16.4 KiB of WAL, so this session pushes
+        // the retained log well past the reclaim threshold in one generation.
+        for index in 0..600 {
+            let key = format!("key{index}");
+            db.put(key.as_bytes(), &payload).unwrap();
+        }
+        db.flush().unwrap();
+
+        assert!(
+            !path.join(WAL_FILE).exists(),
+            "retained WAL must be reclaimed once it passes the threshold"
+        );
+        db.put(b"after", b"value").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"after").unwrap(), Some(b"value".to_vec()));
+        db.close().unwrap();
+    }
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"key0").unwrap(), Some(payload.clone()));
+    let last = format!("key{}", 599);
+    assert_eq!(db.get(last.as_bytes()).unwrap(), Some(payload.clone()));
+    assert_eq!(db.get(b"after").unwrap(), Some(b"value".to_vec()));
+    db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
 fn test_db_gc_mirrors_manifest_before_removing_dead_blob_file() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("gc-fallback.db");
