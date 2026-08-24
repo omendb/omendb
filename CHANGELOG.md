@@ -1,0 +1,52 @@
+# Changelog
+
+All notable changes to OmenDB are documented here. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
+[Semantic Versioning](https://semver.org/) with Cargo's pre-1.0 conventions.
+
+## [Unreleased]
+
+### Added
+
+- Bounded embedded SQL batch execution:
+  `RelationalDatabase::execute_sql_batch`,
+  `execute_sql_batch_with_params`, and the session equivalents, each one
+  atomic transaction with a 1,024-statement limit.
+- SQLite differential test oracle covering the supported SQL subset,
+  including a randomized insert/update/delete trace.
+- Property tests for row-envelope and row-identity encodings (roundtrip,
+  truncation refusal, corruption detection).
+- On-disk format fixtures (`tests/fixtures/format-current/`) that fail CI on
+  unintentional incompatible format changes; regenerate deliberately per
+  format change via `generate_current_format_fixtures`.
+- Operator runbook (`docs/runbook.md`): health checks, verification,
+  maintenance, recovery-required reconciliation, platform/filesystem
+  assumptions.
+- Release contract and gates: `docs/alpha-release-gates.md`.
+- Reproducible single-client OLTP baseline `examples/alpha_oltp.rs` with
+  workload metadata, latency percentiles, peak RSS, and SQLite comparison.
+- Peak-RSS reporting in the benchmark JSON output.
+- Primary-key fast path for SQL `SELECT`/`UPDATE`/`DELETE` equality
+  predicates, including AND-composed composite keys.
+
+### Changed
+
+- Seer read views are cached strongly and invalidated under the publication
+  lock; transaction begins capture frontier and view atomically, removing a
+  race that surfaced as spurious `StorageSnapshotUnavailable` under
+  concurrent writers. Read-only throughput improved roughly an order of
+  magnitude on cached workloads.
+- SQL three-valued logic fixed for `IN`/`NOT IN` against NULL-containing
+  lists; `DISTINCT` now applies before `LIMIT`/`OFFSET`, matching
+  PostgreSQL semantics.
+
+### Removed
+
+- Legacy R-milestone diagnostic examples (`r0_*`, `r1_replay`, `r2_replay`,
+  `seer_r*`, `runtime_mix`, `project_r2_replay`) and their orphaned
+  fixtures; superseded by the integration test suites.
+
+## [0.1.0-alpha.1] - Unreleased
+
+First relational alpha line. Not yet published; see
+`docs/alpha-release-gates.md` for the remaining release contract.
