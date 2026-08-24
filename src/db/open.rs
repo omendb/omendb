@@ -87,6 +87,7 @@ impl DB {
             pending_wal_bytes: 0,
             wal_reserved_extent: 0,
             pending_digest: 0,
+            wal_handle: None,
             pending_blob_changes: recovery
                 .as_ref()
                 .is_some_and(|summary| summary.blob_changed),

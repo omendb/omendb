@@ -17,7 +17,7 @@ use super::{
 };
 use crate::recovery::{SyncPolicy, WalRecord};
 use crate::space::reserve_file;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::time::Instant;
 
@@ -38,26 +38,28 @@ impl DB {
         self.wal.flush(&mut wal_buf)?;
         let should_sync = force_sync || self.wal.sync_policy() != SyncPolicy::None;
         if !wal_buf.is_empty() || should_sync {
-            let wal_path = self.path.join(WAL_FILE);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(!wal_buf.is_empty())
-                .read(should_sync)
-                .write(!wal_buf.is_empty() || should_sync)
-                .open(&wal_path)?;
             if !wal_buf.is_empty() {
-                // Append to WAL file (not overwrite).
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_WRITE.with(|failure| failure.replace(false)) {
+                    self.invalidate_wal_handle();
                     return Err(std::io::Error::other("injected WAL append failure").into());
                 }
-                file.write_all(&wal_buf)?;
+                let appended = (|| {
+                    let file = self.wal_append_handle()?;
+                    let mut file = file;
+                    file.write_all(&wal_buf)
+                })();
+                if let Err(error) = appended {
+                    self.invalidate_wal_handle();
+                    return Err(error.into());
+                }
                 self.publication.wal_bytes_written = self
                     .publication
                     .wal_bytes_written
                     .saturating_add(wal_buf.len() as u64);
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_AFTER_WRITE.with(|failure| failure.replace(false)) {
+                    self.invalidate_wal_handle();
                     return Err(std::io::Error::other("injected post-append WAL failure").into());
                 }
             }
@@ -67,20 +69,53 @@ impl DB {
                 // its commit prefix buffered until the authority frame.
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_SYNC.with(|failure| failure.replace(false)) {
+                    self.invalidate_wal_handle();
                     return Err(std::io::Error::other("injected WAL sync failure").into());
                 }
-                match self.wal.sync_policy() {
-                    SyncPolicy::SyncAll => file.sync_all()?,
-                    SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data()?,
+                let synced = (|| {
+                    let policy = self.wal.sync_policy();
+                    let file = self.wal_append_handle()?;
+                    match policy {
+                        SyncPolicy::SyncAll => file.sync_all(),
+                        SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data(),
+                    }
+                })();
+                if let Err(error) = synced {
+                    self.invalidate_wal_handle();
+                    return Err(error.into());
                 }
                 crate::storage::record_durability_sync();
                 #[cfg(any(test, feature = "fault-injection"))]
                 if FAIL_NEXT_WAL_AFTER_SYNC.with(|failure| failure.replace(false)) {
+                    self.invalidate_wal_handle();
                     return Err(std::io::Error::other("injected post-WAL-sync failure").into());
                 }
             }
         }
         Ok(())
+    }
+
+    /// Return the cached WAL append handle, opening the file on first use.
+    /// The handle is cached across publications because open-per-append
+    /// syscalls dominate the per-record cost of the WAL path.
+    fn wal_append_handle(&mut self) -> std::io::Result<&File> {
+        if self.wal_handle.is_none() {
+            let wal_path = self.path.join(WAL_FILE);
+            self.wal_handle = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&wal_path)?,
+            );
+        }
+        Ok(self.wal_handle.as_ref().expect("wal handle just set"))
+    }
+
+    /// Drop the cached WAL handle so the next append reopens the file.
+    /// Required after reclaim removes the file and after any I/O error that
+    /// may have left the descriptor in an unreliable state.
+    pub(super) fn invalidate_wal_handle(&mut self) {
+        self.wal_handle = None;
     }
 
     /// Journal a mutation after it has successfully changed memory state.

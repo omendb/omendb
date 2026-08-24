@@ -22,6 +22,7 @@ impl DB {
                     fs::remove_file(&wal_path)?;
                     sync_directory(&self.path)?;
                 }
+                self.invalidate_wal_handle();
             }
             self.is_open = false;
             if let Some(lock_file) = self.lock_file.take() {

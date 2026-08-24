@@ -239,6 +239,7 @@ impl DB {
             let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
             if wal_len >= WAL_RETENTION_RECLAIM_BYTES {
                 fs::remove_file(&wal_path)?;
+                self.invalidate_wal_handle();
                 self.wal_reserved_extent = 0;
                 // WAL removal is cleanup after the manifest has selected the
                 // generation. If the directory entry removal is not durable, a
