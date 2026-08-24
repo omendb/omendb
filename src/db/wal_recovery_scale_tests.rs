@@ -8,8 +8,7 @@ use std::time::Instant;
 
 fn synthetic_committed_wal(generations: usize, ops_per_gen: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut commit_id = 1u64;
-    for generation in 0..generations as u64 {
+    for (commit_id, generation) in (1u64..).zip(0..generations as u64) {
         let mut pending = Vec::with_capacity(ops_per_gen);
         for op in 0..ops_per_gen {
             let key = format!("gen{generation}-op{op}");
@@ -29,7 +28,6 @@ fn synthetic_committed_wal(generations: usize, ops_per_gen: usize) -> Vec<u8> {
             mutation_count: pending.len() as u64,
             digest,
         };
-        commit_id += 1;
         out.extend_from_slice(&WalRecord::commit(commit).to_bytes());
     }
     out
@@ -150,4 +148,53 @@ fn probe_journal_path_wall_time() {
     );
     db.close().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+#[ignore]
+fn measure_wal_first_commit_throughput() {
+    use super::DB;
+    use crate::{BatchMutation, Options};
+
+    fn run(label: &str, wal_first: bool, value: &[u8]) -> f64 {
+        let dir = std::env::temp_dir().join(format!(
+            "seerdb-walfirst-bench-{}-{label}",
+            std::process::id()
+        ));
+        let mut db = DB::open(
+            &dir,
+            Options {
+                wal_first_commits: wal_first,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let batches = 300;
+        let ops_per_batch = 16;
+        let start = std::time::Instant::now();
+        for batch in 0..batches {
+            let mutations: Vec<BatchMutation> = (0..ops_per_batch)
+                .map(|op| BatchMutation::Put {
+                    key: format!("batch{batch}-op{op}").into_bytes(),
+                    value: value.to_vec(),
+                })
+                .collect();
+            db.commit_batch(&mutations).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let ops = batches * ops_per_batch;
+        let ops_per_sec = ops as f64 / elapsed.as_secs_f64();
+        println!(
+            "{label}: {ops} durable ops in {:.3}s = {ops_per_sec:.0} ops/s",
+            elapsed.as_secs_f64()
+        );
+        db.close().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        ops_per_sec
+    }
+
+    let value = vec![0x42u8; 128];
+    let baseline = run("default  ", false, &value);
+    let wal_first = run("wal-first ", true, &value);
+    println!("speedup: {:.1}x", wal_first / baseline);
 }

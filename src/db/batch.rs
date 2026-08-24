@@ -180,9 +180,19 @@ impl DB {
         *self.engine.btree_mut() = prepared.candidate_tree;
         self.blobs = prepared.candidate_blobs;
         self.pending_blob_changes = prepared.blob_changed;
+        self.pending_blob_frame |= prepared.blob_changed;
         self.pending_mutations = prepared.next_pending_mutations;
         self.pending_wal_bytes = prepared.next_pending_bytes;
         self.pending_digest = prepared.next_digest;
+        if self.options.wal_first_commits {
+            // Ack after one group-synced WAL append; pages and the authority
+            // frame materialize at flush/checkpoint/close.
+            if let Err(error) = self.publish_envelope_group_wal_first() {
+                self.write_fenced = true;
+                return Err(error);
+            }
+            return Ok(self.durability_status());
+        }
         self.flush()?;
         Ok(self.durability_status())
     }

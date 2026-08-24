@@ -46,6 +46,13 @@ pub struct Options {
     /// including its commit envelope. A fixed reservation extent is rounded
     /// from this limit in 1 MiB segments. Default: 64 MiB.
     pub max_wal_bytes: u64,
+
+    /// Ack batch commits after one group-synced WAL append, deferring page
+    /// materialization and the authority frame to flush/checkpoint/close.
+    /// Experimental: single-write `put`/`delete` semantics are unchanged
+    /// (they were never durable without flush under default CoW policy);
+    /// only envelope-group barriers gain the cheaper ack path.
+    pub wal_first_commits: bool,
 }
 
 impl Default for Options {
@@ -57,6 +64,7 @@ impl Default for Options {
             use_odirect: false,
             sync_writes: false,
             max_wal_bytes: 64 * 1024 * 1024,
+            wal_first_commits: false,
         }
     }
 }

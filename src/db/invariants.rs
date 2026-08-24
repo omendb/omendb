@@ -110,6 +110,16 @@ impl DB {
                 "published manifest history identity differs from the coordinator".into(),
             ));
         }
+        if self.unframed_commits {
+            // WAL-first commits legitimately lead the last authority frame
+            // until materialization names their state with a new frame.
+            if current.generation_id > self.generation_id || current.commit_id > self.commit_id {
+                return Err(Error::Corruption(
+                    "published manifest frontier is ahead of the coordinator".into(),
+                ));
+            }
+            return Ok(());
+        }
         if current.generation_id != self.generation_id {
             return Err(Error::Corruption(
                 "published manifest generation differs from the coordinator".into(),

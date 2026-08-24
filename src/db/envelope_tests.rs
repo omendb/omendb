@@ -3,6 +3,7 @@
 
 use super::metadata_codec::MetaLogEntry;
 use super::*;
+use std::process::Command;
 use tempfile::tempdir;
 
 fn mutations(pairs: &[(&[u8], &[u8])]) -> Vec<BatchMutation> {
@@ -370,4 +371,163 @@ fn test_flush_publishes_staged_envelope_group() {
     let db = DB::open(&path, Options::default()).unwrap();
     assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
     assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+}
+
+fn wal_first_options() -> Options {
+    Options {
+        wal_first_commits: true,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn test_wal_first_commits_replay_after_simulated_crash() {
+    const CHILD_ENV: &str = "SEERDB_WAL_FIRST_CRASH_CHILD_PATH";
+    if let Some(path) = std::env::var_os(CHILD_ENV) {
+        let path = PathBuf::from(path);
+        let mut db = DB::open(&path, wal_first_options()).unwrap();
+        for batch in 0..5 {
+            let mutations: Vec<BatchMutation> = (0..4)
+                .map(|op| BatchMutation::Put {
+                    key: format!("batch{batch}-op{op}").into_bytes(),
+                    value: format!("value-{batch}-{op}").into_bytes(),
+                })
+                .collect();
+            // Each batch acks after one group WAL sync; no close runs, so
+            // the synced WAL prefix is the only durable evidence.
+            db.commit_batch(&mutations).unwrap();
+        }
+        std::process::exit(137);
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-crash.db");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("db::envelope_tests::test_wal_first_commits_replay_after_simulated_crash")
+        .arg("--nocapture")
+        .env(CHILD_ENV, &path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    for batch in 0..5 {
+        for op in 0..4 {
+            let key = format!("batch{batch}-op{op}");
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap().as_deref(),
+                Some(format!("value-{batch}-{op}").as_bytes()),
+                "acked wal-first commit must replay after crash"
+            );
+        }
+    }
+    db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_materializes_on_clean_close() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-close.db");
+    {
+        let mut db = DB::open(&path, wal_first_options()).unwrap();
+        db.commit_batch(&[BatchMutation::Put {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+        }])
+        .unwrap();
+        db.close().unwrap();
+    }
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+    db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_flush_publishes_authority_frame() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-flush.db");
+    let mut db = DB::open(&path, wal_first_options()).unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"key".to_vec(),
+        value: b"v1".to_vec(),
+    }])
+    .unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(b"key").unwrap(), Some(b"v1".to_vec()));
+    db.close().unwrap();
+
+    // After materialization a crash loses nothing: the frame owns the state.
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"key").unwrap(), Some(b"v1".to_vec()));
+    db.verify().unwrap();
+
+    // The engine stays writable after materialization.
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"key2".to_vec(),
+        value: b"v2".to_vec(),
+    }])
+    .unwrap();
+    assert_eq!(db.get(b"key2").unwrap(), Some(b"v2".to_vec()));
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_blob_batch_survives_crash_before_materialization() {
+    const CHILD_ENV: &str = "SEERDB_WAL_FIRST_BLOB_CRASH_CHILD_PATH";
+    if let Some(path) = std::env::var_os(CHILD_ENV) {
+        let path = PathBuf::from(path);
+        let mut db = DB::open(&path, wal_first_options()).unwrap();
+        let large = vec![0xABu8; 2048];
+        db.commit_batch(&[
+            BatchMutation::Put {
+                key: b"inline".to_vec(),
+                value: b"small".to_vec(),
+            },
+            BatchMutation::Put {
+                key: b"blob".to_vec(),
+                value: large,
+            },
+        ])
+        .unwrap();
+        std::process::exit(137);
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-blob.db");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("db::envelope_tests::test_wal_first_blob_batch_survives_crash_before_materialization")
+        .arg("--nocapture")
+        .env(CHILD_ENV, &path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"inline").unwrap(), Some(b"small".to_vec()));
+    assert_eq!(db.get(b"blob").unwrap(), Some(vec![0xABu8; 2048]));
+    db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_disabled_matches_default_behavior() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-off.db");
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    db.commit_batch(&[BatchMutation::Put {
+        key: b"key".to_vec(),
+        value: b"value".to_vec(),
+    }])
+    .unwrap();
+    // Default mode still publishes through the full pipeline on flush.
+    db.flush().unwrap();
+    db.close().unwrap();
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+    db.verify().unwrap();
+    db.close().unwrap();
 }

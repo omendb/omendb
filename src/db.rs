@@ -252,6 +252,12 @@ pub struct DB {
     next_envelope_id: u64,
     /// Whether the pending generation changes the durable blob image/catalog.
     pending_blob_changes: bool,
+    /// Blob changes that no persisted authority frame has named yet. Unlike
+    /// `pending_blob_changes`, this survives soft (WAL-first) barriers so
+    /// materialization still writes the referenced artifacts.
+    pending_blob_frame: bool,
+    /// At least one soft-barrier commit is ahead of the last authority frame.
+    unframed_commits: bool,
     /// Whether the database is open.
     is_open: bool,
     /// Whether a failed publication fenced this writer until reopen.
@@ -305,6 +311,18 @@ impl DB {
             return self.publication_barrier().map(|_| ());
         }
         if self.pending_mutations == 0 {
+            // WAL-first commits may be ahead of the last authority frame with
+            // nothing pending; flush must materialize them, not no-op.
+            if self.unframed_commits {
+                return self
+                    .publish_envelope_group()
+                    .inspect_err(|error| {
+                        if !matches!(error, Error::CapacityPreflight) {
+                            self.write_fenced = true;
+                        }
+                    })
+                    .map(|_| ());
+            }
             return Ok(());
         }
 

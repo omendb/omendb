@@ -277,6 +277,8 @@ impl DB {
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;
         self.pending_blob_changes = false;
+        self.pending_blob_frame = false;
+        self.unframed_commits = false;
         Ok(())
     }
 }

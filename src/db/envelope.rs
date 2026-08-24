@@ -68,6 +68,7 @@ impl DB {
         *self.engine.btree_mut() = prepared.candidate_tree;
         self.blobs = prepared.candidate_blobs;
         self.pending_blob_changes |= prepared.blob_changed;
+        self.pending_blob_frame |= prepared.blob_changed;
         self.pending_mutations = prepared.next_pending_mutations;
         self.pending_wal_bytes = prepared.next_pending_bytes;
         self.pending_digest = prepared.next_digest;
@@ -99,7 +100,14 @@ impl DB {
             return Ok(Vec::new());
         }
         let envelopes = std::mem::take(&mut self.pending_envelopes);
-        if let Err(error) = self.publish_envelope_group() {
+        let result = if self.options.wal_first_commits {
+            // WAL-first: ack after one group-synced WAL append; pages and
+            // authority frame move to materialization (flush/checkpoint/close).
+            self.publish_envelope_group_wal_first()
+        } else {
+            self.publish_envelope_group()
+        };
+        if let Err(error) = result {
             // Nothing can have been admitted while the group was in flight
             // (`&mut self`), so the pending list is still empty and plain
             // assignment restores the original admission order.
@@ -115,30 +123,10 @@ impl DB {
             .collect())
     }
 
-    fn publish_envelope_group(&mut self) -> Result<()> {
-        // Stage 1: data. One capacity preflight, one dirty-page write pass,
-        // and one device sync cover every staged envelope's pages.
-        let parent_manifest = self
-            .manifest_history
-            .latest()
-            .unwrap_or_else(|| self.bootstrap_manifest());
-        #[cfg(any(test, feature = "fault-injection"))]
-        if super::faults::FAIL_NEXT_GROUP_SYNC.with(|failure| failure.replace(false)) {
-            return Err(std::io::Error::other("injected group data sync failure").into());
-        }
-        self.write_wal_to_disk(false)?;
-        self.preflight_publication_capacity()?;
-        if self.engine.reclamation_needs_refresh() {
-            self.engine.refresh_reclamation()?;
-        }
-        let generation = self.next_generation_id;
-        self.engine.set_write_generation(generation.get());
-        let staged = self.engine.write_dirty_pages()?;
-        self.engine.sync_data(staged)?;
-
-        // Blob artifacts once for the group: all staged blob changes are
-        // already installed in the live manager.
-        if self.blobs.is_segmented() || self.pending_blob_changes {
+    /// Blob artifacts once for the group: all staged blob changes are
+    /// already installed in the live manager.
+    fn write_group_blob_artifacts(&mut self, generation: GenerationId) -> Result<()> {
+        if self.blobs.is_segmented() || self.pending_blob_frame {
             let blob_started = Instant::now();
             self.blobs.set_generation(generation.get());
             let blob_bytes = if self.blobs.is_segmented() {
@@ -160,7 +148,9 @@ impl DB {
                 .saturating_add(elapsed_nanos(blob_started));
             // The blob artifact's directory entry must be durable before any
             // frame can name this generation: an established database's
-            // meta.log creation no longer forces it implicitly.
+            // meta.log creation no longer forces it implicitly. The same
+            // ordering rule applies to a WAL-first commit sync that will
+            // reference these bytes from its replayable mutation prefix.
             let directory_started = Instant::now();
             let directory_result = sync_publication_directory(&self.path);
             self.publication_timing.directory_sync_ns = self
@@ -169,6 +159,31 @@ impl DB {
                 .saturating_add(elapsed_nanos(directory_started));
             directory_result?;
         }
+        Ok(())
+    }
+
+    pub(super) fn publish_envelope_group(&mut self) -> Result<()> {
+        // Stage 1: data. One capacity preflight, one dirty-page write pass,
+        // and one device sync cover every staged envelope's pages.
+        let parent_manifest = self
+            .manifest_history
+            .latest()
+            .unwrap_or_else(|| self.bootstrap_manifest());
+        #[cfg(any(test, feature = "fault-injection"))]
+        if super::faults::FAIL_NEXT_GROUP_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected group data sync failure").into());
+        }
+        self.write_wal_to_disk(false)?;
+        self.preflight_publication_capacity()?;
+        if self.engine.reclamation_needs_refresh() {
+            self.engine.refresh_reclamation()?;
+        }
+        let generation = self.next_generation_id;
+        self.engine.set_write_generation(generation.get());
+        let staged = self.engine.write_dirty_pages()?;
+        self.engine.sync_data(staged)?;
+
+        self.write_group_blob_artifacts(generation)?;
 
         // Stage 2: ONE commit record covering the cumulative pending
         // mutation prefix. Under the default CoW policy it remains buffered;
@@ -221,6 +236,50 @@ impl DB {
         }
         let wal_path = self.append_envelope_frame(commit, wal_offset, parent_manifest)?;
         self.finish_generation_publication(commit, wal_path)?;
+        Ok(())
+    }
+
+    /// WAL-first group publication: blob artifacts (only when a frame has
+    /// not yet named them), then ONE cumulative commit envelope synced to
+    /// disk as the ack point. Pages and the authority frame move to
+    /// materialization (flush/checkpoint/close); recovery replays the
+    /// synced prefix ahead of authority via the Greater branch.
+    pub(super) fn publish_envelope_group_wal_first(&mut self) -> Result<()> {
+        let generation = self.next_generation_id;
+        self.write_group_blob_artifacts(generation)?;
+
+        let commit = CommitRecord {
+            commit_id: self.next_commit_id,
+            generation_id: generation,
+            root_page_id: self.engine.btree().root_id() as u64,
+            mutation_count: self.pending_mutations,
+            digest: self.pending_digest,
+        };
+        self.next_commit_id = CommitId::new(
+            self.next_commit_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+        );
+        self.next_generation_id = GenerationId::new(
+            self.next_generation_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("generation ID overflow".into()))?,
+        );
+        self.wal.append(&WalRecord::commit(commit));
+        // The sync IS the acknowledgement point under AckPolicy::GroupSync.
+        self.write_wal_to_disk(true)?;
+
+        self.generation_id = commit.generation_id;
+        self.commit_id = commit.commit_id;
+        self.pending_mutations = 0;
+        self.pending_wal_bytes = 0;
+        self.pending_digest = 0;
+        self.pending_blob_changes = false;
+        // pending_blob_frame and unframed_commits survive: materialization
+        // must still name these bytes and this state with an authority frame.
+        self.unframed_commits = true;
         Ok(())
     }
 }
