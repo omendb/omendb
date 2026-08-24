@@ -222,10 +222,26 @@ fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>
         .execute_sql("UPDATE accounts SET state = 'closed' WHERE id = 2")
         .expect("update row");
     assert_eq!(updated.affected_rows, 1);
+    // Equality on an indexed column resolves through the secondary index;
+    // results must stay identical to a full scan.
+    assert_eq!(
+        database
+            .execute_sql("SELECT id FROM accounts WHERE state = 'open'")
+            .expect("indexed equality select")
+            .rows,
+        vec![vec![Value::I64(1)], vec![Value::I64(4)]]
+    );
     let deleted = database
         .execute_sql("DELETE FROM accounts WHERE state = 'closed'")
         .expect("delete rows");
     assert_eq!(deleted.affected_rows, 2);
+    assert!(
+        database
+            .execute_sql("SELECT id FROM accounts WHERE state = 'closed'")
+            .expect("indexed equality after delete")
+            .rows
+            .is_empty()
+    );
 
     let (transaction_result, transaction_commit) = database
         .transaction(|database, transaction| {

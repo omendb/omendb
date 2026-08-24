@@ -232,7 +232,7 @@ pub(super) fn execute_update(
     }
 
     let rows = if from_scope.is_none() {
-        match super::query::primary_key_rows(
+        match super::query::predicate_candidate_rows(
             database,
             transaction,
             table,
@@ -438,7 +438,7 @@ pub(super) fn execute_delete(
         ));
     }
     let rows = if using_scope.is_none() {
-        match super::query::primary_key_rows(
+        match super::query::predicate_candidate_rows(
             database,
             transaction,
             table,

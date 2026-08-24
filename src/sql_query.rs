@@ -6,8 +6,8 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, RowIdentity,
-    SqlColumn, SqlResult, TableDefinition, Value,
+    ColumnId, DbError, IndexDefinition, RelationalDatabase, RelationalDatabaseTransaction, Result,
+    Row, RowIdentity, SqlColumn, SqlResult, TableDefinition, Value,
 };
 
 use super::values::{coerce_value, literal_value};
@@ -86,7 +86,7 @@ pub(super) fn execute_query(
         return Ok(SqlResult::rows(projection.columns, Vec::new()));
     }
     let subqueries = resolve_subqueries(database, transaction, select.selection.as_ref(), params)?;
-    let rows = match primary_key_rows(
+    let rows = match predicate_candidate_rows(
         database,
         transaction,
         table,
@@ -408,42 +408,20 @@ pub(super) fn primary_key_rows(
     // other shape (OR, BETWEEN, IN, subqueries, column-to-column compare,
     // arithmetic) conservatively falls back to the scan path.
     let mut terms: Vec<(usize, Value)> = Vec::new();
-    if !collect_pk_equalities(selection, table, params, &mut terms)? {
+    if !collect_equality_terms(selection, table, params, &mut terms)? {
         return Ok(None);
+    }
+    if let Some(rows) = null_conjunction_result(&terms) {
+        return Ok(Some(rows));
     }
 
     // Every primary-key column must be covered exactly once; repeated
     // coverage falls back rather than reasoning about contradiction.
-    if primary_key.len() != terms.len()
-        || !primary_key.iter().all(|column| {
-            terms
-                .iter()
-                .filter(|(position, _)| table.columns[*position].id == *column)
-                .count()
-                == 1
-        })
-    {
+    if !columns_covered_exactly_once(primary_key, table, &terms) {
         return Ok(None);
     }
 
-    let mut values = Vec::with_capacity(primary_key.len());
-    for column in primary_key {
-        let position = table
-            .columns
-            .iter()
-            .position(|candidate| candidate.id == *column)
-            .ok_or_else(|| DbError::InvalidState("primary-key column is missing".to_owned()))?;
-        let value = terms
-            .iter()
-            .find(|(term_position, _)| *term_position == position)
-            .map(|(_, value)| value.clone())
-            .expect("coverage check found every primary-key column");
-        if matches!(value, Value::Null) {
-            // col = NULL is UNKNOWN for every row: nothing can match.
-            return Ok(Some(Vec::new()));
-        }
-        values.push(value);
-    }
+    let values = bound_values(primary_key, table, &terms)?;
     let identity = RowIdentity::new(table.id, primary_key.to_vec(), values)?;
     Ok(transaction
         .get_by_identity(database, table.id, &identity)?
@@ -451,19 +429,117 @@ pub(super) fn primary_key_rows(
         .or_else(|| Some(Vec::new())))
 }
 
-/// Collect AND-joined `pk_column = literal` terms. Returns `Ok(false)` when
+/// Candidate rows for SELECT/UPDATE/DELETE: the primary-key identity
+/// lookup when the predicate pins it exactly, otherwise a secondary-index
+/// exact match when an index's full column list is bound, otherwise `None`
+/// (caller falls back to a full scan). Returned rows are ordered by primary
+/// key to preserve the scan-order contract for unordered queries.
+pub(super) fn predicate_candidate_rows(
+    database: &RelationalDatabase,
+    transaction: &mut RelationalDatabaseTransaction,
+    table: &TableDefinition,
+    selection: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Vec<Row>>> {
+    if let Some(rows) = primary_key_rows(database, transaction, table, selection, params)? {
+        return Ok(Some(rows));
+    }
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let mut terms: Vec<(usize, Value)> = Vec::new();
+    if !collect_equality_terms(selection, table, params, &mut terms)? {
+        return Ok(None);
+    }
+    if let Some(rows) = null_conjunction_result(&terms) {
+        return Ok(Some(rows));
+    }
+
+    let primary_key = database.catalog().primary_key(table.id);
+    let mut candidates: Vec<&IndexDefinition> = database
+        .catalog()
+        .indexes()
+        .filter(|index| index.table == table.id)
+        .filter(|index| {
+            !index.columns.is_empty() && index.columns != primary_key.unwrap_or_default()
+        })
+        .filter(|index| columns_covered_exactly_once(&index.columns, table, &terms))
+        .collect();
+    // Most bound columns first; lowest id breaks ties deterministically.
+    candidates.sort_by(|left, right| {
+        right
+            .columns
+            .len()
+            .cmp(&left.columns.len())
+            .then(left.id.cmp(&right.id))
+    });
+    let Some(index) = candidates.first() else {
+        return Ok(None);
+    };
+    let values = bound_values(&index.columns, table, &terms)?;
+    let mut rows = transaction.index_get(database, table.id, index.id, &values)?;
+    rows.sort_by(|left, right| left.primary.cmp(&right.primary));
+    Ok(Some(rows))
+}
+
+/// A pure equality conjunction containing NULL is UNKNOWN for every row.
+fn null_conjunction_result(terms: &[(usize, Value)]) -> Option<Vec<Row>> {
+    terms
+        .iter()
+        .any(|(_, value)| matches!(value, Value::Null))
+        .then(Vec::new)
+}
+
+fn columns_covered_exactly_once(
+    columns: &[ColumnId],
+    table: &TableDefinition,
+    terms: &[(usize, Value)],
+) -> bool {
+    columns.len() == terms.len()
+        && columns.iter().all(|column| {
+            terms
+                .iter()
+                .filter(|(position, _)| table.columns[*position].id == *column)
+                .count()
+                == 1
+        })
+}
+
+fn bound_values(
+    columns: &[ColumnId],
+    table: &TableDefinition,
+    terms: &[(usize, Value)],
+) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        let position = table
+            .columns
+            .iter()
+            .position(|candidate| candidate.id == *column)
+            .ok_or_else(|| DbError::InvalidState("indexed column is missing".to_owned()))?;
+        let value = terms
+            .iter()
+            .find(|(term_position, _)| *term_position == position)
+            .map(|(_, value)| value.clone())
+            .expect("coverage check found every indexed column");
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Collect AND-joined `column = literal` terms. Returns `Ok(false)` when
 /// the predicate contains any shape this fast path does not model.
-fn collect_pk_equalities(
+fn collect_equality_terms(
     expression: &Expr,
     table: &TableDefinition,
     params: &[Value],
     terms: &mut Vec<(usize, Value)>,
 ) -> Result<bool> {
     match expression {
-        Expr::Nested(inner) => collect_pk_equalities(inner, table, params, terms),
+        Expr::Nested(inner) => collect_equality_terms(inner, table, params, terms),
         Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::And => {
-            Ok(collect_pk_equalities(left, table, params, terms)?
-                && collect_pk_equalities(right, table, params, terms)?)
+            Ok(collect_equality_terms(left, table, params, terms)?
+                && collect_equality_terms(right, table, params, terms)?)
         }
         Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::Eq => {
             let (column_expression, value_expression) = match (
