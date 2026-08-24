@@ -45,6 +45,7 @@ impl DB {
 
         self.journal_mutation(record)?;
         self.pending_blob_changes |= outcome.blob_changed;
+        self.pending_blob_frame |= outcome.blob_changed;
 
         Ok(())
     }
@@ -76,6 +77,7 @@ impl DB {
         require_blob_deletion(outcome, "delete")?;
         self.journal_mutation(record)?;
         self.pending_blob_changes |= outcome.blob_changed;
+        self.pending_blob_frame |= outcome.blob_changed;
         Ok(outcome.changed)
     }
 }

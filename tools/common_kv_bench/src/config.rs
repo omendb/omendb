@@ -88,10 +88,9 @@ impl KeyDistribution {
         match value {
             "uniform" => Ok(Self::Uniform),
             "zipf" => Ok(Self::Zipf),
-            _ => Err(format!(
-                "unknown key distribution {value:?}; expected uniform or zipf"
-            )
-            .into()),
+            _ => {
+                Err(format!("unknown key distribution {value:?}; expected uniform or zipf").into())
+            }
         }
     }
 
