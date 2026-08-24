@@ -67,6 +67,10 @@ impl Engine {
                     // sync per page and compare an extra durability policy.
                     sync_writes: false,
                     blob_threshold: usize::MAX,
+                    // Diagnostic-only A/B mode: acks after one group-synced
+                    // WAL append with identical durability semantics (the
+                    // sync is the power-loss boundary either way).
+                    wal_first_commits: wal_first_requested(),
                     ..seerdb::Options::default()
                 };
                 Ok(Self::SeerDb {
@@ -140,6 +144,7 @@ impl Engine {
                     // is the matched durable boundary for this adapter.
                     sync_writes: false,
                     blob_threshold: usize::MAX,
+                    wal_first_commits: wal_first_requested(),
                     ..seerdb::Options::default()
                 };
                 Ok(Self::SeerDb {
@@ -398,4 +403,11 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// Opt-in diagnostic A/B switch for the SeerDB adapter (`--engine seerdb`
+/// only). Default runs keep the hard publication barrier unchanged so the
+/// comparison manifests stay reproducible without the env var set.
+fn wal_first_requested() -> bool {
+    std::env::var("SEERDB_COMMON_KV_WAL_FIRST").is_ok_and(|value| value == "1")
 }
