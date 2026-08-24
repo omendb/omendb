@@ -577,6 +577,16 @@ mod tests {
     }
 
     #[test]
+    fn seer_kernel_satisfies_the_storage_contract_through_the_seam() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let kernel = crate::SeerKernel::create(&crate::SeerKernelConfig::new(
+            directory.path().join("seerdb"),
+        ))
+        .expect("create seer kernel");
+        exercise_generic_kernel(kernel);
+    }
+
+    #[test]
     fn status_projection_and_frontier_catalog_stay_consistent() {
         let mut kernel = InMemoryKernel::new();
         kernel.commit(CommitId(0), &[kv("k", "v")]).expect("commit");
@@ -600,4 +610,134 @@ mod tests {
         kernel.metrics().expect("metrics");
         kernel.close().expect("close");
     }
+}
+
+impl StorageKernel for crate::SeerKernel {
+    type ReadView = seerdb_shim::ReadView;
+    type Lease = crate::SnapshotLease;
+    type IntegrityReport = seerdb_shim::VerificationReport;
+    type CompactionReport = seerdb_shim::CompactionReport;
+    type Metrics = seerdb_shim::DBMetrics;
+
+    fn close(self) -> Result<()> {
+        crate::SeerKernel::close(self)
+    }
+
+    fn commit_id(&self) -> CommitId {
+        crate::SeerKernel::commit_id(self)
+    }
+
+    fn commit(&self, expected: CommitId, mutations: &[KvMutation]) -> Result<CommitOutcome> {
+        crate::SeerKernel::commit(self, expected, mutations)
+    }
+
+    fn commit_with_attempt(
+        &self,
+        expected: CommitId,
+        attempt: TransactionAttemptId,
+        mutations: &[KvMutation],
+    ) -> Result<CommitOutcome> {
+        crate::SeerKernel::commit_with_attempt(self, expected, attempt, mutations)
+    }
+
+    fn resolve_attempt(&self, attempt: TransactionAttemptId) -> Result<Option<AttemptRecord>> {
+        crate::SeerKernel::resolve_attempt(self, attempt)
+    }
+
+    fn attempt_records(&self, limit: usize) -> Result<Vec<AttemptRecord>> {
+        crate::SeerKernel::attempt_records(self, limit)
+    }
+
+    fn import_attempt_records(&mut self, records: &[AttemptRecord]) -> Result<Vec<AttemptRecord>> {
+        crate::SeerKernel::import_attempt_records(self, records)
+    }
+
+    fn forget_attempts(&mut self, attempts: &[TransactionAttemptId]) -> Result<usize> {
+        crate::SeerKernel::forget_attempts(self, attempts)
+    }
+
+    fn get(&self, snapshot: CommitId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        crate::SeerKernel::get(self, snapshot, key)
+    }
+
+    fn scan(
+        &self,
+        snapshot: CommitId,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        crate::SeerKernel::scan(self, snapshot, start, end, limit)
+    }
+
+    fn begin_current_read_view(&self) -> Result<Arc<Self::ReadView>> {
+        crate::SeerKernel::begin_current_read_view(self)
+    }
+
+    fn view_get(&self, view: &Self::ReadView, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.read_view_get(view, key)
+    }
+
+    fn view_scan(
+        &self,
+        view: &Self::ReadView,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.read_view_scan(view, start, end, limit)
+    }
+
+    fn retain(&mut self, commit: CommitId) -> Result<Self::Lease> {
+        crate::SeerKernel::retain(self, commit)
+    }
+
+    fn retain_current(&mut self) -> Result<Self::Lease> {
+        self.retain_current_transaction()
+    }
+
+    fn release_lease(&mut self, lease: &mut Self::Lease) -> Result<()> {
+        crate::SeerKernel::release(self, lease)
+    }
+
+    fn retained_snapshot_count(&self) -> usize {
+        crate::SeerKernel::retained_snapshot_count(self)
+    }
+
+    fn retained_snapshot_commits(&self) -> Vec<CommitId> {
+        crate::SeerKernel::retained_snapshot_commits(self)
+    }
+
+    fn checkpoint(&mut self) -> Result<Self::IntegrityReport> {
+        crate::SeerKernel::checkpoint(self)
+    }
+
+    fn verify(&mut self) -> Result<Self::IntegrityReport> {
+        crate::SeerKernel::verify(self)
+    }
+
+    fn compact(&mut self) -> Result<Self::CompactionReport> {
+        crate::SeerKernel::compact(self)
+    }
+
+    fn metrics(&self) -> Result<Self::Metrics> {
+        crate::SeerKernel::metrics(self)
+    }
+
+    fn published_commits(&self) -> Result<Vec<CommitId>> {
+        crate::SeerKernel::published_commits(self)
+    }
+
+    fn storage_identity(&self) -> Result<StorageIdentity> {
+        crate::SeerKernel::storage_identity(self)
+    }
+
+    fn durability_status(&self) -> Result<SeerDurabilityStatus> {
+        crate::SeerKernel::durability_status(self)
+    }
+}
+
+/// Type aliases keeping seerdb report names out of this module's signatures.
+mod seerdb_shim {
+    pub use seerdb::{CompactionReport, DBMetrics, ReadView, VerificationReport};
 }
