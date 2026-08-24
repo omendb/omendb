@@ -8,19 +8,27 @@
 use super::{BTree, BTreeError, PageId};
 use std::collections::HashSet;
 
+/// Depth bound that replaces per-descent visited sets on the hot lookup
+/// path. A well-formed tree with page-sized nodes cannot approach this.
+const MAX_ROUTING_DEPTH: u32 = 128;
+
 impl BTree {
     /// Find the leaf node where `key` should reside.
     pub(super) fn find_leaf(&self, key: &[u8]) -> Result<PageId, BTreeError> {
         let mut current = self.root;
-        let mut visited = HashSet::new();
+        // Cycle guard without per-descent allocation: a well-formed tree
+        // with page-sized nodes reaches this depth only after astronomically
+        // many keys, so any real routing cycle exceeds it immediately.
+        let mut depth = 0u32;
 
         loop {
-            if !visited.insert(current) {
+            if depth >= MAX_ROUTING_DEPTH {
                 return Err(BTreeError::Corruption(
                     "cycle detected during B-tree descent".into(),
                 ));
             }
-            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;
+            depth += 1;
+            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;;
             if node.is_leaf() {
                 return Ok(current);
             }
