@@ -11,6 +11,7 @@ mod artifact;
 mod attempt;
 mod fault;
 mod group_commit;
+mod kernel;
 mod model;
 mod morsel;
 mod packed;
@@ -36,6 +37,7 @@ pub use archive::{
 pub use attempt::{AttemptRecord, TransactionAttemptId};
 pub use fault::{FailOnce, FaultInjector, FaultPoint, NoFaults};
 pub use group_commit::{GroupCommitConfig, GroupCommitMetrics, GroupCommitPipeline};
+pub use kernel::{InMemoryKernel, StorageKernel};
 pub use model::{CommitId, IndexId, Key, Mutation, StorageIdentity};
 pub use morsel::{
     AggregateAccumulator, AggregateKind, AggregateSpec, AnalyticalExecutor, AnalyticalQuery,
