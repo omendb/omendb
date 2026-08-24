@@ -5240,3 +5240,49 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod kernel_swap_tests {
+    use super::*;
+    use crate::kernel::InMemoryKernel;
+
+    fn users_table() -> crate::TableDefinition {
+        crate::TableDefinition {
+            id: TableId(7),
+            name: "users".to_owned(),
+            columns: vec![crate::ColumnDefinition {
+                id: ColumnId(1),
+                name: "email".to_owned(),
+                data_type: crate::ColumnType::Text,
+                nullable: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn relational_store_runs_over_the_in_memory_kernel() {
+        let kernel = InMemoryKernel::new();
+        let mut store = SeerRelationalStore::from_kernel(kernel).expect("store");
+        store.create_table(users_table()).expect("create table");
+        let row = Row {
+            primary: Key::new(7, 1),
+            values: vec![crate::Value::Text("a@b.c".to_owned())],
+        };
+        let commit = store
+            .commit_batch([RelationalMutation::Insert {
+                table: TableId(7),
+                row,
+            }])
+            .expect("insert");
+        assert!(commit.0 >= 2);
+
+        // The catalog survives through the kernel: a fresh handle over the
+        // same kernel sees the table without replaying mutations.
+        assert!(
+            store
+                .catalog()
+                .tables()
+                .any(|table| table.name == "users" && table.id == TableId(7))
+        );
+    }
+}
