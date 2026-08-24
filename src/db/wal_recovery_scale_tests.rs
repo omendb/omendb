@@ -119,3 +119,35 @@ fn measure_replay_cost_breakdown() {
         full.as_secs_f64() * 1e6 / ops as f64,
     );
 }
+
+#[test]
+#[ignore]
+fn probe_journal_path_wall_time() {
+    use super::DB;
+    use crate::Options;
+    let dir = std::env::temp_dir().join(format!(
+        "seerdb-wal-probe-{}-{:?}",
+        std::process::id(),
+        std::time::Instant::now()
+    ));
+    let mut db = DB::open(&dir, Options::default()).unwrap();
+    let value = vec![0x42u8; 128];
+    for i in 0..200 {
+        db.put(format!("warm{i}").as_bytes(), &value).unwrap();
+    }
+    let start = Instant::now();
+    for i in 0..10_000 {
+        db.put(format!("key{i}").as_bytes(), &value).unwrap();
+    }
+    let journal = start.elapsed();
+    let start = Instant::now();
+    db.flush().unwrap();
+    let publish = start.elapsed();
+    println!(
+        "puts=10000 journal_us_per_put={:.3} publish_us_total={:.0}",
+        journal.as_secs_f64() * 1e6 / 10_000.0,
+        publish.as_secs_f64() * 1e6,
+    );
+    db.close().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
