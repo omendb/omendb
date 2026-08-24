@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::seer_kernel::CommitOutcome;
+use crate::seer_kernel::SnapshotIdentity;
 use crate::{
     AttemptRecord, CommitId, DbError, KvMutation, Result, SeerDurabilityStatus, StorageIdentity,
     TransactionAttemptId,
@@ -112,6 +113,11 @@ pub trait StorageKernel: Send {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// Frontier commit this view was captured at. Views are atomic with
+    /// their frontier observation, so relational snapshot identity comes
+    /// from the view itself rather than a separate read.
+    fn view_commit_id(&self, view: &Self::ReadView) -> CommitId;
+
     /// Pin `commit`'s history behind a caller-owned lease.
     fn retain(&mut self, commit: CommitId) -> Result<Self::Lease>;
 
@@ -143,6 +149,10 @@ pub trait StorageKernel: Send {
     /// Commits visible at this frontier, sorted (authoritative catalog).
     fn published_commits(&self) -> Result<Vec<CommitId>>;
 
+    /// Qualify a snapshot commit with this kernel's database/history
+    /// identity.
+    fn snapshot_identity(&self, commit: CommitId) -> Result<SnapshotIdentity>;
+
     /// Stable engine/storage identity for this database directory.
     fn storage_identity(&self) -> Result<StorageIdentity>;
 
@@ -153,6 +163,13 @@ pub trait StorageKernel: Send {
 /// In-memory [`StorageKernel`] for tests and conformance work: full-copy
 /// snapshot views over one `BTreeMap`, lease counting, and attempt records
 /// stored in reserved keyspace exactly like production kernels.
+/// Snapshot view for [`InMemoryKernel`]: frozen state plus the frontier it
+/// was captured at.
+pub struct InMemoryView {
+    state: BTreeMap<Vec<u8>, Vec<u8>>,
+    commit: CommitId,
+}
+
 #[derive(Default)]
 pub struct InMemoryKernel {
     /// Committed state per commit frontier; index 0 is the empty database.
@@ -194,7 +211,7 @@ fn kernel_lock_poisoned() -> DbError {
 }
 
 impl StorageKernel for InMemoryKernel {
-    type ReadView = BTreeMap<Vec<u8>, Vec<u8>>;
+    type ReadView = InMemoryView;
     type Lease = CommitId;
     type IntegrityReport = usize;
     type CompactionReport = usize;
@@ -382,15 +399,26 @@ impl StorageKernel for InMemoryKernel {
     }
 
     fn begin_current_read_view(&self) -> Result<Arc<Self::ReadView>> {
-        let generations = self
+        let mut generations = self
             .generations
             .lock()
             .map_err(|_| kernel_lock_poisoned())?;
-        Ok(Arc::new(generations.last().expect("frontier").clone()))
+        let commit = CommitId(generations.len() as u64 - 1);
+        let state = generations.last_mut().expect("frontier");
+        let taken = std::mem::take(state);
+        *state = taken.clone();
+        Ok(Arc::new(InMemoryView {
+            state: taken,
+            commit,
+        }))
     }
 
     fn view_get(&self, view: &Self::ReadView, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(view.get(key).cloned())
+        Ok(view.state.get(key).cloned())
+    }
+
+    fn view_commit_id(&self, view: &Self::ReadView) -> CommitId {
+        view.commit
     }
 
     fn view_scan(
@@ -401,6 +429,7 @@ impl StorageKernel for InMemoryKernel {
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(view
+            .state
             .range(start.to_vec()..end.to_vec())
             .take(limit)
             .map(|(key, value)| (key.clone(), value.clone()))
@@ -476,6 +505,13 @@ impl StorageKernel for InMemoryKernel {
         Ok(StorageIdentity {
             database_id: [0; 16],
             history_id: 0,
+        })
+    }
+
+    fn snapshot_identity(&self, commit: CommitId) -> Result<SnapshotIdentity> {
+        Ok(SnapshotIdentity {
+            storage: self.storage_identity()?,
+            commit,
         })
     }
 
@@ -688,6 +724,10 @@ impl StorageKernel for crate::SeerKernel {
         self.read_view_scan(view, start, end, limit)
     }
 
+    fn view_commit_id(&self, view: &Self::ReadView) -> CommitId {
+        CommitId(view.commit_id().get())
+    }
+
     fn retain(&mut self, commit: CommitId) -> Result<Self::Lease> {
         crate::SeerKernel::retain(self, commit)
     }
@@ -734,6 +774,10 @@ impl StorageKernel for crate::SeerKernel {
 
     fn durability_status(&self) -> Result<SeerDurabilityStatus> {
         crate::SeerKernel::durability_status(self)
+    }
+
+    fn snapshot_identity(&self, commit: CommitId) -> Result<SnapshotIdentity> {
+        crate::SeerKernel::snapshot_identity(self, commit)
     }
 }
 

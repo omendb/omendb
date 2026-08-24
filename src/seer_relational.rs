@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::attempt::{digest_kv_mutations, encode_record, seer_key};
+use crate::kernel::StorageKernel;
 use crate::relational::{
     Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, LogicalVerification,
     RelationalMutation, RelationalSchemaDefinition, RelationalSnapshot,
@@ -104,170 +105,19 @@ struct CommittedWriteEntry {
     catalog_changed: bool,
 }
 
-pub struct SeerRelationalStore {
-    kernel: SeerKernel,
+pub struct SeerRelationalStore<K: StorageKernel = SeerKernel> {
+    kernel: K,
     catalog: Catalog,
     committed_writes: Mutex<CommittedWrites>,
 }
 
-impl SeerRelationalStore {
-    pub fn create(config: SeerKernelConfig) -> Result<Self> {
-        Ok(Self {
-            kernel: SeerKernel::create(&config)?,
-            catalog: Catalog::default(),
-            committed_writes: Mutex::new(CommittedWrites::default()),
-        })
-    }
-
-    pub fn open(config: SeerKernelConfig) -> Result<Self> {
-        Self::from_kernel(SeerKernel::open(&config)?)
-    }
-
+impl<K: StorageKernel> SeerRelationalStore<K> {
     /// Consume this store after flushing and closing its SeerDB handle.
     pub fn close(self) -> Result<()> {
         self.kernel.close()
     }
 
-    /// Migrate the current logical state of the legacy relational store into
-    /// a fresh SeerDB directory.
-    ///
-    /// The destination is built in a sibling staging directory, verified,
-    /// closed, and published with an exclusive no-replace rename followed by
-    /// parent-directory sync. The migration is a current-
-    /// state handoff: it preserves catalog definitions, rows, secondary index
-    /// entries, and foreign-key validity, but does not fabricate historical
-    /// SeerDB commits for the legacy store's prior history.
-    pub fn migrate_from_legacy(
-        source: &RelationalStore,
-        config: SeerKernelConfig,
-    ) -> Result<(Self, LegacyMigrationReport)> {
-        Self::migrate_from_legacy_with_options(source, config, LegacyMigrationOptions::default())
-    }
-
-    /// Migrate the source's current logical state with an explicit policy.
-    pub fn migrate_from_legacy_with_options(
-        source: &RelationalStore,
-        config: SeerKernelConfig,
-        options: LegacyMigrationOptions,
-    ) -> Result<(Self, LegacyMigrationReport)> {
-        if config.directory.exists() {
-            return Err(DbError::InvalidState(
-                "migration destination must not already exist".to_owned(),
-            ));
-        }
-        let retained_snapshot_count = source.retained_snapshot_count();
-        if retained_snapshot_count > 0 && !options.allow_history_loss {
-            return Err(DbError::InvalidState(format!(
-                "current-state migration would invalidate {retained_snapshot_count} retained source snapshot(s); set allow_history_loss explicitly"
-            )));
-        }
-        let (catalog, mutations, row_count, index_entry_count) = collect_legacy_migration(source)?;
-        let destination = config.directory.clone();
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| DbError::Io {
-            operation: "create migration parent",
-            source,
-        })?;
-        let name = destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                DbError::InvalidState("migration destination has no valid name".into())
-            })?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| DbError::InvalidState(format!("migration clock is invalid: {error}")))?
-            .as_nanos();
-        let staging = parent.join(format!(
-            ".{name}.seerdb-migration-{}-{nonce}",
-            std::process::id()
-        ));
-        if staging.exists() {
-            return Err(DbError::InvalidState(
-                "migration staging path already exists".to_owned(),
-            ));
-        }
-
-        let staging_config = SeerKernelConfig {
-            directory: staging.clone(),
-            options: config.options.clone(),
-        };
-        let mut published = false;
-        let result = (|| {
-            let mut migrated = Self::create(staging_config)?;
-            let target_commit = if mutations.is_empty() {
-                CommitId(0)
-            } else {
-                migrated.kernel.commit(CommitId(0), &mutations)?.commit
-            };
-            migrated.catalog = catalog;
-            migrated.checkpoint()?;
-            migrated.verify()?;
-            drop(migrated);
-            rename_no_replace(&staging, &destination).map_err(|source| DbError::Io {
-                operation: "publish migrated SeerDB directory",
-                source,
-            })?;
-            published = true;
-            sync_directory(parent).map_err(|error| DbError::MigrationPublished {
-                destination: destination.display().to_string(),
-                reason: error.to_string(),
-            })?;
-            let mut reopened = Self::open(config).map_err(|error| DbError::MigrationPublished {
-                destination: destination.display().to_string(),
-                reason: error.to_string(),
-            })?;
-            reopened
-                .verify()
-                .map_err(|error| DbError::MigrationPublished {
-                    destination: destination.display().to_string(),
-                    reason: error.to_string(),
-                })?;
-            let target_identity =
-                reopened
-                    .storage_identity()
-                    .map_err(|error| DbError::MigrationPublished {
-                        destination: destination.display().to_string(),
-                        reason: error.to_string(),
-                    })?;
-            Ok((
-                reopened,
-                LegacyMigrationReport {
-                    source_commit: source.commit_id(),
-                    target_commit,
-                    target_identity,
-                    table_count: source.catalog().tables().count(),
-                    row_count,
-                    index_entry_count,
-                    mutation_count: mutations.len(),
-                    history_preserved: false,
-                    retained_snapshot_count,
-                    pre_cutover_snapshots_invalidated: retained_snapshot_count > 0,
-                },
-            ))
-        })();
-        if result.is_err() && !published {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        result
-    }
-
-    /// Create an independently verified immutable archive of the current
-    /// typed database without changing this store's directory.
-    pub fn snapshot<P: AsRef<Path>>(&mut self, destination: P) -> Result<seerdb::SnapshotReport> {
-        self.kernel.snapshot(destination)
-    }
-
-    /// Restore an immutable archive into a new writable typed database.
-    pub fn restore<P: AsRef<Path>>(
-        config: SeerKernelConfig,
-        archive: P,
-    ) -> Result<(Self, seerdb::RestoreReport)> {
-        let (kernel, report) = SeerKernel::restore(&config, archive)?;
-        Ok((Self::from_kernel(kernel)?, report))
-    }
-
-    fn from_kernel(kernel: SeerKernel) -> Result<Self> {
+    fn from_kernel(kernel: K) -> Result<Self> {
         let commit = kernel.commit_id();
         let catalog = match kernel.get(commit, CATALOG_KEY)? {
             Some(bytes) => decode_catalog(&bytes)?,
@@ -537,9 +387,9 @@ impl SeerRelationalStore {
     /// Beginning and reading do not require exclusive access to the logical
     /// store. The kernel owns the physical read-view lifetime; the relational
     /// store remains the authority for catalog and row/index semantics.
-    pub fn begin(&self) -> Result<SeerRelationalTransaction> {
+    pub fn begin(&self) -> Result<SeerRelationalTransaction<K>> {
         let read_view = self.kernel.begin_current_read_view()?;
-        let snapshot = CommitId(read_view.commit_id().get());
+        let snapshot = StorageKernel::view_commit_id(&self.kernel, &read_view);
         Ok(SeerRelationalTransaction {
             snapshot,
             read_view: Some(read_view),
@@ -558,7 +408,7 @@ impl SeerRelationalStore {
     /// semantics.
     pub fn transaction<T, F>(&mut self, operation: F) -> Result<(T, CommitId)>
     where
-        F: FnOnce(&Self, &mut SeerRelationalTransaction) -> Result<T>,
+        F: FnOnce(&Self, &mut SeerRelationalTransaction<K>) -> Result<T>,
     {
         let mut transaction = self.begin()?;
         let value = operation(self, &mut transaction)?;
@@ -601,19 +451,19 @@ impl SeerRelationalStore {
     }
 
     /// Retain a published commit for explicit historical reads.
-    pub fn retain(&mut self, snapshot: CommitId) -> Result<crate::SnapshotLease> {
-        self.kernel.retain(snapshot)
+    pub fn retain(&mut self, snapshot: CommitId) -> Result<K::Lease> {
+        StorageKernel::retain(&mut self.kernel, snapshot)
     }
 
     /// Release one caller-owned historical snapshot lease.
-    pub fn release(&mut self, mut lease: crate::SnapshotLease) -> Result<()> {
-        self.kernel.release(&mut lease)
+    pub fn release(&mut self, mut lease: K::Lease) -> Result<()> {
+        StorageKernel::release_lease(&mut self.kernel, &mut lease)
     }
 
     /// Retain the current published root atomically with the kernel's
     /// current-frontier observation.
-    pub fn retain_current(&mut self) -> Result<crate::SnapshotLease> {
-        self.kernel.retain_current_transaction()
+    pub fn retain_current(&mut self) -> Result<K::Lease> {
+        StorageKernel::retain_current(&mut self.kernel)
     }
 
     pub fn get(&self, table: TableId, snapshot: CommitId, primary: Key) -> Result<Option<Row>> {
@@ -776,16 +626,12 @@ impl SeerRelationalStore {
             .collect()
     }
 
-    pub fn checkpoint(&mut self) -> Result<seerdb::VerificationReport> {
-        self.kernel.checkpoint()
+    pub fn checkpoint(&mut self) -> Result<K::IntegrityReport> {
+        StorageKernel::checkpoint(&mut self.kernel)
     }
 
-    pub(crate) fn checkpoint_with_status(&mut self) -> Result<SeerCheckpointReport> {
-        self.kernel.checkpoint_with_status()
-    }
-
-    pub fn verify(&mut self) -> Result<seerdb::VerificationReport> {
-        self.kernel.verify()
+    pub fn verify(&mut self) -> Result<K::IntegrityReport> {
+        StorageKernel::verify(&mut self.kernel)
     }
 
     /// Verify the current typed relational view after the physical SeerDB
@@ -916,13 +762,13 @@ impl SeerRelationalStore {
     fn rows_in_view(
         &self,
         catalog: &Catalog,
-        view: &seerdb::ReadView,
+        view: &K::ReadView,
         table: TableId,
     ) -> Result<Vec<Row>> {
         let definition = catalog.table(table)?;
         let (start, end) = row_range(table);
         self.kernel
-            .read_view_scan(view, &start, &end, usize::MAX)?
+            .view_scan(view, &start, &end, usize::MAX)?
             .into_iter()
             .map(|(key, bytes)| {
                 let identity = row_identity_from_storage_key(table, &key)?;
@@ -934,7 +780,7 @@ impl SeerRelationalStore {
     fn index_rows_in_view(
         &self,
         catalog: &Catalog,
-        view: &seerdb::ReadView,
+        view: &K::ReadView,
         table: TableId,
         index: IndexId,
         bounds: IndexScanBounds<'_>,
@@ -971,13 +817,13 @@ impl SeerRelationalStore {
     fn row_in_view(
         &self,
         catalog: &Catalog,
-        view: &seerdb::ReadView,
+        view: &K::ReadView,
         table: TableId,
         identity: Vec<u8>,
     ) -> Result<Row> {
         let bytes = self
             .kernel
-            .read_view_get(view, &row_storage_key_identity(table, &identity))?
+            .view_get(view, &row_storage_key_identity(table, &identity))?
             .ok_or_else(|| DbError::Corruption {
                 artifact: "seerdb secondary index",
                 reason: "index references a missing row identity".to_owned(),
@@ -988,7 +834,7 @@ impl SeerRelationalStore {
     fn index_entry_keys_in_view(
         &self,
         catalog: &Catalog,
-        view: &seerdb::ReadView,
+        view: &K::ReadView,
         index: IndexId,
         bounds: IndexScanBounds<'_>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1003,7 +849,7 @@ impl SeerRelationalStore {
             .unwrap_or_else(|| prefix_end(&prefix));
 
         self.kernel
-            .read_view_scan(view, &physical_start, &physical_end, bounds.limit)?
+            .view_scan(view, &physical_start, &physical_end, bounds.limit)?
             .into_iter()
             .map(|(key, value)| {
                 if key.len() <= prefix.len() || key[..prefix.len()] != prefix {
@@ -1028,7 +874,7 @@ impl SeerRelationalStore {
     fn index_entries_in_view(
         &self,
         catalog: &Catalog,
-        view: &seerdb::ReadView,
+        view: &K::ReadView,
         index: IndexId,
         rows_by_identity: &BTreeMap<Vec<u8>, Row>,
         bounds: IndexScanBounds<'_>,
@@ -1067,36 +913,12 @@ impl SeerRelationalStore {
             .collect()
     }
 
-    pub fn compact(&mut self) -> Result<seerdb::CompactionReport> {
-        self.kernel.compact()
+    pub fn compact(&mut self) -> Result<K::CompactionReport> {
+        StorageKernel::compact(&mut self.kernel)
     }
 
-    pub(crate) fn compact_with_status(&mut self) -> Result<SeerCompactionReport> {
-        self.kernel.compact_with_status()
-    }
-
-    pub fn compact_with_limit(
-        &mut self,
-        max_relocated_pages: usize,
-    ) -> Result<seerdb::CompactionReport> {
-        self.kernel.compact_with_limit(max_relocated_pages)
-    }
-
-    pub(crate) fn compact_with_limit_status(
-        &mut self,
-        max_relocated_pages: usize,
-    ) -> Result<SeerCompactionReport> {
-        self.kernel.compact_with_limit_status(max_relocated_pages)
-    }
-
-    pub fn metrics(&self) -> Result<seerdb::DBMetrics> {
-        self.kernel.metrics()
-    }
-
-    /// Arm one SeerDB publication fault for the feature-gated R0 harness.
-    #[cfg(feature = "seerdb-fault-injection")]
-    pub fn inject_fault(&self, point: crate::FaultPoint) -> Result<()> {
-        self.kernel.inject_fault(point)
+    pub fn metrics(&self) -> Result<K::Metrics> {
+        StorageKernel::metrics(&self.kernel)
     }
 
     fn publish_catalog(&mut self, candidate: Catalog) -> Result<CommitId> {
@@ -2316,9 +2138,9 @@ pub struct PreparedSeerTransaction {
     pub attempt: Option<TransactionAttemptId>,
 }
 
-pub struct SeerRelationalTransaction {
+pub struct SeerRelationalTransaction<K: StorageKernel = SeerKernel> {
     snapshot: CommitId,
-    read_view: Option<Arc<seerdb::ReadView>>,
+    read_view: Option<Arc<K::ReadView>>,
     mutations: Vec<RelationalMutation>,
     /// Row identities this transaction observed through point reads, in the
     /// same encoding the corresponding writes claim.
@@ -2328,8 +2150,7 @@ pub struct SeerRelationalTransaction {
     table_reads: Mutex<BTreeSet<TableId>>,
     attempt: Option<TransactionAttemptId>,
 }
-
-impl SeerRelationalTransaction {
+impl<K: StorageKernel> SeerRelationalTransaction<K> {
     /// Attach a caller-selected idempotency identity published with this
     /// transaction's mutations.
     pub fn set_attempt(&mut self, attempt: TransactionAttemptId) {
@@ -2345,17 +2166,27 @@ impl SeerRelationalTransaction {
         self.mutations.is_empty()
     }
 
-    pub fn insert(&mut self, store: &SeerRelationalStore, table: TableId, row: Row) -> Result<()> {
+    pub fn insert(
+        &mut self,
+        store: &SeerRelationalStore<K>,
+        table: TableId,
+        row: Row,
+    ) -> Result<()> {
         self.stage(store, RelationalMutation::Insert { table, row })
     }
 
-    pub fn update(&mut self, store: &SeerRelationalStore, table: TableId, row: Row) -> Result<()> {
+    pub fn update(
+        &mut self,
+        store: &SeerRelationalStore<K>,
+        table: TableId,
+        row: Row,
+    ) -> Result<()> {
         self.stage(store, RelationalMutation::Update { table, row })
     }
 
     pub fn delete(
         &mut self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         primary: Key,
     ) -> Result<()> {
@@ -2364,7 +2195,7 @@ impl SeerRelationalTransaction {
 
     pub fn delete_row(
         &mut self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         row: Row,
     ) -> Result<()> {
@@ -2373,7 +2204,7 @@ impl SeerRelationalTransaction {
 
     pub fn get(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         primary: Key,
     ) -> Result<Option<Row>> {
@@ -2396,7 +2227,7 @@ impl SeerRelationalTransaction {
         }
         let mut row = store
             .kernel
-            .read_view_get(view, &row_storage_key(table, primary))?
+            .view_get(view, &row_storage_key(table, primary))?
             .map(|bytes| decode_row(primary, &bytes))
             .transpose()?;
         row = row.map(|row| row.materialize_for(definition)).transpose()?;
@@ -2428,7 +2259,7 @@ impl SeerRelationalTransaction {
     /// including staged inserts, updates, and identity-based deletes.
     pub fn get_by_identity(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         identity: &crate::RowIdentity,
     ) -> Result<Option<Row>> {
@@ -2442,7 +2273,7 @@ impl SeerRelationalTransaction {
             .insert((table, encoded.clone()));
         let mut row = store
             .kernel
-            .read_view_get(view, &row_storage_key_identity(table, &encoded))?
+            .view_get(view, &row_storage_key_identity(table, &encoded))?
             .map(|bytes| row_from_storage_identity(&catalog, definition, &encoded, &bytes))
             .transpose()?;
 
@@ -2483,7 +2314,7 @@ impl SeerRelationalTransaction {
     /// overlaid in primary-key order.
     pub fn scan(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         limit: usize,
     ) -> Result<Vec<Row>> {
@@ -2496,10 +2327,7 @@ impl SeerRelationalTransaction {
             .insert(table);
         let (start, end) = row_range(table);
         let mut rows = BTreeMap::<Vec<u8>, Row>::new();
-        for (key, bytes) in store
-            .kernel
-            .read_view_scan(view, &start, &end, usize::MAX)?
-        {
+        for (key, bytes) in store.kernel.view_scan(view, &start, &end, usize::MAX)? {
             let identity = row_identity_from_storage_key(table, &key)?;
             let row = row_from_storage_identity(&catalog, definition, identity, &bytes)?;
             rows.insert(identity.to_vec(), row);
@@ -2539,7 +2367,7 @@ impl SeerRelationalTransaction {
     /// index changes in this transaction's snapshot.
     pub fn index_get(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         index: IndexId,
         values: &[Value],
@@ -2552,7 +2380,7 @@ impl SeerRelationalTransaction {
     /// staged rows are replaced from the transaction overlay.
     pub fn index_scan(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         index: IndexId,
         start: Option<&[Value]>,
@@ -2564,7 +2392,7 @@ impl SeerRelationalTransaction {
         }
         let view = self.read_view()?;
         let catalog = self.catalog_at_view(store, view)?;
-        let definition = SeerRelationalStore::index_definition(&catalog, table, index)?;
+        let definition = SeerRelationalStore::<K>::index_definition(&catalog, table, index)?;
         let table_definition = catalog.table(table)?;
         self.table_reads
             .lock()
@@ -2623,7 +2451,7 @@ impl SeerRelationalTransaction {
         for (key, value) in
             store
                 .kernel
-                .read_view_scan(view, &physical_start, &physical_end, usize::MAX)?
+                .view_scan(view, &physical_start, &physical_end, usize::MAX)?
         {
             if key.len() <= prefix.len() || key[..prefix.len()] != prefix {
                 return Err(DbError::Corruption {
@@ -2643,7 +2471,7 @@ impl SeerRelationalTransaction {
             if touched.contains(&identity) {
                 let base = store
                     .kernel
-                    .read_view_get(view, &row_storage_key_identity(table, &identity))?
+                    .view_get(view, &row_storage_key_identity(table, &identity))?
                     .ok_or_else(|| DbError::Corruption {
                         artifact: "seerdb secondary index",
                         reason: "index references a missing row identity".to_owned(),
@@ -2706,7 +2534,7 @@ impl SeerRelationalTransaction {
         Ok(rows.into_values().take(limit).collect())
     }
 
-    fn read_view(&self) -> Result<&Arc<seerdb::ReadView>> {
+    fn read_view(&self) -> Result<&Arc<K::ReadView>> {
         self.read_view
             .as_ref()
             .ok_or_else(|| DbError::InvalidState("transaction read view is released".into()))
@@ -2714,10 +2542,10 @@ impl SeerRelationalTransaction {
 
     fn catalog_at_view(
         &self,
-        store: &SeerRelationalStore,
-        view: &seerdb::ReadView,
+        store: &SeerRelationalStore<K>,
+        view: &K::ReadView,
     ) -> Result<Catalog> {
-        match store.kernel.read_view_get(view, CATALOG_KEY)? {
+        match store.kernel.view_get(view, CATALOG_KEY)? {
             Some(bytes) => decode_catalog(&bytes),
             None if self.snapshot == CommitId(0) => Ok(Catalog::default()),
             None => Err(DbError::Corruption {
@@ -2727,7 +2555,7 @@ impl SeerRelationalTransaction {
         }
     }
 
-    pub fn commit(mut self, store: &mut SeerRelationalStore) -> Result<CommitId> {
+    pub fn commit(mut self, store: &mut SeerRelationalStore<K>) -> Result<CommitId> {
         if self.is_read_only() {
             let snapshot = self.snapshot;
             self.read_view.take();
@@ -2772,7 +2600,7 @@ impl SeerRelationalTransaction {
 
     pub fn commit_with_attempt(
         mut self,
-        store: &mut SeerRelationalStore,
+        store: &mut SeerRelationalStore<K>,
         attempt: TransactionAttemptId,
     ) -> Result<CommitId> {
         if self.is_read_only() {
@@ -2795,7 +2623,7 @@ impl SeerRelationalTransaction {
 
     pub fn commit_validated_with_attempt(
         mut self,
-        store: &mut SeerRelationalStore,
+        store: &mut SeerRelationalStore<K>,
         attempt: TransactionAttemptId,
     ) -> Result<CommitId> {
         if self.is_read_only() {
@@ -2808,12 +2636,16 @@ impl SeerRelationalTransaction {
         commit
     }
 
-    pub fn abort(mut self, _store: &mut SeerRelationalStore) -> Result<()> {
+    pub fn abort(mut self, _store: &mut SeerRelationalStore<K>) -> Result<()> {
         self.read_view.take();
         Ok(())
     }
 
-    fn stage(&mut self, store: &SeerRelationalStore, mutation: RelationalMutation) -> Result<()> {
+    fn stage(
+        &mut self,
+        store: &SeerRelationalStore<K>,
+        mutation: RelationalMutation,
+    ) -> Result<()> {
         let view = self.read_view()?;
         let catalog = self.catalog_at_view(store, view)?;
         let mutation = match mutation {
@@ -2883,7 +2715,7 @@ impl SeerRelationalTransaction {
     /// fire in catalog order, children in primary-key scan order.
     fn expand_referential_actions(
         &mut self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         root_table: TableId,
         root_row: &Row,
     ) -> Result<()> {
@@ -2957,7 +2789,7 @@ impl SeerRelationalTransaction {
 
     fn row_by_identity(
         &self,
-        store: &SeerRelationalStore,
+        store: &SeerRelationalStore<K>,
         table: TableId,
         identity: &[u8],
     ) -> Result<Option<Row>> {
@@ -2967,7 +2799,7 @@ impl SeerRelationalTransaction {
 
         let mut row = store
             .kernel
-            .read_view_get(view, &row_storage_key_identity(table, identity))?
+            .view_get(view, &row_storage_key_identity(table, identity))?
             .map(|bytes| row_from_storage_identity(&catalog, definition, identity, &bytes))
             .transpose()?;
 
@@ -3007,7 +2839,6 @@ impl SeerRelationalTransaction {
         Ok(row)
     }
 }
-
 fn index_values_in_bounds(values: &[u8], start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
     start.is_none_or(|start| values >= start) && end.is_none_or(|end| values <= end)
 }
@@ -3105,6 +2936,190 @@ fn prefix_end(prefix: &[u8]) -> Vec<u8> {
         }
     }
     vec![u8::MAX]
+}
+
+/// Engine-specific surface available only on the SeerDB-backed store.
+impl SeerRelationalStore<SeerKernel> {
+    /// Create a typed store over a fresh, verified SeerDB directory.
+    pub fn create(config: SeerKernelConfig) -> Result<Self> {
+        Ok(Self {
+            kernel: SeerKernel::create(&config)?,
+            catalog: Catalog::default(),
+            committed_writes: Mutex::new(CommittedWrites::default()),
+        })
+    }
+
+    /// Open an existing typed store from its SeerDB directory.
+    pub fn open(config: SeerKernelConfig) -> Result<Self> {
+        Self::from_kernel(SeerKernel::open(&config)?)
+    }
+
+    /// Migrate the current logical state of the legacy relational store into
+    /// a fresh SeerDB directory.
+    ///
+    /// The destination is built in a sibling staging directory, verified,
+    /// closed, and published with an exclusive no-replace rename followed by
+    /// parent-directory sync. The migration is a current-state handoff: it
+    /// preserves catalog definitions, rows, secondary index entries, and
+    /// foreign-key validity, but does not fabricate historical SeerDB
+    /// commits for the legacy store's prior history.
+    pub fn migrate_from_legacy(
+        source: &RelationalStore,
+        config: SeerKernelConfig,
+    ) -> Result<(Self, LegacyMigrationReport)> {
+        Self::migrate_from_legacy_with_options(source, config, LegacyMigrationOptions::default())
+    }
+
+    /// Migrate the source's current logical state with an explicit policy.
+    pub fn migrate_from_legacy_with_options(
+        source: &RelationalStore,
+        config: SeerKernelConfig,
+        options: LegacyMigrationOptions,
+    ) -> Result<(Self, LegacyMigrationReport)> {
+        if config.directory.exists() {
+            return Err(DbError::InvalidState(
+                "migration destination must not already exist".to_owned(),
+            ));
+        }
+        let retained_snapshot_count = source.retained_snapshot_count();
+        if retained_snapshot_count > 0 && !options.allow_history_loss {
+            return Err(DbError::InvalidState(format!(
+                "current-state migration would invalidate {retained_snapshot_count} retained source snapshot(s); set allow_history_loss explicitly"
+            )));
+        }
+        let (catalog, mutations, row_count, index_entry_count) = collect_legacy_migration(source)?;
+        let destination = config.directory.clone();
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| DbError::Io {
+            operation: "create migration parent",
+            source,
+        })?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                DbError::InvalidState("migration destination has no valid name".into())
+            })?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| DbError::InvalidState(format!("migration clock is invalid: {error}")))?
+            .as_nanos();
+        let staging = parent.join(format!(
+            ".{name}.seerdb-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        if staging.exists() {
+            return Err(DbError::InvalidState(
+                "migration staging path already exists".to_owned(),
+            ));
+        }
+
+        let staging_config = SeerKernelConfig {
+            directory: staging.clone(),
+            options: config.options.clone(),
+        };
+        let mut published = false;
+        let result = (|| {
+            let mut migrated = Self::create(staging_config)?;
+            let target_commit = if mutations.is_empty() {
+                CommitId(0)
+            } else {
+                migrated.kernel.commit(CommitId(0), &mutations)?.commit
+            };
+            migrated.catalog = catalog;
+            migrated.checkpoint()?;
+            migrated.verify()?;
+            drop(migrated);
+            rename_no_replace(&staging, &destination).map_err(|source| DbError::Io {
+                operation: "publish migrated SeerDB directory",
+                source,
+            })?;
+            published = true;
+            sync_directory(parent).map_err(|error| DbError::MigrationPublished {
+                destination: destination.display().to_string(),
+                reason: error.to_string(),
+            })?;
+            let mut reopened = Self::open(config).map_err(|error| DbError::MigrationPublished {
+                destination: destination.display().to_string(),
+                reason: error.to_string(),
+            })?;
+            reopened
+                .verify()
+                .map_err(|error| DbError::MigrationPublished {
+                    destination: destination.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+            let target_identity =
+                reopened
+                    .storage_identity()
+                    .map_err(|error| DbError::MigrationPublished {
+                        destination: destination.display().to_string(),
+                        reason: error.to_string(),
+                    })?;
+            Ok((
+                reopened,
+                LegacyMigrationReport {
+                    source_commit: source.commit_id(),
+                    target_commit,
+                    target_identity,
+                    table_count: source.catalog().tables().count(),
+                    row_count,
+                    index_entry_count,
+                    mutation_count: mutations.len(),
+                    history_preserved: false,
+                    retained_snapshot_count,
+                    pre_cutover_snapshots_invalidated: retained_snapshot_count > 0,
+                },
+            ))
+        })();
+        if result.is_err() && !published {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
+    }
+
+    /// Create an independently verified immutable archive of the current
+    /// typed database without changing this store's directory.
+    pub fn snapshot<P: AsRef<Path>>(&mut self, destination: P) -> Result<seerdb::SnapshotReport> {
+        self.kernel.snapshot(destination)
+    }
+
+    /// Restore an immutable archive into a new writable typed database.
+    pub fn restore<P: AsRef<Path>>(
+        config: SeerKernelConfig,
+        archive: P,
+    ) -> Result<(Self, seerdb::RestoreReport)> {
+        let (kernel, report) = SeerKernel::restore(&config, archive)?;
+        Ok((Self::from_kernel(kernel)?, report))
+    }
+
+    pub(crate) fn checkpoint_with_status(&mut self) -> Result<SeerCheckpointReport> {
+        self.kernel.checkpoint_with_status()
+    }
+
+    pub(crate) fn compact_with_status(&mut self) -> Result<SeerCompactionReport> {
+        self.kernel.compact_with_status()
+    }
+
+    pub fn compact_with_limit(
+        &mut self,
+        max_relocated_pages: usize,
+    ) -> Result<seerdb::CompactionReport> {
+        self.kernel.compact_with_limit(max_relocated_pages)
+    }
+
+    pub(crate) fn compact_with_limit_status(
+        &mut self,
+        max_relocated_pages: usize,
+    ) -> Result<SeerCompactionReport> {
+        self.kernel.compact_with_limit_status(max_relocated_pages)
+    }
+
+    #[cfg(feature = "seerdb-fault-injection")]
+    /// Arm one SeerDB publication fault for the feature-gated R0 harness.
+    pub fn inject_fault(&self, point: crate::FaultPoint) -> Result<()> {
+        self.kernel.inject_fault(point)
+    }
 }
 
 #[cfg(test)]
