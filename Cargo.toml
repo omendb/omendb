@@ -7,6 +7,8 @@ description = "Embedded relational database built around SeerDB"
 license = "AGPL-3.0-only"
 repository = "https://github.com/omendb/omendb"
 readme = "README.md"
+keywords = ["database", "embedded", "sql", "storage-engine", "oltp"]
+categories = ["database-implementations"]
 
 [features]
 default = []
