@@ -626,3 +626,118 @@ fn test_wal_first_zero_bound_disables_auto_materialization() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn test_wal_first_sync_failure_fences_and_recovery_resolves_outcome() {
+    const CHILD_ENV: &str = "SEERDB_WAL_FIRST_SYNC_FAIL_CHILD_PATH";
+    if let Some(path) = std::env::var_os(CHILD_ENV) {
+        let path = PathBuf::from(path);
+        let mut db = DB::open(&path, wal_first_options()).unwrap();
+        let batch1: Vec<BatchMutation> = (0..4)
+            .map(|op| BatchMutation::Put {
+                key: format!("ack{op}").into_bytes(),
+                value: format!("value-{op}").into_bytes(),
+            })
+            .collect();
+        db.commit_batch(&batch1).unwrap();
+
+        // The next group's WAL sync fails after its bytes reached the file:
+        // the caller sees Err (outcome unknown), the writer fences.
+        db.inject_wal_sync_failure();
+        let result = db.commit_batch(&[BatchMutation::Put {
+            key: b"ambiguous".to_vec(),
+            value: b"value".to_vec(),
+        }]);
+        assert!(result.is_err());
+        assert!(db.durability_status().write_fenced);
+        std::process::exit(137);
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-syncfail.db");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("db::envelope_tests::test_wal_first_sync_failure_fences_and_recovery_resolves_outcome")
+        .arg("--nocapture")
+        .env(CHILD_ENV, &path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+
+    // Recovery must accept both outcomes of the ambiguous batch: its commit
+    // envelope was complete on disk when the process died, so the committed
+    // prefix replays (old-or-complete-new accepts unacknowledged complete
+    // generations). The acked batch is present either way.
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    for op in 0..4 {
+        let key = format!("ack{op}");
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap().as_deref(),
+            Some(format!("value-{op}").as_bytes()),
+            "acked batch must survive"
+        );
+    }
+    assert_eq!(
+        db.get(b"ambiguous").unwrap(),
+        Some(b"value".to_vec()),
+        "complete-but-unacked envelope replays per old-or-complete-new"
+    );
+    db.verify().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn test_wal_first_materialization_failure_preserves_acked_commits() {
+    const CHILD_ENV: &str = "SEERDB_WAL_FIRST_MAT_FAIL_CHILD_PATH";
+    if let Some(path) = std::env::var_os(CHILD_ENV) {
+        let path = PathBuf::from(path);
+        let mut db = DB::open(
+            &path,
+            Options {
+                wal_first_commits: true,
+                // A 1-byte bound makes every ack cross it, so the second
+                // batch's auto-materialization hits the injected fault.
+                wal_materialize_bytes: 1,
+                ..wal_first_options()
+            },
+        )
+        .unwrap();
+        db.commit_batch(&[BatchMutation::Put {
+            key: b"acked".to_vec(),
+            value: b"value".to_vec(),
+        }])
+        .unwrap();
+
+        // Auto-materialization crosses the bound on the next batch; its
+        // authority-frame sync fails after pages were written.
+        db.inject_manifest_sync_failure();
+        let result = db.commit_batch(&[BatchMutation::Put {
+            key: b"second".to_vec(),
+            value: b"value".to_vec(),
+        }]);
+        assert!(result.is_err());
+        std::process::exit(137);
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-first-matfail.db");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("db::envelope_tests::test_wal_first_materialization_failure_preserves_acked_commits")
+        .arg("--nocapture")
+        .env(CHILD_ENV, &path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(137));
+
+    let mut db = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(db.get(b"acked").unwrap(), Some(b"value".to_vec()));
+    // The second batch may have materialized (frame landed despite the
+    // injected sync error being reported) or replay from its WAL prefix;
+    // both outcomes are acceptable old-or-complete-new results.
+    if let Some(value) = db.get(b"second").unwrap() {
+        assert_eq!(value, b"value".to_vec());
+    }
+    db.verify().unwrap();
+    db.close().unwrap();
+}
