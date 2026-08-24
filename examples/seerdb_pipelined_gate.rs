@@ -35,6 +35,7 @@ struct Config {
     max_group: usize,
     key_space: usize,
     path: Option<String>,
+    wal_first: bool,
 }
 
 fn parse_config() -> Result<Config, Box<dyn Error>> {
@@ -44,6 +45,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         max_group: DEFAULT_MAX_GROUP,
         key_space: 64,
         path: None,
+        wal_first: false,
     };
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -61,6 +63,9 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
             }
             "--path" => {
                 config.path = Some(args.next().ok_or("--path requires a value")?);
+            }
+            "--wal-first" => {
+                config.wal_first = true;
             }
             "--help" | "-h" => {
                 println!(
@@ -100,8 +105,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let worker_groups = Arc::clone(&groups);
     let worker_sizes = Arc::clone(&group_sizes);
     let max_group = config.max_group;
+    let wal_first = config.wal_first;
     let worker = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send>> {
-        let mut db = DB::open(&worker_db_path, Options::default())
+        let options = Options {
+            wal_first_commits: wal_first,
+            ..Options::default()
+        };
+        let mut db = DB::open(&worker_db_path, options)
             .map_err(|error| Box::new(error) as Box<dyn Error + Send>)?;
         loop {
             // Drain-close pin: take one envelope's work, then drain to empty
@@ -204,6 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "groups": group_count,
             "avg_group_size": avg_group,
             "ops_per_sec": operations as f64 / elapsed.as_secs_f64(),
+            "wal_first": wal_first,
             "elapsed_ms": elapsed.as_millis() as u64,
             "verified_keys": expected_state.len(),
         })
