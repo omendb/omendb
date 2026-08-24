@@ -404,3 +404,7 @@ mod reclamation_growth_tests;
 #[cfg(test)]
 #[path = "db/published_commits_tests.rs"]
 mod published_commits_tests;
+
+#[cfg(test)]
+#[path = "db/wal_recovery_scale_tests.rs"]
+mod wal_recovery_scale_tests;
