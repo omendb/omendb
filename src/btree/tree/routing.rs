@@ -28,7 +28,7 @@ impl BTree {
                 ));
             }
             depth += 1;
-            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;;
+            let node = self.node(current).ok_or(BTreeError::MissingPage(current))?;
             if node.is_leaf() {
                 return Ok(current);
             }
