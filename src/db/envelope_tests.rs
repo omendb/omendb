@@ -757,43 +757,58 @@ fn probe_wal_first_blob_image_freshness() {
         Some(raw)
     }
 
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("blob-freshness.db");
-    let options = Options {
-        wal_first_commits: true,
-        ..Options::default()
-    };
-    let mut db = DB::open(&path, options.clone()).unwrap();
-    db.commit_batch(&[BatchMutation::Put {
-        key: b"blob0".to_vec(),
-        value: vec![0xB6; 2048],
-    }])
-    .unwrap();
-    println!(
-        "after initial blob put: disk_gen={:?} db_gen={}",
-        disk_blob_generation(&path),
-        db.durability_status().generation_id.get()
-    );
-
-    for index in 0..6usize {
-        let mut tx = db.begin_batch_transaction().unwrap();
-        tx.put(&format!("tx{index}").into_bytes(), b"v").unwrap();
-        if index % 2 == 0 {
-            tx.commit(&mut db).unwrap();
-        } else {
-            tx.abort().unwrap();
-        }
+    for segmented in [false, true] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blob-freshness.db");
+        let options = Options {
+            wal_first_commits: true,
+            blob_storage: if segmented {
+                BlobStorageMode::Segmented
+            } else {
+                BlobStorageMode::WholeImage
+            },
+            ..Options::default()
+        };
+        let mut db = DB::open(&path, options.clone()).unwrap();
+        println!("=== segmented={segmented} ===");
+        db.commit_batch(&[BatchMutation::Put {
+            key: b"blob0".to_vec(),
+            value: vec![0xB6; 2048],
+        }])
+        .unwrap();
         println!(
-            "after tx{index} ({}): disk_gen={:?} db_gen={}",
-            if index % 2 == 0 { "commit" } else { "abort" },
+            "after initial blob put: disk_gen={:?} db_gen={}",
             disk_blob_generation(&path),
             db.durability_status().generation_id.get()
         );
-        if index % 4 == 3 {
-            db.verify().unwrap();
-            db.close().unwrap();
-            db = DB::open(&path, options.clone()).unwrap();
+
+        for index in 0..6usize {
+            let mut tx = db.begin_batch_transaction().unwrap();
+            tx.put(&format!("tx{index}").into_bytes(), b"v").unwrap();
+            if index % 2 == 0 {
+                tx.commit(&mut db).unwrap();
+            } else {
+                tx.abort().unwrap();
+            }
+            println!(
+                "after tx{index} ({}): disk_gen={:?} db_gen={}",
+                if index % 2 == 0 { "commit" } else { "abort" },
+                disk_blob_generation(&path),
+                db.durability_status().generation_id.get()
+            );
+            if index % 4 == 3 {
+                if let Err(error) = db.verify() {
+                    println!("verify FAILED at index {index}: {error}");
+                    break;
+                }
+                db.close().unwrap();
+                db = DB::open(&path, options.clone()).unwrap();
+                if let Err(error) = db.verify() {
+                    println!("reopen verify FAILED at index {index}: {error}");
+                    break;
+                }
+            }
         }
+        db.close().unwrap();
     }
-    db.close().unwrap();
 }
