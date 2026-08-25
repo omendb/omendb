@@ -455,7 +455,9 @@ fn test_wal_first_flush_publishes_authority_frame() {
         value: b"v1".to_vec(),
     }])
     .unwrap();
+    let position = db.durability_status().commit_position;
     db.flush().unwrap();
+    assert_eq!(db.durability_status().commit_position, position);
     assert_eq!(db.get(b"key").unwrap(), Some(b"v1".to_vec()));
     db.close().unwrap();
 

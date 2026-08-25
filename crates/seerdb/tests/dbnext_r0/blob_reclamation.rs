@@ -207,14 +207,21 @@ fn dbnext_r0_recovery_retires_blob_on_inline_wal_replacement() {
 
     let current = active_manifest(&path);
     let record = WalRecord::put(b"key", b"inline-after-recovery");
+    let mut wal_bytes = fs::read(path.join("seerdb.wal")).unwrap();
+    let wal_end = wal_bytes
+        .len()
+        .saturating_add(record.to_bytes().len())
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(current.commit_id.get() + 1),
+        commit_seq: CommitSeq::new(current.commit_seq.get() + 1),
+        lsn: Lsn::from_wal_position(current.wal_segment, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(current.generation_id.get() + 1),
         root_page_id: current.root_page_id,
         mutation_count: 1,
         digest: wal_digest(&record),
     };
-    let mut wal_bytes = record.to_bytes();
+    wal_bytes.extend_from_slice(&record.to_bytes());
     wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
     fs::write(path.join("seerdb.wal"), wal_bytes).unwrap();
 

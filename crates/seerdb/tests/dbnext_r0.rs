@@ -4,7 +4,8 @@
 use seerdb::blob::BlobManager;
 use seerdb::recovery::WalRecord;
 use seerdb::storage::format::{
-    CommitId, CommitRecord, FORMAT_VERSION, GenerationId, MANIFEST_SLOT_SIZE, Manifest,
+    CommitId, CommitRecord, CommitSeq, FORMAT_VERSION, GenerationId, Lsn, MANIFEST_SLOT_SIZE,
+    Manifest,
 };
 use seerdb::{
     BatchMutation, BlobStorageMode, CheckFailureKind, DB, Error, Options, RepairAction,

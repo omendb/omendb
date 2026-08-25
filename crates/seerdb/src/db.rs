@@ -148,8 +148,8 @@ use crate::recovery::{ParseStatus, RecordType, SyncPolicy, WalManager, WalRecord
 use crate::space::{Device, DeviceOptions};
 use crate::storage::StorageEngine;
 use crate::storage::format::{
-    CommitId, CommitRecord, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Manifest,
-    ManifestHistory, PmtCheckpointId, SnapshotId,
+    CommitId, CommitRecord, CommitSeq, DatabaseId, FORMAT_VERSION, GenerationId, HistoryId, Lsn,
+    Manifest, ManifestHistory, PmtCheckpointId, SnapshotId,
 };
 pub(super) use io::{decode_u32, decode_u64, read_exact_at};
 use retention_state::RetentionState;
@@ -220,14 +220,22 @@ pub struct DB {
     history_id: HistoryId,
     /// Latest published generation.
     generation_id: GenerationId,
-    /// Latest published commit.
+    /// Latest published physical commit.
     commit_id: CommitId,
+    /// Latest committed logical visibility sequence (CSN).
+    commit_seq: CommitSeq,
+    /// Latest durable WAL position (LSN).
+    durable_lsn: Lsn,
+    /// WAL segment used by the next append.
+    wal_segment: u64,
     /// Next commit identity reserved for a new logical publication.
     ///
     /// This may be ahead of `commit_id` when a prior publication could have
     /// reached durable WAL or page media but did not become authoritative.
     /// Such an identity is never reused after reopen.
     next_commit_id: CommitId,
+    /// Next logical commit sequence reserved for a new publication.
+    next_commit_seq: CommitSeq,
     /// Next physical generation identity reserved for a new publication.
     next_generation_id: GenerationId,
     /// Number of mutation records since the last published generation.
@@ -258,6 +266,8 @@ pub struct DB {
     pending_blob_frame: bool,
     /// At least one soft-barrier commit is ahead of the last authority frame.
     unframed_commits: bool,
+    /// The newest committed WAL envelope awaiting authority-frame materialization.
+    unframed_commit: Option<CommitRecord>,
     /// WAL bytes acked by soft barriers that no authority frame names yet.
     /// Bounded by `Options::wal_materialize_bytes` to bound replay work.
     unframed_wal_bytes: u64,
@@ -295,8 +305,8 @@ impl DB {
     }
 
     /// Checkpoint a committed WAL prefix discovered during reopen.
-    fn publish_recovered(&mut self, commit: CommitRecord, wal_offset: u64) -> Result<()> {
-        if let Err(error) = self.publish_generation(commit, false, wal_offset) {
+    fn publish_recovered(&mut self, commit: CommitRecord) -> Result<()> {
+        if let Err(error) = self.publish_generation(commit, false) {
             self.write_fenced = true;
             return Err(error);
         }
@@ -318,7 +328,7 @@ impl DB {
             // nothing pending; flush must materialize them, not no-op.
             if self.unframed_commits {
                 return self
-                    .publish_envelope_group()
+                    .materialize_unframed_commit()
                     .inspect_err(|error| {
                         if !matches!(error, Error::CapacityPreflight) {
                             self.write_fenced = true;
@@ -331,13 +341,15 @@ impl DB {
 
         let commit = CommitRecord {
             commit_id: self.next_commit_id,
+            commit_seq: self.next_commit_seq,
+            lsn: Lsn::new(0),
             generation_id: self.next_generation_id,
             root_page_id: self.engine.btree().root_id() as u64,
             mutation_count: self.pending_mutations,
             digest: self.pending_digest,
         };
 
-        if let Err(error) = self.publish_generation(commit, true, 0) {
+        if let Err(error) = self.publish_generation(commit, true) {
             // StorageEngine performs capacity admission before any page
             // write. A refusal at that boundary leaves only an uncommitted
             // WAL mutation prefix, so callers can restore capacity and retry
@@ -382,6 +394,7 @@ impl DB {
             history_id: self.history_id,
             generation_id: GenerationId::new(0),
             commit_id: CommitId::new(0),
+            commit_seq: CommitSeq::new(0),
             page_size: PAGE_SIZE as u32,
             root_page_id: self.engine.btree().root_id() as u64,
             pmt_checkpoint_id: PmtCheckpointId::new(0),
@@ -398,7 +411,6 @@ impl DB {
 #[derive(Debug, Clone, Copy)]
 struct RecoverySummary {
     last_commit: Option<CommitRecord>,
-    last_commit_offset: u64,
     blob_changed: bool,
 }
 

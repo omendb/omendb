@@ -3,6 +3,7 @@
 use crate::blob::DEFAULT_BLOB_THRESHOLD;
 use crate::btree::PAGE_SIZE;
 use crate::error::{Error, Result};
+use crate::storage::format::{CommitRecord, Lsn};
 
 /// Physical layout used for separated values.
 ///
@@ -84,6 +85,15 @@ impl Options {
             return Err(Error::InvalidArgument(format!(
                 "buffer_pool_size must be at least one page ({PAGE_SIZE} bytes)"
             )));
+        }
+        // One WAL segment's LSN stores a 32-bit byte offset. Keep the
+        // configured pending budget below that representable boundary after
+        // accounting for the segment marker and commit envelope.
+        let framing = (4 + 1 + 8 + 4) as u64 + (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
+        if self.max_wal_bytes > Lsn::MAX_OFFSET.saturating_sub(framing) {
+            return Err(Error::InvalidArgument(
+                "max_wal_bytes exceeds the representable WAL LSN segment".into(),
+            ));
         }
         Ok(())
     }

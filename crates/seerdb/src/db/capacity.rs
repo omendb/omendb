@@ -16,7 +16,7 @@ use crate::btree::{BTree, BlobPointer, PAGE_SIZE};
 use crate::mvcc::PageMapping;
 use crate::space::reserve_file;
 use crate::storage::format::{
-    CommitId, FORMAT_VERSION, GenerationId, Manifest, ManifestHistory, PmtCheckpointId,
+    CommitId, CommitSeq, FORMAT_VERSION, GenerationId, Manifest, ManifestHistory, PmtCheckpointId,
 };
 use std::fs::{self, OpenOptions};
 
@@ -146,6 +146,7 @@ impl DB {
             history_id: self.history_id,
             generation_id: GenerationId::new(0),
             commit_id: CommitId::new(0),
+            commit_seq: CommitSeq::new(0),
             page_size: PAGE_SIZE as u32,
             root_page_id: 0,
             pmt_checkpoint_id: PmtCheckpointId::new(0),

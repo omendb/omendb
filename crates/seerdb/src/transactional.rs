@@ -15,7 +15,7 @@
 use crate::db::{BatchMutation, DB, Options};
 use crate::error::{Error, Result};
 use crate::mvcc::{ValueVersion, decode_record, encode_record, latest_record, visible_record};
-use crate::storage::format::{CommitId, CommitSeq, TreeId, TxnId};
+use crate::storage::format::{CommitId, CommitPosition, CommitSeq, TreeId, TxnId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -83,6 +83,7 @@ pub struct Transaction {
     runtime: Arc<Runtime>,
     id: TxnId,
     snapshot: CommitSeq,
+    snapshot_position: CommitPosition,
     writes: BTreeMap<(TreeId, Vec<u8>), Option<Vec<u8>>>,
     created: BTreeSet<TreeId>,
     dropped: BTreeSet<TreeId>,
@@ -131,7 +132,8 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        let snapshot = CommitSeq::new(db.durability_status().commit_id.get());
+        let snapshot_position = db.durability_status().commit_position;
+        let snapshot = snapshot_position.csn;
         self.runtime
             .active_transactions
             .fetch_add(1, Ordering::AcqRel);
@@ -139,6 +141,7 @@ impl TransactionDatabase {
             runtime: Arc::clone(&self.runtime),
             id: TxnId::new(id),
             snapshot,
+            snapshot_position,
             writes: BTreeMap::new(),
             created: BTreeSet::new(),
             dropped: BTreeSet::new(),
@@ -146,8 +149,13 @@ impl TransactionDatabase {
         })
     }
 
-    /// Return the current committed sequence number.
+    /// Return the current logical committed sequence number (CSN).
     pub fn commit_sequence(&self) -> Result<CommitSeq> {
+        Ok(self.commit_position()?.csn)
+    }
+
+    /// Return the current logical and durable commit position.
+    pub fn commit_position(&self) -> Result<CommitPosition> {
         let db = self
             .runtime
             .db
@@ -156,7 +164,7 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        Ok(CommitSeq::new(db.durability_status().commit_id.get()))
+        Ok(db.durability_status().commit_position)
     }
 
     /// Flush and close the underlying durable database.
@@ -194,7 +202,7 @@ impl Runtime {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        let current = CommitSeq::new(db.durability_status().commit_id.get());
+        let current = db.durability_status().commit_position.csn;
         let next = CommitSeq::new(
             current
                 .get()
@@ -223,7 +231,7 @@ impl Runtime {
             },
         ];
         let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
-        let committed = CommitSeq::new(status.commit_id.get());
+        let committed = status.commit_position.csn;
         if committed != next {
             return Err(Error::NeedsRecovery(format!(
                 "tree reservation expected {:?}, storage published {:?}",
@@ -246,6 +254,12 @@ impl Transaction {
     #[must_use]
     pub fn snapshot(&self) -> CommitSeq {
         self.snapshot
+    }
+
+    /// Return the logical and durable position captured at transaction begin.
+    #[must_use]
+    pub fn snapshot_position(&self) -> CommitPosition {
+        self.snapshot_position
     }
 
     /// Return the transaction lifecycle state.
@@ -443,18 +457,22 @@ impl Transaction {
     }
 
     /// Publish all staged tree and key mutations atomically.
-    pub fn commit(&mut self) -> Result<CommitSeq> {
+    pub fn commit(&mut self) -> Result<CommitPosition> {
         self.check_active()?;
         if self.is_read_only() {
-            let commit = self.snapshot;
-            self.state = TransactionState::Committed { commit };
-            return Ok(commit);
+            let position = self.snapshot_position;
+            self.state = TransactionState::Committed {
+                commit: position.csn,
+            };
+            return Ok(position);
         }
         let result = commit_transaction(self);
         match result {
-            Ok(commit) => {
-                self.state = TransactionState::Committed { commit };
-                Ok(commit)
+            Ok(position) => {
+                self.state = TransactionState::Committed {
+                    commit: position.csn,
+                };
+                Ok(position)
             }
             Err(error)
                 if matches!(&error, Error::NeedsRecovery(_))
@@ -531,7 +549,7 @@ impl Drop for Transaction {
     }
 }
 
-fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
+fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
     let mut db = transaction
         .runtime
         .db
@@ -540,7 +558,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
     if transaction.runtime.closed.load(Ordering::Acquire) {
         return Err(Error::InvalidArgument("database is closed".into()));
     }
-    let current = CommitSeq::new(db.durability_status().commit_id.get());
+    let current = db.durability_status().commit_position.csn;
     validate_conflicts(transaction, &db, current)?;
 
     let next = CommitSeq::new(
@@ -601,7 +619,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
         value: encode_change(&change)?,
     });
     let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
-    let committed = CommitSeq::new(status.commit_id.get());
+    let committed = status.commit_position.csn;
     if committed != next {
         return Err(Error::Corruption(format!(
             "transaction expected commit {:?}, storage published {:?}",
@@ -609,7 +627,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
         )));
     }
     lock_changes(&transaction.runtime).insert(committed, change);
-    Ok(committed)
+    Ok(status.commit_position)
 }
 
 fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) -> Result<()> {
@@ -955,8 +973,8 @@ mod tests {
         let mut second = database.begin().expect("second begin");
         first.put(tree, b"a", b"one").expect("first write");
         second.put(tree, b"b", b"two").expect("second write");
-        assert_eq!(first.commit().expect("first commit").get(), 3);
-        assert_eq!(second.commit().expect("disjoint commit").get(), 4);
+        assert_eq!(first.commit().expect("first commit").csn.get(), 3);
+        assert_eq!(second.commit().expect("disjoint commit").csn.get(), 4);
 
         let reader = database.begin().expect("reader begin");
         assert_eq!(
@@ -1084,8 +1102,34 @@ mod tests {
         let snapshot = transaction.snapshot();
         let mut transaction = transaction;
         assert!(transaction.is_read_only());
-        assert_eq!(transaction.commit().expect("commit"), snapshot);
+        assert_eq!(transaction.commit().expect("commit").csn, snapshot);
         assert_eq!(database.commit_sequence().expect("head"), snapshot);
+    }
+
+    #[test]
+    fn commit_position_reports_csn_and_lsn_across_reopen() {
+        let (directory, database) = database();
+        let initial = database.commit_position().expect("initial position");
+        assert_eq!(initial.csn, CommitSeq::new(0));
+        assert_eq!(initial.lsn, crate::storage::format::Lsn::new(0));
+
+        let mut transaction = database.begin().expect("begin");
+        let tree = transaction.create_tree().expect("create tree");
+        transaction.put(tree, b"key", b"value").expect("write");
+        let position = transaction.commit().expect("commit position");
+        drop(transaction);
+        assert!(position.csn > initial.csn);
+        assert!(position.lsn > initial.lsn);
+        assert_eq!(database.commit_position().expect("head"), position);
+        database.close().expect("close");
+
+        let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen");
+        assert_eq!(
+            reopened.commit_position().expect("reopened position"),
+            position
+        );
+        reopened.close().expect("close reopened");
     }
 
     #[test]

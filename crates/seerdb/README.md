@@ -90,9 +90,10 @@ for the cross-project boundary and roadmap.
 The current Rust development lane is a single-writer durable kernel with
 concurrent reads, root-generation retention, WAL recovery, crash-safe
 reclamation, and retryable capacity refusal. `TransactionDatabase` now stores
-committed per-key version chains and supplies first-class trees, fixed-snapshot
-reads, atomic multi-tree mutations, and reopen-persistent write-conflict
-records above that kernel. It is still not the target physical multi-writer
+committed per-key version chains, returns explicit `{CSN, LSN}` commit
+positions, and supplies first-class trees, fixed-snapshot reads, atomic
+multi-tree mutations, and reopen-persistent write-conflict records above that
+kernel. It is still not the target physical multi-writer
 engine or a releasable `0.1.0-alpha.*` crate. Transaction-status indirection,
 an append-oriented undo store, concurrent page/WAL publication, broader
 filesystem/block-layer fault qualification, OmenDB direct integration, and

@@ -23,6 +23,8 @@ fn test_record_types() {
         WalRecord::txn_abort(101),
         WalRecord::commit(CommitRecord {
             commit_id: crate::storage::format::CommitId::new(1),
+            commit_seq: crate::storage::format::CommitSeq::new(1),
+            lsn: crate::storage::format::Lsn::new(0),
             generation_id: crate::storage::format::GenerationId::new(1),
             root_page_id: 0,
             mutation_count: 2,
@@ -73,6 +75,8 @@ fn test_parse_status_distinguishes_torn_and_corrupt_suffixes() {
 fn test_commit_record_roundtrip() {
     let expected = CommitRecord {
         commit_id: crate::storage::format::CommitId::new(8),
+        commit_seq: crate::storage::format::CommitSeq::new(8),
+        lsn: crate::storage::format::Lsn::new(123),
         generation_id: crate::storage::format::GenerationId::new(9),
         root_page_id: 10,
         mutation_count: 11,

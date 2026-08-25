@@ -2,7 +2,7 @@
 
 use super::retention_state::RetentionLease;
 use super::{DB, DurabilityStatus, Error, Result, VerificationReport};
-use crate::storage::format::SnapshotId;
+use crate::storage::format::{CommitPosition, SnapshotId};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +71,11 @@ impl Snapshot {
             .durability_status())
     }
 
+    /// Return the logical and durable position captured by this snapshot.
+    pub fn commit_position(&self) -> Result<CommitPosition> {
+        Ok(self.durability_status()?.commit_position)
+    }
+
     /// Release the snapshot directory immediately.
     pub fn release(mut self) -> Result<()> {
         self.db.take();
@@ -133,6 +138,11 @@ impl RetainedSnapshot {
             .as_ref()
             .ok_or_else(|| Error::InvalidArgument("snapshot has been released".into()))?
             .durability_status()
+    }
+
+    /// Return the logical and durable position captured by this snapshot.
+    pub fn commit_position(&self) -> Result<CommitPosition> {
+        Ok(self.durability_status()?.commit_position)
     }
 
     /// Release the physical root-retention lease and temporary read copy.

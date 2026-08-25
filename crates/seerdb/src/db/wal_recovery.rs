@@ -4,7 +4,7 @@ use super::mutation::{Mutation, apply as apply_mutation};
 use super::{BTree, BlobManager, Error, RecoverySummary, Result};
 use crate::btree::MAX_KEY_SIZE;
 use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
-use crate::storage::format::Manifest;
+use crate::storage::format::{Lsn, Manifest};
 use std::path::Path;
 
 pub(super) struct WalAnalysis {
@@ -31,12 +31,35 @@ pub(super) fn analyze_wal_bytes(
     let mut last_commit_end = 0usize;
     let mut has_unpublished_commit = false;
     let mut offset = 0usize;
+    let mut wal_segment = current_manifest.map_or(0, |manifest| manifest.wal_segment);
+    let mut saw_segment_marker = false;
 
     for record in &records {
         let record_len = record.to_bytes().len();
+        let record_start = offset;
         offset = offset
             .checked_add(record_len)
             .ok_or_else(|| Error::Corruption("WAL record offset overflow".into()))?;
+        if record.record_type == RecordType::WalSegment {
+            if saw_segment_marker || record_start != 0 || !pending.is_empty() {
+                return Err(Error::Corruption(
+                    "WAL segment marker is not the first record".into(),
+                ));
+            }
+            let marker_segment = record
+                .wal_segment_id()
+                .ok_or_else(|| Error::Corruption("invalid WAL segment marker".into()))?;
+            if (current_manifest.is_none() && marker_segment != 0)
+                || current_manifest.is_some_and(|manifest| marker_segment < manifest.wal_segment)
+            {
+                return Err(Error::Corruption(
+                    "WAL segment marker is inconsistent with the manifest segment".into(),
+                ));
+            }
+            wal_segment = marker_segment;
+            saw_segment_marker = true;
+            continue;
+        }
         if is_mutation(record) {
             pending.push(record);
             continue;
@@ -45,6 +68,13 @@ pub(super) fn analyze_wal_bytes(
             let commit = record
                 .commit_record()
                 .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+            let expected_lsn = Lsn::from_wal_position(wal_segment, offset as u64)
+                .ok_or_else(|| Error::Corruption("WAL position exceeds LSN capacity".into()))?;
+            if commit.lsn != expected_lsn {
+                return Err(Error::Corruption(
+                    "WAL commit LSN does not match its record boundary".into(),
+                ));
+            }
             if commit.mutation_count != pending.len() as u64
                 || commit.digest != digest_records(&pending)
             {
@@ -56,7 +86,9 @@ pub(super) fn analyze_wal_bytes(
             if let Some(current) = current_manifest {
                 match commit.generation_id.get().cmp(&current.generation_id.get()) {
                     std::cmp::Ordering::Less => {
-                        if commit.commit_id.get() > current.commit_id.get() {
+                        if commit.commit_id.get() > current.commit_id.get()
+                            || commit.commit_seq.get() > current.commit_seq.get()
+                        {
                             return Err(Error::Corruption(
                                 "WAL commit frontier is inconsistent with manifest".into(),
                             ));
@@ -64,6 +96,14 @@ pub(super) fn analyze_wal_bytes(
                     }
                     std::cmp::Ordering::Equal => {
                         if commit.commit_id != current.commit_id
+                            || commit.commit_seq != current.commit_seq
+                            || commit.lsn
+                                != Lsn::from_wal_position(current.wal_segment, current.wal_offset)
+                                    .ok_or_else(|| {
+                                    Error::Corruption(
+                                        "manifest WAL position exceeds LSN capacity".into(),
+                                    )
+                                })?
                             || commit.root_page_id != current.root_page_id
                             || commit.mutation_count != current.mutation_count
                             || commit.digest != current.digest
@@ -74,7 +114,9 @@ pub(super) fn analyze_wal_bytes(
                         }
                     }
                     std::cmp::Ordering::Greater => {
-                        if commit.commit_id <= current.commit_id {
+                        if commit.commit_id <= current.commit_id
+                            || commit.commit_seq <= current.commit_seq
+                        {
                             return Err(Error::Corruption(
                                 "WAL commit frontier is inconsistent with manifest".into(),
                             ));
@@ -82,7 +124,10 @@ pub(super) fn analyze_wal_bytes(
                         has_unpublished_commit = true;
                     }
                 }
-            } else if commit.generation_id.get() > 0 || commit.commit_id.get() > 0 {
+            } else if commit.generation_id.get() > 0
+                || commit.commit_id.get() > 0
+                || commit.commit_seq.get() > 0
+            {
                 has_unpublished_commit = true;
             }
             pending.clear();
@@ -153,12 +198,34 @@ pub(super) fn recover_from_wal(
 
     let mut pending = Vec::new();
     let mut last_commit = None;
-    let mut last_commit_offset = 0;
     let mut blob_changed = false;
     let mut offset = 0u64;
+    let mut wal_segment = current_manifest.map_or(0, |manifest| manifest.wal_segment);
+    let mut saw_segment_marker = false;
     for record in &records {
         let record_len = record.to_bytes().len() as u64;
+        let record_start = offset;
         match record.record_type {
+            RecordType::WalSegment => {
+                if saw_segment_marker || record_start != 0 || !pending.is_empty() {
+                    return Err(Error::Corruption(
+                        "WAL segment marker is not the first record".into(),
+                    ));
+                }
+                let marker_segment = record
+                    .wal_segment_id()
+                    .ok_or_else(|| Error::Corruption("invalid WAL segment marker".into()))?;
+                if (current_manifest.is_none() && marker_segment != 0)
+                    || current_manifest
+                        .is_some_and(|manifest| marker_segment < manifest.wal_segment)
+                {
+                    return Err(Error::Corruption(
+                        "WAL segment marker is inconsistent with the manifest segment".into(),
+                    ));
+                }
+                wal_segment = marker_segment;
+                saw_segment_marker = true;
+            }
             RecordType::Put | RecordType::Delete | RecordType::PutV2 | RecordType::DeleteV2 => {
                 pending.push(record)
             }
@@ -166,6 +233,16 @@ pub(super) fn recover_from_wal(
                 let commit = record
                     .commit_record()
                     .ok_or_else(|| Error::Corruption("invalid WAL commit envelope".into()))?;
+                let commit_end = offset
+                    .checked_add(record_len)
+                    .ok_or_else(|| Error::Corruption("WAL record offset overflow".into()))?;
+                let expected_lsn = Lsn::from_wal_position(wal_segment, commit_end)
+                    .ok_or_else(|| Error::Corruption("WAL position exceeds LSN capacity".into()))?;
+                if commit.lsn != expected_lsn {
+                    return Err(Error::Corruption(
+                        "WAL commit LSN does not match its record boundary".into(),
+                    ));
+                }
                 if commit.mutation_count != pending.len() as u64
                     || commit.digest != digest_records(&pending)
                 {
@@ -177,7 +254,9 @@ pub(super) fn recover_from_wal(
                 if let Some(current) = current_manifest {
                     match commit.generation_id.get().cmp(&current.generation_id.get()) {
                         std::cmp::Ordering::Less => {
-                            if commit.commit_id.get() > current.commit_id.get() {
+                            if commit.commit_id.get() > current.commit_id.get()
+                                || commit.commit_seq.get() > current.commit_seq.get()
+                            {
                                 return Err(Error::Corruption(
                                     "WAL commit frontier is inconsistent with manifest".into(),
                                 ));
@@ -187,12 +266,21 @@ pub(super) fn recover_from_wal(
                             continue;
                         }
                         std::cmp::Ordering::Equal => {
-                            if commit.commit_id != current.commit_id {
+                            if commit.commit_id != current.commit_id
+                                || commit.commit_seq != current.commit_seq
+                            {
                                 return Err(Error::Corruption(
                                     "WAL commit frontier is inconsistent with manifest".into(),
                                 ));
                             }
-                            if commit.root_page_id != current.root_page_id
+                            if commit.lsn
+                                != Lsn::from_wal_position(current.wal_segment, current.wal_offset)
+                                    .ok_or_else(|| {
+                                    Error::Corruption(
+                                        "manifest WAL position exceeds LSN capacity".into(),
+                                    )
+                                })?
+                                || commit.root_page_id != current.root_page_id
                                 || commit.mutation_count != current.mutation_count
                                 || commit.digest != current.digest
                             {
@@ -205,7 +293,9 @@ pub(super) fn recover_from_wal(
                             continue;
                         }
                         std::cmp::Ordering::Greater => {
-                            if commit.commit_id <= current.commit_id {
+                            if commit.commit_id <= current.commit_id
+                                || commit.commit_seq <= current.commit_seq
+                            {
                                 return Err(Error::Corruption(
                                     "WAL commit frontier is inconsistent with manifest".into(),
                                 ));
@@ -246,7 +336,6 @@ pub(super) fn recover_from_wal(
                     blob_changed |= applied.blob_changed;
                 }
                 last_commit = Some(commit);
-                last_commit_offset = offset;
             }
             _ => {}
         }
@@ -255,7 +344,6 @@ pub(super) fn recover_from_wal(
 
     Ok(RecoverySummary {
         last_commit,
-        last_commit_offset,
         blob_changed,
     })
 }

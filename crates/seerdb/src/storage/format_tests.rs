@@ -22,6 +22,7 @@ fn manifest(generation_id: u64, commit_id: u64) -> Manifest {
         history_id: HistoryId::new(2),
         generation_id: GenerationId::new(generation_id),
         commit_id: CommitId::new(commit_id),
+        commit_seq: CommitSeq::new(commit_id),
         page_size: 4096,
         root_page_id: 42,
         pmt_checkpoint_id: PmtCheckpointId::new(9),
@@ -48,6 +49,8 @@ fn superblock_roundtrip_and_checksum_validation() {
 fn commit_record_roundtrip() {
     let commit = CommitRecord {
         commit_id: CommitId::new(8),
+        commit_seq: CommitSeq::new(8),
+        lsn: Lsn::from_wal_position(3, 8192).unwrap(),
         generation_id: GenerationId::new(9),
         root_page_id: 10,
         mutation_count: 11,

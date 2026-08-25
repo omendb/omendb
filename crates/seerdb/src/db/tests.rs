@@ -514,6 +514,44 @@ fn test_db_rejects_malformed_meta_container() {
 }
 
 #[test]
+fn test_db_reopen_after_wal_recreation_advances_lsn_segment() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal-recreation.db");
+    let first_position = {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"first", b"value").unwrap();
+        db.flush().unwrap();
+        let position = db.durability_status().commit_position;
+        db.close().unwrap();
+        position
+    };
+
+    let second_position = {
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        db.put(b"uncommitted", b"discard").unwrap();
+        drop(db);
+
+        let mut db = DB::open(&path, Options::default()).unwrap();
+        assert_eq!(db.get(b"uncommitted").unwrap(), None);
+        db.put(b"second", b"value").unwrap();
+        db.flush().unwrap();
+        let position = db.durability_status().commit_position;
+        assert!(position.lsn > first_position.lsn);
+        db.close().unwrap();
+        position
+    };
+
+    let mut reopened = DB::open(&path, Options::default()).unwrap();
+    assert_eq!(
+        reopened.durability_status().commit_position,
+        second_position
+    );
+    assert_eq!(reopened.get(b"first").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(reopened.get(b"second").unwrap(), Some(b"value".to_vec()));
+    reopened.close().unwrap();
+}
+
+#[test]
 fn test_db_persistence() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
@@ -788,14 +826,22 @@ fn test_db_recovers_committed_blob_upsert() {
     };
 
     let record = WalRecord::put(b"key", &replacement);
+    let mut wal_bytes = fs::read(path.join(WAL_FILE)).unwrap();
+    let wal_end = wal_bytes
+        .len()
+        .saturating_add(record.to_bytes().len())
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize)
+        as u64;
     let commit = CommitRecord {
         commit_id: CommitId::new(commit_id + 1),
+        commit_seq: CommitSeq::new(commit_id + 1),
+        lsn: Lsn::from_wal_position(0, wal_end).unwrap(),
         generation_id: GenerationId::new(generation_id + 1),
         root_page_id,
         mutation_count: 1,
         digest: digest_records(&[&record]),
     };
-    let mut wal_bytes = record.to_bytes();
+    wal_bytes.extend_from_slice(&record.to_bytes());
     wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
     fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
 
@@ -808,32 +854,19 @@ fn test_db_discards_wal_commit_already_published_by_manifest() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("stale-authoritative-wal.db");
 
-    let (commit_id, generation_id, root_page_id) = {
+    let (commit_id, generation_id) = {
         let mut db = DB::open(&path, Options::default()).unwrap();
         db.put(b"key", b"value").unwrap();
         db.flush().unwrap();
 
-        (
-            db.commit_id,
-            db.generation_id,
-            db.engine.btree().root_id() as u64,
-        )
+        (db.commit_id, db.generation_id)
     };
 
     // Model the crash window where manifest publication succeeded but WAL
-    // cleanup did not. Replaying this commit would publish the same
-    // logical state under a new generation.
-    let record = WalRecord::put(b"key", b"value");
-    let commit = CommitRecord {
-        commit_id,
-        generation_id,
-        root_page_id,
-        mutation_count: 1,
-        digest: digest_records(&[&record]),
-    };
-    let mut wal_bytes = record.to_bytes();
-    wal_bytes.extend_from_slice(&WalRecord::commit(commit).to_bytes());
-    fs::write(path.join(WAL_FILE), wal_bytes).unwrap();
+    // cleanup did not. The retained WAL from the successful publication is
+    // already the stale authoritative prefix; replaying it must not publish
+    // the same logical state under a new generation.
+    assert!(path.join(WAL_FILE).is_file());
 
     let reopened = DB::open(&path, Options::default()).unwrap();
     assert_eq!(reopened.get(b"key").unwrap(), Some(b"value".to_vec()));
@@ -850,8 +883,14 @@ fn test_db_recovers_committed_large_blob_value() {
     let path = dir.path().join("large-blob-recovery.db");
     let value = vec![0x7B; 70_000];
     let record = WalRecord::put(b"large-key", &value);
+    let wal_end = record
+        .to_bytes()
+        .len()
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
+        commit_seq: CommitSeq::new(1),
+        lsn: Lsn::from_wal_position(0, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(1),
         root_page_id: 0,
         mutation_count: 1,
@@ -876,8 +915,14 @@ fn test_db_replays_legacy_wal_put_record() {
     payload.extend_from_slice(&(5u16).to_le_bytes());
     payload.extend_from_slice(b"value");
     let record = WalRecord::new(RecordType::Put, payload);
+    let wal_end = record
+        .to_bytes()
+        .len()
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
+        commit_seq: CommitSeq::new(1),
+        lsn: Lsn::from_wal_position(0, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(1),
         root_page_id: 0,
         mutation_count: 1,

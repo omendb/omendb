@@ -195,6 +195,14 @@ impl DB {
             crate::storage::record_durability_sync();
             sync_directory(&self.path)?;
         }
+        if current == 0 {
+            // A retained WAL file inherits its segment from the authority
+            // manifest. A newly created file must carry its own segment so a
+            // crash after WAL recreation can recover an LSN newer than the
+            // previous manifest even when the old WAL file was reclaimed.
+            self.wal.append(&WalRecord::wal_segment(self.wal_segment));
+            self.write_wal_to_disk(true)?;
+        }
         self.wal_reserved_extent = target;
         Ok(current.max(target))
     }

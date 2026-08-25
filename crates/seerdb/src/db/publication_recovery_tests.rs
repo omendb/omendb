@@ -115,8 +115,15 @@ fn test_db_recovers_committed_wal_prefix_with_torn_suffix() {
         WalRecord::put(b"key3", b"value3"),
     ];
     let references: Vec<_> = records.iter().collect();
+    let wal_end = records
+        .iter()
+        .map(|record| record.to_bytes().len())
+        .sum::<usize>()
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
+        commit_seq: CommitSeq::new(1),
+        lsn: Lsn::from_wal_position(0, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(1),
         root_page_id: 0,
         mutation_count: records.len() as u64,
@@ -148,8 +155,15 @@ fn test_db_reopen_accepts_every_wal_truncation_prefix() {
         WalRecord::put(b"key3", b"value3"),
     ];
     let references: Vec<_> = records.iter().collect();
+    let wal_end = records
+        .iter()
+        .map(|record| record.to_bytes().len())
+        .sum::<usize>()
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
+        commit_seq: CommitSeq::new(1),
+        lsn: Lsn::from_wal_position(0, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(1),
         root_page_id: 0,
         mutation_count: records.len() as u64,
@@ -196,8 +210,14 @@ fn test_db_rejects_wal_commit_digest_mismatch() {
     let path = dir.path().join("test.db");
     let record = WalRecord::put(b"key", b"value");
     let references = vec![&record];
+    let wal_end = record
+        .to_bytes()
+        .len()
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
+        commit_seq: CommitSeq::new(1),
+        lsn: Lsn::from_wal_position(0, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(1),
         root_page_id: 0,
         mutation_count: 1,

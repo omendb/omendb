@@ -194,19 +194,17 @@ impl DB {
         // Stage 2: ONE commit record covering the cumulative pending
         // mutation prefix. Under the default CoW policy it remains buffered;
         // the synced authority frame below is the acknowledgement point.
-        // Explicit `sync_writes` still forces the WAL. The offset is the file
-        // length BEFORE the commit record: mutation records precede it.
-        let wal_path = self.path.join(WAL_FILE);
-        let wal_offset = fs::metadata(&wal_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let commit = CommitRecord {
+        // Explicit `sync_writes` still forces the WAL. The commit position is
+        // assigned at the logical end of its WAL envelope.
+        let commit = self.assign_commit_lsn(CommitRecord {
             commit_id: self.next_commit_id,
+            commit_seq: self.next_commit_seq,
+            lsn: Lsn::new(0),
             generation_id: generation,
             root_page_id: self.engine.btree().root_id() as u64,
             mutation_count: self.pending_mutations,
             digest: self.pending_digest,
-        };
+        })?;
         self.next_commit_id = CommitId::new(
             self.next_commit_id
                 .get()
@@ -240,7 +238,7 @@ impl DB {
                 return Err(std::io::Error::other("injected frame append failure").into());
             }
         }
-        let wal_path = self.append_envelope_frame(commit, wal_offset, parent_manifest)?;
+        let wal_path = self.append_envelope_frame(commit, parent_manifest)?;
         self.finish_generation_publication(commit, wal_path)?;
         Ok(())
     }
@@ -269,13 +267,15 @@ impl DB {
         let generation = self.next_generation_id;
         self.write_group_blob_artifacts(generation)?;
 
-        let commit = CommitRecord {
+        let commit = self.assign_commit_lsn(CommitRecord {
             commit_id: self.next_commit_id,
+            commit_seq: self.next_commit_seq,
+            lsn: Lsn::new(0),
             generation_id: generation,
             root_page_id: self.engine.btree().root_id() as u64,
             mutation_count: self.pending_mutations,
             digest: self.pending_digest,
-        };
+        })?;
         self.next_commit_id = CommitId::new(
             self.next_commit_id
                 .get()
@@ -294,6 +294,15 @@ impl DB {
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
+        self.commit_seq = commit.commit_seq;
+        self.durable_lsn = commit.lsn;
+        self.next_commit_seq = CommitSeq::new(
+            commit
+                .commit_seq
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("commit sequence overflow".into()))?,
+        );
         self.unframed_wal_bytes = self
             .unframed_wal_bytes
             .saturating_add(self.pending_wal_bytes)
@@ -305,6 +314,28 @@ impl DB {
         // pending_blob_frame and unframed_commits survive: materialization
         // must still name these bytes and this state with an authority frame.
         self.unframed_commits = true;
+        self.unframed_commit = Some(commit);
         Ok(())
+    }
+
+    /// Materialize the newest WAL-first commit without inventing a second
+    /// logical CSN. The WAL commit is already durable and visible; this step
+    /// only makes its pages and authority frame durable for bounded recovery.
+    pub(super) fn materialize_unframed_commit(&mut self) -> Result<()> {
+        let commit = self
+            .unframed_commit
+            .ok_or_else(|| Error::Corruption("missing unframed commit metadata".into()))?;
+        let parent_manifest = self
+            .manifest_history
+            .latest()
+            .unwrap_or_else(|| self.bootstrap_manifest());
+        if self.engine.reclamation_needs_refresh() {
+            self.engine.refresh_reclamation()?;
+        }
+        self.preflight_publication_capacity()?;
+        self.engine.set_write_generation(commit.generation_id.get());
+        self.engine.flush_after_reclamation_refresh()?;
+        let wal_path = self.append_envelope_frame(commit, parent_manifest)?;
+        self.finish_generation_publication(commit, wal_path)
     }
 }

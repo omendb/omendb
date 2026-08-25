@@ -98,14 +98,21 @@ fn dbnext_r0_repair_replays_committed_wal_into_new_location() {
 
     let current = active_manifest(&source_path);
     let mutation = WalRecord::put(b"replayed", b"value-2");
+    let mut wal = fs::read(source_path.join("seerdb.wal")).unwrap();
+    let wal_end = wal
+        .len()
+        .saturating_add(mutation.to_bytes().len())
+        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
     let commit = CommitRecord {
         commit_id: CommitId::new(current.commit_id.get() + 1),
+        commit_seq: CommitSeq::new(current.commit_seq.get() + 1),
+        lsn: Lsn::from_wal_position(current.wal_segment, wal_end as u64).unwrap(),
         generation_id: GenerationId::new(current.generation_id.get() + 1),
         root_page_id: current.root_page_id,
         mutation_count: 1,
         digest: wal_digest(&mutation),
     };
-    let mut wal = mutation.to_bytes();
+    wal.extend_from_slice(&mutation.to_bytes());
     wal.extend_from_slice(&WalRecord::commit(commit).to_bytes());
     fs::write(source_path.join("seerdb.wal"), wal).unwrap();
 

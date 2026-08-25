@@ -16,16 +16,32 @@ impl DB {
         &mut self,
         commit: CommitRecord,
         append_commit: bool,
-        recovered_wal_offset: u64,
     ) -> Result<()> {
+        let commit = if append_commit {
+            self.assign_commit_lsn(commit)?
+        } else {
+            commit
+        };
         let preparation = self.prepare_generation_publication(commit)?;
-        let wal_path = self.write_generation_artifacts(
-            commit,
-            append_commit,
-            recovered_wal_offset,
-            preparation.parent_manifest,
-        )?;
+        let wal_path =
+            self.write_generation_artifacts(commit, append_commit, preparation.parent_manifest)?;
         self.finish_generation_publication(commit, wal_path)
+    }
+
+    pub(super) fn assign_commit_lsn(&mut self, mut commit: CommitRecord) -> Result<CommitRecord> {
+        // Pending mutation records may still be buffered in WalManager. Flush
+        // them before measuring the commit envelope's durable end position so
+        // the LSN names the actual WAL boundary rather than a buffer offset.
+        self.write_wal_to_disk(false)?;
+        let wal_len = fs::metadata(self.path.join(WAL_FILE))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let wal_end = wal_len
+            .checked_add(WAL_COMMIT_RECORD_BYTES)
+            .ok_or_else(|| Error::Wal("WAL position overflow".into()))?;
+        commit.lsn = Lsn::from_wal_position(self.wal_segment, wal_end)
+            .ok_or_else(|| Error::Wal("WAL position exceeds LSN capacity".into()))?;
+        Ok(commit)
     }
 
     fn prepare_generation_publication(
@@ -89,7 +105,6 @@ impl DB {
         &mut self,
         commit: CommitRecord,
         append_commit: bool,
-        recovered_wal_offset: u64,
         parent_manifest: Manifest,
     ) -> Result<PathBuf> {
         let blob_started = Instant::now();
@@ -125,23 +140,16 @@ impl DB {
             .blob_write_ns
             .saturating_add(elapsed_nanos(blob_started));
 
-        let wal_path = self.path.join(WAL_FILE);
-        let wal_offset = if append_commit {
+        if append_commit {
             // The commit record completes the generation's mutation prefix.
-            // A default CoW publication does not need a separate WAL barrier:
-            // the synced authority frame below is the acknowledgement point.
-            // Explicit `sync_writes` retains the configured WAL sync policy.
-            let offset = fs::metadata(&wal_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            // `assign_commit_lsn` measured the logical end position before
+            // this publication phase, after flushing pending mutation bytes.
+            // The synced authority frame below remains the acknowledgement
+            // point for the default copy-on-write mode.
             self.wal.append(&WalRecord::commit(commit));
             self.write_wal_to_disk(false)?;
-            offset
-        } else {
-            recovered_wal_offset
-        };
-
-        self.append_envelope_frame(commit, wal_offset, parent_manifest)
+        }
+        self.append_envelope_frame(commit, parent_manifest)
     }
 
     /// Build the published manifest for `commit`, append its authority frame
@@ -153,7 +161,6 @@ impl DB {
     pub(super) fn append_envelope_frame(
         &mut self,
         commit: CommitRecord,
-        wal_offset: u64,
         parent_manifest: Manifest,
     ) -> Result<PathBuf> {
         let wal_path = self.path.join(WAL_FILE);
@@ -162,11 +169,12 @@ impl DB {
             history_id: self.history_id,
             generation_id: commit.generation_id,
             commit_id: commit.commit_id,
+            commit_seq: commit.commit_seq,
             page_size: PAGE_SIZE as u32,
             root_page_id: commit.root_page_id,
             pmt_checkpoint_id: PmtCheckpointId::new(commit.generation_id.get()),
-            wal_segment: 0,
-            wal_offset,
+            wal_segment: commit.lsn.segment(),
+            wal_offset: commit.lsn.offset(),
             mutation_count: commit.mutation_count,
             digest: commit.digest,
             format_version: FORMAT_VERSION,
@@ -238,9 +246,14 @@ impl DB {
         if wal_path.exists() {
             let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
             if wal_len >= WAL_RETENTION_RECLAIM_BYTES {
+                let next_segment = self
+                    .wal_segment
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("WAL segment overflow".into()))?;
                 fs::remove_file(&wal_path)?;
                 self.invalidate_wal_handle();
                 self.wal_reserved_extent = 0;
+                self.wal_segment = next_segment;
                 // WAL removal is cleanup after the manifest has selected the
                 // generation. If the directory entry removal is not durable, a
                 // reopen sees the already-published commit and discards the stale
@@ -255,6 +268,9 @@ impl DB {
 
         self.generation_id = commit.generation_id;
         self.commit_id = commit.commit_id;
+        self.commit_seq = commit.commit_seq;
+        self.wal_segment = self.wal_segment.max(commit.lsn.segment());
+        self.durable_lsn = commit.lsn;
         self.next_generation_id = GenerationId::new(
             self.next_generation_id.get().max(
                 commit
@@ -273,12 +289,22 @@ impl DB {
                     .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
             ),
         );
+        self.next_commit_seq = CommitSeq::new(
+            self.next_commit_seq.get().max(
+                commit
+                    .commit_seq
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("commit sequence overflow".into()))?,
+            ),
+        );
         self.pending_mutations = 0;
         self.pending_wal_bytes = 0;
         self.pending_digest = 0;
         self.pending_blob_changes = false;
         self.pending_blob_frame = false;
         self.unframed_commits = false;
+        self.unframed_commit = None;
         self.unframed_wal_bytes = 0;
         Ok(())
     }

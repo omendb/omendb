@@ -155,6 +155,9 @@ impl DB {
             || manifest.history_id != self.history_id
             || manifest.generation_id != self.generation_id
             || manifest.commit_id != self.commit_id
+            || manifest.commit_seq != self.commit_seq
+            || Lsn::from_wal_position(manifest.wal_segment, manifest.wal_offset)
+                != Some(self.durable_lsn)
         {
             return Err(VerificationFailure {
                 kind: CheckFailureKind::Manifest,

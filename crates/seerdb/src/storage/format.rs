@@ -11,7 +11,11 @@ pub use manifest_history::ManifestHistory;
 pub use super::retention_format::{RetainedRoot, RetentionRegistry};
 
 /// Current durable format version.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 records the logical commit sequence and the WAL end position in
+/// every durable commit envelope. The pre-alpha format has no compatibility
+/// promise, so older stores fail closed instead of being silently upgraded.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Fixed size of the superblock record.
 pub const SUPERBLOCK_SIZE: usize = 4096;
@@ -86,10 +90,64 @@ numeric_id!(
     CommitSeq,
     "Commit sequence number assigned when a transaction becomes visible."
 );
-numeric_id!(
-    Lsn,
-    "Logical write-ahead-log position reserved for replication and change streams."
-);
+
+/// Logical write-ahead-log position.
+///
+/// The high 32 bits identify the retained WAL segment and the low 32 bits
+/// identify a byte offset at the end of a committed WAL record. Encoding the
+/// segment and offset together makes ordering survive WAL-file reclamation
+/// while keeping positions compact in public commit results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Lsn(u64);
+
+impl Lsn {
+    /// Maximum byte offset representable within one WAL segment.
+    pub const MAX_OFFSET: u64 = u32::MAX as u64;
+
+    /// Construct an LSN from its persisted packed representation.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the persisted packed representation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Construct an LSN from a WAL segment and end offset.
+    pub const fn from_wal_position(segment: u64, offset: u64) -> Option<Self> {
+        if segment > u32::MAX as u64 || offset > Self::MAX_OFFSET {
+            return None;
+        }
+        Some(Self((segment << 32) | offset))
+    }
+
+    /// Return the WAL segment component.
+    pub const fn segment(self) -> u64 {
+        self.0 >> 32
+    }
+
+    /// Return the byte offset component.
+    pub const fn offset(self) -> u64 {
+        self.0 & Self::MAX_OFFSET
+    }
+}
+
+/// Logical and durable position returned for a committed transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitPosition {
+    /// Logical committed visibility order (CSN).
+    pub csn: CommitSeq,
+    /// Durable WAL end position (LSN).
+    pub lsn: Lsn,
+}
+
+impl CommitPosition {
+    /// Construct a commit position.
+    pub const fn new(csn: CommitSeq, lsn: Lsn) -> Self {
+        Self { csn, lsn }
+    }
+}
 numeric_id!(TreeId, "First-class ordered keyspace identity.");
 numeric_id!(PageVersion, "Version of one logical page mapping.");
 
@@ -165,8 +223,13 @@ impl Superblock {
 /// Commit metadata persisted in a logical WAL commit record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitRecord {
-    /// Monotonic durable commit identity.
+    /// Monotonic durable commit identity used by the physical generation
+    /// publication protocol.
     pub commit_id: CommitId,
+    /// Logical committed visibility order (CSN).
+    pub commit_seq: CommitSeq,
+    /// Durable WAL end position (LSN) for this commit envelope.
+    pub lsn: Lsn,
     /// Root generation made visible by this commit.
     pub generation_id: GenerationId,
     /// Root page for the new generation.
@@ -179,17 +242,19 @@ pub struct CommitRecord {
 
 impl CommitRecord {
     /// Serialized payload size, including the format version.
-    pub const SERIALIZED_SIZE: usize = 40;
+    pub const SERIALIZED_SIZE: usize = 56;
 
     /// Encode a commit payload for a WAL record.
     pub fn to_bytes(self) -> [u8; Self::SERIALIZED_SIZE] {
         let mut bytes = [0; Self::SERIALIZED_SIZE];
         bytes[0..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[4..12].copy_from_slice(&self.commit_id.get().to_le_bytes());
-        bytes[12..20].copy_from_slice(&self.generation_id.get().to_le_bytes());
-        bytes[20..28].copy_from_slice(&self.root_page_id.to_le_bytes());
-        bytes[28..36].copy_from_slice(&self.mutation_count.to_le_bytes());
-        bytes[36..40].copy_from_slice(&self.digest.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.commit_seq.get().to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.lsn.get().to_le_bytes());
+        bytes[28..36].copy_from_slice(&self.generation_id.get().to_le_bytes());
+        bytes[36..44].copy_from_slice(&self.root_page_id.to_le_bytes());
+        bytes[44..52].copy_from_slice(&self.mutation_count.to_le_bytes());
+        bytes[52..56].copy_from_slice(&self.digest.to_le_bytes());
         bytes
     }
 
@@ -206,10 +271,12 @@ impl CommitRecord {
 
         Some(Self {
             commit_id: CommitId::new(u64::from_le_bytes(bytes[4..12].try_into().ok()?)),
-            generation_id: GenerationId::new(u64::from_le_bytes(bytes[12..20].try_into().ok()?)),
-            root_page_id: u64::from_le_bytes(bytes[20..28].try_into().ok()?),
-            mutation_count: u64::from_le_bytes(bytes[28..36].try_into().ok()?),
-            digest: u32::from_le_bytes(bytes[36..40].try_into().ok()?),
+            commit_seq: CommitSeq::new(u64::from_le_bytes(bytes[12..20].try_into().ok()?)),
+            lsn: Lsn::new(u64::from_le_bytes(bytes[20..28].try_into().ok()?)),
+            generation_id: GenerationId::new(u64::from_le_bytes(bytes[28..36].try_into().ok()?)),
+            root_page_id: u64::from_le_bytes(bytes[36..44].try_into().ok()?),
+            mutation_count: u64::from_le_bytes(bytes[44..52].try_into().ok()?),
+            digest: u32::from_le_bytes(bytes[52..56].try_into().ok()?),
         })
     }
 }
@@ -223,8 +290,10 @@ pub struct Manifest {
     pub history_id: HistoryId,
     /// Generation identity used for slot ordering.
     pub generation_id: GenerationId,
-    /// Commit made visible by this generation.
+    /// Physical publication identity made visible by this generation.
     pub commit_id: CommitId,
+    /// Logical committed visibility order made visible by this generation.
+    pub commit_seq: CommitSeq,
     /// Physical page size used by this database.
     pub page_size: u32,
     /// Root logical page ID.
@@ -257,6 +326,7 @@ impl Manifest {
         bytes[32..40].copy_from_slice(&self.history_id.get().to_le_bytes());
         bytes[40..48].copy_from_slice(&self.generation_id.get().to_le_bytes());
         bytes[48..56].copy_from_slice(&self.commit_id.get().to_le_bytes());
+        bytes[100..108].copy_from_slice(&self.commit_seq.get().to_le_bytes());
         bytes[56..64].copy_from_slice(&self.root_page_id.to_le_bytes());
         bytes[64..72].copy_from_slice(&self.pmt_checkpoint_id.get().to_le_bytes());
         bytes[72..80].copy_from_slice(&self.wal_segment.to_le_bytes());
@@ -321,6 +391,11 @@ impl Manifest {
             )),
             commit_id: CommitId::new(u64::from_le_bytes(
                 bytes[48..56].try_into().map_err(|_| "invalid commit ID")?,
+            )),
+            commit_seq: CommitSeq::new(u64::from_le_bytes(
+                bytes[100..108]
+                    .try_into()
+                    .map_err(|_| "invalid commit sequence")?,
             )),
             root_page_id: u64::from_le_bytes(
                 bytes[56..64]

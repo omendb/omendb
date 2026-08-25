@@ -20,8 +20,8 @@
 //! The low-level durable contract still uses one serialized publication lane
 //! with concurrent readers and explicit root-generation retention. The public
 //! [`TransactionDatabase`] facade now resolves logical per-key MVCC chains and
-//! durable commit identities above that lane; physical page/WAL multi-writer
-//! publication remains a later engine phase.
+//! returns explicit `{CSN, LSN}` commit positions above that lane; physical
+//! page/WAL multi-writer publication remains a later engine phase.
 //!
 //! # Example
 //!
@@ -72,6 +72,7 @@ pub use db::{
 pub use error::{CheckFailureKind, Error, Result};
 pub use storage::StorageMetrics;
 pub use storage::format::{
-    CommitId, CommitSeq, GenerationId, HistoryId, Lsn, PageVersion, SnapshotId, TreeId, TxnId,
+    CommitId, CommitPosition, CommitSeq, GenerationId, HistoryId, Lsn, PageVersion, SnapshotId,
+    TreeId, TxnId,
 };
 pub use transactional::{Transaction, TransactionDatabase, TransactionState};

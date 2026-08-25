@@ -12,7 +12,11 @@ pub(super) struct OpenCatalog {
     pub(super) history_id: HistoryId,
     pub(super) generation_id: GenerationId,
     pub(super) commit_id: CommitId,
+    pub(super) commit_seq: CommitSeq,
+    pub(super) durable_lsn: Lsn,
+    pub(super) wal_segment: u64,
     pub(super) next_commit_id: CommitId,
+    pub(super) next_commit_seq: CommitSeq,
     pub(super) next_generation_id: GenerationId,
     pub(super) retention: Arc<Mutex<RetentionState>>,
     pub(super) protected_offsets: Arc<Mutex<HashSet<u64>>>,
@@ -126,7 +130,7 @@ impl DB {
             });
         }
 
-        let (database_id, history_id, generation_id, commit_id) =
+        let (database_id, history_id, generation_id, commit_id, commit_seq, durable_lsn) =
             Self::open_identities(&paths.path, current_manifest)?;
         // The authority log is the only history source: every valid
         // publication frame contributes its manifest.
@@ -144,8 +148,9 @@ impl DB {
                 .reconcile_current(current)
                 .map_err(|message| Error::Corruption(format!("manifest history {message}")))?;
         }
-        let (next_commit_id, next_generation_id) =
-            Self::next_open_identities(commit_id, generation_id)?;
+        let (next_commit_id, next_commit_seq, next_generation_id) =
+            Self::next_open_identities(commit_id, commit_seq, generation_id)?;
+        let wal_segment = Self::open_wal_segment(paths, current_manifest)?;
         let open_retention =
             Self::load_retention(paths, database_id, history_id, read_only, check_only)?;
 
@@ -160,11 +165,49 @@ impl DB {
             history_id,
             generation_id,
             commit_id,
+            commit_seq,
+            durable_lsn,
+            wal_segment,
             next_commit_id,
+            next_commit_seq,
             next_generation_id,
             retention: open_retention.state,
             protected_offsets: open_retention.protected_offsets,
         })
+    }
+
+    fn open_wal_segment(paths: &OpenPaths, current_manifest: Option<Manifest>) -> Result<u64> {
+        let fallback = match current_manifest {
+            Some(current) if current.wal_offset != 0 => current
+                .wal_segment
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("WAL segment overflow".into()))?,
+            Some(current) => current.wal_segment,
+            None => 0,
+        };
+        if !paths.wal.exists() {
+            return Ok(fallback);
+        }
+
+        let bytes = fs::read(&paths.wal)?;
+        let (records, _) = WalManager::parse_records_with_status(&bytes);
+        let Some(first) = records.first() else {
+            return Ok(current_manifest.map_or(0, |manifest| manifest.wal_segment));
+        };
+        if first.record_type != RecordType::WalSegment {
+            return Ok(current_manifest.map_or(0, |manifest| manifest.wal_segment));
+        }
+        let segment = first
+            .wal_segment_id()
+            .ok_or_else(|| Error::Corruption("invalid WAL segment marker".into()))?;
+        if (current_manifest.is_none() && segment != 0)
+            || current_manifest.is_some_and(|manifest| segment < manifest.wal_segment)
+        {
+            return Err(Error::Corruption(
+                "WAL segment marker is inconsistent with the manifest segment".into(),
+            ));
+        }
+        Ok(segment)
     }
 
     fn validate_selected_artifacts(
@@ -192,7 +235,14 @@ impl DB {
     fn open_identities(
         path: &Path,
         current_manifest: Option<Manifest>,
-    ) -> Result<(DatabaseId, HistoryId, GenerationId, CommitId)> {
+    ) -> Result<(
+        DatabaseId,
+        HistoryId,
+        GenerationId,
+        CommitId,
+        CommitSeq,
+        Lsn,
+    )> {
         if let Some(current) = current_manifest {
             if current.page_size as usize != PAGE_SIZE {
                 return Err(Error::Corruption(format!(
@@ -200,11 +250,15 @@ impl DB {
                     current.page_size
                 )));
             }
+            let durable_lsn = Lsn::from_wal_position(current.wal_segment, current.wal_offset)
+                .ok_or_else(|| Error::Corruption("manifest WAL position overflows LSN".into()))?;
             return Ok((
                 current.database_id,
                 current.history_id,
                 current.generation_id,
                 current.commit_id,
+                current.commit_seq,
+                durable_lsn,
             ));
         }
         Ok((
@@ -212,13 +266,16 @@ impl DB {
             HistoryId::new(1),
             GenerationId::new(0),
             CommitId::new(0),
+            CommitSeq::new(0),
+            Lsn::new(0),
         ))
     }
 
     fn next_open_identities(
         commit_id: CommitId,
+        commit_seq: CommitSeq,
         generation_id: GenerationId,
-    ) -> Result<(CommitId, GenerationId)> {
+    ) -> Result<(CommitId, CommitSeq, GenerationId)> {
         // Identities advance monotonically from the authoritative manifest.
         // If a crashed publication leaves a complete WAL commit prefix, open
         // recovery replays or records that generation before completing. The
@@ -231,6 +288,12 @@ impl DB {
                     .get()
                     .checked_add(1)
                     .ok_or_else(|| Error::Wal("commit ID overflow".into()))?,
+            ),
+            CommitSeq::new(
+                commit_seq
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Wal("commit sequence overflow".into()))?,
             ),
             GenerationId::new(
                 generation_id

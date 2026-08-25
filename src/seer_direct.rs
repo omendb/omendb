@@ -145,7 +145,7 @@ impl DirectSeerStore {
         transaction
             .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
             .map_err(map_seer_error)?;
-        let commit = transaction.commit().map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
         self.table_trees = table_trees;
@@ -191,7 +191,7 @@ impl DirectSeerStore {
         transaction
             .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
             .map_err(map_seer_error)?;
-        let commit = transaction.commit().map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
         self.index_trees = index_trees;
@@ -219,7 +219,7 @@ impl DirectSeerStore {
             .put(table_tree, &identity, &encode_row(&row)?)
             .map_err(map_seer_error)?;
         self.stage_indexes(&mut transaction, table, &definition, &row, &identity, true)?;
-        let commit = transaction.commit().map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         Ok(commit)
     }
@@ -238,7 +238,7 @@ impl DirectSeerStore {
             .delete(table_tree, identity)
             .map_err(map_seer_error)?;
         self.stage_indexes(&mut transaction, table, &definition, &row, identity, false)?;
-        let commit = transaction.commit().map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         Ok(commit)
     }

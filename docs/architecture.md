@@ -202,8 +202,10 @@ relational consumer:
    transactions, committed per-key version chains, ordered scans, atomic
    multi-tree mutation, and durable exact write-conflict records. Transaction
    status indirection, append-oriented undo storage, ordered cursor handles,
-   range dependencies, durable LSN results, retention-aware version GC, and
-   physical multi-writer WAL/page publication remain open.
+   range dependencies, retention-aware version GC, and physical multi-writer
+   WAL/page publication remain open. The transactional facade now returns an
+   explicit `{CSN, LSN}` commit position and persists that position through
+   manifest/WAL recovery; zero-gap committed-change export still remains open.
 3. **OmenDB direct integration — qualification path started:**
    `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
    per index without using `StorageKernel`. Next, expand its relational

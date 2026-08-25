@@ -35,6 +35,11 @@ impl DB {
                 "next commit identity is not ahead of the published commit".into(),
             ));
         }
+        if self.next_commit_seq <= self.commit_seq {
+            return Err(Error::Corruption(
+                "next commit sequence is not ahead of the published sequence".into(),
+            ));
+        }
         if self.next_generation_id <= self.generation_id {
             return Err(Error::Corruption(
                 "next generation identity is not ahead of the published generation".into(),
@@ -44,6 +49,12 @@ impl DB {
         // A fenced handle may contain a partially published in-memory
         // frontier. Its recovery-required outcome must remain visible to the
         // caller instead of being replaced by a derived identity error.
+        if self.unframed_commits != self.unframed_commit.is_some() {
+            return Err(Error::Corruption(
+                "unframed commit flag and metadata disagree".into(),
+            ));
+        }
+
         if !self.write_fenced {
             self.validate_published_frontier()?;
         }
@@ -113,7 +124,10 @@ impl DB {
         if self.unframed_commits {
             // WAL-first commits legitimately lead the last authority frame
             // until materialization names their state with a new frame.
-            if current.generation_id > self.generation_id || current.commit_id > self.commit_id {
+            if current.generation_id > self.generation_id
+                || current.commit_id > self.commit_id
+                || current.commit_seq > self.commit_seq
+            {
                 return Err(Error::Corruption(
                     "published manifest frontier is ahead of the coordinator".into(),
                 ));
@@ -128,6 +142,20 @@ impl DB {
         if current.commit_id != self.commit_id {
             return Err(Error::Corruption(
                 "published manifest commit differs from the coordinator".into(),
+            ));
+        }
+        if current.commit_seq != self.commit_seq {
+            return Err(Error::Corruption(
+                "published manifest commit sequence differs from the coordinator".into(),
+            ));
+        }
+        let manifest_lsn = Lsn::from_wal_position(current.wal_segment, current.wal_offset)
+            .ok_or_else(|| {
+                Error::Corruption("manifest WAL position exceeds LSN capacity".into())
+            })?;
+        if manifest_lsn != self.durable_lsn {
+            return Err(Error::Corruption(
+                "published manifest LSN differs from the coordinator".into(),
             ));
         }
         if self.pending_mutations == 0

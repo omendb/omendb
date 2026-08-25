@@ -81,7 +81,11 @@ impl DB {
             history_id: catalog.history_id,
             generation_id: catalog.generation_id,
             commit_id: catalog.commit_id,
+            commit_seq: catalog.commit_seq,
+            durable_lsn: catalog.durable_lsn,
+            wal_segment: catalog.wal_segment,
             next_commit_id: catalog.next_commit_id,
+            next_commit_seq: catalog.next_commit_seq,
             next_generation_id: catalog.next_generation_id,
             pending_mutations: 0,
             pending_wal_bytes: 0,
@@ -93,6 +97,7 @@ impl DB {
                 .is_some_and(|summary| summary.blob_changed),
             pending_blob_frame: false,
             unframed_commits: false,
+            unframed_commit: None,
             unframed_wal_bytes: 0,
             pending_envelopes: Vec::new(),
             next_envelope_id: 0,
@@ -114,6 +119,7 @@ impl DB {
                 history_id: db.history_id,
                 generation_id: GenerationId::new(0),
                 commit_id: CommitId::new(0),
+                commit_seq: CommitSeq::new(0),
                 page_size: PAGE_SIZE as u32,
                 root_page_id: db.engine.btree().root_id() as u64,
                 pmt_checkpoint_id: PmtCheckpointId::new(0),
@@ -133,7 +139,7 @@ impl DB {
 
         if let Some(recovery) = recovery {
             if let Some(commit) = recovery.last_commit {
-                db.publish_recovered(commit, recovery.last_commit_offset)?;
+                db.publish_recovered(commit)?;
             } else {
                 // Complete mutations without a commit envelope are not
                 // visible in the durable protocol and may be discarded.

@@ -3,7 +3,7 @@
 
 use super::wal_recovery::{digest_records, recover_from_wal};
 use crate::recovery::{ParseStatus, RecordType, WalManager, WalRecord};
-use crate::storage::format::{CommitId, CommitRecord, GenerationId};
+use crate::storage::format::{CommitId, CommitRecord, CommitSeq, GenerationId, Lsn};
 use std::time::Instant;
 
 fn synthetic_committed_wal(generations: usize, ops_per_gen: usize) -> Vec<u8> {
@@ -21,8 +21,15 @@ fn synthetic_committed_wal(generations: usize, ops_per_gen: usize) -> Vec<u8> {
         for record in &pending {
             out.extend_from_slice(&record.to_bytes());
         }
+        let lsn = Lsn::from_wal_position(
+            0,
+            out.len() as u64 + (4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64,
+        )
+        .unwrap();
         let commit = CommitRecord {
             commit_id: CommitId::new(commit_id),
+            commit_seq: CommitSeq::new(commit_id),
+            lsn,
             generation_id: GenerationId::new(generation + 1),
             root_page_id: 1,
             mutation_count: pending.len() as u64,

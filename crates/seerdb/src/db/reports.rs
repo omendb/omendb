@@ -6,7 +6,7 @@
 use crate::buffer::BufferStats;
 use crate::error::Result;
 use crate::storage::StorageMetrics;
-use crate::storage::format::{CommitId, DatabaseId, GenerationId, HistoryId};
+use crate::storage::format::{CommitId, CommitPosition, DatabaseId, GenerationId, HistoryId};
 use std::fs;
 use std::time::Instant;
 
@@ -35,8 +35,10 @@ pub struct DurabilityStatus {
     pub history_id: HistoryId,
     /// Latest manifest generation known to this handle.
     pub generation_id: GenerationId,
-    /// Latest durable commit known to this handle.
+    /// Latest physical publication identity known to this handle.
     pub commit_id: CommitId,
+    /// Latest logical commit and durable WAL position known to this handle.
+    pub commit_position: CommitPosition,
     /// Mutations currently journaled but not yet published in a generation.
     pub pending_mutations: u64,
     /// Whether this writer must be reopened before accepting more writes.
@@ -300,6 +302,7 @@ impl DB {
             history_id: self.history_id,
             generation_id: self.generation_id,
             commit_id: self.commit_id,
+            commit_position: CommitPosition::new(self.commit_seq, self.durable_lsn),
             pending_mutations: self.pending_mutations,
             write_fenced: self.write_fenced,
         }

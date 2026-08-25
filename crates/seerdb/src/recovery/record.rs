@@ -39,6 +39,8 @@ pub enum RecordType {
     PutV2 = 11,
     /// Current Delete: key_len(u32) + key.
     DeleteV2 = 12,
+    /// WAL segment marker written at the start of a newly created segment.
+    WalSegment = 13,
 }
 
 /// Result of parsing a WAL prefix.
@@ -111,6 +113,24 @@ impl WalRecord {
     /// Create a durable commit envelope record.
     pub fn commit(commit: CommitRecord) -> Self {
         Self::new(RecordType::Commit, commit.to_bytes().to_vec())
+    }
+
+    /// Create a WAL segment marker.
+    pub fn wal_segment(segment: u64) -> Self {
+        Self::new(RecordType::WalSegment, segment.to_le_bytes().to_vec())
+    }
+
+    /// Decode this record as a WAL segment marker.
+    pub fn wal_segment_id(&self) -> Option<u64> {
+        (self.record_type == RecordType::WalSegment)
+            .then(|| {
+                self.payload
+                    .as_slice()
+                    .try_into()
+                    .ok()
+                    .map(u64::from_le_bytes)
+            })
+            .flatten()
     }
 
     /// Decode this record as a durable commit envelope.
@@ -194,6 +214,7 @@ impl WalRecord {
             10 => RecordType::Commit,
             11 => RecordType::PutV2,
             12 => RecordType::DeleteV2,
+            13 => RecordType::WalSegment,
             _ => return None, // unknown type
         };
 

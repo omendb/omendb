@@ -4,7 +4,7 @@ use super::retention_state::RetentionLease;
 use super::{BlobReadView, DB, DurabilityStatus, Error, Result};
 use crate::btree::LookupResult;
 use crate::storage::StorageReadView;
-use crate::storage::format::CommitId;
+use crate::storage::format::{CommitId, CommitPosition};
 use std::sync::Arc;
 
 /// A cheap immutable read handle bound to one published SeerDB generation.
@@ -25,6 +25,12 @@ impl ReadView {
     #[must_use]
     pub fn commit_id(&self) -> CommitId {
         self.durability.commit_id
+    }
+
+    /// Return the logical and durable position captured by this view.
+    #[must_use]
+    pub fn commit_position(&self) -> CommitPosition {
+        self.durability.commit_position
     }
 
     /// Return the durability state captured by this view.
