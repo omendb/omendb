@@ -4,15 +4,17 @@
 //! storage engine. It provides first-class tree identities, fixed snapshots,
 //! atomic multi-tree batches, and snapshot-isolation write-conflict checking.
 //! The physical engine remains the single publication authority; this module
-//! owns transaction coordination and the durable conflict record that makes
-//! concurrent in-process transactions restartable.
+//! owns transaction coordination and logical per-key version chains. The
+//! current slice uses the durable commit sequence for visibility and retains
+//! the conflict record for restartable change history.
 //!
 //! The API deliberately does not expose a backend matrix or a fake plugin
 //! trait. OmenDB can call this capability-rich surface directly while the
 //! server/session layer is built above it.
 
-use crate::db::{BatchMutation, DB, Options, ReadView};
+use crate::db::{BatchMutation, DB, Options};
 use crate::error::{Error, Result};
+use crate::mvcc::{ValueVersion, decode_record, encode_record, latest_record, visible_record};
 use crate::storage::format::{CommitId, CommitSeq, TreeId, TxnId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -62,10 +64,10 @@ struct Runtime {
 /// A transactional SeerDB handle.
 ///
 /// The handle may be shared by callers using `Arc`; short database-lock
-/// sections coordinate durable publication while transaction reads use their
-/// independent generation-bound [`ReadView`]. One handle owns one durable
-/// writer directory, and `close` refuses to run while transactions remain
-/// live.
+/// sections coordinate durable publication while transaction reads resolve
+/// committed logical versions from the current durable state. One handle owns
+/// one durable writer directory, and `close` refuses to run while transactions
+/// remain live.
 pub struct TransactionDatabase {
     runtime: Arc<Runtime>,
 }
@@ -74,13 +76,13 @@ pub struct TransactionDatabase {
 ///
 /// Writes to different keys and trees can commit from one snapshot. A write
 /// conflicts when another committed transaction changed the same key or the
-/// lifecycle of its tree after this transaction's snapshot. Reads never see
-/// a mixture of generations, and a multi-tree commit is published atomically.
+/// lifecycle of its tree after this transaction's snapshot. Reads resolve one
+/// version per key at the fixed snapshot, and a multi-tree commit is published
+/// atomically.
 pub struct Transaction {
     runtime: Arc<Runtime>,
     id: TxnId,
     snapshot: CommitSeq,
-    view: Option<Arc<ReadView>>,
     writes: BTreeMap<(TreeId, Vec<u8>), Option<Vec<u8>>>,
     created: BTreeSet<TreeId>,
     dropped: BTreeSet<TreeId>,
@@ -121,7 +123,7 @@ impl TransactionDatabase {
     /// Begin a fixed-snapshot transaction.
     pub fn begin(&self) -> Result<Transaction> {
         let id = allocate_id(&self.runtime.next_transaction, "transaction ID")?;
-        let mut db = self
+        let db = self
             .runtime
             .db
             .lock()
@@ -129,8 +131,7 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        let view = Arc::new(db.begin_read_view()?);
-        let snapshot = CommitSeq::new(view.commit_id().get());
+        let snapshot = CommitSeq::new(db.durability_status().commit_id.get());
         self.runtime
             .active_transactions
             .fetch_add(1, Ordering::AcqRel);
@@ -138,7 +139,6 @@ impl TransactionDatabase {
             runtime: Arc::clone(&self.runtime),
             id: TxnId::new(id),
             snapshot,
-            view: Some(view),
             writes: BTreeMap::new(),
             created: BTreeSet::new(),
             dropped: BTreeSet::new(),
@@ -161,10 +161,10 @@ impl TransactionDatabase {
 
     /// Flush and close the underlying durable database.
     ///
-    /// A live transaction owns a physical read-view lease, so closing with
-    /// live transactions is rejected rather than silently invalidating their
-    /// snapshots. The closed state is shared with transactions that still
-    /// hold an `Arc` to this handle.
+    /// A live transaction keeps the handle's active-transaction guard held,
+    /// so closing with live transactions is rejected rather than invalidating
+    /// their logical snapshots. The closed state is shared with transactions
+    /// that still hold an `Arc` to this handle.
     pub fn close(&self) -> Result<()> {
         let mut db = self
             .runtime
@@ -207,10 +207,15 @@ impl Runtime {
             changed_trees: BTreeSet::from([tree]),
             writes: BTreeSet::new(),
         };
+        let reservation = encode_record(&[ValueVersion {
+            transaction: owner,
+            commit: next,
+            value: Some(TREE_RESERVED.to_vec()),
+        }])?;
         let mutations = [
             BatchMutation::Put {
                 key: tree_record_key(tree),
-                value: TREE_RESERVED.to_vec(),
+                value: reservation,
             },
             BatchMutation::Put {
                 key: change_record_key(next),
@@ -274,7 +279,6 @@ impl Transaction {
                         .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
                 );
                 self.state = TransactionState::RecoveryRequired { commit };
-                self.view.take();
                 return Err(Error::NeedsRecovery(format!(
                     "tree reservation for {:?} may be durable: {error}",
                     tree
@@ -321,8 +325,13 @@ impl Transaction {
         if let Some(value) = self.writes.get(&(tree, key.to_vec())) {
             return Ok(value.clone());
         }
-        let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
-        view.get(&tree_key(tree, key))
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let versions = decode_record(db.get(&tree_key(tree, key))?.as_deref())?;
+        Ok(visible_record(&versions, self.snapshot).and_then(|version| version.value.clone()))
     }
 
     /// List trees visible to this transaction in stable ID order.
@@ -332,10 +341,14 @@ impl Transaction {
     /// returned, so malformed control records fail closed.
     pub fn list_trees(&self) -> Result<Vec<TreeId>> {
         self.check_active()?;
-        let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
         let end = prefix_end(TREE_RECORD_PREFIX);
         let mut trees = BTreeSet::new();
-        for (key, value) in view.range(TREE_RECORD_PREFIX, &end)? {
+        for (key, value) in db.range(TREE_RECORD_PREFIX, &end)? {
             if key.len() != TREE_RECORD_PREFIX.len() + 8 {
                 return Err(Error::Corruption("malformed tree lifecycle key".into()));
             }
@@ -344,14 +357,17 @@ impl Transaction {
                     .try_into()
                     .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
             ));
-            match value.as_slice() {
-                TREE_LIVE => {
+            let versions = decode_record(Some(&value))?;
+            match visible_record(&versions, self.snapshot)
+                .and_then(|version| version.value.as_deref())
+            {
+                Some(TREE_LIVE) => {
                     trees.insert(tree);
                 }
-                TREE_DROPPED | TREE_RESERVED => {
+                Some(TREE_DROPPED) | Some(TREE_RESERVED) | None => {
                     trees.remove(&tree);
                 }
-                _ => {
+                Some(_) => {
                     return Err(Error::Corruption("malformed tree lifecycle value".into()));
                 }
             }
@@ -391,12 +407,19 @@ impl Transaction {
                 .map(|end| append(&prefix, end))
                 .unwrap_or_else(|| prefix_end(&prefix));
             if end != Some(start) {
-                let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
-                for (key, value) in view.range(&physical_start, &physical_end)? {
+                let db = self.runtime.db.lock().map_err(|_| {
+                    Error::Corruption("transaction database mutex is poisoned".into())
+                })?;
+                for (key, value) in db.range(&physical_start, &physical_end)? {
                     let Some(user_key) = decode_tree_key(tree, &key) else {
                         continue;
                     };
-                    values.insert(user_key, value);
+                    let versions = decode_record(Some(&value))?;
+                    if let Some(version) = visible_record(&versions, self.snapshot)
+                        && let Some(value) = &version.value
+                    {
+                        values.insert(user_key, value.clone());
+                    }
                 }
             }
         }
@@ -425,14 +448,12 @@ impl Transaction {
         if self.is_read_only() {
             let commit = self.snapshot;
             self.state = TransactionState::Committed { commit };
-            self.view.take();
             return Ok(commit);
         }
         let result = commit_transaction(self);
         match result {
             Ok(commit) => {
                 self.state = TransactionState::Committed { commit };
-                self.view.take();
                 Ok(commit)
             }
             Err(error)
@@ -446,7 +467,6 @@ impl Transaction {
                         .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
                 );
                 self.state = TransactionState::RecoveryRequired { commit };
-                self.view.take();
                 Err(Error::NeedsRecovery(format!(
                     "transaction {:?} may have committed at {:?}: {error}",
                     self.id, commit
@@ -460,7 +480,6 @@ impl Transaction {
     pub fn abort(&mut self) -> Result<()> {
         self.check_active()?;
         self.state = TransactionState::Aborted;
-        self.view.take();
         Ok(())
     }
 
@@ -473,8 +492,12 @@ impl Transaction {
     }
 
     fn tree_visible(&self, tree: TreeId) -> Result<bool> {
-        let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
-        tree_visible(view, tree)
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        tree_visible(&db, tree, self.snapshot)
     }
 
     fn check_tree_visible_for_read(&self, tree: TreeId) -> Result<()> {
@@ -518,7 +541,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
         return Err(Error::InvalidArgument("database is closed".into()));
     }
     let current = CommitSeq::new(db.durability_status().commit_id.get());
-    validate_conflicts(transaction, current)?;
+    validate_conflicts(transaction, &db, current)?;
 
     let next = CommitSeq::new(
         current
@@ -533,26 +556,37 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
             continue;
         }
         let storage_key = tree_key(*tree, key);
-        match value {
-            Some(value) => mutations.push(BatchMutation::Put {
-                key: storage_key,
-                value: value.clone(),
-            }),
-            None => mutations.push(BatchMutation::Delete { key: storage_key }),
-        }
+        let mut versions = decode_record(db.get(&storage_key)?.as_deref())?;
+        versions.push(ValueVersion {
+            transaction: transaction.id,
+            commit: next,
+            value: value.clone(),
+        });
+        mutations.push(BatchMutation::Put {
+            key: storage_key,
+            value: encode_record(&versions)?,
+        });
         writes.insert((*tree, key.clone()));
     }
 
     let mut changed_trees = transaction.created.clone();
     changed_trees.extend(transaction.dropped.iter().copied());
     for tree in &changed_trees {
+        let lifecycle = if transaction.dropped.contains(tree) {
+            TREE_DROPPED
+        } else {
+            TREE_LIVE
+        };
+        let lifecycle_key = tree_record_key(*tree);
+        let mut versions = decode_record(db.get(&lifecycle_key)?.as_deref())?;
+        versions.push(ValueVersion {
+            transaction: transaction.id,
+            commit: next,
+            value: Some(lifecycle.to_vec()),
+        });
         mutations.push(BatchMutation::Put {
-            key: tree_record_key(*tree),
-            value: if transaction.dropped.contains(tree) {
-                TREE_DROPPED.to_vec()
-            } else {
-                TREE_LIVE.to_vec()
-            },
+            key: lifecycle_key,
+            value: encode_record(&versions)?,
         });
     }
 
@@ -578,56 +612,83 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitSeq> {
     Ok(committed)
 }
 
-fn validate_conflicts(transaction: &Transaction, current: CommitSeq) -> Result<()> {
+fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) -> Result<()> {
     if transaction.snapshot > current {
         return Err(Error::SerializationConflict {
             expected: CommitId::new(transaction.snapshot.get()),
             current: CommitId::new(current.get()),
         });
     }
-    if transaction.snapshot == current {
-        return Ok(());
-    }
-    let changes = lock_changes(&transaction.runtime);
-    let mut commit = transaction.snapshot.get().saturating_add(1);
-    while commit <= current.get() {
-        let sequence = CommitSeq::new(commit);
-        let Some(change) = changes.get(&sequence) else {
-            // A commit not written by this transactional surface cannot be
-            // certified against a byte-level snapshot. Fail closed.
-            return Err(Error::SerializationConflict {
-                expected: CommitId::new(transaction.snapshot.get()),
-                current: CommitId::new(current.get()),
-            });
+
+    for tree in &transaction.created {
+        let versions = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
+        let Some(version) = latest_record(&versions) else {
+            return Err(Error::TreeConflict(*tree));
         };
-        for tree in &transaction.created {
-            if change.transaction != transaction.id && change.changed_trees.contains(tree) {
-                return Err(Error::TreeConflict(*tree));
-            }
+        if version.transaction != transaction.id || version.value.as_deref() != Some(TREE_RESERVED)
+        {
+            return Err(Error::TreeConflict(*tree));
         }
-        for tree in &transaction.dropped {
-            if change.transaction != transaction.id
-                && (change.changed_trees.contains(tree)
-                    || change.writes.iter().any(|(changed, _)| changed == tree))
-            {
-                return Err(Error::TreeConflict(*tree));
-            }
+    }
+
+    for tree in &transaction.dropped {
+        let versions = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
+        if let Some(version) = latest_record(&versions)
+            && version.commit > transaction.snapshot
+            && version.transaction != transaction.id
+        {
+            return Err(Error::TreeConflict(*tree));
         }
-        for (tree, key) in transaction.writes.keys() {
-            if change.transaction != transaction.id && change.changed_trees.contains(tree) {
-                return Err(Error::TreeConflict(*tree));
-            }
-            if change.transaction != transaction.id && change.writes.contains(&(*tree, key.clone()))
-            {
-                return Err(Error::WriteConflict {
-                    tree: *tree,
-                    key: key.clone(),
-                });
-            }
+        if tree_has_conflicting_write(db, *tree, transaction.snapshot, transaction.id)? {
+            return Err(Error::TreeConflict(*tree));
         }
-        commit = commit.saturating_add(1);
+    }
+
+    for (tree, key) in transaction.writes.keys() {
+        if transaction.created.contains(tree) {
+            continue;
+        }
+        let lifecycle = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
+        if let Some(version) = latest_record(&lifecycle)
+            && version.commit > transaction.snapshot
+            && version.transaction != transaction.id
+        {
+            return Err(Error::TreeConflict(*tree));
+        }
+        let versions = decode_record(db.get(&tree_key(*tree, key))?.as_deref())?;
+        if let Some(version) = latest_record(&versions)
+            && version.commit > transaction.snapshot
+            && version.transaction != transaction.id
+        {
+            return Err(Error::WriteConflict {
+                tree: *tree,
+                key: key.clone(),
+            });
+        }
     }
     Ok(())
+}
+
+fn tree_has_conflicting_write(
+    db: &DB,
+    tree: TreeId,
+    snapshot: CommitSeq,
+    transaction: TxnId,
+) -> Result<bool> {
+    let prefix = tree_prefix(tree);
+    let end = prefix_end(&prefix);
+    for (key, value) in db.range(&prefix, &end)? {
+        if decode_tree_key(tree, &key).is_none() {
+            continue;
+        }
+        let versions = decode_record(Some(&value))?;
+        if latest_record(&versions)
+            .is_some_and(|version| version.commit > snapshot && version.transaction != transaction)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn lock_changes(
@@ -647,15 +708,15 @@ fn is_recovery_error(runtime: &Arc<Runtime>) -> Result<bool> {
     Ok(db.durability_status().write_fenced)
 }
 
-fn tree_visible(view: &ReadView, tree: TreeId) -> Result<bool> {
-    match view.get(&tree_record_key(tree))? {
-        Some(value) if value == TREE_LIVE => Ok(true),
-        Some(value) if value == TREE_DROPPED || value == TREE_RESERVED => Ok(false),
+fn tree_visible(db: &DB, tree: TreeId, snapshot: CommitSeq) -> Result<bool> {
+    let versions = decode_record(db.get(&tree_record_key(tree))?.as_deref())?;
+    match visible_record(&versions, snapshot).and_then(|version| version.value.as_deref()) {
+        Some(TREE_LIVE) => Ok(true),
+        Some(TREE_DROPPED) | Some(TREE_RESERVED) | None => Ok(false),
         Some(_) => Err(Error::Corruption(format!(
             "tree {:?} has an invalid lifecycle record",
             tree
         ))),
-        None => Ok(false),
     }
 }
 
@@ -673,11 +734,14 @@ fn load_control_state(db: &mut DB) -> Result<(BTreeMap<CommitSeq, CommittedChang
                 .try_into()
                 .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
         );
-        if value.as_slice() != TREE_LIVE
-            && value.as_slice() != TREE_DROPPED
-            && value.as_slice() != TREE_RESERVED
-        {
-            return Err(Error::Corruption("malformed tree lifecycle value".into()));
+        let versions = decode_record(Some(&value))?;
+        for version in versions {
+            if !matches!(
+                version.value.as_deref(),
+                Some(TREE_LIVE) | Some(TREE_DROPPED) | Some(TREE_RESERVED)
+            ) {
+                return Err(Error::Corruption("malformed tree lifecycle value".into()));
+            }
         }
         max_tree = max_tree.max(tree);
     }
@@ -936,6 +1000,27 @@ mod tests {
     }
 
     #[test]
+    fn dropping_tree_conflicts_with_concurrent_key_writer() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"key", b"old").expect("seed write");
+        seed.commit().expect("seed commit");
+        drop(seed);
+
+        let mut dropper = database.begin().expect("dropper begin");
+        dropper.drop_tree(tree).expect("stage drop");
+        let mut writer = database.begin().expect("writer begin");
+        writer.put(tree, b"key", b"new").expect("writer write");
+        writer.commit().expect("writer commit");
+        assert!(matches!(
+            dropper.commit(),
+            Err(Error::TreeConflict(conflict_tree)) if conflict_tree == tree
+        ));
+        dropper.abort().expect("abort dropper");
+    }
+
+    #[test]
     fn concurrent_threads_commit_disjoint_writes() {
         let (_directory, database) = database();
         let database = Arc::new(database);
@@ -1059,6 +1144,50 @@ mod tests {
         transaction.abort().expect("abort");
         std::mem::drop(transaction);
         reopened.close().expect("close reopened");
+    }
+
+    #[test]
+    fn committed_versions_survive_update_and_reopen() {
+        let (directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"key", b"old").expect("seed write");
+        seed.commit().expect("seed commit");
+        drop(seed);
+
+        let old = database.begin().expect("old snapshot");
+        let mut writer = database.begin().expect("writer");
+        writer.put(tree, b"key", b"new").expect("new write");
+        writer.commit().expect("new commit");
+        assert_eq!(
+            old.get(tree, b"key").expect("old value"),
+            Some(b"old".to_vec())
+        );
+        drop(old);
+        drop(writer);
+        database.close().expect("close");
+
+        let mut raw = DB::open(directory.path().join("db"), Options::for_test()).expect("raw open");
+        let bytes = raw
+            .get(&tree_key(tree, b"key"))
+            .expect("raw value")
+            .expect("record");
+        let versions = decode_record(Some(&bytes)).expect("decode versions");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].value, Some(b"old".to_vec()));
+        assert_eq!(versions[1].value, Some(b"new".to_vec()));
+        raw.close().expect("raw close");
+
+        let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen");
+        let mut current = reopened.begin().expect("current snapshot");
+        assert_eq!(
+            current.get(tree, b"key").expect("current value"),
+            Some(b"new".to_vec())
+        );
+        current.abort().expect("abort");
+        drop(current);
+        reopened.close().expect("reopened close");
     }
 
     #[test]

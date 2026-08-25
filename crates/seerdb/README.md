@@ -23,10 +23,10 @@ foundation beneath a database server:
   publication lane with concurrent reads, root-bound read views, retained
   snapshots, and expected-base conflict refusal.
 - **Transactional ordered-KV facade**: `TransactionDatabase` provides first-class
-  `TreeId`s, fixed snapshots, ordered scans, atomic multi-tree batches, and
-  multi-writer snapshot-isolation conflict checking. Its durable conflict
-  records survive reopen; publication is still serialized by the current
-  physical engine.
+  `TreeId`s, fixed snapshots resolved through committed per-key version chains,
+  ordered scans, atomic multi-tree batches, and multi-writer snapshot-isolation
+  conflict checking. Its durable conflict records and version chains survive
+  reopen; publication is still serialized by the current physical engine.
 - **Capacity handling**: typed ENOSPC refusal and preflight admission cover
   ordinary commits and maintenance, with same-handle retry and reopen tests.
 - **SSD-aware paths**: Linux O_DIRECT, page-aligned buffers, and optional FDP/ZNS
@@ -89,11 +89,12 @@ for the cross-project boundary and roadmap.
 
 The current Rust development lane is a single-writer durable kernel with
 concurrent reads, root-generation retention, WAL recovery, crash-safe
-reclamation, and retryable capacity refusal. `TransactionDatabase` now supplies
-first-class trees, fixed-snapshot reads, atomic multi-tree mutations, and
-reopen-persistent write-conflict records above that kernel. It is still not
-the target physical multi-writer engine or a releasable `0.1.0-alpha.*` crate.
-Physical per-record MVCC, concurrent page/WAL publication, broader
+reclamation, and retryable capacity refusal. `TransactionDatabase` now stores
+committed per-key version chains and supplies first-class trees, fixed-snapshot
+reads, atomic multi-tree mutations, and reopen-persistent write-conflict
+records above that kernel. It is still not the target physical multi-writer
+engine or a releasable `0.1.0-alpha.*` crate. Transaction-status indirection,
+an append-oriented undo store, concurrent page/WAL publication, broader
 filesystem/block-layer fault qualification, OmenDB direct integration, and
 measured device-backed performance remain open. OmenDB integration and the
 alpha release gates are the authoritative cross-project qualification

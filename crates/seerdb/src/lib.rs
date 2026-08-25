@@ -6,9 +6,9 @@
 //! - **SSD-native design**: FDP/ZNS support for minimal write amplification
 //! - **Fixed page format**: the current alpha uses [`PAGE_SIZE`] pages; page
 //!   sizing is not silently configurable through [`Options`]
-//! - **Snapshots**: immutable root generations with explicit retained
-//!   historical reads; the transactional facade adds durable conflict records
-//!   while physical data-version MVCC remains future work
+//! - **Snapshots**: fixed logical snapshots resolve committed per-key version
+//!   chains; low-level APIs also expose immutable root generations for
+//!   physical retention
 //!
 //! # Architecture
 //!
@@ -17,11 +17,11 @@
 //! and garbage collection reclaims invalidated pages. Large values are stored
 //! separately in an append-only blob log.
 //!
-//! The low-level durable contract uses one serialized publication lane with
-//! concurrent readers and explicit root-generation retention. The public
-//! [`TransactionDatabase`] facade adds fixed-snapshot, multi-writer transaction
-//! semantics above that lane; physical page/WAL multi-writer MVCC remains a
-//! later engine phase.
+//! The low-level durable contract still uses one serialized publication lane
+//! with concurrent readers and explicit root-generation retention. The public
+//! [`TransactionDatabase`] facade now resolves logical per-key MVCC chains and
+//! durable commit identities above that lane; physical page/WAL multi-writer
+//! publication remains a later engine phase.
 //!
 //! # Example
 //!

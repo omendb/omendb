@@ -183,9 +183,11 @@ SeerDB integration, SQL/catalog/index/constraint tests, fault and recovery
 coverage, an experimental PostgreSQL wire example, and a separate direct
 SeerDB qualification path (`src/seer_direct.rs`). The qualification path
 exercises catalog/table/index-to-`TreeId` mapping and transaction-scoped
-snapshot reads without pretending to replace the public facade yet. The tree
-does **not** yet provide the server contract described here, full durable
-data-version MVCC, a production physical multi-writer storage API, production
+snapshot reads without pretending to replace the public facade yet. SeerDB's
+transactional facade now persists and resolves committed per-key version
+chains, while the tree still does **not** provide the server contract described
+here, transaction-status indirection, append-oriented undo storage, a
+production physical multi-writer storage API, production
 authentication/authorization, or a PostgreSQL compatibility claim.
 
 The roadmap is intentionally dependency-ordered, but OmenDB follows each
@@ -195,12 +197,13 @@ relational consumer:
 1. **Contracts and model — substantially complete:** workspace ownership,
    generic ordered-KV boundary, TxnId/CSN/LSN rules, tree lifecycle,
    snapshot/change positioning, and crash-state invariants.
-2. **SeerDB transactional foundation — in progress:** the first semantic
-   vertical slice now provides `TxnId`, `CommitSeq`, `TreeId`, fixed-snapshot
-   transactions, ordered scans, atomic multi-tree mutation, and durable exact
-   write-conflict records. Physical record versions/undo, ordered cursor
-   handles, range dependencies, durable LSN results, and physical multi-writer
-   WAL/page publication remain open.
+2. **SeerDB transactional foundation — in progress:** the first vertical
+   slice now provides `TxnId`, `CommitSeq`, `TreeId`, fixed-snapshot
+   transactions, committed per-key version chains, ordered scans, atomic
+   multi-tree mutation, and durable exact write-conflict records. Transaction
+   status indirection, append-oriented undo storage, ordered cursor handles,
+   range dependencies, durable LSN results, retention-aware version GC, and
+   physical multi-writer WAL/page publication remain open.
 3. **OmenDB direct integration — qualification path started:**
    `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
    per index without using `StorageKernel`. Next, expand its relational
