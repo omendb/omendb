@@ -298,6 +298,10 @@ impl DB {
         sync_directory(&self.path)
     }
 
+    pub(crate) fn fence_writes(&mut self) {
+        self.write_fenced = true;
+    }
+
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
         Self::open_with_mode(path, options, OpenMode::Normal)

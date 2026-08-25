@@ -294,7 +294,13 @@ impl TransactionDatabase {
         if !rewrites.is_empty() {
             db.commit_batch(&rewrites)?;
         }
-        let (_, versions_after) = version_store.compact(&retained)?;
+        let (_, versions_after) = match version_store.compact(&retained) {
+            Ok(counts) => counts,
+            Err(error) => {
+                db.fence_writes();
+                return Err(error);
+            }
+        };
         Ok(VersionGcReport {
             watermark,
             versions_before,
