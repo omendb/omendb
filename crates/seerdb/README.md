@@ -22,7 +22,7 @@ foundation beneath a database server:
 - **Reader/writer contract**: the low-level `DB` uses one serialized
   publication lane with concurrent reads, root-bound read views, retained
   snapshots, and expected-base conflict refusal.
-- **Transactional ordered-KV facade**: `TransactionalDB` provides first-class
+- **Transactional ordered-KV facade**: `TransactionDatabase` provides first-class
   `TreeId`s, fixed snapshots, ordered scans, atomic multi-tree batches, and
   multi-writer snapshot-isolation conflict checking. Its durable conflict
   records survive reopen; publication is still serialized by the current
@@ -62,7 +62,7 @@ db.close()?;
 ```
 
 Use `commit_batch` for a low-level atomic group of byte-oriented puts and
-deletes. Use `TransactionalDB` when you need first-class trees, fixed
+deletes. Use `TransactionDatabase` when you need first-class trees, fixed
 snapshots, ordered scans, and concurrent transaction conflict checking. Use
 `begin_read_view`, `retain_commit`, or `begin_snapshot` when a read must stay
 bound to a published historical generation. Call `verify`, `check`, and
@@ -79,7 +79,7 @@ prototype, not the target OmenDB transaction architecture.
 The target SeerDB design is a generic OLTP-oriented transactional ordered-KV
 engine with physical multi-writer snapshot MVCC, ordered cursors, atomic
 multi-tree mutation, recoverable WAL, and a restartable committed-change
-stream. The current `TransactionalDB` is the first semantic vertical slice;
+stream. The current `TransactionDatabase` is the first semantic vertical slice;
 its physical publication lane is intentionally not presented as the final
 architecture. SeerDB remains SQL-agnostic: OmenDB owns row/index codecs and
 relational meaning. See [`../../docs/architecture.md`](../../docs/architecture.md)
@@ -89,7 +89,7 @@ for the cross-project boundary and roadmap.
 
 The current Rust development lane is a single-writer durable kernel with
 concurrent reads, root-generation retention, WAL recovery, crash-safe
-reclamation, and retryable capacity refusal. `TransactionalDB` now supplies
+reclamation, and retryable capacity refusal. `TransactionDatabase` now supplies
 first-class trees, fixed-snapshot reads, atomic multi-tree mutations, and
 reopen-persistent write-conflict records above that kernel. It is still not
 the target physical multi-writer engine or a releasable `0.1.0-alpha.*` crate.

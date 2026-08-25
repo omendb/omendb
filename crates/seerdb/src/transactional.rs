@@ -24,6 +24,7 @@ const CHANGE_RECORD_PREFIX: &[u8] = b"\x00seerdb/change/";
 const TREE_DATA_PREFIX: u8 = 0x01;
 const TREE_LIVE: &[u8] = b"live";
 const TREE_DROPPED: &[u8] = b"dropped";
+const TREE_RESERVED: &[u8] = b"reserved";
 const CHANGE_MAGIC: &[u8; 4] = b"SCM1";
 const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -184,6 +185,51 @@ impl TransactionDatabase {
     }
 }
 
+impl Runtime {
+    fn reserve_tree(&self, owner: TxnId, tree: TreeId) -> Result<CommitSeq> {
+        let mut db = self
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let current = CommitSeq::new(db.durability_status().commit_id.get());
+        let next = CommitSeq::new(
+            current
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
+        );
+        let change = CommittedChange {
+            transaction: owner,
+            snapshot: current,
+            changed_trees: BTreeSet::from([tree]),
+            writes: BTreeSet::new(),
+        };
+        let mutations = [
+            BatchMutation::Put {
+                key: tree_record_key(tree),
+                value: TREE_RESERVED.to_vec(),
+            },
+            BatchMutation::Put {
+                key: change_record_key(next),
+                value: encode_change(&change)?,
+            },
+        ];
+        let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+        let committed = CommitSeq::new(status.commit_id.get());
+        if committed != next {
+            return Err(Error::NeedsRecovery(format!(
+                "tree reservation expected {:?}, storage published {:?}",
+                next, committed
+            )));
+        }
+        lock_changes(self).insert(committed, change);
+        Ok(committed)
+    }
+}
+
 impl Transaction {
     /// Return the stable transaction identity.
     #[must_use]
@@ -219,6 +265,23 @@ impl Transaction {
     pub fn create_tree(&mut self) -> Result<TreeId> {
         self.check_active()?;
         let tree = TreeId::new(allocate_id(&self.runtime.next_tree, "tree ID")?);
+        if let Err(error) = self.runtime.reserve_tree(self.id, tree) {
+            if matches!(&error, Error::NeedsRecovery(_)) || is_recovery_error(&self.runtime)? {
+                let commit = CommitSeq::new(
+                    self.snapshot
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
+                );
+                self.state = TransactionState::RecoveryRequired { commit };
+                self.view.take();
+                return Err(Error::NeedsRecovery(format!(
+                    "tree reservation for {:?} may be durable: {error}",
+                    tree
+                )));
+            }
+            return Err(error);
+        }
         self.created.insert(tree);
         Ok(tree)
     }
@@ -260,6 +323,44 @@ impl Transaction {
         }
         let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
         view.get(&tree_key(tree, key))
+    }
+
+    /// List trees visible to this transaction in stable ID order.
+    ///
+    /// The result includes trees created by this transaction and excludes
+    /// trees dropped by it. Lifecycle metadata is validated before it is
+    /// returned, so malformed control records fail closed.
+    pub fn list_trees(&self) -> Result<Vec<TreeId>> {
+        self.check_active()?;
+        let view = self.view.as_ref().ok_or(Error::TransactionInactive)?;
+        let end = prefix_end(TREE_RECORD_PREFIX);
+        let mut trees = BTreeSet::new();
+        for (key, value) in view.range(TREE_RECORD_PREFIX, &end)? {
+            if key.len() != TREE_RECORD_PREFIX.len() + 8 {
+                return Err(Error::Corruption("malformed tree lifecycle key".into()));
+            }
+            let tree = TreeId::new(u64::from_be_bytes(
+                key[TREE_RECORD_PREFIX.len()..]
+                    .try_into()
+                    .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
+            ));
+            match value.as_slice() {
+                TREE_LIVE => {
+                    trees.insert(tree);
+                }
+                TREE_DROPPED | TREE_RESERVED => {
+                    trees.remove(&tree);
+                }
+                _ => {
+                    return Err(Error::Corruption("malformed tree lifecycle value".into()));
+                }
+            }
+        }
+        trees.extend(self.created.iter().copied());
+        for tree in &self.dropped {
+            trees.remove(tree);
+        }
+        Ok(trees.into_iter().collect())
     }
 
     /// Scan `[start,end)` in key order. `None` for `end` scans through the
@@ -334,7 +435,10 @@ impl Transaction {
                 self.view.take();
                 Ok(commit)
             }
-            Err(error) if is_recovery_error(&self.runtime)? => {
+            Err(error)
+                if matches!(&error, Error::NeedsRecovery(_))
+                    || is_recovery_error(&self.runtime)? =>
+            {
                 let commit = CommitSeq::new(
                     self.snapshot
                         .get()
@@ -497,22 +601,24 @@ fn validate_conflicts(transaction: &Transaction, current: CommitSeq) -> Result<(
             });
         };
         for tree in &transaction.created {
-            if change.changed_trees.contains(tree) {
+            if change.transaction != transaction.id && change.changed_trees.contains(tree) {
                 return Err(Error::TreeConflict(*tree));
             }
         }
         for tree in &transaction.dropped {
-            if change.changed_trees.contains(tree)
-                || change.writes.iter().any(|(changed, _)| changed == tree)
+            if change.transaction != transaction.id
+                && (change.changed_trees.contains(tree)
+                    || change.writes.iter().any(|(changed, _)| changed == tree))
             {
                 return Err(Error::TreeConflict(*tree));
             }
         }
         for (tree, key) in transaction.writes.keys() {
-            if change.changed_trees.contains(tree) {
+            if change.transaction != transaction.id && change.changed_trees.contains(tree) {
                 return Err(Error::TreeConflict(*tree));
             }
-            if change.writes.contains(&(*tree, key.clone())) {
+            if change.transaction != transaction.id && change.writes.contains(&(*tree, key.clone()))
+            {
                 return Err(Error::WriteConflict {
                     tree: *tree,
                     key: key.clone(),
@@ -544,7 +650,7 @@ fn is_recovery_error(runtime: &Arc<Runtime>) -> Result<bool> {
 fn tree_visible(view: &ReadView, tree: TreeId) -> Result<bool> {
     match view.get(&tree_record_key(tree))? {
         Some(value) if value == TREE_LIVE => Ok(true),
-        Some(value) if value == TREE_DROPPED => Ok(false),
+        Some(value) if value == TREE_DROPPED || value == TREE_RESERVED => Ok(false),
         Some(_) => Err(Error::Corruption(format!(
             "tree {:?} has an invalid lifecycle record",
             tree
@@ -567,7 +673,10 @@ fn load_control_state(db: &mut DB) -> Result<(BTreeMap<CommitSeq, CommittedChang
                 .try_into()
                 .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
         );
-        if value.as_slice() != TREE_LIVE && value.as_slice() != TREE_DROPPED {
+        if value.as_slice() != TREE_LIVE
+            && value.as_slice() != TREE_DROPPED
+            && value.as_slice() != TREE_RESERVED
+        {
             return Err(Error::Corruption("malformed tree lifecycle value".into()));
         }
         max_tree = max_tree.max(tree);
@@ -782,8 +891,8 @@ mod tests {
         let mut second = database.begin().expect("second begin");
         first.put(tree, b"a", b"one").expect("first write");
         second.put(tree, b"b", b"two").expect("second write");
-        assert_eq!(first.commit().expect("first commit").get(), 2);
-        assert_eq!(second.commit().expect("disjoint commit").get(), 3);
+        assert_eq!(first.commit().expect("first commit").get(), 3);
+        assert_eq!(second.commit().expect("disjoint commit").get(), 4);
 
         let reader = database.begin().expect("reader begin");
         assert_eq!(
@@ -926,18 +1035,27 @@ mod tests {
         let burned_tree = burned.create_tree().expect("burn tree");
         burned.drop_tree(burned_tree).expect("drop burned tree");
         burned.commit().expect("burn commit");
+        let mut aborted = database.begin().expect("abort begin");
+        let aborted_tree = aborted.create_tree().expect("aborted tree");
+        aborted.abort().expect("abort tree");
         std::mem::drop(drop);
         std::mem::drop(burned);
+        std::mem::drop(aborted);
         database.close().expect("close");
 
         let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
             .expect("reopen");
         let mut transaction = reopened.begin().expect("reopened begin");
+        assert_eq!(
+            transaction.list_trees().expect("list trees"),
+            Vec::<TreeId>::new()
+        );
         assert!(
             matches!(transaction.get(first, b"key"), Err(Error::TreeNotFound(tree)) if tree == first)
         );
         let next = transaction.create_tree().expect("next tree");
         assert!(next > burned_tree);
+        assert!(next > aborted_tree);
         transaction.abort().expect("abort");
         std::mem::drop(transaction);
         reopened.close().expect("close reopened");

@@ -1,12 +1,14 @@
 use super::*;
+#[cfg(feature = "fault-injection")]
+use crate::Options;
 use crate::allocator::PageAllocator;
+use crate::db::DB;
 use crate::db::metadata_codec::{
     encode_checkpoint, encode_meta_log_frame, encode_publication_payload, meta_log_header_bytes,
     parse_meta_log,
 };
+#[cfg(feature = "fault-injection")]
 use crate::error::Error;
-use crate::{Options, db::DB};
-
 use crate::mvcc::PMT;
 use tempfile::tempdir;
 

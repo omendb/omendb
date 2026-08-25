@@ -178,12 +178,15 @@ into permanence.
 
 ## Current status and roadmap
 
-The current tree has a working direct Rust relational API, durable SeerDB
-integration, SQL/catalog/index/constraint tests, fault and recovery coverage,
-and an experimental PostgreSQL wire example. It does **not** yet provide the
-server contract described here, full durable data-version MVCC, a production
-multi-writer storage API, production authentication/authorization, or a
-PostgreSQL compatibility claim.
+The current tree has a working transitional Rust relational API, durable
+SeerDB integration, SQL/catalog/index/constraint tests, fault and recovery
+coverage, an experimental PostgreSQL wire example, and a separate direct
+SeerDB qualification path (`src/seer_direct.rs`). The qualification path
+exercises catalog/table/index-to-`TreeId` mapping and transaction-scoped
+snapshot reads without pretending to replace the public facade yet. The tree
+does **not** yet provide the server contract described here, full durable
+data-version MVCC, a production physical multi-writer storage API, production
+authentication/authorization, or a PostgreSQL compatibility claim.
 
 The roadmap is intentionally dependency-ordered, but OmenDB follows each
 SeerDB milestone immediately so the storage contract is validated by a real
@@ -192,12 +195,18 @@ relational consumer:
 1. **Contracts and model — substantially complete:** workspace ownership,
    generic ordered-KV boundary, TxnId/CSN/LSN rules, tree lifecycle,
    snapshot/change positioning, and crash-state invariants.
-2. **SeerDB transactional foundation — next:** multi-writer snapshot MVCC,
-   record versions/undo, first-class trees, ordered cursors, atomic multi-tree
-   transactions, and durable WAL/recovery primitives.
-3. **OmenDB direct integration:** replace the global-generation
-   `StorageKernel` path; map catalogs, tables, and indexes to SeerDB trees;
-   preserve SQL, constraint, and differential tests as integration gates.
+2. **SeerDB transactional foundation — in progress:** the first semantic
+   vertical slice now provides `TxnId`, `CommitSeq`, `TreeId`, fixed-snapshot
+   transactions, ordered scans, atomic multi-tree mutation, and durable exact
+   write-conflict records. Physical record versions/undo, ordered cursor
+   handles, range dependencies, durable LSN results, and physical multi-writer
+   WAL/page publication remain open.
+3. **OmenDB direct integration — qualification path started:**
+   `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
+   per index without using `StorageKernel`. Next, expand its relational
+   conformance and fault gates, then replace the global-generation path in one
+   deliberate migration after historical retention and durability-position
+   contracts exist.
 4. **Server alpha foundation:** persistent multi-session lifecycle, deliberate
    PostgreSQL protocol subset, authentication, cancellation, configuration,
    diagnostics, and clean shutdown/reopen behavior.

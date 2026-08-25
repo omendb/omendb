@@ -20,6 +20,10 @@ mod relational_database;
 mod replication;
 mod row_identity;
 mod runtime;
+// This direct path is a qualification surface until historical retention and
+// durability-position results are ready to replace the transitional facade.
+#[allow(dead_code, clippy::type_complexity)]
+mod seer_direct;
 mod seer_kernel;
 mod seer_relational;
 mod serializable;
@@ -160,6 +164,10 @@ pub enum DbError {
         "Serializable conflict: transaction snapshot {snapshot} is older than current {current}"
     )]
     SerializationConflict { snapshot: u64, current: u64 },
+    #[error("write conflict on SeerDB tree {tree}, key {key:?}")]
+    SeerWriteConflict { tree: u64, key: Vec<u8> },
+    #[error("tree lifecycle conflict on SeerDB tree {tree}")]
+    SeerTreeConflict { tree: u64 },
     #[error(
         "coalesced publication conflict: transaction {writer} already claimed a row identity in table {table}"
     )]
@@ -259,9 +267,10 @@ impl DbError {
         match self {
             Self::Cancelled => TransactionErrorClass::Cancelled,
             Self::DeadlineExceeded => TransactionErrorClass::DeadlineExceeded,
-            Self::SerializationConflict { .. } | Self::WriteWriteConflict { .. } => {
-                TransactionErrorClass::SerializationRetry
-            }
+            Self::SerializationConflict { .. }
+            | Self::SeerWriteConflict { .. }
+            | Self::SeerTreeConflict { .. }
+            | Self::WriteWriteConflict { .. } => TransactionErrorClass::SerializationRetry,
             Self::StorageCapacity { .. }
             | Self::SnapshotCaptureLimit { .. }
             | Self::ResourceLimitExceeded(_) => TransactionErrorClass::Capacity,
