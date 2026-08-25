@@ -531,8 +531,11 @@ fn test_db_reopen_after_wal_recreation_advances_lsn_segment() {
         db.put(b"uncommitted", b"discard").unwrap();
         drop(db);
 
-        let mut db = DB::open(&path, Options::default()).unwrap();
+        let db = DB::open(&path, Options::default()).unwrap();
         assert_eq!(db.get(b"uncommitted").unwrap(), None);
+        drop(db);
+
+        let mut db = DB::open(&path, Options::default()).unwrap();
         db.put(b"second", b"value").unwrap();
         db.flush().unwrap();
         let position = db.durability_status().commit_position;

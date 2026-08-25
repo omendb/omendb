@@ -192,7 +192,10 @@ impl DB {
         let bytes = fs::read(&paths.wal)?;
         let (records, _) = WalManager::parse_records_with_status(&bytes);
         let Some(first) = records.first() else {
-            return Ok(current_manifest.map_or(0, |manifest| manifest.wal_segment));
+            // A WAL that was truncated to an empty file after an incomplete
+            // append is a newly recreated segment. Keep the next segment
+            // chosen from the authoritative manifest across another reopen.
+            return Ok(fallback);
         };
         if first.record_type != RecordType::WalSegment {
             return Ok(current_manifest.map_or(0, |manifest| manifest.wal_segment));
