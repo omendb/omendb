@@ -7,7 +7,8 @@
 //! - **Fixed page format**: the current alpha uses [`PAGE_SIZE`] pages; page
 //!   sizing is not silently configurable through [`Options`]
 //! - **Snapshots**: immutable root generations with explicit retained
-//!   historical reads; durable data-version MVCC remains a future extension
+//!   historical reads; the transactional facade adds durable conflict records
+//!   while physical data-version MVCC remains future work
 //!
 //! # Architecture
 //!
@@ -16,9 +17,11 @@
 //! and garbage collection reclaims invalidated pages. Large values are stored
 //! separately in an append-only blob log.
 //!
-//! The current durable contract uses one serialized writer lane with concurrent
-//! readers and explicit root-generation retention. It does not yet claim full
-//! durable data-version MVCC or multi-writer transaction semantics.
+//! The low-level durable contract uses one serialized publication lane with
+//! concurrent readers and explicit root-generation retention. The public
+//! [`TransactionDatabase`] facade adds fixed-snapshot, multi-writer transaction
+//! semantics above that lane; physical page/WAL multi-writer MVCC remains a
+//! later engine phase.
 //!
 //! # Example
 //!
@@ -55,6 +58,7 @@ pub mod mvcc;
 pub mod recovery;
 pub mod space;
 pub mod storage;
+pub mod transactional;
 
 // Re-export main types at crate root.
 pub use btree::PAGE_SIZE;
@@ -67,4 +71,7 @@ pub use db::{
 };
 pub use error::{CheckFailureKind, Error, Result};
 pub use storage::StorageMetrics;
-pub use storage::format::{CommitId, GenerationId, HistoryId, SnapshotId};
+pub use storage::format::{
+    CommitId, CommitSeq, GenerationId, HistoryId, Lsn, PageVersion, SnapshotId, TreeId, TxnId,
+};
+pub use transactional::{Transaction, TransactionDatabase, TransactionState};

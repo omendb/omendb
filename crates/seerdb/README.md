@@ -19,8 +19,14 @@ foundation beneath a database server:
 - **KV separation**: large values use the compatibility whole-image blob format;
   the segmented catalog layout is available as an opt-in format under separate
   qualification.
-- **Reader/writer contract**: one serialized writer with concurrent reads,
-  root-bound read views, retained snapshots, and expected-base conflict refusal.
+- **Reader/writer contract**: the low-level `DB` uses one serialized
+  publication lane with concurrent reads, root-bound read views, retained
+  snapshots, and expected-base conflict refusal.
+- **Transactional ordered-KV facade**: `TransactionalDB` provides first-class
+  `TreeId`s, fixed snapshots, ordered scans, atomic multi-tree batches, and
+  multi-writer snapshot-isolation conflict checking. Its durable conflict
+  records survive reopen; publication is still serialized by the current
+  physical engine.
 - **Capacity handling**: typed ENOSPC refusal and preflight admission cover
   ordinary commits and maintenance, with same-handle retry and reopen tests.
 - **SSD-aware paths**: Linux O_DIRECT, page-aligned buffers, and optional FDP/ZNS
@@ -32,9 +38,10 @@ The current development line uses a fixed 4 KiB page format, exposed as
 requires a separately versioned format and matching buffer/device
 implementation.
 
-SeerDB does not claim durable per-record MVCC, parallel writers, SQL, HA, or
-cross-device performance parity. Multi-writer MVCC and the OmenDB server
-contract are active architecture work, not release guarantees.
+SeerDB does not yet claim physical per-record page MVCC, parallel physical
+publication, SQL, HA, or cross-device performance parity. The transactional
+facade is a qualified development surface, not a release guarantee; the
+OmenDB server contract remains active architecture work.
 
 ## Basic use
 
@@ -54,7 +61,9 @@ assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
 db.close()?;
 ```
 
-Use `commit_batch` for an atomic group of byte-oriented puts and deletes. Use
+Use `commit_batch` for a low-level atomic group of byte-oriented puts and
+deletes. Use `TransactionalDB` when you need first-class trees, fixed
+snapshots, ordered scans, and concurrent transaction conflict checking. Use
 `begin_read_view`, `retain_commit`, or `begin_snapshot` when a read must stay
 bound to a published historical generation. Call `verify`, `check`, and
 `durability_status` in operational tooling rather than treating a successful
@@ -68,9 +77,11 @@ reclamation. Its one-writer/root-generation contract is a transitional
 prototype, not the target OmenDB transaction architecture.
 
 The target SeerDB design is a generic OLTP-oriented transactional ordered-KV
-engine with first-class trees, multi-writer snapshot MVCC, ordered cursors,
-atomic multi-tree mutation, recoverable WAL, and a restartable committed-change
-stream. SeerDB remains SQL-agnostic: OmenDB owns row/index codecs and
+engine with physical multi-writer snapshot MVCC, ordered cursors, atomic
+multi-tree mutation, recoverable WAL, and a restartable committed-change
+stream. The current `TransactionalDB` is the first semantic vertical slice;
+its physical publication lane is intentionally not presented as the final
+architecture. SeerDB remains SQL-agnostic: OmenDB owns row/index codecs and
 relational meaning. See [`../../docs/architecture.md`](../../docs/architecture.md)
 for the cross-project boundary and roadmap.
 
@@ -78,12 +89,15 @@ for the cross-project boundary and roadmap.
 
 The current Rust development lane is a single-writer durable kernel with
 concurrent reads, root-generation retention, WAL recovery, crash-safe
-reclamation, and retryable capacity refusal. It has useful integrity and
-fault-injection coverage, but it is not yet the target multi-writer
-transactional engine or a releasable `0.1.0-alpha.*` crate. Durable
-per-record MVCC, concurrent transaction semantics, broader filesystem/block-
-layer fault qualification, and measured device-backed performance remain open. OmenDB integration and the alpha release gates are
-the authoritative cross-project qualification surfaces.
+reclamation, and retryable capacity refusal. `TransactionalDB` now supplies
+first-class trees, fixed-snapshot reads, atomic multi-tree mutations, and
+reopen-persistent write-conflict records above that kernel. It is still not
+the target physical multi-writer engine or a releasable `0.1.0-alpha.*` crate.
+Physical per-record MVCC, concurrent page/WAL publication, broader
+filesystem/block-layer fault qualification, OmenDB direct integration, and
+measured device-backed performance remain open. OmenDB integration and the
+alpha release gates are the authoritative cross-project qualification
+surfaces.
 
 On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
 it fails each observed `fsync`, `fdatasync`, rename, and `write` call once both

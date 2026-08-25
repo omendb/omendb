@@ -39,8 +39,8 @@ impl DatabaseId {
 }
 
 macro_rules! numeric_id {
-    ($name:ident) => {
-        #[doc = "Stable persisted identity represented by a monotonic integer."]
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
         pub struct $name(u64);
 
@@ -58,11 +58,40 @@ macro_rules! numeric_id {
     };
 }
 
-numeric_id!(HistoryId);
-numeric_id!(GenerationId);
-numeric_id!(CommitId);
-numeric_id!(PmtCheckpointId);
-numeric_id!(SnapshotId);
+numeric_id!(
+    HistoryId,
+    "Stable persisted identity represented by a monotonic integer."
+);
+numeric_id!(
+    GenerationId,
+    "Stable persisted identity represented by a monotonic integer."
+);
+numeric_id!(
+    CommitId,
+    "Stable persisted identity represented by a monotonic integer."
+);
+numeric_id!(
+    PmtCheckpointId,
+    "Stable persisted identity represented by a monotonic integer."
+);
+numeric_id!(
+    SnapshotId,
+    "Stable persisted identity represented by a monotonic integer."
+);
+numeric_id!(
+    TxnId,
+    "Logical transaction identity, distinct from the commit sequence assigned on success."
+);
+numeric_id!(
+    CommitSeq,
+    "Commit sequence number assigned when a transaction becomes visible."
+);
+numeric_id!(
+    Lsn,
+    "Logical write-ahead-log position reserved for replication and change streams."
+);
+numeric_id!(TreeId, "First-class ordered keyspace identity.");
+numeric_id!(PageVersion, "Version of one logical page mapping.");
 
 /// Fixed-format database superblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

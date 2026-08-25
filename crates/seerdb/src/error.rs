@@ -3,7 +3,7 @@
 use crate::blob::BlobManagerError;
 use crate::btree::{BTreeError, InsertError, SplitError};
 use crate::buffer::BufferError;
-use crate::storage::format::CommitId;
+use crate::storage::format::{CommitId, TreeId};
 
 /// Category of a failure reported by the non-mutating integrity checker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -115,6 +115,24 @@ pub enum Error {
         /// Commit currently published by this writer.
         current: CommitId,
     },
+
+    /// A tree is not visible in the transaction snapshot.
+    #[error("tree {0:?} is not visible")]
+    TreeNotFound(TreeId),
+
+    /// A transaction attempted to modify a tree whose lifecycle changed after
+    /// its snapshot.
+    #[error("tree {0:?} changed concurrently")]
+    TreeConflict(TreeId),
+
+    /// A transaction attempted to modify a key changed by another committed
+    /// transaction after its snapshot.
+    #[error("write conflict on tree {tree:?}, key {key:?}")]
+    WriteConflict { tree: TreeId, key: Vec<u8> },
+
+    /// A transaction handle was used after commit, abort, or recovery fencing.
+    #[error("transaction is no longer active")]
+    TransactionInactive,
 
     /// A bounded maintenance operation owns the serialized writer lane.
     #[error("maintenance is in progress: {0}")]
