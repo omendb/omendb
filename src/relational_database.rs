@@ -21,8 +21,8 @@ use crate::seer_relational::{
     LegacyMigrationOptions, LegacyMigrationReport, SeerRelationalStore, SeerRelationalTransaction,
 };
 use crate::{
-    AttemptRecord, CommitId, DatabaseConfig, DbError, Key, NoFaults, Result, RowIdentity,
-    SeerDurabilityStatus, SeerKernelConfig, SnapshotLease, StorageIdentity, TableId,
+    AttemptRecord, CommitId, DatabaseConfig, DbError, DurabilityStatus, Key, NoFaults, Result,
+    RowIdentity, SeerKernel, SeerKernelConfig, SnapshotLease, StorageIdentity, TableId,
     TransactionAttemptId, Value,
 };
 
@@ -973,7 +973,7 @@ impl RelationalDatabase {
                 Backend::Temporary(Box::new(RelationalStore::create(config)?))
             }
             RelationalBackendConfig::Seer(config) => {
-                Backend::Seer(Box::new(SeerRelationalStore::create(config)?))
+                Backend::Seer(Box::new(SeerRelationalStore::<SeerKernel>::create(config)?))
             }
         };
         Ok(Self::with_backend(backend))
@@ -988,7 +988,7 @@ impl RelationalDatabase {
                 Backend::Temporary(Box::new(RelationalStore::open(config, &mut faults)?))
             }
             RelationalBackendConfig::Seer(config) => {
-                Backend::Seer(Box::new(SeerRelationalStore::open(config)?))
+                Backend::Seer(Box::new(SeerRelationalStore::<SeerKernel>::open(config)?))
             }
         };
         Ok(Self::with_backend(backend))
@@ -1233,7 +1233,7 @@ impl RelationalDatabase {
     /// Return the stable identity for this database history.
     pub fn storage_identity(&self) -> Result<StorageIdentity> {
         match &self.backend {
-            Backend::Temporary(store) => Ok(store.storage_identity()),
+            Backend::Temporary(store) => store.storage_identity(),
             Backend::Seer(store) => store.storage_identity(),
         }
     }
@@ -1532,13 +1532,7 @@ impl RelationalDatabase {
     ) -> Result<CommitId> {
         let result = match &mut self.backend {
             Backend::Temporary(store) => {
-                let mut faults = NoFaults;
-                store.create_table_with_schema_and_primary_key(
-                    table,
-                    primary_key,
-                    schema,
-                    &mut faults,
-                )
+                store.create_table_with_schema_and_primary_key(table, primary_key, schema)
             }
             Backend::Seer(store) => {
                 store.create_table_with_schema_and_primary_key(table, primary_key, schema)
@@ -1555,10 +1549,7 @@ impl RelationalDatabase {
         column: crate::ColumnDefinition,
     ) -> Result<CommitId> {
         let result = match &mut self.backend {
-            Backend::Temporary(store) => {
-                let mut faults = NoFaults;
-                store.add_nullable_column(table, column, &mut faults)
-            }
+            Backend::Temporary(store) => store.add_nullable_column(table, column),
             Backend::Seer(store) => store.add_nullable_column(table, column),
         };
         self.record_commit_result(result)
@@ -1567,10 +1558,7 @@ impl RelationalDatabase {
     /// Publish an index definition and return its commit.
     pub fn create_index(&mut self, index: IndexDefinition) -> Result<CommitId> {
         let result = match &mut self.backend {
-            Backend::Temporary(store) => {
-                let mut faults = NoFaults;
-                store.create_index(index, &mut faults)
-            }
+            Backend::Temporary(store) => store.create_index(index),
             Backend::Seer(store) => store.create_index(index),
         };
         self.record_commit_result(result)
@@ -1580,10 +1568,7 @@ impl RelationalDatabase {
     /// selected backend's catalog.
     pub fn create_named_index(&mut self, index: IndexDefinition, name: String) -> Result<CommitId> {
         let result = match &mut self.backend {
-            Backend::Temporary(store) => {
-                let mut faults = NoFaults;
-                store.create_named_index(index, name, &mut faults)
-            }
+            Backend::Temporary(store) => store.create_named_index(index, name),
             Backend::Seer(store) => store.create_named_index(index, name),
         };
         self.record_commit_result(result)
@@ -1858,8 +1843,7 @@ impl RelationalDatabase {
         let (after, verified_physical_pages, data_bytes, blob_bytes, wal_bytes, reclaimable_pages) =
             match &mut self.backend {
                 Backend::Temporary(store) => {
-                    let mut faults = NoFaults;
-                    store.checkpoint(&mut faults)?;
+                    store.checkpoint()?;
                     (temporary_status(store), None, None, None, None, None)
                 }
                 Backend::Seer(store) => {
@@ -1976,7 +1960,10 @@ impl RelationalDatabase {
     pub fn verify(&mut self) -> Result<RelationalVerificationReport> {
         let result = match &mut self.backend {
             Backend::Temporary(store) => {
-                let logical = store.verify()?;
+                let logical = {
+                    store.verify()?;
+                    store.verify_logical()?
+                };
                 Ok(verification_report(
                     RelationalBackendKind::Temporary,
                     store.commit_id(),
@@ -2015,7 +2002,7 @@ impl RelationalDatabase {
     pub fn metrics(&self) -> Result<RelationalMetrics> {
         let metrics = match &self.backend {
             Backend::Temporary(store) => {
-                let metrics = store.metrics();
+                let metrics = store.metrics()?;
                 RelationalMetrics {
                     backend: RelationalBackendKind::Temporary,
                     commit: store.commit_id(),
@@ -2175,7 +2162,7 @@ impl RelationalDatabase {
         };
         let result = match (&mut self.backend, lease.backend) {
             (Backend::Temporary(store), SnapshotLeaseBackend::Temporary(snapshot)) => {
-                store.release(snapshot);
+                store.release(snapshot)?;
                 Ok(())
             }
             (Backend::Seer(store), SnapshotLeaseBackend::Seer(lease)) => store.release(lease),
@@ -2482,8 +2469,7 @@ impl RelationalDatabaseTransaction {
         }
         let result = match (self.backend, &mut store.backend, attempt) {
             (TransactionBackend::Temporary(transaction), Backend::Temporary(store), None) => {
-                let mut faults = NoFaults;
-                transaction.commit(store, &mut faults)
+                transaction.commit(store)
             }
             (
                 TransactionBackend::Temporary(transaction),
@@ -2515,8 +2501,7 @@ impl RelationalDatabaseTransaction {
         }
         let result = match (self.backend, &mut store.backend, attempt) {
             (TransactionBackend::Temporary(transaction), Backend::Temporary(store), None) => {
-                let mut faults = NoFaults;
-                transaction.commit_validated(store, &mut faults)
+                transaction.commit_validated(store)
             }
             (
                 TransactionBackend::Temporary(transaction),
@@ -2524,10 +2509,10 @@ impl RelationalDatabaseTransaction {
                 Some(attempt),
             ) => transaction.commit_validated_with_attempt(store, attempt),
             (TransactionBackend::Seer(transaction), Backend::Seer(store), None) => {
-                transaction.commit(store)
+                transaction.commit_validated(store)
             }
             (TransactionBackend::Seer(transaction), Backend::Seer(store), Some(attempt)) => {
-                transaction.commit_with_attempt(store, attempt)
+                transaction.commit_validated_with_attempt(store, attempt)
             }
             _ => Err(invalid_transaction_owner()),
         };
@@ -2640,10 +2625,7 @@ fn temporary_status(store: &RelationalStore) -> RelationalDatabaseStatus {
     }
 }
 
-fn seer_status(
-    store: &SeerRelationalStore,
-    status: SeerDurabilityStatus,
-) -> RelationalDatabaseStatus {
+fn seer_status(store: &SeerRelationalStore, status: DurabilityStatus) -> RelationalDatabaseStatus {
     RelationalDatabaseStatus {
         backend: RelationalBackendKind::Seer,
         state: lifecycle_state(status.write_fenced),
@@ -2688,10 +2670,7 @@ fn verification_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, FailOnce, FaultPoint, IndexId,
-        TableDefinition,
-    };
+    use crate::{ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, IndexId, TableDefinition};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -3144,73 +3123,6 @@ mod tests {
 
         let seer = tempfile::tempdir().expect("seer directory");
         exercise_maintenance_reports(RelationalBackendKind::Seer, &seer.path().join("seer"));
-    }
-
-    #[test]
-    fn temporary_status_reports_recovery_required_after_ambiguous_publication() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let mut database = RelationalDatabase::create(config(
-            RelationalBackendKind::Temporary,
-            &directory.path().join("temporary"),
-        ))
-        .expect("create");
-        database.create_table(table()).expect("table");
-        let Backend::Temporary(store) = &mut database.backend else {
-            panic!("expected temporary backend");
-        };
-        let result = store.commit_batch(
-            [RelationalMutation::Insert {
-                table: TableId(7),
-                row: row(1, "alice"),
-            }],
-            &mut FailOnce::at([FaultPoint::AfterWalAppend]),
-        );
-        assert!(matches!(
-            result,
-            Err(DbError::InjectedFailure(FaultPoint::AfterWalAppend))
-        ));
-        let status = database.status().expect("status");
-        assert_eq!(status.state, RelationalLifecycleState::RecoveryRequired);
-        assert!(status.write_fenced);
-        let diagnostic = database.diagnose().expect("recovery diagnostic");
-        assert!(diagnostic.has_errors());
-        let finding = diagnostic
-            .findings
-            .iter()
-            .find(|finding| finding.code == RelationalDiagnosticCode::RecoveryRequired)
-            .expect("recovery finding");
-        assert_eq!(finding.severity, RelationalDiagnosticSeverity::Error);
-        assert_eq!(finding.component, RelationalDiagnosticComponent::Lifecycle);
-        assert_eq!(
-            finding.code.recommended_action(),
-            "close the handle and reopen the database"
-        );
-    }
-
-    #[test]
-    fn recovery_required_close_reports_reopen_and_releases_writer() {
-        let parent = tempfile::tempdir().expect("temporary directory");
-        let path = parent.path().join("temporary");
-        let config = config(RelationalBackendKind::Temporary, &path);
-        let mut database = RelationalDatabase::create(config.clone()).expect("create");
-        database.create_table(table()).expect("table");
-        let Backend::Temporary(store) = &mut database.backend else {
-            panic!("expected temporary backend");
-        };
-        let result = store.commit_batch(
-            [RelationalMutation::Insert {
-                table: TableId(7),
-                row: row(1, "alice"),
-            }],
-            &mut FailOnce::at([FaultPoint::AfterWalAppend]),
-        );
-        assert!(matches!(
-            result,
-            Err(DbError::InjectedFailure(FaultPoint::AfterWalAppend))
-        ));
-
-        assert!(matches!(database.close(), Err(DbError::RecoveryRequired)));
-        RelationalDatabase::open(config).expect("reopen after fenced close");
     }
 
     #[test]

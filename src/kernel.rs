@@ -10,8 +10,9 @@
 //! legacy migration) stay as inherent methods on concrete kernels; generic
 //! relational code never reaches past this trait.
 //!
-//! Two implementations exist: [`crate::SeerKernel`] (production) and
-//! [`InMemoryKernel`] (tests and conformance work). New backends implement
+//! OmenDB ships [`crate::SeerKernel`] as its durable Rust engine,
+//! [`crate::TemporaryKernel`] as a compatibility adapter, and
+//! [`InMemoryKernel`] for tests and conformance work. New backends implement
 //! this trait plus their config/constructor pair.
 
 use std::collections::BTreeMap;
@@ -20,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::seer_kernel::CommitOutcome;
 use crate::seer_kernel::SnapshotIdentity;
 use crate::{
-    AttemptRecord, CommitId, DbError, KvMutation, Result, SeerDurabilityStatus, StorageIdentity,
+    AttemptRecord, CommitId, DbError, DurabilityStatus, KvMutation, Result, StorageIdentity,
     TransactionAttemptId,
 };
 
@@ -143,6 +144,13 @@ pub trait StorageKernel: Send {
     /// Reclaim dead versions/pages, respecting every held lease.
     fn compact(&mut self) -> Result<Self::CompactionReport>;
 
+    /// Reclaim at most `max_work_units` units, respecting every held lease.
+    /// Engines without bounded maintenance may use the unbounded operation.
+    fn compact_with_limit(&mut self, max_work_units: usize) -> Result<Self::CompactionReport> {
+        let _ = max_work_units;
+        self.compact()
+    }
+
     /// Operational counters snapshot.
     fn metrics(&self) -> Result<Self::Metrics>;
 
@@ -157,7 +165,7 @@ pub trait StorageKernel: Send {
     fn storage_identity(&self) -> Result<StorageIdentity>;
 
     /// Lifecycle/publication status projection.
-    fn durability_status(&self) -> Result<SeerDurabilityStatus>;
+    fn durability_status(&self) -> Result<DurabilityStatus>;
 }
 
 /// In-memory [`StorageKernel`] for tests and conformance work: full-copy
@@ -515,8 +523,8 @@ impl StorageKernel for InMemoryKernel {
         })
     }
 
-    fn durability_status(&self) -> Result<SeerDurabilityStatus> {
-        Ok(SeerDurabilityStatus {
+    fn durability_status(&self) -> Result<DurabilityStatus> {
+        Ok(DurabilityStatus {
             storage: self.storage_identity()?,
             generation: self.commit_id().0,
             commit: self.commit_id(),
@@ -760,6 +768,10 @@ impl StorageKernel for crate::SeerKernel {
         crate::SeerKernel::compact(self)
     }
 
+    fn compact_with_limit(&mut self, max_work_units: usize) -> Result<Self::CompactionReport> {
+        crate::SeerKernel::compact_with_limit(self, max_work_units)
+    }
+
     fn metrics(&self) -> Result<Self::Metrics> {
         crate::SeerKernel::metrics(self)
     }
@@ -772,7 +784,7 @@ impl StorageKernel for crate::SeerKernel {
         crate::SeerKernel::storage_identity(self)
     }
 
-    fn durability_status(&self) -> Result<SeerDurabilityStatus> {
+    fn durability_status(&self) -> Result<DurabilityStatus> {
         crate::SeerKernel::durability_status(self)
     }
 

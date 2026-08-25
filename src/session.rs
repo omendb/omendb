@@ -1182,7 +1182,7 @@ impl RelationalDatabaseSession {
     ///
     /// A duplicate committed attempt returns an explicit durable record and
     /// does not rerun the caller closure. Otherwise this behaves exactly like
-    /// [`RelationalDatabase::transaction_with_group_commit`]: the same
+    /// [`Self::transaction_with_group_commit`]: the same
     /// attempt identity survives serialization retries, and the durable
     /// idempotency record publishes inside the shared coalesced envelope.
     pub fn transaction_with_group_commit_attempt<T, F>(

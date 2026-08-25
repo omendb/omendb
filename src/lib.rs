@@ -26,6 +26,7 @@ mod serializable;
 mod session;
 mod sql;
 mod store;
+pub mod temporary_kernel;
 mod wal;
 
 pub use archive::{
@@ -76,8 +77,8 @@ pub use runtime::{
     ReactorError, ResourceGovernor, WorkClass, WorkId, WorkItem, WorkerId,
 };
 pub use seer_kernel::{
-    CommitOutcome, KvMutation, SeerDurabilityStatus, SeerKernel, SeerKernelConfig,
-    SnapshotIdentity, SnapshotLease,
+    CommitOutcome, DurabilityStatus, KvMutation, SeerKernel, SeerKernelConfig, SnapshotIdentity,
+    SnapshotLease,
 };
 pub use seer_relational::{
     LegacyMigrationOptions, LegacyMigrationReport, SeerRelationalStore, SeerRelationalTransaction,
@@ -91,6 +92,7 @@ pub use session::{
     RelationalSessionStatus,
 };
 pub use sql::{SqlColumn, SqlResult};
+pub use temporary_kernel::{TemporaryKernel, TemporaryReadView};
 #[cfg(feature = "pgwire")]
 pub mod pgwire_server;
 pub use store::{

@@ -657,9 +657,8 @@ impl Database {
         }
     }
 
-    /// Reopen durable artifacts for the active handle's read-only integrity
-    /// pass without attempting to become a second writer. This is deliberately
-    /// crate-private; callers must use [`Self::open`] for a database handle.
+    /// Reopen durable artifacts for a read-only integrity pass without
+    /// attempting to become a second writer.
     pub(crate) fn open_for_verification(
         config: DatabaseConfig,
         faults: &mut dyn FaultInjector,
@@ -668,6 +667,10 @@ impl Database {
         let mut database = Self::initialize(config.clone(), false)?;
         database.recover(config)?;
         Ok(database)
+    }
+
+    pub(crate) fn database_config(&self) -> DatabaseConfig {
+        self.config.clone()
     }
 
     fn recover(&mut self, config: DatabaseConfig) -> Result<()> {
@@ -1130,6 +1133,18 @@ impl Database {
     pub fn get_bytes(&self, snapshot: CommitId, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let key = PhysicalKey::bytes(key)?;
         self.get_physical(snapshot, &key)
+    }
+
+    /// Whether this byte key has a durable version at or before `snapshot`.
+    /// The compatibility adapter uses this to distinguish a new byte-key
+    /// tombstone from an absent key in a legacy typed-index namespace.
+    pub fn has_bytes_history(&self, snapshot: CommitId, key: &[u8]) -> Result<bool> {
+        self.validate_snapshot(snapshot)?;
+        let key = PhysicalKey::bytes(key.to_vec())?;
+        Ok(self
+            .fragments
+            .get(&key)
+            .is_some_and(|history| history.iter().any(|fragment| fragment.commit <= snapshot)))
     }
 
     fn get_physical(&self, snapshot: CommitId, key: &PhysicalKey) -> Result<Option<Vec<u8>>> {

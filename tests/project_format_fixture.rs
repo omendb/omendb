@@ -109,6 +109,52 @@ fn current_format_fixtures_reopen_with_expected_content() {
     }
 }
 
+#[test]
+fn legacy_temporary_index_is_hidden_after_byte_key_update() {
+    let workspace = tempdir().expect("fixture workspace");
+    let working = workspace.path().join("temporary");
+    let source = fixture_root().join("temporary");
+    copy_tree(&source, &working);
+    let mut database = RelationalDatabase::open(config(RelationalBackendKind::Temporary, &working))
+        .expect("open legacy temporary fixture");
+
+    database
+        .execute_sql("UPDATE inventory SET label = 'renamed' WHERE id = 2")
+        .expect("update legacy row");
+    assert!(
+        database
+            .execute_sql("SELECT id FROM inventory WHERE label = 'gadget'")
+            .expect("read old index value")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .execute_sql("SELECT id FROM inventory WHERE label = 'renamed'")
+            .expect("read new index value")
+            .rows,
+        vec![vec![omendb::Value::I64(2)]]
+    );
+    database.close().expect("close fixture");
+    let mut reopened = RelationalDatabase::open(config(RelationalBackendKind::Temporary, &working))
+        .expect("reopen updated legacy fixture");
+    assert!(
+        reopened
+            .execute_sql("SELECT id FROM inventory WHERE label = 'gadget'")
+            .expect("read old index value after reopen")
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .execute_sql("SELECT id FROM inventory WHERE label = 'renamed'")
+            .expect("read new index value after reopen")
+            .rows,
+        vec![vec![omendb::Value::I64(2)]]
+    );
+    reopened.close().expect("close reopened fixture");
+}
+
 #[ignore = "generator: writes committed fixtures; run explicitly"]
 #[test]
 fn generate_current_format_fixtures() {

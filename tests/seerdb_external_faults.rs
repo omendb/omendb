@@ -6,11 +6,11 @@ use omendb::FaultPoint;
 #[cfg(feature = "seerdb-fault-injection")]
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, RelationalMutation, Row,
-    SeerRelationalStore, TableDefinition, TableId, Value,
+    SeerKernel, SeerRelationalStore, TableDefinition, TableId, Value,
 };
 use omendb::{
     CommitId, DatabaseConfig, DbError, KvMutation, RelationalBackendConfig, RelationalDatabase,
-    SeerKernel, SeerKernelConfig,
+    SeerKernelConfig,
 };
 use tempfile::tempdir;
 
@@ -273,7 +273,8 @@ fn seerdb_typed_adapter_recovers_after_process_termination_faults() {
             "after-manifest" => FaultPoint::AfterManifestPublish,
             _ => panic!("unknown fault {fault}"),
         };
-        let mut store = SeerRelationalStore::create(config).expect("create typed crash child");
+        let mut store =
+            SeerRelationalStore::<SeerKernel>::create(config).expect("create typed crash child");
         store
             .create_table(typed_table())
             .expect("create typed table");
@@ -323,7 +324,7 @@ fn seerdb_typed_adapter_recovers_after_process_termination_faults() {
             "typed crash child exited cleanly for {fault}"
         );
 
-        let mut recovered = SeerRelationalStore::open(SeerKernelConfig::new(path))
+        let mut recovered = SeerRelationalStore::<SeerKernel>::open(SeerKernelConfig::new(path))
             .unwrap_or_else(|error| panic!("typed reopen after {fault}: {error}"));
         let commit = recovered.commit_id();
         assert!(

@@ -46,7 +46,7 @@ pub struct SnapshotIdentity {
 /// Durable publication state projected without exposing SeerDB's physical
 /// status type to OmenDB callers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SeerDurabilityStatus {
+pub struct DurabilityStatus {
     pub storage: StorageIdentity,
     pub generation: u64,
     pub commit: CommitId,
@@ -57,13 +57,13 @@ pub struct SeerDurabilityStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SeerCheckpointReport {
     pub physical: seerdb::VerificationReport,
-    pub durability: SeerDurabilityStatus,
+    pub durability: DurabilityStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SeerCompactionReport {
     pub physical: seerdb::CompactionReport,
-    pub durability: SeerDurabilityStatus,
+    pub durability: DurabilityStatus,
 }
 
 /// One atomic byte-key mutation owned by OmenDB's logical layer.
@@ -806,7 +806,7 @@ impl SeerKernel {
 
     /// Return durable publication state for diagnostics and recovery
     /// decisions without exposing SeerDB's physical status type.
-    pub fn durability_status(&self) -> Result<SeerDurabilityStatus> {
+    pub fn durability_status(&self) -> Result<DurabilityStatus> {
         let db = self.db.lock().map_err(|_| database_lock_error())?;
         Ok(project_durability_status(db.durability_status()))
     }
@@ -921,8 +921,8 @@ fn storage_identity(status: seerdb::DurabilityStatus) -> StorageIdentity {
     }
 }
 
-fn project_durability_status(status: seerdb::DurabilityStatus) -> SeerDurabilityStatus {
-    SeerDurabilityStatus {
+fn project_durability_status(status: seerdb::DurabilityStatus) -> DurabilityStatus {
+    DurabilityStatus {
         storage: storage_identity(status),
         generation: status.generation_id.get(),
         commit: CommitId(status.commit_id.get()),

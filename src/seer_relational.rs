@@ -30,7 +30,7 @@ use crate::relational::{
 use crate::row_identity::encode_legacy_key;
 use crate::seer_kernel::{SeerCheckpointReport, SeerCompactionReport};
 use crate::{
-    AttemptRecord, CommitId, DbError, IndexId, Key, KvMutation, Result, SeerDurabilityStatus,
+    AttemptRecord, CommitId, DbError, DurabilityStatus, IndexId, Key, KvMutation, Result,
     SeerKernel, SeerKernelConfig, SnapshotIdentity, StorageIdentity, TransactionAttemptId,
 };
 
@@ -106,7 +106,7 @@ struct CommittedWriteEntry {
 }
 
 pub struct SeerRelationalStore<K: StorageKernel = SeerKernel> {
-    kernel: K,
+    pub(crate) kernel: K,
     catalog: Catalog,
     committed_writes: Mutex<CommittedWrites>,
 }
@@ -117,7 +117,10 @@ impl<K: StorageKernel> SeerRelationalStore<K> {
         self.kernel.close()
     }
 
-    fn from_kernel(kernel: K) -> Result<Self> {
+    /// Construct the relational layer over any kernel implementing
+    /// [`StorageKernel`]. The kernel owns durability and recovery; OmenDB
+    /// owns catalog, row, index, and constraint semantics.
+    pub fn from_kernel(kernel: K) -> Result<Self> {
         let commit = kernel.commit_id();
         let catalog = match kernel.get(commit, CATALOG_KEY)? {
             Some(bytes) => decode_catalog(&bytes)?,
@@ -150,7 +153,7 @@ impl<K: StorageKernel> SeerRelationalStore<K> {
 
     /// Return physical publication state through the narrow OmenDB kernel
     /// projection rather than exposing SeerDB's status type.
-    pub(crate) fn durability_status(&self) -> Result<SeerDurabilityStatus> {
+    pub(crate) fn durability_status(&self) -> Result<DurabilityStatus> {
         self.kernel.durability_status()
     }
 
@@ -1453,6 +1456,37 @@ impl<K: StorageKernel> SeerRelationalStore<K> {
         Ok(outcome.commit)
     }
 
+    fn commit_transaction_at_current(
+        &self,
+        current: CommitId,
+        snapshot: CommitId,
+        mutations: &[RelationalMutation],
+    ) -> Result<CommitId> {
+        let batch = self.build_batch(snapshot, mutations)?;
+        let outcome = self.kernel.commit(current, &batch)?;
+        self.record_committed_writes(
+            outcome.commit,
+            Self::committed_entry_for(&self.catalog, mutations),
+        );
+        Ok(outcome.commit)
+    }
+
+    fn commit_transaction_with_attempt_at_current(
+        &self,
+        current: CommitId,
+        snapshot: CommitId,
+        mutations: &[RelationalMutation],
+        attempt: TransactionAttemptId,
+    ) -> Result<CommitId> {
+        let batch = self.build_batch(snapshot, mutations)?;
+        let outcome = self.kernel.commit_with_attempt(current, attempt, &batch)?;
+        self.record_committed_writes(
+            outcome.commit,
+            Self::committed_entry_for(&self.catalog, mutations),
+        );
+        Ok(outcome.commit)
+    }
+
     fn build_batch(
         &self,
         snapshot: CommitId,
@@ -2621,6 +2655,40 @@ impl<K: StorageKernel> SeerRelationalTransaction<K> {
         commit
     }
 
+    pub fn commit_validated(mut self, store: &mut SeerRelationalStore<K>) -> Result<CommitId> {
+        if self.is_read_only() {
+            let snapshot = self.snapshot;
+            self.read_view.take();
+            return Ok(snapshot);
+        }
+        let point_reads = self.point_reads.lock().expect("read set poisoned").clone();
+        let table_reads = self.table_reads.lock().expect("read set poisoned").clone();
+        let catalog = store.catalog_at(store.commit_id())?;
+        let entry = SeerRelationalStore::<K>::committed_entry_for(&catalog, &self.mutations);
+        let write_identities = entry.identities.clone();
+        let write_uniques = entry.uniques.clone();
+        let current = store.commit_id();
+        let certified = current == self.snapshot
+            || store.certify_against_committed(
+                self.snapshot,
+                &point_reads,
+                &table_reads,
+                &write_identities,
+                &write_uniques,
+                &catalog,
+            );
+        let commit = if !certified {
+            Err(DbError::SerializationConflict {
+                snapshot: self.snapshot.0,
+                current: current.0,
+            })
+        } else {
+            store.commit_transaction_at_current(current, self.snapshot, &self.mutations)
+        };
+        self.read_view.take();
+        commit
+    }
+
     pub fn commit_validated_with_attempt(
         mut self,
         store: &mut SeerRelationalStore<K>,
@@ -2631,7 +2699,33 @@ impl<K: StorageKernel> SeerRelationalTransaction<K> {
             self.read_view.take();
             return Ok(snapshot);
         }
-        let commit = store.commit_transaction_with_attempt(self.snapshot, &self.mutations, attempt);
+        let point_reads = self.point_reads.lock().expect("read set poisoned").clone();
+        let table_reads = self.table_reads.lock().expect("read set poisoned").clone();
+        let catalog = store.catalog_at(store.commit_id())?;
+        let entry = SeerRelationalStore::<K>::committed_entry_for(&catalog, &self.mutations);
+        let current = store.commit_id();
+        let certified = current == self.snapshot
+            || store.certify_against_committed(
+                self.snapshot,
+                &point_reads,
+                &table_reads,
+                &entry.identities,
+                &entry.uniques,
+                &catalog,
+            );
+        let commit = if !certified {
+            Err(DbError::SerializationConflict {
+                snapshot: self.snapshot.0,
+                current: current.0,
+            })
+        } else {
+            store.commit_transaction_with_attempt_at_current(
+                current,
+                self.snapshot,
+                &self.mutations,
+                attempt,
+            )
+        };
         self.read_view.take();
         commit
     }
@@ -3262,7 +3356,7 @@ mod tests {
     fn coalesced_publication_commits_same_snapshot_transactions_in_one_envelope() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
 
         let mut first = store.begin().expect("begin");
@@ -3301,7 +3395,7 @@ mod tests {
     fn coalesced_publication_rejects_overlapping_writes_and_stale_snapshots() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
 
         // Two same-snapshot transactions claiming the same row identity.
@@ -3360,7 +3454,7 @@ mod tests {
     fn coalesced_publication_rejects_read_write_cycles_but_allows_one_direction() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
         for id in 1..=4u64 {
             let mut seed = store.begin().expect("begin");
@@ -3420,7 +3514,7 @@ mod tests {
     fn coalesced_publication_certifies_unaffected_stale_snapshots() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
         for id in 1..=4u64 {
             let mut seed = store.begin().expect("begin");
@@ -3457,7 +3551,7 @@ mod tests {
             "certified stale member must commit: {results:?}"
         );
         store.close().expect("close");
-        let reopened = SeerRelationalStore::open(config).expect("reopen");
+        let reopened = SeerRelationalStore::<SeerKernel>::open(config).expect("reopen");
         let committed = reopened
             .scan(TableId(7), reopened.commit_id(), 16)
             .expect("scan");
@@ -3472,7 +3566,7 @@ mod tests {
     fn coalesced_publication_conflicts_stale_snapshots_overlapping_the_window() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
         assert_eq!(store.create_index(index()).expect("index"), CommitId(2));
         for id in 1..=3u64 {
@@ -3528,7 +3622,7 @@ mod tests {
     fn coalesced_publication_hard_conflicts_when_window_history_is_pruned() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
         let mut seed = store.begin().expect("begin");
         seed.insert(&store, TableId(7), row(1, "seed1", 100))
@@ -3560,7 +3654,7 @@ mod tests {
     fn coalesced_publication_rejects_shared_unique_values_across_transactions() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         store
             .create_table_with_schema(
                 table(),
@@ -3607,7 +3701,7 @@ mod tests {
     fn typed_transaction_publishes_rows_and_index_atomically_and_reopens() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         assert_eq!(store.create_table(table()).expect("table"), CommitId(1));
 
         let first = row(1, "alice@example.com", 30);
@@ -3703,7 +3797,7 @@ mod tests {
         store.verify().expect("verify");
         drop(store);
 
-        let reopened = SeerRelationalStore::open(config).expect("reopen");
+        let reopened = SeerRelationalStore::<SeerKernel>::open(config).expect("reopen");
         assert_eq!(reopened.commit_id(), CommitId(5));
         assert_eq!(
             reopened.catalog.table(TableId(7)).expect("table").name,
@@ -3726,7 +3820,7 @@ mod tests {
     fn typed_transaction_overlays_row_scans_and_secondary_indexes() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         store.create_index(index()).expect("index");
 
@@ -3822,7 +3916,8 @@ mod tests {
         let restored_directory = restored_parent.path().join("restored");
         let source_config = SeerKernelConfig::new(source_directory.clone());
         let restored_config = SeerKernelConfig::new(restored_directory.clone());
-        let mut source = SeerRelationalStore::create(source_config.clone()).expect("create");
+        let mut source =
+            SeerRelationalStore::<SeerKernel>::create(source_config.clone()).expect("create");
         source.create_table(table()).expect("table");
         assert_eq!(source.create_index(index()).expect("index"), CommitId(2));
         let first = row(1, "alice@example.com", 30);
@@ -3838,7 +3933,7 @@ mod tests {
         let snapshot = source.snapshot(&archive).expect("snapshot");
 
         let (mut restored, restore) =
-            SeerRelationalStore::restore(restored_config, &archive).expect("restore");
+            SeerRelationalStore::<SeerKernel>::restore(restored_config, &archive).expect("restore");
         assert_eq!(restore.source.commit_id, snapshot.source.commit_id);
         assert_eq!(restored.commit_id(), CommitId(3));
         assert_eq!(
@@ -3887,7 +3982,8 @@ mod tests {
         drop(restored);
         drop(source);
 
-        let mut source = SeerRelationalStore::open(source_config).expect("reopen source");
+        let mut source =
+            SeerRelationalStore::<SeerKernel>::open(source_config).expect("reopen source");
         assert_eq!(source.commit_id(), CommitId(3));
         assert_eq!(
             source
@@ -3925,7 +4021,8 @@ mod tests {
         let restored_directory = restored_parent.path().join("restored");
         let source_config = SeerKernelConfig::new(source_directory.clone());
         let restored_config = SeerKernelConfig::new(restored_directory);
-        let mut store = SeerRelationalStore::create(source_config.clone()).expect("create");
+        let mut store =
+            SeerRelationalStore::<SeerKernel>::create(source_config.clone()).expect("create");
         store.create_table(table()).expect("table");
         store.create_index(index()).expect("index");
 
@@ -4109,7 +4206,8 @@ mod tests {
         );
 
         let (mut restored, restore) =
-            SeerRelationalStore::restore(restored_config, &archive).expect("workload restore");
+            SeerRelationalStore::<SeerKernel>::restore(restored_config, &archive)
+                .expect("workload restore");
         assert_eq!(
             restore.source.commit_id,
             seerdb::CommitId::new(current_commit.0)
@@ -4175,7 +4273,8 @@ mod tests {
         ));
         drop(store);
 
-        let mut reopened = SeerRelationalStore::open(source_config).expect("reopen workload");
+        let mut reopened =
+            SeerRelationalStore::<SeerKernel>::open(source_config).expect("reopen workload");
         assert_eq!(reopened.commit_id(), current_commit);
         assert_eq!(
             reopened
@@ -4209,26 +4308,20 @@ mod tests {
         })
         .expect("create legacy store");
         source.create_table(table()).expect("legacy table");
-        let mut faults = crate::NoFaults;
-        source
-            .create_index(index(), &mut faults)
-            .expect("legacy index");
+        source.create_index(index()).expect("legacy index");
         let first = row(1, "alice@example.com", 30);
         let second = row(2, "bob@example.com", 31);
         source
-            .commit_batch(
-                [
-                    RelationalMutation::Insert {
-                        table: TableId(7),
-                        row: first.clone(),
-                    },
-                    RelationalMutation::Insert {
-                        table: TableId(7),
-                        row: second.clone(),
-                    },
-                ],
-                &mut faults,
-            )
+            .commit_batch([
+                RelationalMutation::Insert {
+                    table: TableId(7),
+                    row: first.clone(),
+                },
+                RelationalMutation::Insert {
+                    table: TableId(7),
+                    row: second.clone(),
+                },
+            ])
             .expect("legacy rows");
         let source_commit = source.commit_id();
         let source_catalog = encode_catalog(source.catalog()).expect("source catalog");
@@ -4285,7 +4378,7 @@ mod tests {
         migrated.verify().expect("migration verify");
         drop(migrated);
 
-        let reopened = SeerRelationalStore::open(config).expect("reopen migrated");
+        let reopened = SeerRelationalStore::<SeerKernel>::open(config).expect("reopen migrated");
         assert_eq!(reopened.commit_id(), CommitId(1));
         assert_eq!(
             reopened
@@ -4311,20 +4404,14 @@ mod tests {
         })
         .expect("create legacy store");
         source.create_table(table()).expect("legacy table");
-        let mut faults = crate::NoFaults;
-        source
-            .create_index(index(), &mut faults)
-            .expect("legacy index");
+        source.create_index(index()).expect("legacy index");
 
         let first = row(1, "alice@example.com", 30);
         source
-            .commit_batch(
-                [RelationalMutation::Insert {
-                    table: TableId(7),
-                    row: first.clone(),
-                }],
-                &mut faults,
-            )
+            .commit_batch([RelationalMutation::Insert {
+                table: TableId(7),
+                row: first.clone(),
+            }])
             .expect("legacy historical row");
         let historical_commit = source.commit_id();
         source
@@ -4333,13 +4420,10 @@ mod tests {
 
         let second = row(2, "bob@example.com", 31);
         source
-            .commit_batch(
-                [RelationalMutation::Insert {
-                    table: TableId(7),
-                    row: second.clone(),
-                }],
-                &mut faults,
-            )
+            .commit_batch([RelationalMutation::Insert {
+                table: TableId(7),
+                row: second.clone(),
+            }])
             .expect("legacy current row");
         let source_commit = source.commit_id();
         let historical_rows = source
@@ -4389,14 +4473,16 @@ mod tests {
         migrated.verify().expect("migration verify");
         drop(migrated);
 
-        let reopened = SeerRelationalStore::open(config).expect("reopen migrated");
+        let reopened = SeerRelationalStore::<SeerKernel>::open(config).expect("reopen migrated");
         assert_eq!(
             reopened
                 .scan(TableId(7), report.target_commit, 10)
                 .expect("reopened current rows"),
             current_rows
         );
-        source.release(historical_commit);
+        source
+            .release(historical_commit)
+            .expect("release historical snapshot");
     }
 
     #[test]
@@ -4410,13 +4496,10 @@ mod tests {
         .expect("create legacy store");
         source.create_table(table()).expect("legacy table");
         source
-            .commit_batch(
-                [RelationalMutation::Insert {
-                    table: TableId(7),
-                    row: row(1, "alice@example.com", 30),
-                }],
-                &mut crate::NoFaults,
-            )
+            .commit_batch([RelationalMutation::Insert {
+                table: TableId(7),
+                row: row(1, "alice@example.com", 30),
+            }])
             .expect("legacy row");
         let historical_commit = source.commit_id();
         source
@@ -4434,19 +4517,22 @@ mod tests {
         ));
         assert!(!target_directory.exists());
         assert_eq!(source.retained_snapshot_count(), 1);
-        source.release(historical_commit);
+        source
+            .release(historical_commit)
+            .expect("release historical snapshot");
     }
 
     #[test]
     fn typed_create_refuses_existing_store_without_resetting_catalog() {
         let parent = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(parent.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         store.create_table(table()).expect("table");
         drop(store);
 
-        assert!(SeerRelationalStore::create(config.clone()).is_err());
-        let reopened = SeerRelationalStore::open(config).expect("reopen existing store");
+        assert!(SeerRelationalStore::<SeerKernel>::create(config.clone()).is_err());
+        let reopened =
+            SeerRelationalStore::<SeerKernel>::open(config).expect("reopen existing store");
         assert_eq!(
             reopened
                 .catalog
@@ -4501,7 +4587,8 @@ mod tests {
         migrated.verify().expect("empty verify");
         drop(migrated);
 
-        let reopened = SeerRelationalStore::open(config).expect("reopen empty migration");
+        let reopened =
+            SeerRelationalStore::<SeerKernel>::open(config).expect("reopen empty migration");
         assert_eq!(reopened.commit_id(), CommitId(0));
         assert!(reopened.catalog.tables().next().is_none());
     }
@@ -4516,15 +4603,11 @@ mod tests {
         })
         .expect("create legacy store");
         source.create_table(table()).expect("legacy table");
-        let mut faults = crate::NoFaults;
         source
-            .commit_batch(
-                [RelationalMutation::Insert {
-                    table: TableId(7),
-                    row: row(1, "alice@example.com", 30),
-                }],
-                &mut faults,
-            )
+            .commit_batch([RelationalMutation::Insert {
+                table: TableId(7),
+                row: row(1, "alice@example.com", 30),
+            }])
             .expect("legacy row");
 
         let mut config = SeerKernelConfig::new(target_directory.clone());
@@ -4611,17 +4694,13 @@ mod tests {
         };
         source.create_table(parent).expect("parent table");
         source.create_table(child).expect("child table");
-        let mut faults = crate::NoFaults;
         source
-            .create_index(
-                IndexDefinition {
-                    id: IndexId(80),
-                    table: TableId(80),
-                    columns: vec![ColumnId(1)],
-                    unique: true,
-                },
-                &mut faults,
-            )
+            .create_index(IndexDefinition {
+                id: IndexId(80),
+                table: TableId(80),
+                columns: vec![ColumnId(1)],
+                unique: true,
+            })
             .expect("parent index");
         source
             .create_foreign_key(ForeignKeyDefinition {
@@ -4635,25 +4714,22 @@ mod tests {
             })
             .expect("foreign key");
         source
-            .commit_batch(
-                [
-                    RelationalMutation::Insert {
-                        table: TableId(80),
-                        row: Row {
-                            primary: Key::new(80, 1),
-                            values: vec![Value::U64(1)],
-                        },
+            .commit_batch([
+                RelationalMutation::Insert {
+                    table: TableId(80),
+                    row: Row {
+                        primary: Key::new(80, 1),
+                        values: vec![Value::U64(1)],
                     },
-                    RelationalMutation::Insert {
-                        table: TableId(81),
-                        row: Row {
-                            primary: Key::new(81, 1),
-                            values: vec![Value::U64(1)],
-                        },
+                },
+                RelationalMutation::Insert {
+                    table: TableId(81),
+                    row: Row {
+                        primary: Key::new(81, 1),
+                        values: vec![Value::U64(1)],
                     },
-                ],
-                &mut faults,
-            )
+                },
+            ])
             .expect("legacy rows");
 
         let config = SeerKernelConfig::new(target_directory);
@@ -4677,7 +4753,7 @@ mod tests {
     fn transaction_snapshot_is_owned_until_abort() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         let transaction = store.begin().expect("begin");
         assert_eq!(transaction.snapshot(), store.commit_id());
@@ -4688,7 +4764,7 @@ mod tests {
     fn transaction_helper_commits_writes_and_skips_read_only_commit() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         let primary = Key::new(7, 91);
         let row = row(91, "transaction@example.com", 30);
@@ -4733,7 +4809,7 @@ mod tests {
     fn direct_empty_commits_are_backend_neutral_read_only_boundaries() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         let current = store.commit_id();
 
@@ -4762,7 +4838,7 @@ mod tests {
     fn typed_attempt_api_persists_and_forgets_cleanup_batch() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         let attempt = crate::TransactionAttemptId::new([12; 16]);
         let commit = store
@@ -4793,7 +4869,7 @@ mod tests {
     fn current_transaction_read_view_does_not_rewalk_the_current_tree() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         store
             .commit_batch((1..=128).map(|id| RelationalMutation::Insert {
@@ -4817,7 +4893,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let database_path = directory.path().join("seerdb");
         let config = SeerKernelConfig::new(database_path.clone());
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
 
         let retained_files = || {
@@ -4841,7 +4917,7 @@ mod tests {
     fn concurrent_read_transactions_begin_from_shared_store() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         store
             .commit_batch([RelationalMutation::Insert {
@@ -4871,7 +4947,7 @@ mod tests {
     fn foreign_keys_validate_final_batches_and_reject_orphans() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         let parent = TableDefinition {
             id: TableId(80),
             name: "parents".to_owned(),
@@ -4973,7 +5049,7 @@ mod tests {
     fn retained_transaction_reads_old_root_and_rejects_stale_commit() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
 
         let mut old = store.begin().expect("old begin");
@@ -5005,7 +5081,7 @@ mod tests {
     fn historical_reads_use_the_catalog_at_the_retained_commit() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
         store
             .commit_batch([RelationalMutation::Insert {
@@ -5028,7 +5104,7 @@ mod tests {
     fn typed_boundary_exposes_storage_metrics_and_bounded_reclaim() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config).expect("create");
         store.create_table(table()).expect("table");
 
         let mutations = (0..64)
@@ -5070,7 +5146,8 @@ mod tests {
         for point in MATRIX {
             let directory = tempfile::tempdir().expect("temporary directory");
             let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-            let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+            let mut store =
+                SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
             store.create_table(table()).expect("table");
             store.create_index(index()).expect("index");
             let baseline = store.commit_id();
@@ -5083,7 +5160,7 @@ mod tests {
             assert!(result.is_err(), "fault {point:?} did not fail the commit");
             drop(store);
 
-            let reopened = SeerRelationalStore::open(config)
+            let reopened = SeerRelationalStore::<SeerKernel>::open(config)
                 .unwrap_or_else(|error| panic!("reopen after {point:?}: {error}"));
             let recovered = reopened.commit_id();
             let old_generation = recovered == baseline;
@@ -5121,7 +5198,7 @@ mod tests {
     fn composite_identity_catalog_and_rows_reopen_old_or_complete_new_after_faults() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-        let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+        let mut store = SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
         store
             .inject_fault(FaultPoint::AfterWalSync)
             .expect("arm schema fault");
@@ -5136,7 +5213,7 @@ mod tests {
         );
         drop(store);
 
-        let mut reopened = SeerRelationalStore::open(config).expect("reopen");
+        let mut reopened = SeerRelationalStore::<SeerKernel>::open(config).expect("reopen");
         let table_exists = reopened.catalog().table(TableId(70)).is_ok();
         let index_count = reopened.catalog().indexes_for(TableId(70)).count();
         assert_eq!(table_exists, index_count == 2);
@@ -5177,7 +5254,8 @@ mod tests {
         for point in MATRIX {
             let directory = tempfile::tempdir().expect("temporary directory");
             let config = SeerKernelConfig::new(directory.path().join("seerdb"));
-            let mut store = SeerRelationalStore::create(config.clone()).expect("create");
+            let mut store =
+                SeerRelationalStore::<SeerKernel>::create(config.clone()).expect("create");
             store
                 .create_table_with_schema_and_primary_key(
                     composite_table(),
@@ -5203,7 +5281,7 @@ mod tests {
             );
             drop(store);
 
-            let mut reopened = SeerRelationalStore::open(config)
+            let mut reopened = SeerRelationalStore::<SeerKernel>::open(config)
                 .unwrap_or_else(|error| panic!("reopen after {point:?}: {error}"));
             reopened.verify().expect("verify recovered composite state");
             assert_eq!(
