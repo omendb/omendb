@@ -26,7 +26,8 @@ foundation beneath a database server:
   `TreeId`s, fixed snapshots resolved through current records and an
   append-oriented before-image version store, durable transaction-status
   indirection, ordered scans, atomic multi-tree batches, snapshot-isolation
-  conflict checking, and bounded `gc_versions` maintenance that respects
+  conflict checking, ordered cursor handles with read-range phantom
+  protection, and bounded `gc_versions` maintenance that respects
   active snapshots. Its durable conflict records and version history survive
   reopen; publication is still serialized
   by the current physical engine.

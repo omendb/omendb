@@ -75,4 +75,6 @@ pub use storage::format::{
     CommitId, CommitPosition, CommitSeq, GenerationId, HistoryId, Lsn, PageVersion, SnapshotId,
     TreeId, TxnId,
 };
-pub use transactional::{Transaction, TransactionDatabase, TransactionState, VersionGcReport};
+pub use transactional::{
+    Cursor, Transaction, TransactionDatabase, TransactionState, VersionGcReport,
+};

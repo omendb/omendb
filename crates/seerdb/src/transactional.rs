@@ -143,8 +143,23 @@ pub struct Transaction {
     writes: BTreeMap<(TreeId, Vec<u8>), Option<Vec<u8>>>,
     created: BTreeSet<TreeId>,
     dropped: BTreeSet<TreeId>,
+    read_ranges: BTreeSet<(TreeId, Vec<u8>, Option<Vec<u8>>)>,
     state: TransactionState,
     snapshot_registered: bool,
+}
+
+/// Ordered forward cursor over one tree at the transaction's fixed snapshot.
+///
+/// The cursor merges snapshot-visible storage with the transaction's own
+/// staged writes, so it reads its own writes. Creating it registers a range
+/// dependency: a concurrent commit that writes any key inside the scanned
+/// range conflicts with this transaction's later commit, protecting reads
+/// from phantoms under snapshot isolation.
+pub struct Cursor<'a> {
+    transaction: &'a Transaction,
+    tree: TreeId,
+    end: Option<Vec<u8>>,
+    position: Option<Vec<u8>>,
 }
 
 impl TransactionDatabase {
@@ -223,6 +238,7 @@ impl TransactionDatabase {
             writes: BTreeMap::new(),
             created: BTreeSet::new(),
             dropped: BTreeSet::new(),
+            read_ranges: BTreeSet::new(),
             state: TransactionState::Active,
             snapshot_registered: true,
         })
@@ -681,6 +697,32 @@ impl Transaction {
         Ok(values.into_iter().take(limit).collect())
     }
 
+    /// Open an ordered forward cursor over `[start,end)` in key order.
+    ///
+    /// The cursor resolves visibility at this transaction's fixed snapshot and
+    /// observes the transaction's own staged writes. Creating it registers a
+    /// range dependency, so a concurrent commit writing any key inside the
+    /// range conflicts with this transaction's commit (phantom protection).
+    pub fn cursor(&mut self, tree: TreeId, start: &[u8], end: Option<&[u8]>) -> Result<Cursor<'_>> {
+        self.check_active()?;
+        self.check_tree_visible_for_read(tree)?;
+        if let Some(end) = end
+            && start > end
+        {
+            return Err(Error::InvalidArgument(
+                "cursor end must not precede cursor start".into(),
+            ));
+        }
+        self.read_ranges
+            .insert((tree, start.to_vec(), end.map(ToOwned::to_owned)));
+        Ok(Cursor {
+            transaction: self,
+            tree,
+            end: end.map(ToOwned::to_owned),
+            position: Some(start.to_vec()),
+        })
+    }
+
     /// Publish all staged tree and key mutations atomically.
     pub fn commit(&mut self) -> Result<CommitPosition> {
         self.check_active()?;
@@ -785,6 +827,125 @@ impl Transaction {
             Err(Error::TreeNotFound(tree))
         }
     }
+}
+
+impl Cursor<'_> {
+    /// Advance to the next visible entry in key order.
+    fn advance(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            let Some(position) = self.position.clone() else {
+                return Ok(None);
+            };
+            if let Some(end) = &self.end
+                && position.as_slice() >= end.as_slice()
+            {
+                self.position = None;
+                return Ok(None);
+            }
+            let storage = self.storage_entry(&position)?;
+            let staged = self.staged_entry(&position);
+            let chosen = match (&storage, &staged) {
+                (None, None) => {
+                    self.position = None;
+                    return Ok(None);
+                }
+                (Some((storage_key, _)), None) => storage_key.clone(),
+                (None, Some((staged_key, _))) => staged_key.clone(),
+                (Some((storage_key, _)), Some((staged_key, _))) => {
+                    storage_key.min(staged_key).clone()
+                }
+            };
+            self.position = Some(successor(&chosen));
+            match staged.iter().find(|(key, _)| *key == chosen) {
+                Some((_, Some(value))) => return Ok(Some((chosen, value.clone()))),
+                // A staged delete shadows the storage entry; keep scanning.
+                Some((_, None)) => continue,
+                None => {
+                    debug_assert_eq!(storage.as_ref().map(|(key, _)| key), Some(&chosen));
+                    if let Some((_, value)) = storage {
+                        return Ok(Some((chosen, value)));
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// First snapshot-visible storage entry at or after `position`.
+    fn storage_entry(&self, position: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if self.transaction.created.contains(&self.tree) {
+            return Ok(None);
+        }
+        let prefix = tree_prefix(self.tree);
+        let physical_start = append(&prefix, position);
+        let physical_end = self
+            .end
+            .as_deref()
+            .map(|end| append(&prefix, end))
+            .unwrap_or_else(|| prefix_end(&prefix));
+        let db = self
+            .transaction
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let mut version_store = self
+            .transaction
+            .runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let statuses = self
+            .transaction
+            .runtime
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
+        for (key, value) in db.range(&physical_start, &physical_end)? {
+            let Some(user_key) = decode_tree_key(self.tree, &key) else {
+                continue;
+            };
+            let current = decode_current(Some(&value))?;
+            if let Some(version) = visible_current(
+                &mut version_store,
+                &statuses,
+                &current,
+                self.transaction.snapshot,
+            )? && let Some(value) = version.value
+            {
+                return Ok(Some((user_key, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// First staged write at or after `position`, as `(key, staged value)`.
+    fn staged_entry(&self, position: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        self.transaction
+            .writes
+            .range((self.tree, position.to_vec())..)
+            .take_while(|((tree, key), _)| {
+                *tree == self.tree && self.end.as_ref().is_none_or(|end| key.as_slice() < end)
+            })
+            .next()
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.advance().transpose()
+    }
+}
+
+/// Smallest key strictly greater than `key` across all byte strings.
+fn successor(key: &[u8]) -> Vec<u8> {
+    let mut next = Vec::with_capacity(key.len() + 1);
+    next.extend_from_slice(key);
+    next.push(0);
+    next
 }
 
 impl Drop for Transaction {
@@ -1030,6 +1191,42 @@ fn validate_conflicts(
                 tree: *tree,
                 key: key.clone(),
             });
+        }
+    }
+    validate_range_dependencies(transaction, db, current)
+}
+
+/// Reject commits whose registered read ranges saw a phantom: any concurrent
+/// commit after the transaction's snapshot that wrote inside the range.
+fn validate_range_dependencies(
+    transaction: &Transaction,
+    db: &DB,
+    current: CommitSeq,
+) -> Result<()> {
+    for (tree, start, end) in &transaction.read_ranges {
+        let prefix = CHANGE_RECORD_PREFIX;
+        for (key, value) in db.range(prefix, &prefix_end(prefix))? {
+            let Some(commit) = decode_change_commit(&key) else {
+                continue;
+            };
+            if commit <= transaction.snapshot || commit > current {
+                continue;
+            }
+            let change = decode_change(&value)?;
+            for (changed_tree, changed_key) in &change.writes {
+                if *changed_tree != *tree
+                    || changed_key.as_slice() < start.as_slice()
+                    || end
+                        .as_ref()
+                        .is_some_and(|end| changed_key.as_slice() >= end.as_slice())
+                {
+                    continue;
+                }
+                return Err(Error::SerializationConflict {
+                    expected: CommitId::new(transaction.snapshot.get()),
+                    current: CommitId::new(current.get()),
+                });
+            }
         }
     }
     Ok(())
@@ -1314,6 +1511,12 @@ fn tree_record_key(tree: TreeId) -> Vec<u8> {
 
 fn change_record_key(commit: CommitSeq) -> Vec<u8> {
     append(CHANGE_RECORD_PREFIX, &commit.get().to_be_bytes())
+}
+
+fn decode_change_commit(key: &[u8]) -> Option<CommitSeq> {
+    key.strip_prefix(CHANGE_RECORD_PREFIX)
+        .and_then(|rest| <[u8; 8]>::try_from(rest).ok())
+        .map(|bytes| CommitSeq::new(u64::from_be_bytes(bytes)))
 }
 
 fn append(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
@@ -1743,6 +1946,142 @@ mod tests {
         current.abort().expect("abort current");
         drop(current);
         reopened.close().expect("close reopened");
+    }
+
+    #[test]
+    fn cursor_merges_storage_and_staged_writes_in_order() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        for key in [b"b", b"d"] {
+            seed.put(tree, key, key).expect("seed write");
+        }
+        seed.commit().expect("seed commit");
+
+        let mut writer = database.begin().expect("writer begin");
+        writer.put(tree, b"a", b"a").expect("stage a");
+        writer.put(tree, b"c", b"c").expect("stage c");
+        writer.delete(tree, b"d").expect("stage delete d");
+        let mut cursor = writer.cursor(tree, b"", None).expect("open cursor");
+        let mut collected = Vec::new();
+        for entry in &mut cursor {
+            collected.push(entry.expect("cursor step"));
+        }
+        assert_eq!(
+            collected,
+            vec![
+                (b"a".to_vec(), b"a".to_vec()),
+                (b"b".to_vec(), b"b".to_vec()),
+                (b"c".to_vec(), b"c".to_vec()),
+            ]
+        );
+        // Exhausted cursors stay exhausted.
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn cursor_respects_bounds_and_created_trees() {
+        let (_directory, database) = database();
+        let mut creator = database.begin().expect("creator begin");
+        let fresh = creator.create_tree().expect("create tree");
+        creator.put(fresh, b"k1", b"v1").expect("write");
+        creator.commit().expect("commit");
+
+        let mut reader = database.begin().expect("reader begin");
+        let mut bounded = reader
+            .cursor(fresh, b"k0", Some(b"k1"))
+            .expect("bounded cursor");
+        assert!(bounded.next().is_none());
+        drop(bounded);
+
+        let mut unbounded = reader.cursor(fresh, b"", None).expect("unbounded cursor");
+        assert_eq!(
+            unbounded.next().expect("first entry").ok(),
+            Some((b"k1".to_vec(), b"v1".to_vec()))
+        );
+        assert!(unbounded.next().is_none());
+    }
+
+    #[test]
+    fn cursor_holds_fixed_snapshot_under_concurrent_commit() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"before", b"1").expect("seed write");
+        seed.commit().expect("seed commit");
+
+        let mut reader = database.begin().expect("reader begin");
+        let mut cursor = reader.cursor(tree, b"", None).expect("open cursor");
+        assert_eq!(
+            cursor.next().expect("snapshot entry").ok(),
+            Some((b"before".to_vec(), b"1".to_vec()))
+        );
+
+        let mut concurrent = database.begin().expect("concurrent begin");
+        concurrent
+            .put(tree, b"after", b"2")
+            .expect("concurrent write");
+        concurrent.commit().expect("concurrent commit");
+
+        // The fixed snapshot never exposes the later commit.
+        assert!(cursor.next().is_none());
+    }
+
+    #[test]
+    fn cursor_range_dependency_rejects_phantom_insert() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"a", b"1").expect("seed write");
+        seed.commit().expect("seed commit");
+
+        let mut scanner = database.begin().expect("scanner begin");
+        {
+            let mut cursor = scanner
+                .cursor(tree, b"a", Some(b"z"))
+                .expect("range cursor");
+            assert!(cursor.next().expect("scan seeded range").is_ok());
+        }
+
+        let mut inserter = database.begin().expect("inserter begin");
+        inserter.put(tree, b"m", b"phantom").expect("phantom write");
+        inserter.commit().expect("phantom commit");
+
+        // The read range was registered, so the upgrade-to-write commit must
+        // detect the phantom even though the transaction wrote a different key.
+        scanner.put(tree, b"a", b"updated").expect("scanner write");
+        assert!(matches!(
+            scanner.commit(),
+            Err(Error::SerializationConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn write_outside_cursor_range_commits_cleanly() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"in-range", b"1").expect("seed write");
+        seed.commit().expect("seed commit");
+
+        let mut scanner = database.begin().expect("scanner begin");
+        {
+            let mut cursor = scanner
+                .cursor(tree, b"a", Some(b"m"))
+                .expect("range cursor");
+            while cursor.next().is_some() {}
+        }
+
+        let mut inserter = database.begin().expect("inserter begin");
+        inserter
+            .put(tree, b"z-outside", b"2")
+            .expect("outside write");
+        inserter.commit().expect("outside commit");
+
+        scanner.put(tree, b"in-range", b"updated").expect("write");
+        scanner
+            .commit()
+            .expect("writes outside the range do not conflict");
     }
 
     #[test]
