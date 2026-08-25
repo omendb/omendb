@@ -114,6 +114,11 @@ incumbent performance or block-layer power-loss equivalence.
 
 ## Portable qualification
 
+The repository's `tools/` directory contains development-only qualification
+and comparison harnesses. It is not a workspace member, runtime dependency, or
+published crate content. The comparison scripts may invoke other engines as
+measurement controls; SeerDB does not ship adapters for them.
+
 Run the deterministic mixed workload and emit a JSON qualification artifact:
 
 ```bash

@@ -7,6 +7,7 @@ authors = ["seerdb contributors"]
 description = "High-performance out-of-place B-tree storage engine for NVMe SSDs"
 repository = "https://github.com/omendb/omendb"
 readme = "README.md"
+exclude = ["tools/**"]
 keywords = ["database", "btree", "storage", "nvme", "oltp"]
 categories = ["database-implementations", "data-structures"]
 
