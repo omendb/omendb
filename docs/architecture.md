@@ -97,7 +97,9 @@ semantics. OmenDB must not bypass SeerDB's transaction/MVCC machinery.
 A generic storage-plugin matrix is not the product architecture. OmenDB should
 call SeerDB through a capability-rich Rust API. A future alternate engine can
 integrate through a deliberate adapter, but OmenDB will not hard-code a list of
-RocksDB, Fjall, redb, or other first-party backends.
+RocksDB, Fjall, redb, or other first-party backends. The transaction, crash,
+and snapshot invariants are recorded in
+[`docs/adr/0001-seerdb-transaction-contract.md`](adr/0001-seerdb-transaction-contract.md).
 
 ## Transaction and durability identities
 
