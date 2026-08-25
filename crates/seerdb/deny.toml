@@ -1,0 +1,29 @@
+# Dependency policy for the SeerDB alpha release gate.
+#
+# Keep this file intentionally small: the lockfile is the dependency
+# inventory, while this file states the accepted provenance and license
+# policy. A new exception requires a crate-specific reason in review.
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    { crate = "r-efi", allow = ["Apache-2.0", "LGPL-2.1-or-later", "MIT"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,54 @@
+[package]
+name = "seerdb-fuzz"
+version = "0.1.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+seerdb = { path = "..", features = ["fault-injection"] }
+
+[[bin]]
+name = "fuzz_btree_operations"
+path = "fuzz_targets/fuzz_btree_operations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_page_parsing"
+path = "fuzz_targets/fuzz_page_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_parsing"
+path = "fuzz_targets/fuzz_wal_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_blob_parsing"
+path = "fuzz_targets/fuzz_blob_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_format_parsing"
+path = "fuzz_targets/fuzz_format_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crash_recovery"
+path = "fuzz_targets/fuzz_crash_recovery.rs"
+test = false
+doc = false
+bench = false
