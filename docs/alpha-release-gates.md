@@ -16,13 +16,19 @@ The old line is not deleted or recreated. Existing dependents that require
 `omendb ^0.0.37` remain on that line. A new alpha dependency must opt into the
 `0.1.0-alpha.*` line explicitly.
 
-OmenDB and its storage dependency are released together:
+OmenDB and SeerDB are independently versioned and published, but an OmenDB
+release records the exact SeerDB version it was qualified against. During
+workspace development OmenDB uses the local path dependency. For a registry
+release:
 
 1. publish a compatible SeerDB prerelease, initially `seerdb 0.1.0-alpha.1`;
-2. change OmenDB's release manifest from the development git revision to the
+2. change OmenDB's release manifest from the workspace path dependency to the
    exact compatible registry requirement;
-3. run package and install checks from a clean checkout;
+3. run package and install checks for both crates from a clean checkout;
 4. publish `omendb 0.1.0-alpha.1` only after the release gate passes.
+
+The crate licenses remain distinct: OmenDB is AGPL-3.0-only and SeerDB is
+Apache-2.0.
 
 `cargo publish --dry-run` is required before either publish. No published
 version is overwritten. A bad prerelease can be yanked, but its source and
@@ -33,8 +39,11 @@ version remain part of the public history.
 The alpha supports two application-facing surfaces:
 
 - the typed Rust API, including transactions, snapshots, schema, indexes,
-  constraints, recovery state, and backend diagnostics;
-- the documented, bounded embedded SQL subset.
+  constraints, recovery state, and storage diagnostics;
+- the documented, bounded SQL subset through the direct API.
+
+The standalone server is the product roadmap, but is not yet part of this
+alpha contract.
 
 The SQL subset is intentionally not PostgreSQL-compatible. Unsupported syntax
 must return `DbError::SqlUnsupported` rather than silently doing something
@@ -113,10 +122,10 @@ the open performance work.
       tests, clippy, and package checks;
 - [x] supported platform and filesystem assumptions are documented
       (`docs/runbook.md`);
-- [ ] `cargo package --list` contains only intended files;
+- [ ] `cargo package --list` contains only intended files for each package;
 - [ ] `cargo publish --dry-run` succeeds for SeerDB first and OmenDB second;
-- [ ] README, API docs, changelog, license, and security policy describe the
-      alpha contract and known non-goals.
+- [ ] README, API docs, changelog, both licenses, and security policy describe
+      the alpha contract and known non-goals.
 
 ## Version progression
 
