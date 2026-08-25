@@ -809,6 +809,29 @@ fn probe_wal_first_blob_image_freshness() {
                 }
             }
         }
+        // Pinpoint the first generation whose delta chain fails to replay.
+        let base = std::fs::read(path.join(BLOB_FILE)).unwrap();
+        let deltas = std::fs::read(path.join(BLOB_DELTA_FILE)).unwrap_or_default();
+        let mut first_broken = None;
+        for target in 1..=db.durability_status().generation_id.get() {
+            let parsed = parse_blob_catalog(&path, &base, Some(target))
+                .ok()
+                .flatten();
+            if parsed.is_none() && first_broken.is_none() {
+                first_broken = Some(target);
+            }
+            println!(
+                "replay target={target}: {}",
+                if parsed.is_some() { "ok" } else { "BROKEN" }
+            );
+        }
+        println!("first_broken_gen={:?}", first_broken);
+        println!(
+            "delta_log_len={} base_len={} delta_head={:02x?}",
+            deltas.len(),
+            base.len(),
+            &deltas[..deltas.len().min(40)]
+        );
         db.close().unwrap();
     }
 }
