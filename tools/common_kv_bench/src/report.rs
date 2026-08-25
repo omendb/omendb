@@ -166,7 +166,7 @@ pub(super) fn render_result(result: &RunResult) -> String {
         config.value_bytes,
         config.range_width,
         config.seed,
-                config.key_distribution.name(),
+        config.key_distribution.name(),
         result.preload_ns,
         result.workload_ns,
         result.reopen_ns,

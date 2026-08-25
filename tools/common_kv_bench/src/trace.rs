@@ -74,11 +74,16 @@ impl ZipfIndex {
         for weight in &mut weights {
             *weight /= total;
         }
-        Self { cumulative: weights }
+        Self {
+            cumulative: weights,
+        }
     }
 
     fn index(&self, draw: f64) -> usize {
-        match self.cumulative.binary_search_by(|p| p.partial_cmp(&draw).unwrap_or(std::cmp::Ordering::Equal)) {
+        match self
+            .cumulative
+            .binary_search_by(|p| p.partial_cmp(&draw).unwrap_or(std::cmp::Ordering::Equal))
+        {
             Ok(i) => i,
             Err(i) => i.min(self.cumulative.len() - 1),
         }
