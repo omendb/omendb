@@ -14,7 +14,9 @@
 
 use crate::db::{BatchMutation, DB, Options};
 use crate::error::{Error, Result};
-use crate::mvcc::{CurrentRecord, VersionStore, decode_current, encode_current, visible_current};
+use crate::mvcc::{
+    CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
+};
 use crate::storage::format::{CommitId, CommitPosition, CommitSeq, TreeId, TxnId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -22,12 +24,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const TREE_RECORD_PREFIX: &[u8] = b"\x00seerdb/tree/";
+const STATUS_RECORD_PREFIX: &[u8] = b"\x00seerdb/status/";
 const CHANGE_RECORD_PREFIX: &[u8] = b"\x00seerdb/change/";
 const TREE_DATA_PREFIX: u8 = 0x01;
 const TREE_LIVE: &[u8] = b"live";
 const TREE_DROPPED: &[u8] = b"dropped";
 const TREE_RESERVED: &[u8] = b"reserved";
 const CHANGE_MAGIC: &[u8; 4] = b"SCM1";
+const STATUS_MAGIC: &[u8; 4] = b"SST1";
 const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const VERSION_STORE_FILE: &str = "seerdb.mvcc";
 
@@ -81,9 +85,17 @@ impl ActiveSnapshots {
     }
 }
 
+struct ControlState {
+    statuses: BTreeMap<TxnId, CommitSeq>,
+    changes: BTreeMap<CommitSeq, CommittedChange>,
+    max_transaction: u64,
+    max_tree: u64,
+}
+
 struct Runtime {
     db: Mutex<DB>,
     versions: Mutex<VersionStore>,
+    statuses: Mutex<BTreeMap<TxnId, CommitSeq>>,
     changes: Mutex<BTreeMap<CommitSeq, CommittedChange>>,
     active_snapshots: Mutex<ActiveSnapshots>,
     next_transaction: AtomicU64,
@@ -139,7 +151,12 @@ impl TransactionDatabase {
 
     fn from_db(mut db: DB, versions: VersionStore) -> Result<Self> {
         let mut versions = versions;
-        let (changes, max_transaction, max_tree) = load_control_state(&mut db, &mut versions)?;
+        let ControlState {
+            statuses,
+            changes,
+            max_transaction,
+            max_tree,
+        } = load_control_state(&mut db, &mut versions)?;
         let next_transaction = max_transaction
             .checked_add(1)
             .ok_or_else(|| Error::Wal("transaction ID exhausted".into()))?;
@@ -150,6 +167,7 @@ impl TransactionDatabase {
             runtime: Arc::new(Runtime {
                 db: Mutex::new(db),
                 versions: Mutex::new(versions),
+                statuses: Mutex::new(statuses),
                 changes: Mutex::new(changes),
                 active_snapshots: Mutex::new(ActiveSnapshots::new()),
                 next_transaction: AtomicU64::new(next_transaction),
@@ -282,6 +300,10 @@ impl Runtime {
             .versions
             .lock()
             .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let mut statuses = self
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
         let current = db.durability_status().commit_position.csn;
         let next = CommitSeq::new(
             current
@@ -299,7 +321,7 @@ impl Runtime {
         let undo_head = append_before_image(&mut versions, &current_record)?;
         let reservation = encode_current(&CurrentRecord {
             transaction: owner,
-            commit: next,
+            commit: CommitSeq::new(0),
             undo_head,
             value: Some(TREE_RESERVED.to_vec()),
         })?;
@@ -308,6 +330,10 @@ impl Runtime {
             BatchMutation::Put {
                 key: tree_record_key(tree),
                 value: reservation,
+            },
+            BatchMutation::Put {
+                key: status_record_key(owner),
+                value: encode_status(next),
             },
             BatchMutation::Put {
                 key: change_record_key(next),
@@ -322,6 +348,7 @@ impl Runtime {
                 next, committed
             )));
         }
+        statuses.insert(owner, committed);
         lock_changes(self).insert(committed, change);
         Ok(committed)
     }
@@ -435,8 +462,13 @@ impl Transaction {
             .versions
             .lock()
             .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let statuses = self
+            .runtime
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
         Ok(
-            visible_current(&mut version_store, &current, self.snapshot)?
+            visible_current(&mut version_store, &statuses, &current, self.snapshot)?
                 .and_then(|version| version.value),
         )
     }
@@ -458,6 +490,11 @@ impl Transaction {
             .versions
             .lock()
             .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let statuses = self
+            .runtime
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
         let end = prefix_end(TREE_RECORD_PREFIX);
         let mut trees = BTreeSet::new();
         for (key, value) in db.range(TREE_RECORD_PREFIX, &end)? {
@@ -470,7 +507,7 @@ impl Transaction {
                     .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
             ));
             let current = decode_current(Some(&value))?;
-            match visible_current(&mut version_store, &current, self.snapshot)?
+            match visible_current(&mut version_store, &statuses, &current, self.snapshot)?
                 .and_then(|version| version.value)
                 .as_deref()
             {
@@ -527,13 +564,16 @@ impl Transaction {
                 let mut version_store = self.runtime.versions.lock().map_err(|_| {
                     Error::Corruption("MVCC version store mutex is poisoned".into())
                 })?;
+                let statuses = self.runtime.statuses.lock().map_err(|_| {
+                    Error::Corruption("transaction status mutex is poisoned".into())
+                })?;
                 for (key, value) in entries {
                     let Some(user_key) = decode_tree_key(tree, &key) else {
                         continue;
                     };
                     let current = decode_current(Some(&value))?;
                     if let Some(version) =
-                        visible_current(&mut version_store, &current, self.snapshot)?
+                        visible_current(&mut version_store, &statuses, &current, self.snapshot)?
                         && let Some(value) = version.value
                     {
                         values.insert(user_key, value);
@@ -635,7 +675,12 @@ impl Transaction {
             .versions
             .lock()
             .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
-        tree_visible(&db, &mut version_store, tree, self.snapshot)
+        let statuses = self
+            .runtime
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
+        tree_visible(&db, &mut version_store, &statuses, tree, self.snapshot)
     }
 
     fn check_tree_visible_for_read(&self, tree: TreeId) -> Result<()> {
@@ -684,8 +729,13 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
         .versions
         .lock()
         .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+    let mut statuses = transaction
+        .runtime
+        .statuses
+        .lock()
+        .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
     let current = db.durability_status().commit_position.csn;
-    validate_conflicts(transaction, &db, current)?;
+    validate_conflicts(transaction, &db, &statuses, current)?;
 
     let next = CommitSeq::new(
         current
@@ -706,7 +756,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
             key: storage_key,
             value: encode_current(&CurrentRecord {
                 transaction: transaction.id,
-                commit: next,
+                commit: CommitSeq::new(0),
                 undo_head,
                 value: value.clone(),
             })?,
@@ -729,7 +779,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
             key: lifecycle_key,
             value: encode_current(&CurrentRecord {
                 transaction: transaction.id,
-                commit: next,
+                commit: CommitSeq::new(0),
                 undo_head,
                 value: Some(lifecycle.to_vec()),
             })?,
@@ -743,6 +793,10 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
         writes: writes.clone(),
     };
     mutations.push(BatchMutation::Put {
+        key: status_record_key(transaction.id),
+        value: encode_status(next),
+    });
+    mutations.push(BatchMutation::Put {
         key: change_record_key(next),
         value: encode_change(&change)?,
     });
@@ -755,6 +809,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
             next, committed
         )));
     }
+    statuses.insert(transaction.id, committed);
     lock_changes(&transaction.runtime).insert(committed, change);
     Ok(status.commit_position)
 }
@@ -773,7 +828,12 @@ fn append_before_image(
         .map(Some)
 }
 
-fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) -> Result<()> {
+fn validate_conflicts(
+    transaction: &Transaction,
+    db: &DB,
+    statuses: &BTreeMap<TxnId, CommitSeq>,
+    current: CommitSeq,
+) -> Result<()> {
     if transaction.snapshot > current {
         return Err(Error::SerializationConflict {
             expected: CommitId::new(transaction.snapshot.get()),
@@ -792,12 +852,12 @@ fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) ->
 
     for tree in &transaction.dropped {
         let current_record = decode_current(db.get(&tree_record_key(*tree))?.as_deref())?;
-        if current_record.commit > transaction.snapshot
-            && current_record.transaction != transaction.id
-        {
+        let current_commit =
+            resolve_commit(statuses, current_record.transaction, current_record.commit)?;
+        if current_commit > transaction.snapshot && current_record.transaction != transaction.id {
             return Err(Error::TreeConflict(*tree));
         }
-        if tree_has_conflicting_write(db, *tree, transaction.snapshot, transaction.id)? {
+        if tree_has_conflicting_write(db, statuses, *tree, transaction.snapshot, transaction.id)? {
             return Err(Error::TreeConflict(*tree));
         }
     }
@@ -807,13 +867,14 @@ fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) ->
             continue;
         }
         let lifecycle = decode_current(db.get(&tree_record_key(*tree))?.as_deref())?;
-        if lifecycle.commit > transaction.snapshot && lifecycle.transaction != transaction.id {
+        let lifecycle_commit = resolve_commit(statuses, lifecycle.transaction, lifecycle.commit)?;
+        if lifecycle_commit > transaction.snapshot && lifecycle.transaction != transaction.id {
             return Err(Error::TreeConflict(*tree));
         }
         let current_record = decode_current(db.get(&tree_key(*tree, key))?.as_deref())?;
-        if current_record.commit > transaction.snapshot
-            && current_record.transaction != transaction.id
-        {
+        let current_commit =
+            resolve_commit(statuses, current_record.transaction, current_record.commit)?;
+        if current_commit > transaction.snapshot && current_record.transaction != transaction.id {
             return Err(Error::WriteConflict {
                 tree: *tree,
                 key: key.clone(),
@@ -825,6 +886,7 @@ fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) ->
 
 fn tree_has_conflicting_write(
     db: &DB,
+    statuses: &BTreeMap<TxnId, CommitSeq>,
     tree: TreeId,
     snapshot: CommitSeq,
     transaction: TxnId,
@@ -836,7 +898,8 @@ fn tree_has_conflicting_write(
             continue;
         }
         let current = decode_current(Some(&value))?;
-        if current.commit > snapshot && current.transaction != transaction {
+        let current_commit = resolve_commit(statuses, current.transaction, current.commit)?;
+        if current_commit > snapshot && current.transaction != transaction {
             return Ok(true);
         }
     }
@@ -863,11 +926,14 @@ fn is_recovery_error(runtime: &Arc<Runtime>) -> Result<bool> {
 fn tree_visible(
     db: &DB,
     version_store: &mut VersionStore,
+    statuses: &BTreeMap<TxnId, CommitSeq>,
     tree: TreeId,
     snapshot: CommitSeq,
 ) -> Result<bool> {
     let current = decode_current(db.get(&tree_record_key(tree))?.as_deref())?;
-    match visible_current(version_store, &current, snapshot)?.and_then(|version| version.value) {
+    match visible_current(version_store, statuses, &current, snapshot)?
+        .and_then(|version| version.value)
+    {
         Some(value) if value.as_slice() == TREE_LIVE => Ok(true),
         Some(value) if value.as_slice() == TREE_DROPPED || value.as_slice() == TREE_RESERVED => {
             Ok(false)
@@ -895,12 +961,32 @@ fn validate_version_chain(version_store: &mut VersionStore, current: &CurrentRec
     Ok(())
 }
 
-fn load_control_state(
-    db: &mut DB,
-    version_store: &mut VersionStore,
-) -> Result<(BTreeMap<CommitSeq, CommittedChange>, u64, u64)> {
-    let mut changes = BTreeMap::new();
+fn load_control_state(db: &mut DB, version_store: &mut VersionStore) -> Result<ControlState> {
+    let mut statuses = BTreeMap::new();
+    let status_end = prefix_end(STATUS_RECORD_PREFIX);
     let mut max_transaction = 0;
+    for (key, value) in db.range(STATUS_RECORD_PREFIX, &status_end)? {
+        if key.len() != STATUS_RECORD_PREFIX.len() + 8 {
+            return Err(Error::Corruption("malformed transaction status key".into()));
+        }
+        let transaction = TxnId::new(u64::from_be_bytes(
+            key[STATUS_RECORD_PREFIX.len()..]
+                .try_into()
+                .map_err(|_| Error::Corruption("malformed transaction status ID".into()))?,
+        ));
+        if transaction.get() == 0 {
+            return Err(Error::Corruption("transaction status ID is zero".into()));
+        }
+        let commit = decode_status(&value)?;
+        if statuses.insert(transaction, commit).is_some() {
+            return Err(Error::Corruption(
+                "duplicate transaction status record".into(),
+            ));
+        }
+        max_transaction = max_transaction.max(transaction.get());
+    }
+
+    let mut changes = BTreeMap::new();
     let mut max_tree = 0;
     let tree_end = prefix_end(TREE_RECORD_PREFIX);
     for (key, value) in db.range(TREE_RECORD_PREFIX, &tree_end)? {
@@ -954,7 +1040,42 @@ fn load_control_state(
             ));
         }
     }
-    Ok((changes, max_transaction, max_tree))
+    Ok(ControlState {
+        statuses,
+        changes,
+        max_transaction,
+        max_tree,
+    })
+}
+
+fn status_record_key(transaction: TxnId) -> Vec<u8> {
+    append(STATUS_RECORD_PREFIX, &transaction.get().to_be_bytes())
+}
+
+fn encode_status(commit: CommitSeq) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(STATUS_MAGIC.len() + 8);
+    bytes.extend_from_slice(STATUS_MAGIC);
+    bytes.extend_from_slice(&commit.get().to_be_bytes());
+    bytes
+}
+
+fn decode_status(bytes: &[u8]) -> Result<CommitSeq> {
+    if bytes.len() != STATUS_MAGIC.len() + 8 || &bytes[..STATUS_MAGIC.len()] != STATUS_MAGIC {
+        return Err(Error::Corruption(
+            "malformed transaction status record".into(),
+        ));
+    }
+    let commit = CommitSeq::new(u64::from_be_bytes(
+        bytes[STATUS_MAGIC.len()..]
+            .try_into()
+            .map_err(|_| Error::Corruption("malformed transaction status commit".into()))?,
+    ));
+    if commit.get() == 0 {
+        return Err(Error::Corruption(
+            "transaction status commit is zero".into(),
+        ));
+    }
+    Ok(commit)
 }
 
 fn encode_change(change: &CommittedChange) -> Result<Vec<u8>> {
@@ -1376,7 +1497,16 @@ mod tests {
             .expect("raw value")
             .expect("record");
         let current = decode_current(Some(&bytes)).expect("decode current");
+        assert_eq!(current.commit, CommitSeq::new(0));
         assert_eq!(current.value, Some(b"new".to_vec()));
+        let status_bytes = raw
+            .get(&status_record_key(current.transaction))
+            .expect("status value")
+            .expect("status record");
+        assert_eq!(
+            decode_status(&status_bytes).expect("decode status"),
+            CommitSeq::new(4)
+        );
         let mut version_store =
             VersionStore::open(directory.path().join("db").join(VERSION_STORE_FILE))
                 .expect("open version store");

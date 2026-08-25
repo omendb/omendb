@@ -136,29 +136,48 @@ pub(crate) fn decode_current(bytes: Option<&[u8]>) -> Result<CurrentRecord> {
 /// Resolve the newest version visible to a snapshot.
 pub(crate) fn visible_current(
     store: &mut VersionStore,
+    statuses: &BTreeMap<TxnId, CommitSeq>,
     current: &CurrentRecord,
     snapshot: CommitSeq,
 ) -> Result<Option<VisibleVersion>> {
-    if current.commit <= snapshot {
+    let current_commit = resolve_commit(statuses, current.transaction, current.commit)?;
+    if current_commit <= snapshot {
         return Ok(Some(VisibleVersion {
             transaction: current.transaction,
-            commit: current.commit,
+            commit: current_commit,
             value: current.value.clone(),
         }));
     }
     let mut head = current.undo_head;
     while let Some(id) = head {
         let record = store.get(id)?;
-        if record.commit <= snapshot {
+        let record_commit = resolve_commit(statuses, record.transaction, record.commit)?;
+        if record_commit <= snapshot {
             return Ok(Some(VisibleVersion {
                 transaction: record.transaction,
-                commit: record.commit,
+                commit: record_commit,
                 value: record.value,
             }));
         }
         head = record.previous;
     }
     Ok(None)
+}
+
+pub(crate) fn resolve_commit(
+    statuses: &BTreeMap<TxnId, CommitSeq>,
+    transaction: TxnId,
+    commit: CommitSeq,
+) -> Result<CommitSeq> {
+    if commit.get() != 0 || transaction.get() == 0 {
+        return Ok(commit);
+    }
+    statuses.get(&transaction).copied().ok_or_else(|| {
+        Error::Corruption(format!(
+            "MVCC version references unknown transaction {}",
+            transaction.get()
+        ))
+    })
 }
 
 fn read_u64(bytes: &[u8], field: &str) -> Result<u64> {
@@ -489,23 +508,27 @@ mod tests {
             .expect("append");
         let current = CurrentRecord {
             transaction: TxnId::new(2),
-            commit: CommitSeq::new(2),
+            commit: CommitSeq::new(0),
             undo_head: Some(head),
             value: Some(b"new".to_vec()),
         };
+        let statuses = BTreeMap::from([
+            (TxnId::new(1), CommitSeq::new(1)),
+            (TxnId::new(2), CommitSeq::new(2)),
+        ]);
         let encoded = encode_current(&current).expect("encode current");
         assert_eq!(
             decode_current(Some(&encoded)).expect("decode current"),
             current
         );
         assert_eq!(
-            visible_current(&mut store, &current, CommitSeq::new(1))
+            visible_current(&mut store, &statuses, &current, CommitSeq::new(1))
                 .expect("visible old")
                 .and_then(|version| version.value),
             Some(b"old".to_vec())
         );
         assert_eq!(
-            visible_current(&mut store, &current, CommitSeq::new(2))
+            visible_current(&mut store, &statuses, &current, CommitSeq::new(2))
                 .expect("visible new")
                 .and_then(|version| version.value),
             Some(b"new".to_vec())

@@ -204,9 +204,10 @@ relational consumer:
    records. It also returns an explicit `{CSN, LSN}` commit position and
    persists that position through manifest/WAL recovery. The implementation is
    design-gated by [ADR 0002](adr/0002-seerdb-mvcc-version-storage.md) and
-   [ADR 0003](adr/0003-seerdb-commit-recovery-state-machine.md); transaction-
-   status indirection, active-snapshot retention, and version GC remain the
-   next correctness layers. Ordered cursor handles,
+   [ADR 0003](adr/0003-seerdb-commit-recovery-state-machine.md); the initial
+   transaction-status table and active-snapshot registry now exist, while
+   status freezing, retention-aware version GC, and physical multi-writer
+   publication remain the next correctness layers. Ordered cursor handles,
    range dependencies, physical multi-writer WAL/page publication, and
    zero-gap committed-change export remain open.
 3. **OmenDB direct integration — qualification path started:**

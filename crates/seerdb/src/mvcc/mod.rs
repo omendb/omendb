@@ -11,5 +11,5 @@ mod version_store;
 
 pub use pmt::{PMT, PageMapping};
 pub(crate) use version_store::{
-    CurrentRecord, VersionStore, decode_current, encode_current, visible_current,
+    CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
 };
