@@ -200,12 +200,15 @@ relational consumer:
 2. **SeerDB transactional foundation — in progress:** the first vertical
    slice now provides `TxnId`, `CommitSeq`, `TreeId`, fixed-snapshot
    transactions, committed per-key version chains, ordered scans, atomic
-   multi-tree mutation, and durable exact write-conflict records. Transaction
-   status indirection, append-oriented undo storage, ordered cursor handles,
-   range dependencies, retention-aware version GC, and physical multi-writer
-   WAL/page publication remain open. The transactional facade now returns an
-   explicit `{CSN, LSN}` commit position and persists that position through
-   manifest/WAL recovery; zero-gap committed-change export still remains open.
+   multi-tree mutation, and durable exact write-conflict records. It now also
+   returns an explicit `{CSN, LSN}` commit position and persists that position
+   through manifest/WAL recovery. The next implementation is design-gated by
+   [ADR 0002](adr/0002-seerdb-mvcc-version-storage.md) and
+   [ADR 0003](adr/0003-seerdb-commit-recovery-state-machine.md): replace inline
+   chains with transaction-status indirection and append-oriented undo/version
+   storage, then add active-snapshot retention and GC. Ordered cursor handles,
+   range dependencies, physical multi-writer WAL/page publication, and
+   zero-gap committed-change export remain open.
 3. **OmenDB direct integration — qualification path started:**
    `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
    per index without using `StorageKernel`. Next, expand its relational

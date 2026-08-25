@@ -93,7 +93,9 @@ it must never expose a partial multi-tree transaction.
 
 The exact WAL/page record layout remains an implementation choice, but every
 arrow in this table needs a deterministic fault test before format stability is
-claimed.
+claimed. The target logical version/undo ownership and retention rules are
+specified in [ADR 0002](0002-seerdb-mvcc-version-storage.md); the detailed
+commit/recovery protocol is specified in [ADR 0003](0003-seerdb-commit-recovery-state-machine.md).
 
 ## Snapshot and change position
 
