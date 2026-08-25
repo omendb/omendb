@@ -5,9 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["seerdb contributors"]
 description = "High-performance out-of-place B-tree storage engine for NVMe SSDs"
-repository = "https://github.com/omendb/seerdb"
+repository = "https://github.com/omendb/omendb"
 readme = "README.md"
-keywords = ["database", "btree", "storage", "nvme", "embedded"]
+keywords = ["database", "btree", "storage", "nvme", "oltp"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]
@@ -40,9 +40,3 @@ fdp = []
 io-uring = []
 # Deterministic device failures for recovery and publication tests.
 fault-injection = []
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-debug = true

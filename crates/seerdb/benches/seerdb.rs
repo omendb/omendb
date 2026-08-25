@@ -62,7 +62,7 @@ fn bench_btree_point_lookup(c: &mut Criterion) {
     let mut group = configure_group(c, "btree_point_lookup");
     group.bench_function(BenchmarkId::new("keys", DEFAULT_KEYS), |benchmark| {
         benchmark.iter(|| {
-                let result = tree.lookup(black_box(probe_key.as_bytes())).unwrap();
+            let result = tree.lookup(black_box(probe_key.as_bytes())).unwrap();
             black_box(
                 matches!(result, LookupResult::Found(value) if value == probe_value.as_bytes()),
             );
@@ -216,8 +216,8 @@ fn bench_db_flush_amplification(c: &mut Criterion) {
                             .storage
                             .page_bytes_written
                             .saturating_sub(before.storage.page_bytes_written);
-                        let amplification = (page_bytes + wal_bytes) as f64
-                            / logical_bytes.max(1) as f64;
+                        let amplification =
+                            (page_bytes + wal_bytes) as f64 / logical_bytes.max(1) as f64;
                         black_box(amplification);
                         drop(db);
                         drop(directory);

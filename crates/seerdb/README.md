@@ -1,11 +1,13 @@
 # seerdb
 
-Embedded durable ordered byte-KV storage engine for Rust consumers. Written in Rust.
+Generic durable ordered byte-KV storage engine for Rust consumers. Written in Rust and maintained as an independently versioned crate in the OmenDB workspace. SeerDB is a storage foundation, not a SQL engine or an embedded-only product.
 
 ## What
 
-SeerDB provides a small durable kernel for applications that need ordered byte
-keys and values without a separate database server:
+SeerDB provides a generic durable kernel for applications and database
+products that need ordered byte keys and values. It can be embedded by a Rust
+consumer, but its long-term role in OmenDB is the transactional storage
+foundation beneath a database server:
 
 - **Durable generations**: pages, checkpoints, commit metadata, manifests, and
   WAL cleanup publish in a checked order. Two independently valid manifest slots
@@ -31,7 +33,8 @@ requires a separately versioned format and matching buffer/device
 implementation.
 
 SeerDB does not claim durable per-record MVCC, parallel writers, SQL, HA, or
-cross-device performance parity. Those are later DBNext or post-v0.1 concerns.
+cross-device performance parity. Multi-writer MVCC and the OmenDB server
+contract are active architecture work, not current alpha guarantees.
 
 ## Basic use
 
@@ -59,39 +62,28 @@ open as a complete integrity audit.
 
 ## Direction
 
-The accepted architecture is a record-aware, out-of-place, versioned B+tree
-with WAL, immutable root generations, snapshots, blobs, and generation-safe
-reclamation. The first production slice is deliberately a single-writer
-durable kernel with concurrent readers. See
-[`ai/design/target_architecture.md`](ai/design/target_architecture.md) for the
-current design and staged optimization plan.
+The current implementation is a correctness-oriented out-of-place B+tree
+kernel with WAL, immutable root generations, snapshots, blobs, and
+reclamation. Its one-writer/root-generation contract is a transitional
+prototype, not the target OmenDB transaction architecture.
+
+The target SeerDB design is a generic OLTP-oriented transactional ordered-KV
+engine with first-class trees, multi-writer snapshot MVCC, ordered cursors,
+atomic multi-tree mutation, recoverable WAL, and a restartable committed-change
+stream. SeerDB remains SQL-agnostic: OmenDB owns row/index codecs and
+relational meaning. See [`../../docs/architecture.md`](../../docs/architecture.md)
+for the cross-project boundary and roadmap.
 
 ## Status
 
 The current Rust lane is a single-writer durable kernel with concurrent reads,
 root-generation retention, WAL recovery, crash-safe reclamation, and retryable
-capacity refusal. The current release suite passes 241 unit tests, 75 DBNext R0
-tests, 7 storage properties, all-target Clippy, and warnings-as-errors docs. A
-524,288-operation ARM64 Linux workload/recovery soak passed with digest/reopen
-parity, and the DBNext R0 integrity gate accepts its replay and 13 fault cases.
-
-The opt-in segmented blob path also has deterministic recovery coverage for
-short and checksum-torn physical suffixes and direct catalog-delta appends;
-reopen keeps the manifest-selected catalog generation authoritative and retry
-truncates unselected future bytes. These are in-process recovery seams, not
-external filesystem or block-layer qualification.
-
-Post-manifest segmented cleanup also covers a failure after one stale segment
-is removed: reopen keeps the new catalog root authoritative and the next
-publication retries the remaining cleanup. Mixed-GC candidate capacity refusal
-is classified before candidate installation, so it remains retryable on the
-same handle rather than being mistaken for a post-write failure.
-
-It is not yet a v0.1 release: the local environments lack the Linux
-`dm-log-writes` target for external power-loss qualification, and controlled
-device-backed comparison, broader DBNext R1/R2 semantics, and final filesystem
-fault races remain open. See [ai/STATUS.md](ai/STATUS.md) for the evidence and
-remaining gates.
+capacity refusal. It has useful integrity and fault-injection coverage, but it
+is not yet the target multi-writer transactional engine and is not a v0.1
+release. Durable per-record MVCC, concurrent transaction semantics, broader
+filesystem/block-layer fault qualification, and measured device-backed
+performance remain open. OmenDB integration and the alpha release gates are
+the authoritative cross-project qualification surfaces.
 
 On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
 it fails each observed `fsync`, `fdatasync`, rename, and `write` call once both
