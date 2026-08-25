@@ -25,9 +25,10 @@ foundation beneath a database server:
 - **Transactional ordered-KV facade**: `TransactionDatabase` provides first-class
   `TreeId`s, fixed snapshots resolved through current records and an
   append-oriented before-image version store, durable transaction-status
-  indirection, ordered scans, atomic multi-tree batches, and snapshot-isolation
-  conflict checking. Its durable conflict
-  records and version history survive reopen; publication is still serialized
+  indirection, ordered scans, atomic multi-tree batches, snapshot-isolation
+  conflict checking, and bounded `gc_versions` maintenance that respects
+  active snapshots. Its durable conflict records and version history survive
+  reopen; publication is still serialized
   by the current physical engine.
 - **Capacity handling**: typed ENOSPC refusal and preflight admission cover
   ordinary commits and maintenance, with same-handle retry and reopen tests.
@@ -96,8 +97,8 @@ committed per-key version chains, returns explicit `{CSN, LSN}` commit
 positions, and supplies first-class trees, fixed-snapshot reads, atomic
 multi-tree mutations, and reopen-persistent write-conflict records above that
 kernel. It is still not the target physical multi-writer
-engine or a releasable `0.1.0-alpha.*` crate. Status-table retention/freeze,
-active-snapshot-driven version GC, concurrent page/WAL publication,
+engine or a releasable `0.1.0-alpha.*` crate. Status-table freezing,
+durable retained-snapshot/change-consumer leases, concurrent page/WAL publication,
 broader filesystem/block-layer fault qualification, OmenDB direct integration,
 and measured device-backed performance remain open. OmenDB integration and the
 alpha release gates are the authoritative cross-project qualification

@@ -4,9 +4,10 @@
 //! storage engine. It provides first-class tree identities, fixed snapshots,
 //! atomic multi-tree batches, and snapshot-isolation write-conflict checking.
 //! The physical engine remains the single publication authority; this module
-//! owns transaction coordination and logical per-key version chains. The
-//! current slice uses the durable commit sequence for visibility and retains
-//! the conflict record for restartable change history.
+//! owns transaction coordination, transaction-status resolution, and
+//! append-oriented logical version history. The current slice uses the durable
+//! commit sequence for visibility and retains the conflict record for
+//! restartable change history.
 //!
 //! The API deliberately does not expose a backend matrix or a fake plugin
 //! trait. OmenDB can call this capability-rich surface directly while the
@@ -47,6 +48,19 @@ pub enum TransactionState {
     /// Publication may have reached durable media; reopen is required before
     /// deciding whether the logical batch became visible.
     RecoveryRequired { commit: CommitSeq },
+}
+
+/// Result of a bounded logical MVCC version-store compaction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct VersionGcReport {
+    /// Oldest active snapshot that constrained retention, if any.
+    pub watermark: Option<CommitSeq>,
+    /// Number of version records before compaction.
+    pub versions_before: usize,
+    /// Number of version records retained after compaction.
+    pub versions_after: usize,
+    /// Number of current records whose undo heads were cleared.
+    pub current_records_rewritten: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,6 +246,61 @@ impl TransactionDatabase {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
         self.runtime.oldest_active_snapshot()
+    }
+
+    /// Compact logical MVCC history while preserving every active snapshot.
+    pub fn gc_versions(&self) -> Result<VersionGcReport> {
+        let mut db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let mut version_store = self
+            .runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let statuses = self
+            .runtime
+            .statuses
+            .lock()
+            .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
+        let watermark = self
+            .runtime
+            .active_snapshots
+            .lock()
+            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
+            .oldest();
+        let mut retained = BTreeSet::new();
+        let mut rewrites = Vec::new();
+        let data_prefix = vec![TREE_DATA_PREFIX];
+        {
+            let mut gc = GcContext {
+                db: &db,
+                version_store: &mut version_store,
+                statuses: &statuses,
+                watermark,
+                retained: &mut retained,
+                rewrites: &mut rewrites,
+            };
+            gc.collect(TREE_RECORD_PREFIX, &prefix_end(TREE_RECORD_PREFIX))?;
+            gc.collect(&data_prefix, &prefix_end(&data_prefix))?;
+        }
+
+        let versions_before = version_store.len();
+        if !rewrites.is_empty() {
+            db.commit_batch(&rewrites)?;
+        }
+        let (_, versions_after) = version_store.compact(&retained)?;
+        Ok(VersionGcReport {
+            watermark,
+            versions_before,
+            versions_after,
+            current_records_rewritten: rewrites.len(),
+        })
     }
 
     /// Flush and close the underlying durable database.
@@ -812,6 +881,76 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
     statuses.insert(transaction.id, committed);
     lock_changes(&transaction.runtime).insert(committed, change);
     Ok(status.commit_position)
+}
+
+struct GcContext<'a> {
+    db: &'a DB,
+    version_store: &'a mut VersionStore,
+    statuses: &'a BTreeMap<TxnId, CommitSeq>,
+    watermark: Option<CommitSeq>,
+    retained: &'a mut BTreeSet<crate::storage::format::VersionId>,
+    rewrites: &'a mut Vec<BatchMutation>,
+}
+
+impl GcContext<'_> {
+    fn collect(&mut self, start: &[u8], end: &[u8]) -> Result<()> {
+        for (key, value) in self.db.range(start, end)? {
+            let current = decode_current(Some(&value))?;
+            retain_current_chain(
+                self.version_store,
+                self.statuses,
+                &current,
+                self.watermark,
+                self.retained,
+            )?;
+            let clear_history = match self.watermark {
+                None => true,
+                Some(watermark) => {
+                    resolve_commit(self.statuses, current.transaction, current.commit)? <= watermark
+                }
+            };
+            if clear_history && current.undo_head.is_some() {
+                let mut rewritten = current;
+                rewritten.undo_head = None;
+                self.rewrites.push(BatchMutation::Put {
+                    key,
+                    value: encode_current(&rewritten)?,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn retain_current_chain(
+    version_store: &mut VersionStore,
+    statuses: &BTreeMap<TxnId, CommitSeq>,
+    current: &CurrentRecord,
+    watermark: Option<CommitSeq>,
+    retained: &mut BTreeSet<crate::storage::format::VersionId>,
+) -> Result<()> {
+    let Some(watermark) = watermark else {
+        let mut head = current.undo_head;
+        while let Some(id) = head {
+            head = version_store.get(id)?.previous;
+        }
+        return Ok(());
+    };
+    let current_commit = resolve_commit(statuses, current.transaction, current.commit)?;
+    if current_commit <= watermark {
+        return Ok(());
+    }
+    let mut head = current.undo_head;
+    while let Some(id) = head {
+        retained.insert(id);
+        let record = version_store.get(id)?;
+        let commit = resolve_commit(statuses, record.transaction, record.commit)?;
+        if commit <= watermark {
+            break;
+        }
+        head = record.previous;
+    }
+    Ok(())
 }
 
 fn append_before_image(
@@ -1547,6 +1686,51 @@ mod tests {
         ));
         drop(transaction);
         database.close().expect("close after drop");
+    }
+
+    #[test]
+    fn version_gc_respects_active_snapshot_then_reclaims_history() {
+        let (directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"key", b"old").expect("seed write");
+        seed.commit().expect("seed commit");
+
+        let mut old = database.begin().expect("old begin");
+        let mut writer = database.begin().expect("writer begin");
+        writer.put(tree, b"key", b"new").expect("new write");
+        writer.commit().expect("writer commit");
+        assert_eq!(
+            old.get(tree, b"key").expect("old read"),
+            Some(b"old".to_vec())
+        );
+
+        let retained = database.gc_versions().expect("retain old history");
+        assert_eq!(retained.watermark, Some(old.snapshot()));
+        assert!(retained.versions_after > 0);
+        assert_eq!(
+            old.get(tree, b"key").expect("old read after GC"),
+            Some(b"old".to_vec())
+        );
+        old.abort().expect("release old");
+        drop(old);
+
+        let reclaimed = database.gc_versions().expect("reclaim history");
+        assert_eq!(reclaimed.watermark, None);
+        assert_eq!(reclaimed.versions_after, 0);
+        drop(writer);
+        database.close().expect("close");
+
+        let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen");
+        let mut current = reopened.begin().expect("current begin");
+        assert_eq!(
+            current.get(tree, b"key").expect("current read"),
+            Some(b"new".to_vec())
+        );
+        current.abort().expect("abort current");
+        drop(current);
+        reopened.close().expect("close reopened");
     }
 
     #[test]

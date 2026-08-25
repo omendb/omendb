@@ -6,9 +6,9 @@
 //! - **SSD-native design**: FDP/ZNS support for minimal write amplification
 //! - **Fixed page format**: the current alpha uses [`PAGE_SIZE`] pages; page
 //!   sizing is not silently configurable through [`Options`]
-//! - **Snapshots**: fixed logical snapshots resolve committed per-key version
-//!   chains; low-level APIs also expose immutable root generations for
-//!   physical retention
+//! - **Snapshots**: fixed logical snapshots resolve current records through
+//!   transaction status and append-oriented before-images; low-level APIs also
+//!   expose immutable root generations for physical retention
 //!
 //! # Architecture
 //!
@@ -75,4 +75,4 @@ pub use storage::format::{
     CommitId, CommitPosition, CommitSeq, GenerationId, HistoryId, Lsn, PageVersion, SnapshotId,
     TreeId, TxnId,
 };
-pub use transactional::{Transaction, TransactionDatabase, TransactionState};
+pub use transactional::{Transaction, TransactionDatabase, TransactionState, VersionGcReport};

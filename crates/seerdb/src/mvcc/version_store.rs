@@ -8,10 +8,10 @@
 
 use crate::error::{Error, Result};
 use crate::storage::format::{CommitSeq, TxnId, VersionId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"SVE1";
 const CURRENT_MAGIC: &[u8; 4] = b"SVC1";
@@ -186,6 +186,41 @@ fn read_u64(bytes: &[u8], field: &str) -> Result<u64> {
     })?))
 }
 
+fn encode_frame(record: &VersionRecord) -> Result<Vec<u8>> {
+    let value_length = record
+        .value
+        .as_ref()
+        .map(|value| {
+            u32::try_from(value.len())
+                .map_err(|_| Error::InvalidArgument("MVCC version value is too large".into()))
+        })
+        .transpose()?
+        .unwrap_or(VALUE_TOMBSTONE);
+    let value_len = record.value.as_ref().map_or(0, Vec::len);
+    let frame_len = usize::try_from(FIXED_HEADER_BYTES + CHECKSUM_BYTES)
+        .expect("fixed version frame fits usize")
+        .checked_add(value_len)
+        .ok_or_else(|| Error::InvalidArgument("MVCC version frame is too large".into()))?;
+    if frame_len > MAX_VERSION_BYTES {
+        return Err(Error::InvalidArgument(
+            "MVCC version frame exceeds the retention limit".into(),
+        ));
+    }
+    let mut frame = Vec::with_capacity(frame_len);
+    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(&record.id.get().to_be_bytes());
+    frame.extend_from_slice(&record.previous.map_or(0, VersionId::get).to_be_bytes());
+    frame.extend_from_slice(&record.transaction.get().to_be_bytes());
+    frame.extend_from_slice(&record.commit.get().to_be_bytes());
+    frame.extend_from_slice(&value_length.to_be_bytes());
+    if let Some(value) = &record.value {
+        frame.extend_from_slice(value);
+    }
+    let checksum = crc32c::crc32c(&frame);
+    frame.extend_from_slice(&checksum.to_be_bytes());
+    Ok(frame)
+}
+
 /// Append-only version file with an in-memory logical-ID index.
 ///
 /// The file is scanned on open and a truncated final frame is discarded. A
@@ -193,6 +228,7 @@ fn read_u64(bytes: &[u8], field: &str) -> Result<u64> {
 /// treated as an absent version. The file is not a second WAL: callers must
 /// order its sync with the transaction WAL and commit decision.
 pub(crate) struct VersionStore {
+    path: PathBuf,
     file: File,
     offsets: BTreeMap<VersionId, u64>,
     next_id: VersionId,
@@ -205,8 +241,9 @@ impl VersionStore {
             .create_new(true)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(&path)?;
         Ok(Self {
+            path: path.as_ref().to_path_buf(),
             file,
             offsets: BTreeMap::new(),
             next_id: VersionId::new(1),
@@ -215,8 +252,10 @@ impl VersionStore {
 
     /// Open an existing store, indexing valid frames and refusing corruption.
     pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut store = Self {
+            path,
             file,
             offsets: BTreeMap::new(),
             next_id: VersionId::new(1),
@@ -226,8 +265,7 @@ impl VersionStore {
     }
 
     /// Return the number of indexed version records.
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.offsets.len()
     }
 
@@ -245,38 +283,14 @@ impl VersionStore {
             ));
         }
         let id = self.next_id;
-        let value_length = value
-            .map(|value| {
-                u32::try_from(value.len())
-                    .map_err(|_| Error::InvalidArgument("MVCC version value is too large".into()))
-            })
-            .transpose()?
-            .unwrap_or(VALUE_TOMBSTONE);
-        let value_len = value.map_or(0, <[u8]>::len);
-        let frame_len = usize::try_from(FIXED_HEADER_BYTES + CHECKSUM_BYTES)
-            .expect("fixed version frame fits usize")
-            .checked_add(value_len)
-            .ok_or_else(|| Error::InvalidArgument("MVCC version frame is too large".into()))?;
-        if frame_len > MAX_VERSION_BYTES {
-            return Err(Error::InvalidArgument(
-                "MVCC version frame exceeds the retention limit".into(),
-            ));
-        }
-
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let mut frame = Vec::with_capacity(frame_len);
-        frame.extend_from_slice(MAGIC);
-        frame.extend_from_slice(&id.get().to_be_bytes());
-        frame.extend_from_slice(&previous.map_or(0, VersionId::get).to_be_bytes());
-        frame.extend_from_slice(&transaction.get().to_be_bytes());
-        frame.extend_from_slice(&commit.get().to_be_bytes());
-        frame.extend_from_slice(&value_length.to_be_bytes());
-        if let Some(value) = value {
-            frame.extend_from_slice(value);
-        }
-        let checksum = crc32c::crc32c(&frame);
-        frame.extend_from_slice(&checksum.to_be_bytes());
-        self.file.write_all(&frame)?;
+        let record = VersionRecord {
+            id,
+            previous,
+            transaction,
+            commit,
+            value: value.map(ToOwned::to_owned),
+        };
+        let offset = self.append_record(&record)?;
         self.offsets.insert(id, offset);
         self.next_id = VersionId::new(
             id.get()
@@ -284,6 +298,13 @@ impl VersionStore {
                 .ok_or_else(|| Error::Wal("MVCC version ID exhausted".into()))?,
         );
         Ok(id)
+    }
+
+    fn append_record(&mut self, record: &VersionRecord) -> Result<u64> {
+        let frame = encode_frame(record)?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&frame)?;
+        Ok(offset)
     }
 
     /// Make appended version records durable.
@@ -299,6 +320,40 @@ impl VersionStore {
             .get(&id)
             .ok_or_else(|| Error::Corruption(format!("unknown MVCC version {}", id.get())))?;
         self.read_at(offset)
+    }
+
+    /// Rewrite only the supplied reachable records while preserving IDs.
+    pub(crate) fn compact(&mut self, retained: &BTreeSet<VersionId>) -> Result<(usize, usize)> {
+        let old_count = self.offsets.len();
+        let next_id = self.next_id;
+        let temporary = self.path.with_extension("mvcc.compact.tmp");
+        if temporary.exists() {
+            std::fs::remove_file(&temporary)?;
+        }
+        let mut compacted = Self::create(&temporary)?;
+        for id in retained {
+            let mut record = self.get(*id)?;
+            record.previous = record
+                .previous
+                .filter(|previous| retained.contains(previous));
+            let offset = compacted.append_record(&record)?;
+            compacted.offsets.insert(record.id, offset);
+        }
+        compacted.next_id = next_id;
+        compacted.sync()?;
+        drop(compacted);
+
+        self.file.sync_data()?;
+        std::fs::rename(&temporary, &self.path)?;
+        sync_parent_directory(&self.path)?;
+        let replacement = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let old_file = std::mem::replace(&mut self.file, replacement);
+        drop(old_file);
+        self.offsets.clear();
+        self.next_id = VersionId::new(1);
+        self.scan_existing()?;
+        self.next_id = self.next_id.max(next_id);
+        Ok((old_count, self.offsets.len()))
     }
 
     fn scan_existing(&mut self) -> Result<()> {
@@ -342,14 +397,20 @@ impl VersionStore {
             }
             let record = self.read_at(offset)?;
             let id = record.id;
-            if self.offsets.insert(id, offset).is_some() {
+            if self.offsets.contains_key(&id) {
                 return Err(Error::Corruption("duplicate MVCC version ID".into()));
             }
-            if id != self.next_id {
+            if self
+                .offsets
+                .keys()
+                .next_back()
+                .is_some_and(|previous| id <= *previous)
+            {
                 return Err(Error::Corruption(
-                    "MVCC version IDs are not contiguous".into(),
+                    "MVCC version IDs are not strictly increasing".into(),
                 ));
             }
+            self.offsets.insert(id, offset);
             if let Some(previous) = record.previous {
                 if previous >= id {
                     return Err(Error::Corruption(
@@ -436,6 +497,12 @@ impl VersionStore {
             value,
         })
     }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -532,6 +599,61 @@ mod tests {
                 .expect("visible new")
                 .and_then(|version| version.value),
             Some(b"new".to_vec())
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_ids_and_append_frontier() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("seerdb.mvcc");
+        let mut store = VersionStore::create(&path).expect("create");
+        let first = store
+            .append(None, TxnId::new(1), CommitSeq::new(1), Some(b"one"))
+            .expect("first");
+        let second = store
+            .append(Some(first), TxnId::new(2), CommitSeq::new(2), Some(b"two"))
+            .expect("second");
+        let third = store
+            .append(
+                Some(second),
+                TxnId::new(3),
+                CommitSeq::new(3),
+                Some(b"three"),
+            )
+            .expect("third");
+        let retained = BTreeSet::from([second]);
+        assert_eq!(store.compact(&retained).expect("compact"), (3, 1));
+        assert_eq!(
+            store.get(second).expect("retained").value,
+            Some(b"two".to_vec())
+        );
+        assert!(matches!(
+            store.get(first),
+            Err(Error::Corruption(message)) if message.contains("unknown MVCC version")
+        ));
+        assert!(matches!(
+            store.get(third),
+            Err(Error::Corruption(message)) if message.contains("unknown MVCC version")
+        ));
+        let next = store
+            .append(
+                Some(second),
+                TxnId::new(4),
+                CommitSeq::new(4),
+                Some(b"four"),
+            )
+            .expect("append after compact");
+        assert_eq!(next, VersionId::new(4));
+        store.sync().expect("sync compacted store");
+        drop(store);
+        let mut reopened = VersionStore::open(&path).expect("reopen compacted store");
+        assert_eq!(
+            reopened.get(second).expect("reopened second").value,
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            reopened.get(next).expect("reopened next").previous,
+            Some(second)
         );
     }
 
