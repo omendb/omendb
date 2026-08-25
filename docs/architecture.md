@@ -196,6 +196,11 @@ The implementation order is:
 6. complete serializable isolation, WAL replication, and zero-gap logical CDC;
 7. optimize from reproducible OLTP profiles, including p99 and recovery time.
 
+A test-only SeerDB reference model now exercises snapshot isolation, disjoint
+and conflicting writers, atomic multi-tree mutation, tree-ID burn on abort,
+and retained snapshot visibility. It is a semantic oracle, not a production
+backend.
+
 Alpha release gates remain authoritative. An alpha must not be described as
 production-ready or PostgreSQL-compatible until the corresponding correctness,
 performance, packaging, and operational evidence exists.

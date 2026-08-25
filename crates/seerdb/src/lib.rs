@@ -41,6 +41,9 @@
 
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
 
+#[cfg(test)]
+mod transaction_model;
+
 pub mod allocator;
 pub mod blob;
 pub mod btree;
