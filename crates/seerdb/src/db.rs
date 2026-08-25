@@ -82,6 +82,10 @@ mod single_write;
 mod snapshot;
 #[path = "db/transaction.rs"]
 mod transaction;
+#[cfg(test)]
+#[path = "db/transactional_fault_tests.rs"]
+mod transactional_fault_tests;
+
 #[path = "db/vacuum.rs"]
 mod vacuum;
 #[path = "db/wal_admission.rs"]

@@ -10,8 +10,8 @@ mod pmt;
 mod version_store;
 
 pub use pmt::{PMT, PageMapping};
-#[cfg(test)]
-pub(crate) use version_store::fail_next_compaction_rename;
 pub(crate) use version_store::{
     CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
 };
+#[cfg(test)]
+pub(crate) use version_store::{fail_next_compaction_rename, fail_next_version_sync};

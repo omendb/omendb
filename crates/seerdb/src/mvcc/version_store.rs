@@ -25,6 +25,7 @@ const MAX_VERSION_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_COMPACTION_RENAME: Cell<bool> = const { Cell::new(false) };
+    static FAIL_NEXT_VERSION_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// One logical before-image in the append-oriented version store.
@@ -316,6 +317,10 @@ impl VersionStore {
 
     /// Make appended version records durable.
     pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_VERSION_SYNC.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected MVCC version sync failure").into());
+        }
         self.file.sync_data()?;
         Ok(())
     }
@@ -513,6 +518,11 @@ impl VersionStore {
 #[cfg(test)]
 pub(crate) fn fail_next_compaction_rename() {
     FAIL_NEXT_COMPACTION_RENAME.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_version_sync() {
+    FAIL_NEXT_VERSION_SYNC.with(|failure| failure.set(true));
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
