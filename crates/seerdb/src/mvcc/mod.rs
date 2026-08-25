@@ -2,15 +2,14 @@
 //!
 //! This module separates logical record-version visibility from the Page
 //! Mapping Table (PMT), which tracks physical page locations in the
-//! out-of-place B-tree. The logical record chain is the first physical-MVCC
-//! slice; transaction-status indirection and an append-oriented undo store
-//! remain later work.
+//! out-of-place B-tree. Current records now have an append-oriented logical
+//! before-image store; transaction-status indirection and retention-aware GC
+//! remain the next integration steps.
 
 mod pmt;
-mod record;
+mod version_store;
 
 pub use pmt::{PMT, PageMapping};
-pub(crate) use record::{
-    ValueVersion, decode as decode_record, encode as encode_record, latest as latest_record,
-    visible as visible_record,
+pub(crate) use version_store::{
+    CurrentRecord, VersionStore, decode_current, encode_current, visible_current,
 };

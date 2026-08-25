@@ -14,11 +14,11 @@
 
 use crate::db::{BatchMutation, DB, Options};
 use crate::error::{Error, Result};
-use crate::mvcc::{ValueVersion, decode_record, encode_record, latest_record, visible_record};
+use crate::mvcc::{CurrentRecord, VersionStore, decode_current, encode_current, visible_current};
 use crate::storage::format::{CommitId, CommitPosition, CommitSeq, TreeId, TxnId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const TREE_RECORD_PREFIX: &[u8] = b"\x00seerdb/tree/";
@@ -29,6 +29,7 @@ const TREE_DROPPED: &[u8] = b"dropped";
 const TREE_RESERVED: &[u8] = b"reserved";
 const CHANGE_MAGIC: &[u8; 4] = b"SCM1";
 const MAX_CHANGE_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const VERSION_STORE_FILE: &str = "seerdb.mvcc";
 
 /// Lifecycle state of one transaction.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -52,12 +53,41 @@ struct CommittedChange {
     writes: BTreeSet<(TreeId, Vec<u8>)>,
 }
 
+struct ActiveSnapshots {
+    snapshots: BTreeMap<TxnId, CommitSeq>,
+}
+
+impl ActiveSnapshots {
+    fn new() -> Self {
+        Self {
+            snapshots: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, transaction: TxnId, snapshot: CommitSeq) {
+        self.snapshots.insert(transaction, snapshot);
+    }
+
+    fn remove(&mut self, transaction: TxnId) {
+        self.snapshots.remove(&transaction);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.snapshots.is_empty()
+    }
+
+    fn oldest(&self) -> Option<CommitSeq> {
+        self.snapshots.values().copied().min()
+    }
+}
+
 struct Runtime {
     db: Mutex<DB>,
+    versions: Mutex<VersionStore>,
     changes: Mutex<BTreeMap<CommitSeq, CommittedChange>>,
+    active_snapshots: Mutex<ActiveSnapshots>,
     next_transaction: AtomicU64,
     next_tree: AtomicU64,
-    active_transactions: AtomicUsize,
     closed: AtomicBool,
 }
 
@@ -88,21 +118,28 @@ pub struct Transaction {
     created: BTreeSet<TreeId>,
     dropped: BTreeSet<TreeId>,
     state: TransactionState,
+    snapshot_registered: bool,
 }
 
 impl TransactionDatabase {
     /// Create a new transactional database at `path`.
     pub fn create<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
-        Self::from_db(DB::create(path, options)?)
+        let db = DB::create(path, options)?;
+        let versions = VersionStore::create(db.directory().join(VERSION_STORE_FILE))?;
+        db.sync_directory_entry()?;
+        Self::from_db(db, versions)
     }
 
     /// Open an existing transactional database at `path`.
     pub fn open<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
-        Self::from_db(DB::open(path, options)?)
+        let db = DB::open(path, options)?;
+        let versions = VersionStore::open(db.directory().join(VERSION_STORE_FILE))?;
+        Self::from_db(db, versions)
     }
 
-    fn from_db(mut db: DB) -> Result<Self> {
-        let (changes, max_transaction, max_tree) = load_control_state(&mut db)?;
+    fn from_db(mut db: DB, versions: VersionStore) -> Result<Self> {
+        let mut versions = versions;
+        let (changes, max_transaction, max_tree) = load_control_state(&mut db, &mut versions)?;
         let next_transaction = max_transaction
             .checked_add(1)
             .ok_or_else(|| Error::Wal("transaction ID exhausted".into()))?;
@@ -112,10 +149,11 @@ impl TransactionDatabase {
         Ok(Self {
             runtime: Arc::new(Runtime {
                 db: Mutex::new(db),
+                versions: Mutex::new(versions),
                 changes: Mutex::new(changes),
+                active_snapshots: Mutex::new(ActiveSnapshots::new()),
                 next_transaction: AtomicU64::new(next_transaction),
                 next_tree: AtomicU64::new(next_tree),
-                active_transactions: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
             }),
         })
@@ -135,8 +173,10 @@ impl TransactionDatabase {
         let snapshot_position = db.durability_status().commit_position;
         let snapshot = snapshot_position.csn;
         self.runtime
-            .active_transactions
-            .fetch_add(1, Ordering::AcqRel);
+            .active_snapshots
+            .lock()
+            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
+            .insert(TxnId::new(id), snapshot);
         Ok(Transaction {
             runtime: Arc::clone(&self.runtime),
             id: TxnId::new(id),
@@ -146,6 +186,7 @@ impl TransactionDatabase {
             created: BTreeSet::new(),
             dropped: BTreeSet::new(),
             state: TransactionState::Active,
+            snapshot_registered: true,
         })
     }
 
@@ -167,6 +208,14 @@ impl TransactionDatabase {
         Ok(db.durability_status().commit_position)
     }
 
+    /// Return the oldest snapshot currently pinning logical MVCC history.
+    pub fn oldest_active_snapshot(&self) -> Result<Option<CommitSeq>> {
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        self.runtime.oldest_active_snapshot()
+    }
+
     /// Flush and close the underlying durable database.
     ///
     /// A live transaction keeps the handle's active-transaction guard held,
@@ -179,7 +228,13 @@ impl TransactionDatabase {
             .db
             .lock()
             .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
-        if self.runtime.active_transactions.load(Ordering::Acquire) != 0 {
+        if !self
+            .runtime
+            .active_snapshots
+            .lock()
+            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
+            .is_empty()
+        {
             return Err(Error::InvalidArgument(
                 "cannot close database while transactions are active".into(),
             ));
@@ -187,6 +242,11 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?
+            .sync()?;
         db.close()?;
         self.runtime.closed.store(true, Ordering::Release);
         Ok(())
@@ -194,6 +254,22 @@ impl TransactionDatabase {
 }
 
 impl Runtime {
+    fn release_snapshot(&self, transaction: TxnId) -> Result<()> {
+        self.active_snapshots
+            .lock()
+            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
+            .remove(transaction);
+        Ok(())
+    }
+
+    fn oldest_active_snapshot(&self) -> Result<Option<CommitSeq>> {
+        Ok(self
+            .active_snapshots
+            .lock()
+            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
+            .oldest())
+    }
+
     fn reserve_tree(&self, owner: TxnId, tree: TreeId) -> Result<CommitSeq> {
         let mut db = self
             .db
@@ -202,6 +278,10 @@ impl Runtime {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        let mut versions = self
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
         let current = db.durability_status().commit_position.csn;
         let next = CommitSeq::new(
             current
@@ -215,11 +295,15 @@ impl Runtime {
             changed_trees: BTreeSet::from([tree]),
             writes: BTreeSet::new(),
         };
-        let reservation = encode_record(&[ValueVersion {
+        let current_record = decode_current(db.get(&tree_record_key(tree))?.as_deref())?;
+        let undo_head = append_before_image(&mut versions, &current_record)?;
+        let reservation = encode_current(&CurrentRecord {
             transaction: owner,
             commit: next,
+            undo_head,
             value: Some(TREE_RESERVED.to_vec()),
-        }])?;
+        })?;
+        versions.sync()?;
         let mutations = [
             BatchMutation::Put {
                 key: tree_record_key(tree),
@@ -293,6 +377,7 @@ impl Transaction {
                         .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
                 );
                 self.state = TransactionState::RecoveryRequired { commit };
+                self.release_snapshot()?;
                 return Err(Error::NeedsRecovery(format!(
                     "tree reservation for {:?} may be durable: {error}",
                     tree
@@ -344,8 +429,16 @@ impl Transaction {
             .db
             .lock()
             .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
-        let versions = decode_record(db.get(&tree_key(tree, key))?.as_deref())?;
-        Ok(visible_record(&versions, self.snapshot).and_then(|version| version.value.clone()))
+        let current = decode_current(db.get(&tree_key(tree, key))?.as_deref())?;
+        let mut version_store = self
+            .runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        Ok(
+            visible_current(&mut version_store, &current, self.snapshot)?
+                .and_then(|version| version.value),
+        )
     }
 
     /// List trees visible to this transaction in stable ID order.
@@ -360,6 +453,11 @@ impl Transaction {
             .db
             .lock()
             .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let mut version_store = self
+            .runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
         let end = prefix_end(TREE_RECORD_PREFIX);
         let mut trees = BTreeSet::new();
         for (key, value) in db.range(TREE_RECORD_PREFIX, &end)? {
@@ -371,9 +469,10 @@ impl Transaction {
                     .try_into()
                     .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
             ));
-            let versions = decode_record(Some(&value))?;
-            match visible_record(&versions, self.snapshot)
-                .and_then(|version| version.value.as_deref())
+            let current = decode_current(Some(&value))?;
+            match visible_current(&mut version_store, &current, self.snapshot)?
+                .and_then(|version| version.value)
+                .as_deref()
             {
                 Some(TREE_LIVE) => {
                     trees.insert(tree);
@@ -424,15 +523,20 @@ impl Transaction {
                 let db = self.runtime.db.lock().map_err(|_| {
                     Error::Corruption("transaction database mutex is poisoned".into())
                 })?;
-                for (key, value) in db.range(&physical_start, &physical_end)? {
+                let entries = db.range(&physical_start, &physical_end)?;
+                let mut version_store = self.runtime.versions.lock().map_err(|_| {
+                    Error::Corruption("MVCC version store mutex is poisoned".into())
+                })?;
+                for (key, value) in entries {
                     let Some(user_key) = decode_tree_key(tree, &key) else {
                         continue;
                     };
-                    let versions = decode_record(Some(&value))?;
-                    if let Some(version) = visible_record(&versions, self.snapshot)
-                        && let Some(value) = &version.value
+                    let current = decode_current(Some(&value))?;
+                    if let Some(version) =
+                        visible_current(&mut version_store, &current, self.snapshot)?
+                        && let Some(value) = version.value
                     {
-                        values.insert(user_key, value.clone());
+                        values.insert(user_key, value);
                     }
                 }
             }
@@ -464,6 +568,7 @@ impl Transaction {
             self.state = TransactionState::Committed {
                 commit: position.csn,
             };
+            self.release_snapshot()?;
             return Ok(position);
         }
         let result = commit_transaction(self);
@@ -472,6 +577,7 @@ impl Transaction {
                 self.state = TransactionState::Committed {
                     commit: position.csn,
                 };
+                self.release_snapshot()?;
                 Ok(position)
             }
             Err(error)
@@ -485,6 +591,7 @@ impl Transaction {
                         .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
                 );
                 self.state = TransactionState::RecoveryRequired { commit };
+                self.release_snapshot()?;
                 Err(Error::NeedsRecovery(format!(
                     "transaction {:?} may have committed at {:?}: {error}",
                     self.id, commit
@@ -498,6 +605,14 @@ impl Transaction {
     pub fn abort(&mut self) -> Result<()> {
         self.check_active()?;
         self.state = TransactionState::Aborted;
+        self.release_snapshot()
+    }
+
+    fn release_snapshot(&mut self) -> Result<()> {
+        if self.snapshot_registered {
+            self.runtime.release_snapshot(self.id)?;
+            self.snapshot_registered = false;
+        }
         Ok(())
     }
 
@@ -515,7 +630,12 @@ impl Transaction {
             .db
             .lock()
             .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
-        tree_visible(&db, tree, self.snapshot)
+        let mut version_store = self
+            .runtime
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        tree_visible(&db, &mut version_store, tree, self.snapshot)
     }
 
     fn check_tree_visible_for_read(&self, tree: TreeId) -> Result<()> {
@@ -543,9 +663,10 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        self.runtime
-            .active_transactions
-            .fetch_sub(1, Ordering::AcqRel);
+        if self.snapshot_registered {
+            let _ = self.runtime.release_snapshot(self.id);
+            self.snapshot_registered = false;
+        }
     }
 }
 
@@ -558,6 +679,11 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
     if transaction.runtime.closed.load(Ordering::Acquire) {
         return Err(Error::InvalidArgument("database is closed".into()));
     }
+    let mut version_store = transaction
+        .runtime
+        .versions
+        .lock()
+        .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
     let current = db.durability_status().commit_position.csn;
     validate_conflicts(transaction, &db, current)?;
 
@@ -574,15 +700,16 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
             continue;
         }
         let storage_key = tree_key(*tree, key);
-        let mut versions = decode_record(db.get(&storage_key)?.as_deref())?;
-        versions.push(ValueVersion {
-            transaction: transaction.id,
-            commit: next,
-            value: value.clone(),
-        });
+        let current_record = decode_current(db.get(&storage_key)?.as_deref())?;
+        let undo_head = append_before_image(&mut version_store, &current_record)?;
         mutations.push(BatchMutation::Put {
             key: storage_key,
-            value: encode_record(&versions)?,
+            value: encode_current(&CurrentRecord {
+                transaction: transaction.id,
+                commit: next,
+                undo_head,
+                value: value.clone(),
+            })?,
         });
         writes.insert((*tree, key.clone()));
     }
@@ -596,15 +723,16 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
             TREE_LIVE
         };
         let lifecycle_key = tree_record_key(*tree);
-        let mut versions = decode_record(db.get(&lifecycle_key)?.as_deref())?;
-        versions.push(ValueVersion {
-            transaction: transaction.id,
-            commit: next,
-            value: Some(lifecycle.to_vec()),
-        });
+        let current_record = decode_current(db.get(&lifecycle_key)?.as_deref())?;
+        let undo_head = append_before_image(&mut version_store, &current_record)?;
         mutations.push(BatchMutation::Put {
             key: lifecycle_key,
-            value: encode_record(&versions)?,
+            value: encode_current(&CurrentRecord {
+                transaction: transaction.id,
+                commit: next,
+                undo_head,
+                value: Some(lifecycle.to_vec()),
+            })?,
         });
     }
 
@@ -618,6 +746,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
         key: change_record_key(next),
         value: encode_change(&change)?,
     });
+    version_store.sync()?;
     let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
     let committed = status.commit_position.csn;
     if committed != next {
@@ -630,6 +759,20 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
     Ok(status.commit_position)
 }
 
+fn append_before_image(
+    version_store: &mut VersionStore,
+    current: &CurrentRecord,
+) -> Result<Option<crate::storage::format::VersionId>> {
+    version_store
+        .append(
+            current.undo_head,
+            current.transaction,
+            current.commit,
+            current.value.as_deref(),
+        )
+        .map(Some)
+}
+
 fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) -> Result<()> {
     if transaction.snapshot > current {
         return Err(Error::SerializationConflict {
@@ -639,21 +782,18 @@ fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) ->
     }
 
     for tree in &transaction.created {
-        let versions = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
-        let Some(version) = latest_record(&versions) else {
-            return Err(Error::TreeConflict(*tree));
-        };
-        if version.transaction != transaction.id || version.value.as_deref() != Some(TREE_RESERVED)
+        let current_record = decode_current(db.get(&tree_record_key(*tree))?.as_deref())?;
+        if current_record.transaction != transaction.id
+            || current_record.value.as_deref() != Some(TREE_RESERVED)
         {
             return Err(Error::TreeConflict(*tree));
         }
     }
 
     for tree in &transaction.dropped {
-        let versions = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
-        if let Some(version) = latest_record(&versions)
-            && version.commit > transaction.snapshot
-            && version.transaction != transaction.id
+        let current_record = decode_current(db.get(&tree_record_key(*tree))?.as_deref())?;
+        if current_record.commit > transaction.snapshot
+            && current_record.transaction != transaction.id
         {
             return Err(Error::TreeConflict(*tree));
         }
@@ -666,17 +806,13 @@ fn validate_conflicts(transaction: &Transaction, db: &DB, current: CommitSeq) ->
         if transaction.created.contains(tree) {
             continue;
         }
-        let lifecycle = decode_record(db.get(&tree_record_key(*tree))?.as_deref())?;
-        if let Some(version) = latest_record(&lifecycle)
-            && version.commit > transaction.snapshot
-            && version.transaction != transaction.id
-        {
+        let lifecycle = decode_current(db.get(&tree_record_key(*tree))?.as_deref())?;
+        if lifecycle.commit > transaction.snapshot && lifecycle.transaction != transaction.id {
             return Err(Error::TreeConflict(*tree));
         }
-        let versions = decode_record(db.get(&tree_key(*tree, key))?.as_deref())?;
-        if let Some(version) = latest_record(&versions)
-            && version.commit > transaction.snapshot
-            && version.transaction != transaction.id
+        let current_record = decode_current(db.get(&tree_key(*tree, key))?.as_deref())?;
+        if current_record.commit > transaction.snapshot
+            && current_record.transaction != transaction.id
         {
             return Err(Error::WriteConflict {
                 tree: *tree,
@@ -699,10 +835,8 @@ fn tree_has_conflicting_write(
         if decode_tree_key(tree, &key).is_none() {
             continue;
         }
-        let versions = decode_record(Some(&value))?;
-        if latest_record(&versions)
-            .is_some_and(|version| version.commit > snapshot && version.transaction != transaction)
-        {
+        let current = decode_current(Some(&value))?;
+        if current.commit > snapshot && current.transaction != transaction {
             return Ok(true);
         }
     }
@@ -726,11 +860,19 @@ fn is_recovery_error(runtime: &Arc<Runtime>) -> Result<bool> {
     Ok(db.durability_status().write_fenced)
 }
 
-fn tree_visible(db: &DB, tree: TreeId, snapshot: CommitSeq) -> Result<bool> {
-    let versions = decode_record(db.get(&tree_record_key(tree))?.as_deref())?;
-    match visible_record(&versions, snapshot).and_then(|version| version.value.as_deref()) {
-        Some(TREE_LIVE) => Ok(true),
-        Some(TREE_DROPPED) | Some(TREE_RESERVED) | None => Ok(false),
+fn tree_visible(
+    db: &DB,
+    version_store: &mut VersionStore,
+    tree: TreeId,
+    snapshot: CommitSeq,
+) -> Result<bool> {
+    let current = decode_current(db.get(&tree_record_key(tree))?.as_deref())?;
+    match visible_current(version_store, &current, snapshot)?.and_then(|version| version.value) {
+        Some(value) if value.as_slice() == TREE_LIVE => Ok(true),
+        Some(value) if value.as_slice() == TREE_DROPPED || value.as_slice() == TREE_RESERVED => {
+            Ok(false)
+        }
+        None => Ok(false),
         Some(_) => Err(Error::Corruption(format!(
             "tree {:?} has an invalid lifecycle record",
             tree
@@ -738,7 +880,25 @@ fn tree_visible(db: &DB, tree: TreeId, snapshot: CommitSeq) -> Result<bool> {
     }
 }
 
-fn load_control_state(db: &mut DB) -> Result<(BTreeMap<CommitSeq, CommittedChange>, u64, u64)> {
+fn validate_version_chain(version_store: &mut VersionStore, current: &CurrentRecord) -> Result<()> {
+    let mut head = current.undo_head;
+    while let Some(id) = head {
+        let record = version_store.get(id)?;
+        if !matches!(
+            record.value.as_deref(),
+            Some(TREE_LIVE) | Some(TREE_DROPPED) | Some(TREE_RESERVED) | None
+        ) {
+            return Err(Error::Corruption("malformed tree lifecycle value".into()));
+        }
+        head = record.previous;
+    }
+    Ok(())
+}
+
+fn load_control_state(
+    db: &mut DB,
+    version_store: &mut VersionStore,
+) -> Result<(BTreeMap<CommitSeq, CommittedChange>, u64, u64)> {
     let mut changes = BTreeMap::new();
     let mut max_transaction = 0;
     let mut max_tree = 0;
@@ -752,15 +912,14 @@ fn load_control_state(db: &mut DB) -> Result<(BTreeMap<CommitSeq, CommittedChang
                 .try_into()
                 .map_err(|_| Error::Corruption("malformed tree lifecycle ID".into()))?,
         );
-        let versions = decode_record(Some(&value))?;
-        for version in versions {
-            if !matches!(
-                version.value.as_deref(),
-                Some(TREE_LIVE) | Some(TREE_DROPPED) | Some(TREE_RESERVED)
-            ) {
-                return Err(Error::Corruption("malformed tree lifecycle value".into()));
-            }
+        let current = decode_current(Some(&value))?;
+        if !matches!(
+            current.value.as_deref(),
+            Some(TREE_LIVE) | Some(TREE_DROPPED) | Some(TREE_RESERVED)
+        ) {
+            return Err(Error::Corruption("malformed tree lifecycle value".into()));
         }
+        validate_version_chain(version_store, &current)?;
         max_tree = max_tree.max(tree);
     }
 
@@ -1216,11 +1375,25 @@ mod tests {
             .get(&tree_key(tree, b"key"))
             .expect("raw value")
             .expect("record");
-        let versions = decode_record(Some(&bytes)).expect("decode versions");
-        assert_eq!(versions.len(), 2);
-        assert_eq!(versions[0].value, Some(b"old".to_vec()));
-        assert_eq!(versions[1].value, Some(b"new".to_vec()));
+        let current = decode_current(Some(&bytes)).expect("decode current");
+        assert_eq!(current.value, Some(b"new".to_vec()));
+        let mut version_store =
+            VersionStore::open(directory.path().join("db").join(VERSION_STORE_FILE))
+                .expect("open version store");
+        let previous = version_store
+            .get(current.undo_head.expect("undo head"))
+            .expect("previous version");
+        assert_eq!(previous.value, Some(b"old".to_vec()));
+        let version_path = directory.path().join("db").join(VERSION_STORE_FILE);
+        assert!(
+            version_path.is_file(),
+            "version store missing before raw close"
+        );
         raw.close().expect("raw close");
+        assert!(
+            version_path.is_file(),
+            "version store missing after raw close"
+        );
 
         let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
             .expect("reopen");
@@ -1244,5 +1417,27 @@ mod tests {
         ));
         drop(transaction);
         database.close().expect("close after drop");
+    }
+
+    #[test]
+    fn snapshot_watermark_releases_when_transaction_finishes() {
+        let (_directory, database) = database();
+        let mut first = database.begin().expect("first begin");
+        let second = database.begin().expect("second begin");
+        assert_eq!(
+            database.oldest_active_snapshot().expect("oldest snapshot"),
+            Some(first.snapshot())
+        );
+        first.commit().expect("first commit");
+        assert_eq!(
+            database.oldest_active_snapshot().expect("oldest snapshot"),
+            Some(second.snapshot())
+        );
+        drop(second);
+        assert_eq!(
+            database.oldest_active_snapshot().expect("oldest snapshot"),
+            None
+        );
+        database.close().expect("close");
     }
 }

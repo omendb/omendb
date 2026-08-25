@@ -290,6 +290,14 @@ pub struct DB {
 }
 
 impl DB {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn sync_directory_entry(&self) -> Result<()> {
+        sync_directory(&self.path)
+    }
+
     /// Open or create a database at the given path.
     pub fn open<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
         Self::open_with_mode(path, options, OpenMode::Normal)

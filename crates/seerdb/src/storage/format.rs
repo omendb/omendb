@@ -90,6 +90,10 @@ numeric_id!(
     CommitSeq,
     "Commit sequence number assigned when a transaction becomes visible."
 );
+numeric_id!(
+    VersionId,
+    "Logical identity of an append-oriented transactional version record."
+);
 
 /// Logical write-ahead-log position.
 ///
