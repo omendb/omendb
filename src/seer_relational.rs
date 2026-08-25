@@ -1,9 +1,10 @@
-//! Typed OmenDB adoption slice backed by Rust SeerDB.
+//! Transitional typed OmenDB adoption slice backed by Rust SeerDB.
 //!
-//! `RelationalStore` remains the existing OmenDB implementation while this
-//! boundary is proven. This type deliberately keeps the logical model in
-//! OmenDB and routes every durable row, secondary-index, and catalog change
-//! through one SeerDB commit batch.
+//! This type deliberately keeps the logical model in OmenDB and routes every
+//! durable row, secondary-index, and catalog change through one SeerDB commit
+//! batch. Its generic kernel parameter exists for conformance tests while the
+//! capability-rich SeerDB transaction API is built; it is not the target
+//! production storage-plugin boundary.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -74,8 +75,9 @@ pub struct LegacyMigrationOptions {
 }
 
 /// A typed relational store using SeerDB as its sole durable publication
-/// authority. This is an adoption slice, not yet a replacement for the
-/// existing [`crate::RelationalStore`].
+/// authority. This is the current adoption slice and transitional relational
+/// implementation; it will move from the CAS conformance seam to SeerDB's
+/// capability-rich transaction API.
 /// Publications retained for stale-snapshot certification. Every successful
 /// publication appends one entry; the oldest entries prune once the window
 /// exceeds its budget, and members whose snapshot falls below the retained
@@ -117,9 +119,10 @@ impl<K: StorageKernel> SeerRelationalStore<K> {
         self.kernel.close()
     }
 
-    /// Construct the relational layer over any kernel implementing
-    /// [`StorageKernel`]. The kernel owns durability and recovery; OmenDB
-    /// owns catalog, row, index, and constraint semantics.
+    /// Construct the transitional relational layer over a conformance
+    /// [`StorageKernel`]. The kernel owns durability and recovery; OmenDB owns
+    /// catalog, row, index, and constraint semantics. Production integration
+    /// will call SeerDB directly once its transaction API replaces this seam.
     pub fn from_kernel(kernel: K) -> Result<Self> {
         let commit = kernel.commit_id();
         let catalog = match kernel.get(commit, CATALOG_KEY)? {

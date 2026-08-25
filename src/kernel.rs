@@ -1,19 +1,19 @@
 //! The storage-kernel seam: transactional versioned byte-key/value storage.
 //!
-//! One [`StorageKernel`] implementation backs one relational store. The
-//! contract is deliberately narrower than any engine's full surface: atomic
-//! CAS batches over [`KvMutation`]s, point/range reads at an explicit
-//! snapshot, snapshot-retention leases that pin history against reclamation,
-//! durable idempotency (attempt) records, and maintenance entry points.
+//! Transitional conformance seam for the current relational implementation.
+//! It models atomic byte mutations, snapshot reads, retention, idempotency, and
+//! maintenance so the temporary and SeerDB adapters can share semantic tests.
 //!
-//! Engine-specific capabilities (fault injection, physical archive/restore,
-//! legacy migration) stay as inherent methods on concrete kernels; generic
-//! relational code never reaches past this trait.
+//! This least-common-denominator CAS API is not the target production storage
+//! boundary. OmenDB's server architecture will call SeerDB directly through a
+//! capability-rich transactional ordered-KV API; the trait remains only while
+//! that replacement is built. Engine-specific capabilities stay on concrete
+//! kernels and generic relational code does not reach past this seam.
 //!
-//! OmenDB ships [`crate::SeerKernel`] as its durable Rust engine,
+//! OmenDB ships [`crate::SeerKernel`] as its current durable adapter,
 //! [`crate::TemporaryKernel`] as a compatibility adapter, and
-//! [`InMemoryKernel`] for tests and conformance work. New backends implement
-//! this trait plus their config/constructor pair.
+//! [`InMemoryKernel`] for model/conformance tests. Do not add a first-party
+//! backend matrix to this trait.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

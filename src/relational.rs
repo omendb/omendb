@@ -846,9 +846,11 @@ pub fn decode_row(primary: Key, bytes: &[u8]) -> Result<Row> {
     Ok(Row { primary, values })
 }
 
-/// Temporary backend: the shared relational implementation over the legacy
-/// durable kernel adapter. The adapter is kept for compatibility and for
-/// differential conformance; new engines implement `StorageKernel` instead.
+/// Temporary/reference backend: the shared relational implementation over
+/// the legacy durable kernel adapter. The adapter is kept for compatibility
+/// and differential conformance while the production path moves to SeerDB's
+/// capability-rich transaction API. This is not an invitation to add a
+/// first-party backend matrix.
 pub type RelationalStore = crate::SeerRelationalStore<crate::temporary_kernel::TemporaryKernel>;
 pub type RelationalTransaction =
     crate::SeerRelationalTransaction<crate::temporary_kernel::TemporaryKernel>;
