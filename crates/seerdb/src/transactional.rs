@@ -202,7 +202,13 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
-        let snapshot_position = db.durability_status().commit_position;
+        let durability = db.durability_status();
+        if durability.write_fenced {
+            return Err(Error::NeedsRecovery(
+                "transaction database is fenced; reopen required".into(),
+            ));
+        }
+        let snapshot_position = durability.commit_position;
         let snapshot = snapshot_position.csn;
         self.runtime
             .active_snapshots
@@ -1735,6 +1741,35 @@ mod tests {
             Some(b"new".to_vec())
         );
         current.abort().expect("abort current");
+        drop(current);
+        reopened.close().expect("close reopened");
+    }
+
+    #[test]
+    fn version_gc_failure_fences_and_reopens_safely() {
+        let (directory, database) = database();
+        let tree = tree(&database);
+        let mut transaction = database.begin().expect("begin");
+        transaction.put(tree, b"key", b"value").expect("write");
+        transaction.commit().expect("commit");
+        drop(transaction);
+
+        crate::mvcc::fail_next_compaction_rename();
+        assert!(database.gc_versions().is_err());
+        assert!(matches!(
+            database.begin(),
+            Err(Error::NeedsRecovery(message)) if message.contains("fenced")
+        ));
+        drop(database);
+
+        let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen after gc failure");
+        let mut current = reopened.begin().expect("begin after reopen");
+        assert_eq!(
+            current.get(tree, b"key").expect("read after reopen"),
+            Some(b"value".to_vec())
+        );
+        current.abort().expect("abort");
         drop(current);
         reopened.close().expect("close reopened");
     }

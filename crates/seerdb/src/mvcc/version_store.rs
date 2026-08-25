@@ -8,6 +8,8 @@
 
 use crate::error::{Error, Result};
 use crate::storage::format::{CommitSeq, TxnId, VersionId};
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,6 +21,11 @@ const VALUE_TOMBSTONE: u32 = u32::MAX;
 const FIXED_HEADER_BYTES: u64 = 4 + 8 + 8 + 8 + 8 + 4;
 const CHECKSUM_BYTES: u64 = 4;
 const MAX_VERSION_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_COMPACTION_RENAME: Cell<bool> = const { Cell::new(false) };
+}
 
 /// One logical before-image in the append-oriented version store.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -344,6 +351,10 @@ impl VersionStore {
         drop(compacted);
 
         self.file.sync_data()?;
+        #[cfg(test)]
+        if FAIL_NEXT_COMPACTION_RENAME.with(|failure| failure.replace(false)) {
+            return Err(std::io::Error::other("injected version compaction rename failure").into());
+        }
         std::fs::rename(&temporary, &self.path)?;
         sync_parent_directory(&self.path)?;
         let replacement = OpenOptions::new().read(true).write(true).open(&self.path)?;
@@ -497,6 +508,11 @@ impl VersionStore {
             value,
         })
     }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_compaction_rename() {
+    FAIL_NEXT_COMPACTION_RENAME.with(|failure| failure.set(true));
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {
