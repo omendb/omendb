@@ -1,6 +1,6 @@
 # OmenDB
 
-OmenDB is an embedded relational database built around [SeerDB](https://github.com/omendb/seerdb). It provides typed rows, transactions, catalog and index management, retained snapshots, bounded embedded SQL, sessions, and two selectable storage backends.
+OmenDB is a relational database system in development, currently delivered as an embedded library built around [SeerDB](https://github.com/omendb/seerdb). It provides typed rows, transactions, catalog and index management, retained snapshots, bounded SQL, sessions, and a storage-kernel adapter boundary. The embedded library is the first deployment surface—not the long-term product boundary.
 
 > **Developer preview:** This tree is targeting a relational `0.1.0-alpha.1` release, but it is not alpha-ready yet. APIs, persistence formats, supported platforms, and performance are subject to change. PostgreSQL wire support is experimental and feature-gated. See [`docs/alpha-release-gates.md`](docs/alpha-release-gates.md) for the release contract.
 
@@ -45,6 +45,23 @@ supports the tested subset of schema changes, `SELECT`, `INSERT`, `UPDATE`,
 `DELETE`, parameters, joins, aggregates, indexes, and constraints. Unsupported
 syntax returns `DbError::SqlUnsupported`; use the typed API when you need
 control over transaction, snapshot, or backend behavior.
+
+## Deployment roadmap
+
+The current alpha target is a reliable single-process embedded library. That
+lets us establish storage, transaction, recovery, and SQL correctness before
+adding a network boundary. The planned server track will put a standalone
+OmenDB daemon in front of the same relational engine and provide multi-client
+concurrency, connection/session lifecycle, authentication and authorization,
+configuration, observability, backups, and operational upgrade procedures.
+
+The long-term goal is a competitive OmenDB server for general OLTP workloads,
+with PostgreSQL-class deployment capabilities and a PostgreSQL-compatible wire
+option where it is useful. That work is not implied by the current embedded
+alpha: the exploratory wire example below is a compatibility experiment, not
+an alpha server or a claim of PostgreSQL feature parity. SeerDB remains the
+Rust storage engine; the storage-kernel adapter keeps the relational layer
+replaceable without hard-coding a list of alternate engines.
 
 Each direct SQL write is one transaction. Use `execute_sql_batch` (or its
 parameterized variant) or a typed transaction with
