@@ -48,5 +48,5 @@ All notable changes to OmenDB are documented here. Format follows
 
 ## [0.1.0-alpha.1] - Unreleased
 
-First relational alpha line. Not yet published; see
-`docs/alpha-release-gates.md` for the remaining release contract.
+Reserved relational alpha line. It is not yet published or release-ready;
+see `docs/alpha-release-gates.md` for the server-first release contract.

@@ -36,25 +36,50 @@ version remain part of the public history.
 
 ## Alpha application contract
 
-The alpha supports two application-facing surfaces:
+`0.1.0-alpha.*` is reserved for a future server-first alpha. The current tree
+is an internal development preview and does not satisfy this contract merely
+because its direct Rust API and bounded SQL tests pass.
 
-- the typed Rust API, including transactions, snapshots, schema, indexes,
-  constraints, recovery state, and storage diagnostics;
-- the documented, bounded SQL subset through the direct API.
+A releasable alpha has two surfaces sharing one transaction implementation:
 
-The standalone server is the product roadmap, but is not yet part of this
-alpha contract.
+- a persistent single-node OmenDB server with multiple sessions, an explicitly
+  documented PostgreSQL protocol subset, authentication, clean lifecycle, and
+  operational diagnostics;
+- a secondary typed Rust API for integration, testing, and embedded use.
 
 The SQL subset is intentionally not PostgreSQL-compatible. Unsupported syntax
 must return `DbError::SqlUnsupported` rather than silently doing something
-else. PostgreSQL wire support remains experimental and is not part of the
-alpha compatibility promise.
+else. PostgreSQL compatibility claims require a tested compatibility matrix;
+the exploratory wire example is not evidence of that claim.
 
 The alpha does not promise production safety, stable storage-format upgrades,
-or performance parity with SQLite until the corresponding gates below have
-passing fixtures and published evidence.
+or competitive OLTP performance until the corresponding storage, server,
+correctness, performance, packaging, and operational gates below have passing
+evidence. SQLite remains useful as a bounded differential oracle, but it is not
+the primary performance target; release evidence must include a reproducible
+PostgreSQL-class comparison where the supported workload overlaps.
 
 ## Required gates
+
+### Storage and transaction foundation
+
+- [ ] SeerDB provides multi-writer snapshot MVCC with distinct `TxnId`, CSN,
+      and LSN identities;
+- [ ] first-class trees, ordered cursors, atomic multi-tree transactions, and
+      snapshot `{CSN, restart LSN}` export are exercised through OmenDB;
+- [ ] committed changes are restartable without reconstructing history by
+      rescanning relational tables;
+- [ ] crash/recovery tests cover commit, WAL, page-map, checkpoint, GC, and
+      retained-snapshot boundaries.
+
+### Server and protocol
+
+- [ ] a persistent daemon opens a durable database and supports multiple
+      sessions with clean startup, shutdown, cancellation, and reopen;
+- [ ] authentication, authorization, resource limits, and operational
+      diagnostics have an explicit documented baseline;
+- [ ] the supported PostgreSQL protocol/SQL subset has differential and
+      negative compatibility tests; unsupported behavior fails explicitly.
 
 ### Correctness and isolation
 

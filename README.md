@@ -2,7 +2,7 @@
 
 OmenDB is a server-first relational database system in development, written in Rust and built on [SeerDB](crates/seerdb). It targets PostgreSQL-class single-node OLTP with PostgreSQL ecosystem compatibility at deliberate external boundaries. A direct embedded Rust API remains useful for integration and testing, but it is a secondary deployment surface—not the product boundary.
 
-> **Developer preview:** This tree is targeting a relational `0.1.0-alpha.1` release, but it is not alpha-ready yet. APIs, persistence formats, supported platforms, and performance are subject to change. PostgreSQL wire support is experimental and feature-gated. See [`docs/architecture.md`](docs/architecture.md) for the server-first design and [`docs/alpha-release-gates.md`](docs/alpha-release-gates.md) for the release contract.
+> **Developer preview:** The relational `0.1.0-alpha.*` line is reserved but not alpha-ready. APIs, persistence formats, supported platforms, and performance are subject to change. The current direct API is a qualification surface; a releasable alpha must satisfy the server-first storage and server gates. PostgreSQL wire support is experimental and feature-gated. See [`docs/architecture.md`](docs/architecture.md) for the design and [`docs/alpha-release-gates.md`](docs/alpha-release-gates.md) for the release contract.
 
 ## Quick start
 
@@ -50,20 +50,27 @@ control over transaction, snapshot, or backend behavior.
 
 ## Deployment roadmap
 
-The product roadmap is server-first. The planned standalone OmenDB daemon will
-provide multi-client concurrency, connection/session lifecycle,
-authentication and authorization, configuration, observability, backups, and
-operational upgrade procedures in front of the same relational and SeerDB
-transaction foundations. The current tree still exposes those foundations
-primarily through a direct Rust API; the exploratory wire example below is not
-yet the alpha server.
+The roadmap is server-first, with SeerDB and OmenDB advancing as one vertical
+slice rather than as isolated rewrites:
 
-The long-term goal is a competitive OmenDB server for general OLTP workloads,
-with PostgreSQL-class deployment capabilities and PostgreSQL ecosystem
-compatibility where it is useful. SeerDB is an independent Apache-2.0 Rust
-crate developed in this monorepo and published on its own version line. OmenDB
-owns SQL, schema, row/index encoding, and relational semantics; SeerDB owns
-generic ordered-KV storage and transaction durability. Alternate storage
+1. **SeerDB foundation:** multi-writer snapshot MVCC, first-class trees,
+   ordered cursors, atomic multi-tree writes, crash-safe WAL, and snapshot plus
+   restart-LSN change positions.
+2. **OmenDB integration:** replace the global-generation storage seam and map
+   catalogs, tables, and indexes directly onto SeerDB capabilities while
+   preserving relational correctness tests.
+3. **Server alpha:** deliver a persistent single-node daemon with multiple
+   sessions, a deliberate PostgreSQL protocol subset, authentication, clean
+   lifecycle, and operational diagnostics.
+4. **Measured acceleration:** add typed OLTP micro-plans, batch execution,
+   replication/CDC, and benchmark-led page, buffer, WAL, and runtime
+   optimizations.
+
+The current direct Rust API and exploratory wire example are development
+surfaces, not the target alpha product. SeerDB is an independent Apache-2.0
+Rust crate developed in this monorepo and published on its own version line.
+OmenDB owns SQL, schema, row/index encoding, and relational semantics; SeerDB
+owns generic ordered-KV storage and transaction durability. Alternate storage
 engines are an integration concern, not a first-party engine matrix.
 
 Each direct SQL write is one transaction. Use `execute_sql_batch` (or its

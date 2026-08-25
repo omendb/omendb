@@ -1,9 +1,10 @@
-# OmenDB operator runbook (alpha)
+# OmenDB operator runbook (development preview)
 
-This runbook covers the operational surface of one `RelationalDatabase` or
-`RelationalDatabaseSession` handle: health checks, integrity verification,
-maintenance, and recovery after an ambiguous durable write. It describes the
-alpha contract only; behavior may change between prereleases.
+This runbook covers the current operational surface of one `RelationalDatabase`
+or `RelationalDatabaseSession` handle: health checks, integrity verification,
+maintenance, and recovery after an ambiguous durable write. It is a
+qualification aid for the unreleased development line, not the final
+server-operations contract; behavior may change before the server-first alpha.
 
 ## Platform and filesystem assumptions
 

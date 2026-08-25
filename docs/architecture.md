@@ -176,7 +176,7 @@ certification, buffer translation, WAL commit modes, and device-specific
 optimizations. No disk-format stability promise should force v1 architecture
 into permanence.
 
-## Current status and next phases
+## Current status and roadmap
 
 The current tree has a working direct Rust relational API, durable SeerDB
 integration, SQL/catalog/index/constraint tests, fault and recovery coverage,
@@ -185,22 +185,29 @@ server contract described here, full durable data-version MVCC, a production
 multi-writer storage API, production authentication/authorization, or a
 PostgreSQL compatibility claim.
 
-The implementation order is:
+The roadmap is intentionally dependency-ordered, but OmenDB follows each
+SeerDB milestone immediately so the storage contract is validated by a real
+relational consumer:
 
-1. consolidate and qualify the workspace boundary;
-2. define transaction, tree, snapshot/CDC, and crash-state contracts;
-3. replace the global-generation relational seam with a capability-rich
-   SeerDB transaction API;
-4. deliver a persistent multi-session server with explicit auth and lifecycle;
-5. add typed micro-plans, cursors, and a batch executor;
-6. complete serializable isolation, WAL replication, and zero-gap logical CDC;
-7. optimize from reproducible OLTP profiles, including p99 and recovery time.
+1. **Contracts and model — substantially complete:** workspace ownership,
+   generic ordered-KV boundary, TxnId/CSN/LSN rules, tree lifecycle,
+   snapshot/change positioning, and crash-state invariants.
+2. **SeerDB transactional foundation — next:** multi-writer snapshot MVCC,
+   record versions/undo, first-class trees, ordered cursors, atomic multi-tree
+   transactions, and durable WAL/recovery primitives.
+3. **OmenDB direct integration:** replace the global-generation
+   `StorageKernel` path; map catalogs, tables, and indexes to SeerDB trees;
+   preserve SQL, constraint, and differential tests as integration gates.
+4. **Server alpha foundation:** persistent multi-session lifecycle, deliberate
+   PostgreSQL protocol subset, authentication, cancellation, configuration,
+   diagnostics, and clean shutdown/reopen behavior.
+5. **Correctness and scale:** serializable certification, snapshot plus
+   zero-gap logical CDC, physical replication, typed OLTP micro-plans, batch
+   execution, and benchmark-led storage/runtime optimization.
 
-A test-only SeerDB reference model now exercises snapshot isolation, disjoint
-and conflicting writers, atomic multi-tree mutation, tree-ID burn on abort,
-and retained snapshot visibility. It is a semantic oracle, not a production
-backend.
-
-Alpha release gates remain authoritative. An alpha must not be described as
-production-ready or PostgreSQL-compatible until the corresponding correctness,
-performance, packaging, and operational evidence exists.
+A test-only SeerDB reference model exercises snapshot visibility, disjoint and
+conflicting writers, atomic multi-tree mutation, tree-ID burn on abort, and
+retained snapshot visibility. It is a semantic oracle, not a production
+backend. The alpha release gates define evidence requirements; the current
+`0.1.0-alpha.*` line remains unreleased until the server-first storage and
+server criteria are met.

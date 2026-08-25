@@ -27,14 +27,14 @@ foundation beneath a database server:
   feature flags exist, but device-specific optimization is not required by the
   baseline contract.
 
-The current alpha uses a fixed 4 KiB page format, exposed as
+The current development line uses a fixed 4 KiB page format, exposed as
 `seerdb::PAGE_SIZE`. Page sizing is not an ignored tuning knob: changing it
 requires a separately versioned format and matching buffer/device
 implementation.
 
 SeerDB does not claim durable per-record MVCC, parallel writers, SQL, HA, or
 cross-device performance parity. Multi-writer MVCC and the OmenDB server
-contract are active architecture work, not current alpha guarantees.
+contract are active architecture work, not release guarantees.
 
 ## Basic use
 
@@ -76,13 +76,13 @@ for the cross-project boundary and roadmap.
 
 ## Status
 
-The current Rust lane is a single-writer durable kernel with concurrent reads,
-root-generation retention, WAL recovery, crash-safe reclamation, and retryable
-capacity refusal. It has useful integrity and fault-injection coverage, but it
-is not yet the target multi-writer transactional engine and is not a v0.1
-release. Durable per-record MVCC, concurrent transaction semantics, broader
-filesystem/block-layer fault qualification, and measured device-backed
-performance remain open. OmenDB integration and the alpha release gates are
+The current Rust development lane is a single-writer durable kernel with
+concurrent reads, root-generation retention, WAL recovery, crash-safe
+reclamation, and retryable capacity refusal. It has useful integrity and
+fault-injection coverage, but it is not yet the target multi-writer
+transactional engine or a releasable `0.1.0-alpha.*` crate. Durable
+per-record MVCC, concurrent transaction semantics, broader filesystem/block-
+layer fault qualification, and measured device-backed performance remain open. OmenDB integration and the alpha release gates are
 the authoritative cross-project qualification surfaces.
 
 On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
