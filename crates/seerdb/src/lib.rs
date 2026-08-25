@@ -76,5 +76,6 @@ pub use storage::format::{
     TreeId, TxnId,
 };
 pub use transactional::{
-    Cursor, Transaction, TransactionDatabase, TransactionState, VersionGcReport,
+    ChangeGcReport, CommittedChange, Cursor, RetentionLease, SnapshotExport, Transaction,
+    TransactionDatabase, TransactionState, VersionGcReport,
 };

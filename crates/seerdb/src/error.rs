@@ -3,7 +3,7 @@
 use crate::blob::BlobManagerError;
 use crate::btree::{BTreeError, InsertError, SplitError};
 use crate::buffer::BufferError;
-use crate::storage::format::{CommitId, TreeId};
+use crate::storage::format::{CommitId, CommitSeq, TreeId};
 
 /// Category of a failure reported by the non-mutating integrity checker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -106,6 +106,17 @@ pub enum Error {
     /// A retained historical root is no longer available to this handle.
     #[error("snapshot unavailable: {0}")]
     SnapshotUnavailable(String),
+
+    /// The requested committed-change range reaches below the oldest record
+    /// retained by active retention leases. Reattach or advance a lease from
+    /// `oldest` to stream forward without gaps.
+    #[error("committed changes pruned: requested from {requested:?}, oldest retained {oldest:?}")]
+    ChangesPruned {
+        /// First commit sequence the reader requested.
+        requested: CommitSeq,
+        /// Oldest change record still retained.
+        oldest: CommitSeq,
+    },
 
     /// The caller attempted to commit against a stale published state.
     #[error("serialization conflict: expected commit {expected:?}, current commit {current:?}")]

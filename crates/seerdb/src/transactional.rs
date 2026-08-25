@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::mvcc::{
     CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
 };
-use crate::storage::format::{CommitId, CommitPosition, CommitSeq, TreeId, TxnId};
+use crate::storage::format::{CommitId, CommitPosition, CommitSeq, Lsn, TreeId, TxnId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +27,9 @@ use std::sync::{Arc, Mutex};
 const TREE_RECORD_PREFIX: &[u8] = b"\x00seerdb/tree/";
 const STATUS_RECORD_PREFIX: &[u8] = b"\x00seerdb/status/";
 const CHANGE_RECORD_PREFIX: &[u8] = b"\x00seerdb/change/";
+const LEASE_RECORD_PREFIX: &[u8] = b"\x00seerdb/lease/";
+/// Longest accepted retention-lease name in bytes.
+const MAX_LEASE_NAME_LEN: usize = 255;
 const TREE_DATA_PREFIX: u8 = 0x01;
 const TREE_LIVE: &[u8] = b"live";
 const TREE_DROPPED: &[u8] = b"dropped";
@@ -63,12 +66,150 @@ pub struct VersionGcReport {
     pub current_records_rewritten: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct CommittedChange {
-    transaction: TxnId,
-    snapshot: CommitSeq,
-    changed_trees: BTreeSet<TreeId>,
-    writes: BTreeSet<(TreeId, Vec<u8>)>,
+/// A commit that became visible in the committed-change stream.
+///
+/// `commit` is the stream position: every published commit sequence number
+/// has exactly one change record, so consecutive records are gap-free while
+/// a retention lease pins their range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedChange {
+    /// Committed sequence number of the change (its stream position).
+    pub commit: CommitSeq,
+    /// Transaction that produced the change; zero for system writers.
+    pub transaction: TxnId,
+    /// Snapshot the transaction read at begin time.
+    pub snapshot: CommitSeq,
+    /// Trees whose lifecycle or contents changed.
+    pub changed_trees: BTreeSet<TreeId>,
+    /// Written keys, including tree reservations with no key writes.
+    pub writes: BTreeSet<(TreeId, Vec<u8>)>,
+}
+
+/// A durable restart point for consumers: resume snapshots at `csn` after
+/// replaying the physical log through `restart_lsn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotExport {
+    /// Logical committed visibility order at export time.
+    pub csn: CommitSeq,
+    /// Durable WAL end position covering every commit up to `csn`.
+    pub restart_lsn: Lsn,
+}
+
+/// Outcome of a committed-change retention pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeGcReport {
+    /// Minimum floor across active retention leases, if any.
+    pub floor: Option<CommitSeq>,
+    /// Change records before the pass.
+    pub changes_before: usize,
+    /// Change records retained after the pass.
+    pub changes_after: usize,
+}
+
+/// A durable retention lease pinning committed-change records.
+///
+/// The lease survives process restarts by design: drop does not release it,
+/// because a crashed consumer must still find its history on reopen. Call
+/// [`RetentionLease::release`] explicitly when the consumer is done. While
+/// any lease is active, maintenance never prunes change records at or above
+/// its floor; with no leases, nothing is pruned.
+pub struct RetentionLease {
+    runtime: Arc<Runtime>,
+    name: Vec<u8>,
+    released: AtomicBool,
+}
+
+impl RetentionLease {
+    /// Lease identity used to reattach after restart.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Current durable floor pinned by this lease.
+    pub fn floor(&self) -> Result<CommitSeq> {
+        self.check_active()?;
+        let leases = self
+            .runtime
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
+        leases.get(&self.name).copied().ok_or_else(|| {
+            Error::Corruption("retention lease record vanished from runtime state".into())
+        })
+    }
+
+    fn check_active(&self) -> Result<()> {
+        if self.released.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument(
+                "retention lease was already released".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advance the floor to `csn`, durably releasing older history. The
+    /// floor only moves forward; going backwards is accepted as a no-op and
+    /// returns the unchanged floor.
+    pub fn advance(&self, csn: CommitSeq) -> Result<CommitSeq> {
+        self.check_active()?;
+        let mut db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let mut leases = self
+            .runtime
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
+        let current = leases.get(&self.name).copied().ok_or_else(|| {
+            Error::Corruption("retention lease record vanished from runtime state".into())
+        })?;
+        if csn <= current {
+            return Ok(current);
+        }
+        publish_lease_write(&mut db, &self.runtime, &mut leases, &self.name, Some(csn))?;
+        Ok(csn)
+    }
+
+    /// Durably remove the lease, unpinning history it held back. The lease
+    /// cannot be used afterwards; releasing twice reports an error without
+    /// touching storage.
+    pub fn release(&self) -> Result<()> {
+        self.check_active()?;
+        let mut db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let mut leases = self
+            .runtime
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
+        if leases.get(&self.name).is_none() {
+            return Err(Error::Corruption(
+                "retention lease record vanished from runtime state".into(),
+            ));
+        }
+        publish_lease_write(&mut db, &self.runtime, &mut leases, &self.name, None)?;
+        self.released.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for RetentionLease {
+    fn drop(&mut self) {
+        // Deliberate no-op: leases are durable consumer state and must
+        // outlive careless handle drops. Release requires an explicit call.
+    }
 }
 
 struct ActiveSnapshots {
@@ -102,6 +243,7 @@ impl ActiveSnapshots {
 struct ControlState {
     statuses: BTreeMap<TxnId, CommitSeq>,
     changes: BTreeMap<CommitSeq, CommittedChange>,
+    leases: BTreeMap<Vec<u8>, CommitSeq>,
     max_transaction: u64,
     max_tree: u64,
 }
@@ -111,6 +253,7 @@ struct Runtime {
     versions: Mutex<VersionStore>,
     statuses: Mutex<BTreeMap<TxnId, CommitSeq>>,
     changes: Mutex<BTreeMap<CommitSeq, CommittedChange>>,
+    leases: Mutex<BTreeMap<Vec<u8>, CommitSeq>>,
     active_snapshots: Mutex<ActiveSnapshots>,
     next_transaction: AtomicU64,
     next_tree: AtomicU64,
@@ -183,6 +326,7 @@ impl TransactionDatabase {
         let ControlState {
             statuses,
             changes,
+            leases,
             max_transaction,
             max_tree,
         } = load_control_state(&mut db, &mut versions)?;
@@ -198,6 +342,7 @@ impl TransactionDatabase {
                 versions: Mutex::new(versions),
                 statuses: Mutex::new(statuses),
                 changes: Mutex::new(changes),
+                leases: Mutex::new(leases),
                 active_snapshots: Mutex::new(ActiveSnapshots::new()),
                 next_transaction: AtomicU64::new(next_transaction),
                 next_tree: AtomicU64::new(next_tree),
@@ -366,6 +511,200 @@ impl TransactionDatabase {
         self.runtime.closed.store(true, Ordering::Release);
         Ok(())
     }
+
+    /// Acquire or reattach to a durable retention lease named `name`.
+    ///
+    /// The lease pins committed-change records from its floor onward so a
+    /// consumer can stream them without gaps across restarts. Reattaching to
+    /// an existing lease with `start` at or below its floor is free; a higher
+    /// `start` advances the floor durably. The floor never moves backwards:
+    /// history the caller failed to pin may already be pruned, and reads that
+    /// reach below the floor report [`Error::ChangesPruned`].
+    pub fn acquire_change_lease(&self, name: &[u8], start: CommitSeq) -> Result<RetentionLease> {
+        if name.is_empty() || name.len() > MAX_LEASE_NAME_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "lease name must be 1..={MAX_LEASE_NAME_LEN} bytes"
+            )));
+        }
+        if start.get() == 0 {
+            return Err(Error::InvalidArgument(
+                "lease start must be a nonzero commit sequence".into(),
+            ));
+        }
+        let mut db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let mut leases = self
+            .runtime
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
+        match leases.get(name) {
+            Some(&floor) if start <= floor => (),
+            _ => publish_lease_write(&mut db, &self.runtime, &mut leases, name, Some(start))?,
+        }
+        Ok(RetentionLease {
+            runtime: Arc::clone(&self.runtime),
+            name: name.to_vec(),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// Read up to `limit` committed changes starting exactly at `from`.
+    ///
+    /// Records are returned in commit order with no gaps. While a retention
+    /// lease covers the range this cannot fail for retention reasons; reads
+    /// reaching below the oldest retained record report
+    /// [`Error::ChangesPruned`]. A `from` above the current head returns an
+    /// empty result.
+    pub fn read_changes(&self, from: CommitSeq, limit: usize) -> Result<Vec<CommittedChange>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let changes = lock_changes(&self.runtime);
+        let head = db.durability_status().commit_position.csn;
+        if from > head {
+            return Ok(Vec::new());
+        }
+        let Some(&oldest) = changes.keys().next() else {
+            return Err(Error::Corruption(
+                "committed-change stream has no records despite published commits".into(),
+            ));
+        };
+        if from < oldest {
+            return Err(Error::ChangesPruned {
+                requested: from,
+                oldest,
+            });
+        }
+        let mut out = Vec::with_capacity(limit.min(64));
+        let mut expected = from;
+        for (&commit, change) in changes.range(from..) {
+            if commit != expected {
+                return Err(Error::Corruption(format!(
+                    "committed-change stream has a gap before {commit:?}"
+                )));
+            }
+            out.push(change.clone());
+            if out.len() == limit {
+                break;
+            }
+            let Some(next) = expected.get().checked_add(1) else {
+                break;
+            };
+            expected = CommitSeq::new(next);
+        }
+        Ok(out)
+    }
+
+    /// Oldest committed-change record still retained, if any.
+    pub fn oldest_retained_change(&self) -> Result<Option<CommitSeq>> {
+        Ok(lock_changes(&self.runtime).keys().next().copied())
+    }
+
+    /// Prune committed-change records strictly below the minimum active
+    /// retention-lease floor. With no leases nothing is pruned, keeping the
+    /// full history available until a consumer takes responsibility for it.
+    pub fn gc_changes(&self) -> Result<ChangeGcReport> {
+        let mut db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
+        let leases = self
+            .runtime
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
+        let mut changes = lock_changes(&self.runtime);
+        let before = changes.len();
+        let Some(floor) = leases.values().copied().min() else {
+            return Ok(ChangeGcReport {
+                floor: None,
+                changes_before: before,
+                changes_after: before,
+            });
+        };
+        let stale_commits: Vec<CommitSeq> =
+            changes.range(..floor).map(|(commit, _)| *commit).collect();
+        if stale_commits.is_empty() {
+            return Ok(ChangeGcReport {
+                floor: Some(floor),
+                changes_before: before,
+                changes_after: before,
+            });
+        }
+        let current = db.durability_status().commit_position.csn;
+        let next = CommitSeq::new(
+            current
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
+        );
+        // System change record keeps the CSN stream gap-free.
+        let change = CommittedChange {
+            commit: next,
+            transaction: TxnId::new(0),
+            snapshot: current,
+            changed_trees: BTreeSet::new(),
+            writes: BTreeSet::new(),
+        };
+        let mut mutations: Vec<BatchMutation> = stale_commits
+            .iter()
+            .map(|commit| BatchMutation::Delete {
+                key: change_record_key(*commit),
+            })
+            .collect();
+        mutations.push(BatchMutation::Put {
+            key: change_record_key(next),
+            value: encode_change(&change)?,
+        });
+        let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+        let committed = status.commit_position.csn;
+        if committed != next {
+            return Err(Error::Corruption(format!(
+                "change GC expected commit {:?}, storage published {:?}",
+                next, committed
+            )));
+        }
+        for commit in &stale_commits {
+            changes.remove(commit);
+        }
+        changes.insert(committed, change);
+        Ok(ChangeGcReport {
+            floor: Some(floor),
+            changes_before: before,
+            changes_after: changes.len(),
+        })
+    }
+
+    /// Export a durable restart point: resume logical snapshots at `csn`
+    /// after replaying the physical log through `restart_lsn`.
+    pub fn snapshot_export(&self) -> Result<SnapshotExport> {
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let position = db.durability_status().commit_position;
+        Ok(SnapshotExport {
+            csn: position.csn,
+            restart_lsn: position.lsn,
+        })
+    }
 }
 
 impl Runtime {
@@ -409,6 +748,7 @@ impl Runtime {
                 .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
         );
         let change = CommittedChange {
+            commit: next,
             transaction: owner,
             snapshot: current,
             changed_trees: BTreeSet::from([tree]),
@@ -1029,6 +1369,7 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
     }
 
     let change = CommittedChange {
+        commit: next,
         transaction: transaction.id,
         snapshot: transaction.snapshot,
         changed_trees: changed_trees.clone(),
@@ -1212,7 +1553,7 @@ fn validate_range_dependencies(
             if commit <= transaction.snapshot || commit > current {
                 continue;
             }
-            let change = decode_change(&value)?;
+            let change = decode_change(&key, &value)?;
             for (changed_tree, changed_key) in &change.writes {
                 if *changed_tree != *tree
                     || changed_key.as_slice() < start.as_slice()
@@ -1367,8 +1708,8 @@ fn load_control_state(db: &mut DB, version_store: &mut VersionStore) -> Result<C
                 .try_into()
                 .map_err(|_| Error::Corruption("malformed transaction commit ID".into()))?,
         ));
-        let change = decode_change(&value)?;
-        if change.snapshot > commit {
+        let change = decode_change(&key, &value)?;
+        if change.snapshot > change.commit {
             return Err(Error::Corruption(
                 "transaction change snapshot is newer than its commit".into(),
             ));
@@ -1388,9 +1729,24 @@ fn load_control_state(db: &mut DB, version_store: &mut VersionStore) -> Result<C
             ));
         }
     }
+    let mut leases = BTreeMap::new();
+    let lease_end = prefix_end(LEASE_RECORD_PREFIX);
+    for (key, value) in db.range(LEASE_RECORD_PREFIX, &lease_end)? {
+        let name = &key[LEASE_RECORD_PREFIX.len()..];
+        if name.is_empty() || name.len() > MAX_LEASE_NAME_LEN {
+            return Err(Error::Corruption(
+                "retention lease record has malformed name".into(),
+            ));
+        }
+        let floor = decode_lease_floor(&value)?;
+        if leases.insert(name.to_vec(), floor).is_some() {
+            return Err(Error::Corruption("duplicate retention lease record".into()));
+        }
+    }
     Ok(ControlState {
         statuses,
         changes,
+        leases,
         max_transaction,
         max_tree,
     })
@@ -1455,7 +1811,9 @@ fn encode_change(change: &CommittedChange) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn decode_change(bytes: &[u8]) -> Result<CommittedChange> {
+fn decode_change(key: &[u8], bytes: &[u8]) -> Result<CommittedChange> {
+    let commit = decode_change_commit(key)
+        .ok_or_else(|| Error::Corruption("malformed transaction change key".into()))?;
     if bytes.len() > MAX_CHANGE_RECORD_BYTES {
         return Err(Error::Corruption(
             "transaction conflict record exceeds limit".into(),
@@ -1488,6 +1846,7 @@ fn decode_change(bytes: &[u8]) -> Result<CommittedChange> {
         ));
     }
     Ok(CommittedChange {
+        commit,
         transaction,
         snapshot,
         changed_trees,
@@ -1511,6 +1870,85 @@ fn tree_record_key(tree: TreeId) -> Vec<u8> {
 
 fn change_record_key(commit: CommitSeq) -> Vec<u8> {
     append(CHANGE_RECORD_PREFIX, &commit.get().to_be_bytes())
+}
+
+fn lease_record_key(name: &[u8]) -> Vec<u8> {
+    append(LEASE_RECORD_PREFIX, name)
+}
+
+fn encode_lease_floor(floor: CommitSeq) -> Vec<u8> {
+    floor.get().to_be_bytes().to_vec()
+}
+
+fn decode_lease_floor(bytes: &[u8]) -> Result<CommitSeq> {
+    let raw = <[u8; 8]>::try_from(bytes)
+        .map_err(|_| Error::Corruption("malformed retention lease record".into()))?;
+    let floor = CommitSeq::new(u64::from_be_bytes(raw));
+    if floor.get() == 0 {
+        return Err(Error::Corruption("retention lease floor is zero".into()));
+    }
+    Ok(floor)
+}
+
+/// Publish a retention-lease mutation (set or clear one floor) as one atomic
+/// durable batch. Every batch consumes exactly one commit sequence number,
+/// so an empty system change record is written alongside to keep the
+/// committed-change stream gap-free.
+fn publish_lease_write(
+    db: &mut DB,
+    runtime: &Runtime,
+    leases: &mut BTreeMap<Vec<u8>, CommitSeq>,
+    name: &[u8],
+    floor: Option<CommitSeq>,
+) -> Result<()> {
+    let current = db.durability_status().commit_position.csn;
+    let next = CommitSeq::new(
+        current
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
+    );
+    let change = CommittedChange {
+        commit: next,
+        transaction: TxnId::new(0),
+        snapshot: current,
+        changed_trees: BTreeSet::new(),
+        writes: BTreeSet::new(),
+    };
+    let lease_mutation = match floor {
+        Some(csn) => BatchMutation::Put {
+            key: lease_record_key(name),
+            value: encode_lease_floor(csn),
+        },
+        None => BatchMutation::Delete {
+            key: lease_record_key(name),
+        },
+    };
+    let mutations = [
+        lease_mutation,
+        BatchMutation::Put {
+            key: change_record_key(next),
+            value: encode_change(&change)?,
+        },
+    ];
+    let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+    let committed = status.commit_position.csn;
+    if committed != next {
+        return Err(Error::Corruption(format!(
+            "retention write expected commit {:?}, storage published {:?}",
+            next, committed
+        )));
+    }
+    match floor {
+        Some(csn) => {
+            leases.insert(name.to_vec(), csn);
+        }
+        None => {
+            leases.remove(name);
+        }
+    }
+    lock_changes(runtime).insert(committed, change);
+    Ok(())
 }
 
 fn decode_change_commit(key: &[u8]) -> Option<CommitSeq> {
@@ -1597,6 +2035,149 @@ mod tests {
         let tree = transaction.create_tree().expect("create tree");
         transaction.commit().expect("commit tree");
         tree
+    }
+
+    fn commit_key(database: &TransactionDatabase, tree: TreeId, key: &[u8]) {
+        let mut transaction = database.begin().expect("begin");
+        transaction.put(tree, key, key).expect("put");
+        transaction.commit().expect("commit");
+    }
+
+    #[test]
+    fn change_stream_reads_contiguous_history() {
+        let (_directory, database) = database();
+        let first = tree(&database);
+        let second = tree(&database);
+        commit_key(&database, first, b"a");
+        let mut multi = database.begin().expect("begin");
+        multi.put(first, b"b", b"b").expect("put");
+        multi.put(second, b"c", b"c").expect("put");
+        multi.commit().expect("commit");
+
+        let head = database.snapshot_export().expect("export").csn;
+        let changes = database
+            .read_changes(CommitSeq::new(1), usize::MAX)
+            .expect("read all");
+        assert_eq!(changes.len(), head.get() as usize);
+        for (position, change) in changes.iter().enumerate() {
+            assert_eq!(change.commit.get(), (position + 1) as u64);
+        }
+        let last = changes.last().expect("non-empty").clone();
+        assert_eq!(
+            last.writes,
+            BTreeSet::from([(first, b"b".to_vec()), (second, b"c".to_vec())])
+        );
+
+        // Bounded reads resume exactly where they stopped.
+        let tail = database
+            .read_changes(CommitSeq::new(head.get() - 1), 1)
+            .expect("bounded read");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].commit.get(), head.get() - 1);
+
+        // Reads above the head are empty.
+        assert!(
+            database
+                .read_changes(CommitSeq::new(head.get() + 1), 8)
+                .expect("past head")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retention_lease_survives_reopen_and_pins_history() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("db");
+        let database = TransactionDatabase::create(&path, Options::for_test()).expect("create");
+        let owned = tree(&database);
+        commit_key(&database, owned, b"a");
+        commit_key(&database, owned, b"b");
+
+        let lease = database
+            .acquire_change_lease(b"cdc", CommitSeq::new(2))
+            .expect("lease");
+        assert_eq!(lease.floor().expect("floor"), CommitSeq::new(2));
+        drop(lease);
+        drop(database);
+
+        // The lease is durable consumer state: it survives reopen even with
+        // no live handles.
+        let reopened = TransactionDatabase::open(&path, Options::for_test()).expect("reopen");
+        assert_eq!(
+            reopened.oldest_retained_change().expect("oldest"),
+            Some(CommitSeq::new(1))
+        );
+        let reattached = reopened
+            .acquire_change_lease(b"cdc", CommitSeq::new(1))
+            .expect("reattach");
+        assert_eq!(reattached.floor().expect("floor"), CommitSeq::new(2));
+        assert_eq!(reattached.name(), b"cdc");
+
+        // Advancing releases older records from the stream.
+        let head = reopened.snapshot_export().expect("export").csn;
+        reattached.advance(head).expect("advance");
+        let report = reopened.gc_changes().expect("gc");
+        // Records pinned at the floor plus the advance/GC system records.
+        assert_eq!(report.changes_after, 3);
+        assert_eq!(
+            reopened.oldest_retained_change().expect("oldest"),
+            Some(head)
+        );
+        assert!(matches!(
+            reopened.read_changes(CommitSeq::new(1), 4),
+            Err(Error::ChangesPruned { requested, oldest })
+                if requested == CommitSeq::new(1) && oldest == head
+        ));
+        assert_eq!(reopened.read_changes(head, 4).expect("from floor").len(), 3);
+
+        // Backwards advance is a no-op; release unpins everything.
+        reattached.advance(CommitSeq::new(1)).expect("backwards");
+        reattached.release().expect("release");
+        // A released name can be re-acquired fresh, but it no longer
+        // inherits the old floor: reads reaching pruned history report the gap.
+        let fresh = reopened
+            .acquire_change_lease(b"cdc", CommitSeq::new(1))
+            .expect("re-acquire");
+        assert_eq!(fresh.floor().expect("floor"), CommitSeq::new(1));
+        assert!(matches!(
+            reopened.read_changes(CommitSeq::new(1), 4),
+            Err(Error::ChangesPruned { .. })
+        ));
+    }
+
+    #[test]
+    fn gc_changes_without_leases_retains_everything() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        commit_key(&database, owned, b"a");
+        let report = database.gc_changes().expect("gc without leases");
+        assert_eq!(report.floor, None);
+        assert_eq!(report.changes_before, report.changes_after);
+        assert!(database.oldest_retained_change().expect("oldest").is_some());
+    }
+
+    #[test]
+    fn multiple_leases_pin_to_the_minimum_floor() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        for key in [b"a", b"b", b"c"] {
+            commit_key(&database, owned, key);
+        }
+        let slow = database
+            .acquire_change_lease(b"slow", CommitSeq::new(1))
+            .expect("slow");
+        let fast = database
+            .acquire_change_lease(b"fast", CommitSeq::new(1))
+            .expect("fast");
+        let head = database.snapshot_export().expect("export").csn;
+        fast.advance(head).expect("fast advance");
+
+        let report = database.gc_changes().expect("gc");
+        assert_eq!(report.changes_after, report.changes_before);
+
+        slow.advance(head).expect("slow advance");
+        let pruned = database.gc_changes().expect("gc after both advance");
+        assert!(pruned.changes_after < pruned.changes_before);
     }
 
     #[test]

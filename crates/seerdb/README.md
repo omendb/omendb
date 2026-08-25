@@ -31,6 +31,12 @@ foundation beneath a database server:
   active snapshots. Its durable conflict records and version history survive
   reopen; publication is still serialized
   by the current physical engine.
+- **Committed-change stream**: every commit sequence number has exactly one
+  durable change record, so `read_changes` walks gap-free history from any
+  retained position. Durable retention leases (`acquire_change_lease`,
+  advance, release) pin ranges across restarts; `gc_changes` prunes only
+  below the minimum active floor and keeps everything when no lease exists.
+  `snapshot_export` yields the `{CSN, restart LSN}` resume point.
 - **Capacity handling**: typed ENOSPC refusal and preflight admission cover
   ordinary commits and maintenance, with same-handle retry and reopen tests.
 - **SSD-aware paths**: Linux O_DIRECT, page-aligned buffers, and optional FDP/ZNS
