@@ -743,20 +743,11 @@ fn test_wal_first_materialization_failure_preserves_acked_commits() {
 }
 
 #[test]
-#[ignore]
-fn probe_wal_first_blob_image_freshness() {
-    // Mirrors the failing property-test sequence: initial blob put, then
-    // transaction commit/abort cycles with periodic close/reopen, checking
-    // the generation recorded inside the on-disk blob image after each step.
-    fn disk_blob_generation(path: &std::path::Path) -> Option<u64> {
-        let bytes = std::fs::read(path.join(BLOB_FILE)).ok()?;
-        if bytes.len() < 28 {
-            return Some(0);
-        }
-        let raw = u64::from_le_bytes(bytes[20..28].try_into().ok()?);
-        Some(raw)
-    }
-
+fn wal_first_blob_catalog_replays_across_transaction_cycles() {
+    // Regression: a soft-barrier segmented consolidation used to strand the
+    // catalog backup, letting the next publication delete the delta log and
+    // break replay from the anchor to later generations. Consolidations now
+    // escalate to full publications; every generation must stay replayable.
     for segmented in [false, true] {
         let dir = tempdir().unwrap();
         let path = dir.path().join("blob-freshness.db");
@@ -770,17 +761,11 @@ fn probe_wal_first_blob_image_freshness() {
             ..Options::default()
         };
         let mut db = DB::open(&path, options.clone()).unwrap();
-        println!("=== segmented={segmented} ===");
         db.commit_batch(&[BatchMutation::Put {
             key: b"blob0".to_vec(),
             value: vec![0xB6; 2048],
         }])
         .unwrap();
-        println!(
-            "after initial blob put: disk_gen={:?} db_gen={}",
-            disk_blob_generation(&path),
-            db.durability_status().generation_id.get()
-        );
 
         for index in 0..6usize {
             let mut tx = db.begin_batch_transaction().unwrap();
@@ -790,48 +775,28 @@ fn probe_wal_first_blob_image_freshness() {
             } else {
                 tx.abort().unwrap();
             }
-            println!(
-                "after tx{index} ({}): disk_gen={:?} db_gen={}",
-                if index % 2 == 0 { "commit" } else { "abort" },
-                disk_blob_generation(&path),
-                db.durability_status().generation_id.get()
-            );
             if index % 4 == 3 {
-                if let Err(error) = db.verify() {
-                    println!("verify FAILED at index {index}: {error}");
-                    break;
-                }
+                db.verify().unwrap_or_else(|error| {
+                    panic!("segmented={segmented} verify failed at index {index}: {error}")
+                });
                 db.close().unwrap();
                 db = DB::open(&path, options.clone()).unwrap();
-                if let Err(error) = db.verify() {
-                    println!("reopen verify FAILED at index {index}: {error}");
-                    break;
-                }
+                db.verify().unwrap_or_else(|error| {
+                    panic!("segmented={segmented} reopen verify failed at index {index}: {error}")
+                });
             }
         }
-        // Pinpoint the first generation whose delta chain fails to replay.
+        // Every generation up to the live frontier must replay.
         let base = std::fs::read(path.join(BLOB_FILE)).unwrap();
-        let deltas = std::fs::read(path.join(BLOB_DELTA_FILE)).unwrap_or_default();
-        let mut first_broken = None;
         for target in 1..=db.durability_status().generation_id.get() {
-            let parsed = parse_blob_catalog(&path, &base, Some(target))
-                .ok()
-                .flatten();
-            if parsed.is_none() && first_broken.is_none() {
-                first_broken = Some(target);
-            }
-            println!(
-                "replay target={target}: {}",
-                if parsed.is_some() { "ok" } else { "BROKEN" }
+            assert!(
+                parse_blob_catalog(&path, &base, Some(target))
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                "segmented={segmented} catalog does not replay to generation {target}"
             );
         }
-        println!("first_broken_gen={:?}", first_broken);
-        println!(
-            "delta_log_len={} base_len={} delta_head={:02x?}",
-            deltas.len(),
-            base.len(),
-            &deltas[..deltas.len().min(40)]
-        );
         db.close().unwrap();
     }
 }

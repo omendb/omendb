@@ -258,6 +258,14 @@ impl DB {
     }
 
     pub(super) fn publish_envelope_group_wal_first(&mut self) -> Result<()> {
+        // A segmented consolidation rewrites the catalog anchor and retires
+        // the delta log, which is only safe once the manifest names the new
+        // generation in the same publication. Soft barriers leave the
+        // manifest behind, so recovery would face an anchor newer than its
+        // target with a broken delta chain; escalate to a full publication.
+        if self.blobs.is_segmented() && self.segmented_catalog_consolidation_needed() {
+            return self.publish_envelope_group();
+        }
         let generation = self.next_generation_id;
         self.write_group_blob_artifacts(generation)?;
 

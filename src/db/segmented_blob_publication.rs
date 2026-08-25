@@ -58,6 +58,12 @@ impl DB {
         Ok(())
     }
 
+    /// Whether the next segmented publication must rewrite a consolidated
+    /// catalog anchor instead of appending a delta.
+    pub(super) fn segmented_catalog_consolidation_needed(&self) -> bool {
+        !self.path.join(BLOB_FILE).exists() || self.blobs.catalog_needs_consolidation()
+    }
+
     fn append_segment_catalog_delta(&self, delta: &[u8]) -> Result<u64> {
         let delta_path = self.path.join(BLOB_DELTA_FILE);
         let existing = match fs::read(&delta_path) {
@@ -241,8 +247,7 @@ impl DB {
     }
 
     pub(super) fn write_blob_segments(&mut self) -> Result<u64> {
-        let catalog_path = self.path.join(BLOB_FILE);
-        let consolidate = !catalog_path.exists() || self.blobs.catalog_needs_consolidation();
+        let consolidate = self.segmented_catalog_consolidation_needed();
         self.prepare_segment_catalog_backup(consolidate)?;
         let segment_bytes = self.write_segment_suffixes()?;
         let catalog_bytes = self.publish_segment_catalog(consolidate)?;
