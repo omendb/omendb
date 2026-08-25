@@ -54,7 +54,8 @@ pub struct VerificationReport {
     pub data_bytes: u64,
     /// Current serialized blob-file size in bytes.
     pub blob_bytes: u64,
-    /// Current WAL size in bytes, if a pending batch exists.
+    /// Current retained WAL size in bytes. A non-zero value can be clean
+    /// history retained for recovery, replication, or change consumers.
     pub wal_bytes: u64,
     /// Physical page slots currently safe for reuse.
     pub reclaimable_pages: u64,

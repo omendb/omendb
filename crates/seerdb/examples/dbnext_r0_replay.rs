@@ -299,13 +299,18 @@ fn apply_checkpoint(db: &mut DB, state: &mut R0State, event: &Map<String, Value>
     if name.is_empty() {
         return Err(invalid("checkpoint event.name must not be empty"));
     }
-    let report = db.checkpoint()?;
+    let _report = db.checkpoint()?;
     let durability = db.durability_status();
-    if durability.commit_id.get() != state.commit_id || report.wal_bytes != 0 {
+    if durability.commit_id.get() != state.commit_id
+        || durability.pending_mutations != 0
+        || durability.write_fenced
+    {
         return Err(invalid(
             "checkpoint did not verify a clean durable boundary",
         ));
     }
+    // SeerDB may retain a clean WAL prefix for recovery, replication, or
+    // change-stream consumers. A non-zero WAL size is not pending work.
     state.checkpoints.insert(name, visible_digest(&state.rows));
     Ok(())
 }
@@ -369,7 +374,10 @@ fn replay_trace(trace: &Path, db_path: &Path) -> AnyResult<Value> {
     let verification = db.verify()?;
     let metrics = db.metrics()?;
     let durability = db.durability_status();
-    if durability.commit_id.get() != state.commit_id || verification.wal_bytes != 0 {
+    if durability.commit_id.get() != state.commit_id
+        || durability.pending_mutations != 0
+        || durability.write_fenced
+    {
         return Err(invalid(
             "final SeerDB state is not a clean durable boundary",
         ));
