@@ -29,10 +29,11 @@ pub struct SeerKernelConfig {
 impl SeerKernelConfig {
     #[must_use]
     pub fn new(directory: PathBuf) -> Self {
-        Self {
-            directory,
-            options: Options::default(),
-        }
+        let mut options = Options::default();
+        // OmenDB's durable transaction contract acknowledges only after the
+        // SeerDB WAL has reached the configured local durability barrier.
+        options.sync_writes = true;
+        Self { directory, options }
     }
 }
 
