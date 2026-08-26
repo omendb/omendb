@@ -100,6 +100,17 @@ impl DB {
             return Ok(self.durability_status());
         }
 
+        // Load every mutation's root-to-leaf path into the sparse overlay
+        // BEFORE cloning the candidate: prepare_mutation adds nodes to the
+        // live B-tree, and the candidate must capture them.
+        for batch in batches {
+            for mutation in batch {
+                let key = match mutation {
+                    BatchMutation::Put { key, .. } | BatchMutation::Delete { key } => key,
+                };
+                self.engine.prepare_mutation(key)?;
+            }
+        }
         let candidate_started = Instant::now();
         let mut chain_tree = self.engine.btree().clone();
         let mut chain_blobs = self.blobs.clone();
@@ -124,12 +135,6 @@ impl DB {
                     .checked_add(record.to_bytes().len() as u64)
                     .ok_or(Error::DiskFull)?;
                 records.push(record);
-            }
-            for mutation in batch {
-                let key = match mutation {
-                    BatchMutation::Put { key, .. } | BatchMutation::Delete { key } => key,
-                };
-                self.engine.prepare_mutation(key)?;
             }
             for mutation in batch {
                 let outcome = match mutation {
