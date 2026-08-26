@@ -1,6 +1,6 @@
 # ADR 0005: Delete the storage-kernel seam; DirectSeerStore becomes the backend
 
-- **Status:** accepted; execution in progress
+- **Status:** accepted; implemented
 - **Scope:** OmenDB relational facade, SQL integration, kernel modules
 - **Depends on:** [ADR 0004](0004-group-commit-publication-lane.md)
 
@@ -38,14 +38,14 @@ Delete the seam rather than porting it. The target shape:
 
 ## Staged execution (each stage lands green)
 
-1. Grow `DirectSeerStore`'s transactional surface (this stage).
-2. Re-plumb the SQL layer from `RelationalDatabaseTransaction` to
-   `DirectTransaction`; delete attempt machinery.
-3. Swap `Backend::Seer` to `DirectSeerStore`; delete `seer_relational.rs`,
-   kernels, archive; trim facade methods whose only purpose was kernel
-   features.
-4. Final cleanup: remove transitional docs/tests; rename or fold the
-   remaining conformance harness.
+1. Grow `DirectSeerStore`'s transactional surface — **done** (`4c2844b`).
+2. Re-plumb the facade onto SeerDB transactions; delete attempt machinery,
+   coalescing, group-commit pipeline, parallel preparation, replication
+   scaffolding, archive/restore, snapshot capture/leases, checkpoint/
+   compaction/verify/diagnostics surfaces — **done** (`7114f66`).
+3. Adapt integration tests and examples; delete feature-dead test files —
+   **done** (`ea0ffa7`).
+4. Documentation cleanup — **done** (this change).
 
 ## Consequences
 

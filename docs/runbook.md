@@ -25,56 +25,18 @@ and local runs.
 
 ## Health checks
 
-`status()` returns backend-neutral lifecycle state without I/O:
-
-- `state: Ready` — the handle accepts ordinary work.
-- `state: RecoveryRequired` — an earlier durable outcome is ambiguous. Close
-  and reopen before relying on or extending this handle's state.
-- `commit` — the visible commit frontier.
-- `pending_mutations` — journaled mutations not yet in a published
-  generation. Non-zero means work exists beyond the last published
-  checkpoint; it is normal between publications and drains on the next
-  commit or `checkpoint()`.
-- `write_fenced` — true means the writer refused further publications after
-  an error; reopen is mandatory before more writes.
-
-`diagnose()` correlates status, metrics, storage identity, and findings into
-one report. Findings map to actions through
-`RelationalDiagnosticCode::message()` and `recommended_action()`; treat
-`Error`-severity findings as stop conditions for the current handle.
-
-`support_bundle()` returns a redacted, bounded event snapshot for bug
-reports. It performs no verification and never contains row data.
-
-## Integrity verification
-
-`verify()` runs a read-only integrity pass and returns logical counts
-(tables, indexes, rows, index entries). SeerDB backends additionally report
-physical pages, data/blob bytes, and WAL bytes. Run it:
-
-- after reopening following a crash or ambiguous error;
-- before taking a snapshot/archive;
-- periodically as a scheduled check — it does not repair anything.
-
-A failing verify is corruption evidence: stop using the handle, preserve the
-directory as-is, and recover from a verified archive
-(`SeerKernel::snapshot` output) if one exists. Do not delete files from the
-database directory to "clean up".
+Session admission exposes `admission_status()` — active operations, writer
+counts, admission waits, and rejections. `commit_id()` returns the visible
+commit frontier (the SeerDB commit sequence number). There is no separate
+lifecycle-status or diagnostic-report surface; a failed durable write fences
+writes until reopen, and reopen failure surfaces as an open error.
 
 ## Routine maintenance
 
-- `checkpoint()` publishes the current state through the backend checkpoint
-  protocol and reports before/after frontiers. Use it after large import
-  batches to bound recovery time; it is idempotent at an unchanged frontier.
-- `compact()` reclaims dead versions/pages. On SeerDB it reports reclaimed
-  physical pages; on Temporary it reports reclaimed row/index fragments.
-  Compaction respects active readers; retained snapshots pin their history
-  until released via `release(lease)`.
-
-Retention discipline matters: every `retain`/`retain_current` lease keeps its
-snapshot's history alive and blocks reclamation of that root. Release leases
-when the read completes; long-lived leases are the most common cause of
-unbounded growth.
+SeerDB owns reclamation: MVCC version-store GC and change-stream GC run
+against retention leases inside the engine; there is no operator-facing
+`checkpoint()`/`compact()` surface. Long-lived retention leases keep history
+alive and block reclamation — release them when the consumer finishes.
 
 ## Recovery-required handling
 
@@ -86,24 +48,19 @@ state. The reconciliation procedure is:
 1. Stop issuing operations on the handle; close it (a close error still
    consumes the handle).
 2. Reopen with the same `RelationalBackendConfig`.
-3. Check application-level effects: for attempt-aware transactions call
-   `resolve_attempt(attempt)` — `Some` means published (do not rerun), `None`
-   means not published (safe to retry with a fresh attempt).
-4. For plain transactions, inspect application-visible state (for example,
-   re-read the rows the transaction would have written) and reapply only if
-   absent.
-5. Run `verify()` before resuming ordinary traffic.
+3. Inspect application-visible state (for example, re-read the rows the
+   transaction would have written) and reapply only if absent.
 
-Never retry a possibly-committed transaction under the same attempt identity
-without resolving first; idempotency records exist precisely to make that
-check cheap and definitive.
+Transactions publish atomically through SeerDB's group-commit lane, so an
+ambiguous outcome is exactly "committed" or "not committed"; application-level
+idempotency keys are the caller's reconciliation tool.
 
 ## Backups
 
-Use `SeerKernel::snapshot(archive_path)` (verified, immutable archive) rather
-than copying live files. Restore with `SeerKernel::restore` into a fresh
-directory; a failed restore never creates the destination. Copying a running
-database directory is not supported.
+Copy the database directory only while no process holds it closed; SeerDB
+enforces a writer lock per directory. Snapshot export through SeerDB's
+`snapshot_export()` (`{CSN, restart LSN}`) identifies a consistent position
+for logical exports; physical archive/restore is future work.
 
 ## Escalation
 

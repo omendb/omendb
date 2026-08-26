@@ -36,11 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The target directory must not already exist when creating a database. Use
-`RelationalBackendConfig::Seer(SeerKernelConfig::new(path))` to select the
-persistent SeerDB-backed storage engine. The temporary backend remains a
-reference and compatibility path while the server-first storage transaction
-architecture is being rebuilt.
+The target directory must not already exist when creating a database.
+`RelationalBackendConfig::new(path)` selects the persistent SeerDB-backed
+storage engine — the only backend; SeerDB owns durability end to end.
 
 The SQL layer is deliberately bounded rather than PostgreSQL-compatible. It
 supports the tested subset of schema changes, `SELECT`, `INSERT`, `UPDATE`,

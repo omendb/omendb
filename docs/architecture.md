@@ -213,12 +213,13 @@ relational consumer:
    freezing (GC rewrites current records to carry their resolved CSN and prunes
    status entries no retained reference needs) are implemented.
    Page-level multi-writer installation remains open.
-3. **OmenDB direct integration — qualification path started:**
-   `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
-   per index without using `StorageKernel`. Next, expand its relational
-   conformance and fault gates, then replace the global-generation path in one
-   deliberate migration after historical retention and durability-position
-   contracts exist.
+3. **OmenDB direct integration — complete:**
+   `src/seer_direct.rs` is the only production backend ([ADR 0005](adr/0005-delete-storage-kernel-seam.md)):
+   one catalog tree, one tree per table, one tree per index, typed
+   transactions over SeerDB snapshots, immediate foreign-key validation,
+   and ON DELETE CASCADE/SET NULL referential actions at commit time.
+   The storage-kernel seam, attempt machinery, coalesced publication,
+   archive/restore, and the temporary backend were deleted outright.
 4. **Server alpha foundation:** persistent multi-session lifecycle, deliberate
    PostgreSQL protocol subset, authentication, cancellation, configuration,
    diagnostics, and clean shutdown/reopen behavior.

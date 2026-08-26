@@ -100,12 +100,12 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 ### Durability and operations
 
-- [x] corruption, archive, compaction, and external fault tests exist;
-- [x] the crash matrix runs from a clean subprocess for create, commit,
-      checkpoint, compaction, archive restore, reopen, and the SQL batch
-      boundary;
-- [x] `verify`, diagnostics, support bundles, and recovery-required behavior
-      have an operator-facing runbook (`docs/runbook.md`);
+- [x] corruption and fault-atomicity qualification tests exist (seer_direct suite);
+- [x] the crash/fault matrix covers WAL write failure, authority-frame sync
+      failure, orphaned versions, pre-publication retryability, and status
+      replay (SeerDB transactional fault tests + seer_direct qualification);
+- [x] recovery-required behavior has an operator-facing runbook
+      (`docs/runbook.md`);
 - [ ] recovery tests assert both the durable outcome and the allowed next
       operation, not only that reopening succeeds.
 
