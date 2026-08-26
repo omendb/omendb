@@ -13,7 +13,7 @@
 //! trait. OmenDB can call this capability-rich surface directly while the
 //! server/session layer is built above it.
 
-use crate::db::{BatchMutation, DB, Options};
+use crate::db::{BatchMutation, DB, DBMetrics, Options};
 use crate::error::{Error, Result};
 use crate::mvcc::{
     CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
@@ -454,6 +454,17 @@ impl TransactionDatabase {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
         self.runtime.oldest_active_snapshot()
+    }
+
+    /// Return engine-level metrics, including cumulative publication-phase
+    /// wall-clock timing.
+    pub fn metrics(&self) -> Result<DBMetrics> {
+        let db = self
+            .runtime
+            .db
+            .lock()
+            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        db.metrics()
     }
 
     /// Compact logical MVCC history while preserving every active snapshot.

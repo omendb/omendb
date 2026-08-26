@@ -140,12 +140,26 @@ fn ensure_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
 pub struct RelationalBackendConfig {
     /// Directory holding the SeerDB page store, WAL, and direct catalog.
     pub path: PathBuf,
+    /// Ack batched commits after one group-synced WAL append, deferring
+    /// page materialization and the authority frame to flush/checkpoint/
+    /// close. Trades crash-recovery replay work for commit latency.
+    pub wal_first_commits: bool,
 }
 
 impl RelationalBackendConfig {
     /// Configure a database at `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            wal_first_commits: false,
+        }
+    }
+
+    /// Enable WAL-first commit acknowledgement.
+    #[must_use]
+    pub fn with_wal_first_commits(mut self) -> Self {
+        self.wal_first_commits = true;
+        self
     }
 }
 
@@ -269,7 +283,7 @@ pub struct RelationalDatabase {
 impl RelationalDatabase {
     /// Create an empty database at the configured path.
     pub fn create(config: RelationalBackendConfig) -> Result<Self> {
-        let store = DirectSeerStore::create(&config.path, seerdb::db::Options::default())?;
+        let store = DirectSeerStore::create(&config.path, options_from_config(&config))?;
         Ok(Self {
             store,
             handle_id: NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
@@ -278,7 +292,7 @@ impl RelationalDatabase {
 
     /// Open an existing database at the configured path.
     pub fn open(config: RelationalBackendConfig) -> Result<Self> {
-        let store = DirectSeerStore::open(&config.path, seerdb::db::Options::default())?;
+        let store = DirectSeerStore::open(&config.path, options_from_config(&config))?;
         Ok(Self {
             store,
             handle_id: NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
@@ -308,6 +322,12 @@ impl RelationalDatabase {
     /// Alias of [`Self::commit_id`].
     pub fn head(&self) -> CommitId {
         self.commit_id()
+    }
+
+    /// Return engine-level storage metrics, including publication-phase
+    /// wall-clock timing.
+    pub fn metrics(&self) -> crate::DBMetrics {
+        self.store.metrics()
     }
 
     // ---- Schema ------------------------------------------------------------
@@ -382,13 +402,13 @@ impl RelationalDatabase {
     // ---- Rows ---------------------------------------------------------------
 
     /// Insert one row atomically with its index entries.
-    pub fn insert(&mut self, table: TableId, row: Row) -> Result<CommitId> {
+    pub fn insert(&self, table: TableId, row: Row) -> Result<CommitId> {
         let commit = self.store.insert(table, row)?;
         Ok(CommitId(commit.get()))
     }
 
     /// Replace one row identified by the incoming row's primary-key identity.
-    pub fn update(&mut self, table: TableId, row: Row) -> Result<CommitId> {
+    pub fn update(&self, table: TableId, row: Row) -> Result<CommitId> {
         let commit = self.store.update(table, row)?;
         Ok(CommitId(commit.get()))
     }
@@ -603,6 +623,14 @@ impl RelationalDatabase {
     pub fn sql_parameter_types(&self, sql: &str) -> Result<Vec<Option<crate::ColumnType>>> {
         crate::sql::describe_parameters(self, sql)
     }
+}
+
+fn options_from_config(config: &RelationalBackendConfig) -> seerdb::db::Options {
+    let mut options = seerdb::db::Options::default();
+    if config.wal_first_commits {
+        options.wal_first_commits = true;
+    }
+    options
 }
 
 fn validate_legacy_key(table: TableId, key: Key) -> Result<()> {

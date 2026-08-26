@@ -333,21 +333,21 @@ impl DirectSeerStore {
     }
 
     /// Insert one row and all derived index entries atomically.
-    pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<CommitSeq> {
+    pub(crate) fn insert(&self, table: TableId, row: Row) -> Result<CommitSeq> {
         let mut transaction = self.begin_transaction()?;
         transaction.insert(table, row)?;
         transaction.commit()
     }
 
     /// Replace one row by its identity and refresh derived index entries.
-    pub(crate) fn update(&mut self, table: TableId, row: Row) -> Result<CommitSeq> {
+    pub(crate) fn update(&self, table: TableId, row: Row) -> Result<CommitSeq> {
         let mut transaction = self.begin_transaction()?;
         transaction.update(table, row)?;
         transaction.commit()
     }
 
     /// Delete one row and its derived index entries atomically.
-    pub(crate) fn delete(&mut self, table: TableId, identity: &[u8]) -> Result<CommitSeq> {
+    pub(crate) fn delete(&self, table: TableId, identity: &[u8]) -> Result<CommitSeq> {
         let mut transaction = self.begin_transaction()?;
         transaction.delete(table, identity)?;
         transaction.commit()
@@ -403,39 +403,30 @@ impl DirectSeerStore {
             )));
         }
         let value_key = index_values_key(&definition, index_definition, values)?;
-        let index_tree = self.index_tree(index)?;
-        let table_tree = self.table_tree(table)?;
-        let mut transaction = self.database.begin().map_err(map_seer_error)?;
-        let mut rows = Vec::new();
-        for (entry, identity) in transaction
-            .scan(index_tree, &[], None, usize::MAX)
-            .map_err(map_seer_error)?
-        {
-            let (entry_values, entry_identity) = decode_index_entry(&entry, &identity)?;
-            if entry_values != value_key {
-                continue;
-            }
-            let row_bytes = transaction
-                .get(table_tree, &entry_identity)
-                .map_err(map_seer_error)?
-                .ok_or_else(|| DbError::Corruption {
+        let mut transaction = self.begin_transaction()?;
+        let identities = transaction.index_identities_for(index, &value_key)?;
+        let mut rows = Vec::with_capacity(identities.len());
+        for row_identity in identities {
+            rows.push(transaction.get(table, &row_identity)?.ok_or_else(|| {
+                DbError::Corruption {
                     artifact: "direct SeerDB index",
                     reason: "index entry references a missing row".to_owned(),
-                })?;
-            rows.push(row_from_storage_identity(
-                &self.catalog,
-                &definition,
-                &entry_identity,
-                &row_bytes,
-            )?);
+                }
+            })?);
         }
-        transaction.abort().map_err(map_seer_error)?;
         Ok(rows)
     }
 
     /// Begin an explicit multi-statement transaction over the mapped trees.
     pub(crate) fn begin_transaction(&self) -> Result<DirectTransaction> {
         DirectTransaction::begin(self)
+    }
+
+    /// Return engine-level metrics including publication timing.
+    pub(crate) fn metrics(&self) -> seerdb::DBMetrics {
+        self.database
+            .metrics()
+            .expect("open database reports metrics")
     }
 
     /// Return the latest published commit sequence number.
@@ -465,8 +456,10 @@ impl DirectSeerStore {
         identity: &[u8],
         insert: bool,
     ) -> Result<()> {
-        for index in self.catalog.indexes_for(table) {
-            let Some(values) = row_index_key(definition, index, row)? else {
+        let applicable: Vec<crate::relational::IndexDefinition> =
+            self.catalog.indexes_for(table).cloned().collect();
+        for index in applicable {
+            let Some(values) = row_index_key(definition, &index, row)? else {
                 continue;
             };
             let tree = self.index_tree(index.id)?;
@@ -639,21 +632,12 @@ impl DirectTransaction {
             )));
         }
         let value_key = index_values_key(&definition, index_definition, values)?;
-        let index_tree = self.index_tree(index)?;
-        let table_tree = self.table_tree(table)?;
-        let mut rows = Vec::new();
-        for (entry, identity) in self
-            .transaction
-            .scan(index_tree, &[], None, usize::MAX)
-            .map_err(map_seer_error)?
-        {
-            let (entry_values, entry_identity) = decode_index_entry(&entry, &identity)?;
-            if entry_values != value_key {
-                continue;
-            }
-            let row_bytes = self
+        let identities = self.index_identities_for(index, &value_key)?;
+        let mut rows = Vec::with_capacity(identities.len());
+        for row_identity in &identities {
+            let bytes = self
                 .transaction
-                .get(table_tree, &entry_identity)
+                .get(self.table_tree(table)?, row_identity)
                 .map_err(map_seer_error)?
                 .ok_or_else(|| DbError::Corruption {
                     artifact: "direct SeerDB index",
@@ -662,11 +646,67 @@ impl DirectTransaction {
             rows.push(row_from_storage_identity(
                 &self.catalog,
                 &definition,
-                &entry_identity,
-                &row_bytes,
+                row_identity,
+                &bytes,
             )?);
         }
         Ok(rows)
+    }
+
+    /// Probe whether any staged or committed entry carries one value key
+    /// under a unique index.
+    ///
+    /// The probe registers its key range as a transactional read dependency:
+    /// if a concurrent transaction commits an entry inside the range after
+    /// our snapshot, our commit fails with a serialization conflict. Without
+    /// that registration two transactions could insert the same unique value
+    /// concurrently from disjoint snapshots and both pass.
+    fn index_has_conflict(&mut self, index: IndexId, value_key: &[u8]) -> Result<bool> {
+        let prefix = index_entry_prefix(value_key);
+        let end = prefix_successor(&prefix);
+        let tree = self.index_tree(index)?;
+        let mut cursor = self
+            .transaction
+            .cursor(tree, &prefix, end.as_deref())
+            .map_err(map_seer_error)?;
+        Ok(cursor.next().is_some_and(|result| match result {
+            Ok((entry, _)) => entry.starts_with(&prefix),
+            Err(_) => true,
+        }))
+    }
+
+    /// Resolve one encoded value key to its row identities through a
+    /// prefix-bounded index scan: same-value entries share an exact key
+    /// prefix and therefore sort contiguously.
+    pub(crate) fn index_identities_for(
+        &mut self,
+        index: IndexId,
+        value_key: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let prefix = index_entry_prefix(value_key);
+        let end = prefix_successor(&prefix);
+        let tree = self.index_tree(index)?;
+        let mut identities: Vec<Vec<u8>> = Vec::new();
+        const PAGE: usize = 256;
+        loop {
+            let start: Vec<u8> = match identities.last() {
+                Some(last) => encode_index_entry(value_key, last)?,
+                None => prefix.clone(),
+            };
+            let batch = self
+                .transaction
+                .scan(tree, &start, end.as_deref(), PAGE)
+                .map_err(map_seer_error)?;
+            let mut advanced = false;
+            let batch_count = batch.len();
+            for (_entry, row_identity) in batch {
+                identities.push(row_identity);
+                advanced = true;
+            }
+            if !advanced || batch_count < PAGE {
+                return Ok(identities);
+            }
+        }
     }
 
     /// Stage a row insert plus its derived index entries; uniqueness is
@@ -843,26 +883,19 @@ impl DirectTransaction {
         identity: &[u8],
         insert: bool,
     ) -> Result<()> {
-        for index in self.catalog.indexes_for(table) {
-            let Some(values) = row_index_key(definition, index, row)? else {
+        let applicable: Vec<crate::relational::IndexDefinition> =
+            self.catalog.indexes_for(table).cloned().collect();
+        for index in applicable {
+            let Some(values) = row_index_key(definition, &index, row)? else {
                 continue;
             };
             let tree = self.index_tree(index.id)?;
             let key = encode_index_entry(&values, identity)?;
-            if insert && index.unique {
-                for (entry, existing_identity) in self
-                    .transaction
-                    .scan(tree, &[], None, usize::MAX)
-                    .map_err(map_seer_error)?
-                {
-                    let (existing_values, _) = decode_index_entry(&entry, &existing_identity)?;
-                    if existing_values == values {
-                        return Err(DbError::UniqueViolation {
-                            index: index.id.0,
-                            key: values,
-                        });
-                    }
-                }
+            if insert && index.unique && self.index_has_conflict(index.id, &values)? {
+                return Err(DbError::UniqueViolation {
+                    index: index.id.0,
+                    key: values,
+                });
             }
             if insert {
                 self.transaction
@@ -1105,6 +1138,35 @@ fn decode_catalog_state(
         });
     }
     Ok((catalog, table_trees, index_trees))
+}
+
+/// Byte prefix shared by every index entry carrying one encoded value key.
+fn index_entry_prefix(values: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + values.len());
+    bytes.extend_from_slice(
+        &u32::try_from(values.len())
+            .expect("index value length")
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(values);
+    bytes
+}
+
+/// Exclusive upper bound for all keys beginning with one prefix: the
+/// prefix with its last byte incremented. Overflow is impossible here
+/// because the leading u32 length can never be all-zero bytes.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for byte in end.iter_mut().rev() {
+        match *byte {
+            0xFF => *byte = 0x00,
+            _ => {
+                *byte += 1;
+                return Some(end);
+            }
+        }
+    }
+    None
 }
 
 fn encode_index_entry(values: &[u8], identity: &[u8]) -> Result<Vec<u8>> {
@@ -1421,7 +1483,7 @@ mod tests {
         assert_eq!(indexed[0].values, row(7, "alice@example.com").values);
         store.close().expect("close");
 
-        let mut reopened = DirectSeerStore::open(directory.path().join("db"), Options::for_test())
+        let reopened = DirectSeerStore::open(directory.path().join("db"), Options::for_test())
             .expect("reopen");
         assert_eq!(reopened.catalog().tables().count(), 1);
         assert_eq!(reopened.catalog().indexes().count(), 1);

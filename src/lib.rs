@@ -46,6 +46,8 @@ pub use runtime::{
     Dispatch, GovernorConfig, GovernorError, GovernorStats, OverloadPolicy, Reactor, ReactorConfig,
     ReactorError, ResourceGovernor, WorkClass, WorkId, WorkItem, WorkerId,
 };
+pub use seerdb::DBMetrics;
+pub use seerdb::PublicationTimingMetrics;
 pub use serializable::{
     CertificationConflict, CertifierAlgorithm, CertifierMetrics, SerializableCertifier,
     TransactionDependencySpec,

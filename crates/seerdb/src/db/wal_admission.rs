@@ -201,7 +201,14 @@ impl DB {
             // crash after WAL recreation can recover an LSN newer than the
             // previous manifest even when the old WAL file was reclaimed.
             self.wal.append(&WalRecord::wal_segment(self.wal_segment));
-            self.write_wal_to_disk(true)?;
+            if let Err(error) = self.write_wal_to_disk(true) {
+                // The WAL handle may now be unusable and the file lacks its
+                // segment record; further publications would violate the
+                // recovery contract. Fence until reopen, which retries this
+                // bootstrap against a fresh handle.
+                self.write_fenced = true;
+                return Err(error);
+            }
         }
         self.wal_reserved_extent = target;
         Ok(current.max(target))
