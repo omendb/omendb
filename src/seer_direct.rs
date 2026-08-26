@@ -13,8 +13,10 @@ use std::path::Path;
 use seerdb::{CommitSeq, Error as SeerError, Options, Transaction, TransactionDatabase, TreeId};
 
 use crate::relational::{
-    Catalog, ColumnId, IndexDefinition, Row, TableDefinition, TableId, encode_catalog, encode_row,
-    index_values_key, row_from_storage_identity, row_identity_bytes, row_index_key,
+    Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, RelationalSchemaDefinition, Row,
+    TableDefinition, TableId, Value, encode_catalog, encode_row, foreign_key_values,
+    index_values_key, row_from_storage_identity, row_identity_bytes, row_identity_bytes_for_lookup,
+    row_index_key,
 };
 use crate::{DbError, IndexId, Result};
 
@@ -152,16 +154,85 @@ impl DirectSeerStore {
         Ok(commit)
     }
 
+    /// Create one table with its secondary schema objects and physical
+    /// trees in one transaction. Index trees stay empty because the new
+    /// table has no rows yet.
+    pub(crate) fn create_table_with_schema_and_primary_key(
+        &mut self,
+        table: TableDefinition,
+        primary_key: Option<Vec<ColumnId>>,
+        schema: RelationalSchemaDefinition,
+    ) -> Result<CommitSeq> {
+        let mut candidate = self.catalog.clone();
+        candidate.create_table_with_primary_key(table.clone(), primary_key)?;
+        for named in &schema.indexes {
+            match &named.name {
+                Some(name) => {
+                    candidate.create_named_index(named.definition.clone(), name.clone())?
+                }
+                None => candidate.create_index(named.definition.clone())?,
+            }
+        }
+        for named in &schema.foreign_keys {
+            match &named.name {
+                Some(name) => {
+                    candidate.create_named_foreign_key(named.definition.clone(), name.clone())?
+                }
+                None => candidate.create_foreign_key(named.definition.clone())?,
+            }
+        }
+        let mut transaction = self.database.begin().map_err(map_seer_error)?;
+        let tree = transaction.create_tree().map_err(map_seer_error)?;
+        let mut table_trees = self.table_trees.clone();
+        table_trees.insert(table.id, tree);
+        let mut index_trees = self.index_trees.clone();
+        for named in &schema.indexes {
+            let index_tree = transaction.create_tree().map_err(map_seer_error)?;
+            index_trees.insert(named.definition.id, index_tree);
+        }
+        let state = encode_catalog_state(&candidate, &table_trees, &index_trees)?;
+        transaction
+            .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
+            .map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
+        drop(transaction);
+        self.catalog = candidate;
+        self.table_trees = table_trees;
+        self.index_trees = index_trees;
+        Ok(commit)
+    }
+
     /// Create one secondary index and build its entries atomically with the
     /// catalog mapping. The first direct path uses a deterministic encoded
     /// entry key and scans it for exact-value lookup; ordered index cursors
     /// are a later optimization once the physical key codec is benchmarked.
     pub(crate) fn create_index(&mut self, index: IndexDefinition) -> Result<CommitSeq> {
+        self.create_index_with_name(index, None)
+    }
+
+    /// Create one secondary index while retaining its SQL object name in
+    /// the catalog.
+    pub(crate) fn create_named_index(
+        &mut self,
+        index: IndexDefinition,
+        name: String,
+    ) -> Result<CommitSeq> {
+        self.create_index_with_name(index, Some(name))
+    }
+
+    fn create_index_with_name(
+        &mut self,
+        index: IndexDefinition,
+        name: Option<String>,
+    ) -> Result<CommitSeq> {
         if self.catalog.index(index.id) == Some(&index) {
             return self.database.commit_sequence().map_err(map_seer_error);
         }
         let mut candidate = self.catalog.clone();
-        candidate.create_index(index.clone())?;
+        match &name {
+            Some(name) => candidate.create_named_index(index.clone(), name.clone())?,
+            None => candidate.create_index(index.clone())?,
+        }
         let table_tree = self.table_tree(index.table)?;
         let table = candidate.table(index.table)?.clone();
         let mut transaction = self.database.begin().map_err(map_seer_error)?;
@@ -198,49 +269,89 @@ impl DirectSeerStore {
         Ok(commit)
     }
 
-    /// Insert one row and all derived index entries atomically.
-    pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<CommitSeq> {
-        let definition = self.catalog.table(table)?.clone();
-        row.validate(&definition)?;
-        let identity = row_identity_bytes(&self.catalog, &definition, &row)?;
-        let table_tree = self.table_tree(table)?;
+    /// Append one nullable column atomically. Existing rows expose a
+    /// logical `NULL` for the new field without a table-sized rewrite.
+    pub(crate) fn add_nullable_column(
+        &mut self,
+        table: TableId,
+        column: crate::ColumnDefinition,
+    ) -> Result<CommitSeq> {
+        let candidate = {
+            let mut candidate = self.catalog.clone();
+            candidate.add_nullable_column(table, column)?;
+            candidate
+        };
+        self.publish_catalog(candidate)
+    }
+
+    /// Validate and publish one foreign-key definition.
+    pub(crate) fn create_foreign_key(
+        &mut self,
+        foreign_key: ForeignKeyDefinition,
+    ) -> Result<CommitSeq> {
+        self.create_foreign_key_with_name(foreign_key, None)
+    }
+
+    /// Validate and publish one foreign-key definition with an object name.
+    pub(crate) fn create_named_foreign_key(
+        &mut self,
+        foreign_key: ForeignKeyDefinition,
+        name: String,
+    ) -> Result<CommitSeq> {
+        self.create_foreign_key_with_name(foreign_key, Some(name))
+    }
+
+    fn create_foreign_key_with_name(
+        &mut self,
+        foreign_key: ForeignKeyDefinition,
+        name: Option<String>,
+    ) -> Result<CommitSeq> {
+        let candidate = {
+            let mut candidate = self.catalog.clone();
+            match &name {
+                Some(name) => {
+                    candidate.create_named_foreign_key(foreign_key.clone(), name.clone())?
+                }
+                None => candidate.create_foreign_key(foreign_key.clone())?,
+            }
+            candidate
+        };
+        self.begin_transaction()?
+            .validate_one_foreign_key(&foreign_key)?;
+        self.publish_catalog(candidate)
+    }
+
+    fn publish_catalog(&mut self, candidate: Catalog) -> Result<CommitSeq> {
         let mut transaction = self.database.begin().map_err(map_seer_error)?;
-        if transaction
-            .get(table_tree, &identity)
-            .map_err(map_seer_error)?
-            .is_some()
-        {
-            return Err(DbError::InvalidState(format!(
-                "row {:?} already exists in table {}",
-                identity, table.0
-            )));
-        }
+        let state = encode_catalog_state(&candidate, &self.table_trees, &self.index_trees)?;
         transaction
-            .put(table_tree, &identity, &encode_row(&row)?)
+            .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
             .map_err(map_seer_error)?;
-        self.stage_indexes(&mut transaction, table, &definition, &row, &identity, true)?;
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
+        self.catalog = candidate;
         Ok(commit)
+    }
+
+    /// Insert one row and all derived index entries atomically.
+    pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<CommitSeq> {
+        let mut transaction = self.begin_transaction()?;
+        transaction.insert(table, row)?;
+        transaction.commit()
+    }
+
+    /// Replace one row by its identity and refresh derived index entries.
+    pub(crate) fn update(&mut self, table: TableId, row: Row) -> Result<CommitSeq> {
+        let mut transaction = self.begin_transaction()?;
+        transaction.update(table, row)?;
+        transaction.commit()
     }
 
     /// Delete one row and its derived index entries atomically.
     pub(crate) fn delete(&mut self, table: TableId, identity: &[u8]) -> Result<CommitSeq> {
-        let definition = self.catalog.table(table)?.clone();
-        let table_tree = self.table_tree(table)?;
-        let mut transaction = self.database.begin().map_err(map_seer_error)?;
-        let bytes = transaction
-            .get(table_tree, identity)
-            .map_err(map_seer_error)?
-            .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
-        let row = row_from_storage_identity(&self.catalog, &definition, identity, &bytes)?;
-        transaction
-            .delete(table_tree, identity)
-            .map_err(map_seer_error)?;
-        self.stage_indexes(&mut transaction, table, &definition, &row, identity, false)?;
-        let commit = transaction.commit().map_err(map_seer_error)?.csn;
-        drop(transaction);
-        Ok(commit)
+        let mut transaction = self.begin_transaction()?;
+        transaction.delete(table, identity)?;
+        transaction.commit()
     }
 
     /// Read one row through a transaction-scoped fixed snapshot.
@@ -324,7 +435,7 @@ impl DirectSeerStore {
     }
 
     /// Begin an explicit multi-statement transaction over the mapped trees.
-    pub(crate) fn begin_transaction(&self) -> Result<DirectTransaction<'_>> {
+    pub(crate) fn begin_transaction(&self) -> Result<DirectTransaction> {
         DirectTransaction::begin(self)
     }
 
@@ -379,40 +490,115 @@ impl DirectSeerStore {
 /// trees. Reads resolve at one fixed snapshot and observe the transaction's
 /// own staged writes; `commit` publishes every staged row, index, and catalog
 /// change as one atomic SeerDB commit.
-pub(crate) struct DirectTransaction<'a> {
-    store: &'a DirectSeerStore,
+pub(crate) struct DirectTransaction {
+    catalog: Catalog,
+    table_trees: BTreeMap<TableId, TreeId>,
+    index_trees: BTreeMap<IndexId, TreeId>,
     transaction: Transaction,
 }
 
-impl<'a> DirectTransaction<'a> {
-    fn begin(store: &'a DirectSeerStore) -> Result<Self> {
+impl DirectTransaction {
+    pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {
         let transaction = store.database.begin().map_err(map_seer_error)?;
-        Ok(Self { store, transaction })
+        Ok(Self {
+            catalog: store.catalog.clone(),
+            table_trees: store.table_trees.clone(),
+            index_trees: store.index_trees.clone(),
+            transaction,
+        })
+    }
+
+    /// Validate that current snapshot-plus-staged rows already satisfy one
+    /// newly created foreign-key definition.
+    pub(crate) fn validate_one_foreign_key(
+        &self,
+        foreign_key: &ForeignKeyDefinition,
+    ) -> Result<()> {
+        let child_definition = self.catalog.table(foreign_key.table)?;
+        let referenced_definition = self.catalog.table(foreign_key.referenced_table)?;
+        let referenced_index = self
+            .catalog
+            .indexes_for(foreign_key.referenced_table)
+            .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
+            .ok_or_else(|| {
+                DbError::InvalidState(format!(
+                    "foreign key {} has no unique referenced index",
+                    foreign_key.id.0
+                ))
+            })?;
+        let referenced_values: std::collections::HashSet<Vec<u8>> = self
+            .transaction
+            .scan(self.index_tree(referenced_index.id)?, &[], None, usize::MAX)
+            .map_err(map_seer_error)?
+            .into_iter()
+            .filter_map(|(entry, existing_identity)| {
+                decode_index_entry(&entry, &existing_identity)
+                    .ok()
+                    .map(|(values, _)| values)
+            })
+            .collect();
+        let child_rows = self
+            .transaction
+            .scan(self.table_tree(foreign_key.table)?, &[], None, usize::MAX)
+            .map_err(map_seer_error)?;
+        for (identity_bytes, bytes) in child_rows {
+            let row = row_from_storage_identity(
+                &self.catalog,
+                child_definition,
+                &identity_bytes,
+                &bytes,
+            )?;
+            let values = foreign_key_values(&row, child_definition, &foreign_key.columns)?;
+            if values.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            let encoded = index_values_key(referenced_definition, referenced_index, &values)?;
+            if !referenced_values.contains(&encoded) {
+                return Err(DbError::ForeignKeyViolation {
+                    constraint: foreign_key.id.0,
+                    table: foreign_key.table.0,
+                    referenced_table: foreign_key.referenced_table.0,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn table_tree(&self, table: TableId) -> Result<TreeId> {
+        self.table_trees
+            .get(&table)
+            .copied()
+            .ok_or_else(|| DbError::InvalidState(format!("table {} has no SeerDB tree", table.0)))
+    }
+
+    fn index_tree(&self, index: IndexId) -> Result<TreeId> {
+        self.index_trees
+            .get(&index)
+            .copied()
+            .ok_or_else(|| DbError::InvalidState(format!("index {} has no SeerDB tree", index.0)))
     }
 
     /// Read one row at this transaction's snapshot.
     pub(crate) fn get(&mut self, table: TableId, identity: &[u8]) -> Result<Option<Row>> {
-        let definition = self.store.catalog.table(table)?.clone();
-        let tree = self.store.table_tree(table)?;
+        let definition = self.catalog.table(table)?.clone();
+        let tree = self.table_tree(table)?;
         self.transaction
             .get(tree, identity)
             .map_err(map_seer_error)?
-            .map(|bytes| {
-                row_from_storage_identity(&self.store.catalog, &definition, identity, &bytes)
-            })
+            .map(|bytes| row_from_storage_identity(&self.catalog, &definition, identity, &bytes))
             .transpose()
     }
 
     /// Scan all rows of one table at this transaction's snapshot.
     pub(crate) fn scan(&mut self, table: TableId) -> Result<Vec<Row>> {
-        let definition = self.store.catalog.table(table)?.clone();
-        let tree = self.store.table_tree(table)?;
+        let definition = self.catalog.table(table)?.clone();
+        let tree = self.table_tree(table)?;
         self.transaction
             .scan(tree, &[], None, usize::MAX)
             .map_err(map_seer_error)?
             .into_iter()
             .map(|(identity, bytes)| {
-                row_from_storage_identity(&self.store.catalog, &definition, &identity, &bytes)
+                row_from_storage_identity(&self.catalog, &definition, &identity, &bytes)
             })
             .collect()
     }
@@ -424,11 +610,11 @@ impl<'a> DirectTransaction<'a> {
         index: IndexId,
         values: &[crate::Value],
     ) -> Result<Vec<Row>> {
-        let definition = self.store.catalog.table(table)?.clone();
-        let index_definition =
-            self.store.catalog.index(index).ok_or_else(|| {
-                DbError::InvalidState(format!("index {} does not exist", index.0))
-            })?;
+        let definition = self.catalog.table(table)?.clone();
+        let index_definition = self
+            .catalog
+            .index(index)
+            .ok_or_else(|| DbError::InvalidState(format!("index {} does not exist", index.0)))?;
         if index_definition.table != table {
             return Err(DbError::InvalidState(format!(
                 "index {} does not belong to table {}",
@@ -436,8 +622,8 @@ impl<'a> DirectTransaction<'a> {
             )));
         }
         let value_key = index_values_key(&definition, index_definition, values)?;
-        let index_tree = self.store.index_tree(index)?;
-        let table_tree = self.store.table_tree(table)?;
+        let index_tree = self.index_tree(index)?;
+        let table_tree = self.table_tree(table)?;
         let mut rows = Vec::new();
         for (entry, identity) in self
             .transaction
@@ -457,7 +643,7 @@ impl<'a> DirectTransaction<'a> {
                     reason: "index entry references a missing row".to_owned(),
                 })?;
             rows.push(row_from_storage_identity(
-                &self.store.catalog,
+                &self.catalog,
                 &definition,
                 &entry_identity,
                 &row_bytes,
@@ -469,10 +655,10 @@ impl<'a> DirectTransaction<'a> {
     /// Stage a row insert plus its derived index entries; uniqueness is
     /// checked against the snapshot and this transaction's staged state.
     pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<()> {
-        let definition = self.store.catalog.table(table)?.clone();
+        let definition = self.catalog.table(table)?.clone();
         row.validate(&definition)?;
-        let identity = row_identity_bytes(&self.store.catalog, &definition, &row)?;
-        let tree = self.store.table_tree(table)?;
+        let identity = row_identity_bytes(&self.catalog, &definition, &row)?;
+        let tree = self.table_tree(table)?;
         if self
             .transaction
             .get(tree, &identity)
@@ -490,20 +676,111 @@ impl<'a> DirectTransaction<'a> {
         self.stage_indexes_for(table, &definition, &row, &identity, true)
     }
 
+    /// Replace one row identified by the incoming row's primary-key
+    /// identity. The row must already exist at that identity; derived
+    /// index entries are refreshed from the old and new contents.
+    pub(crate) fn update(&mut self, table: TableId, row: Row) -> Result<()> {
+        let definition = self.catalog.table(table)?.clone();
+        row.validate(&definition)?;
+        let identity = row_identity_bytes(&self.catalog, &definition, &row)?;
+        let tree = self.table_tree(table)?;
+        let bytes = self
+            .transaction
+            .get(tree, &identity)
+            .map_err(map_seer_error)?
+            .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
+        let previous = row_from_storage_identity(&self.catalog, &definition, &identity, &bytes)?;
+        self.stage_indexes_for(table, &definition, &previous, &identity, false)?;
+        self.transaction
+            .put(tree, &identity, &encode_row(&row)?)
+            .map_err(map_seer_error)?;
+        self.stage_indexes_for(table, &definition, &row, &identity, true)
+    }
+
     /// Stage a row delete plus its derived index entries.
     pub(crate) fn delete(&mut self, table: TableId, identity: &[u8]) -> Result<()> {
-        let definition = self.store.catalog.table(table)?.clone();
-        let tree = self.store.table_tree(table)?;
+        let definition = self.catalog.table(table)?.clone();
+        let tree = self.table_tree(table)?;
         let bytes = self
             .transaction
             .get(tree, identity)
             .map_err(map_seer_error)?
             .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
-        let row = row_from_storage_identity(&self.store.catalog, &definition, identity, &bytes)?;
+        let row = row_from_storage_identity(&self.catalog, &definition, identity, &bytes)?;
         self.transaction
             .delete(tree, identity)
             .map_err(map_seer_error)?;
-        self.stage_indexes_for(table, &definition, &row, identity, false)
+        self.stage_indexes_for(table, &definition, &row, identity, false)?;
+        self.expand_referential_actions(table, &row, 0)
+    }
+
+    /// Expand `ON DELETE` actions for one deleted parent row. Cascaded
+    /// deletions and NULL updates are staged eagerly so later staged reads
+    /// observe them; cycles terminate because deleted rows vanish from the
+    /// staged view. `Restrict` is enforced by commit-time referential
+    /// validation instead.
+    fn expand_referential_actions(
+        &mut self,
+        parent_table: TableId,
+        parent_row: &Row,
+        depth: usize,
+    ) -> Result<()> {
+        let applicable: Vec<ForeignKeyDefinition> = self
+            .catalog
+            .foreign_keys()
+            .filter(|fk| fk.referenced_table == parent_table)
+            .cloned()
+            .collect();
+        for foreign_key in applicable {
+            if foreign_key.on_delete == crate::relational::ReferentialAction::Restrict {
+                continue;
+            }
+            if depth + 1 > crate::relational::MAX_CASCADE_DEPTH {
+                return Err(DbError::CascadeDepthExceeded {
+                    constraint: foreign_key.id.0,
+                    table: foreign_key.table.0,
+                });
+            }
+            let child_definition = self.catalog.table(foreign_key.table)?.clone();
+            let referenced_definition = self.catalog.table(parent_table)?.clone();
+            let required = foreign_key_values(
+                parent_row,
+                &referenced_definition,
+                &foreign_key.referenced_columns,
+            )?;
+            if required.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            for child in self.scan(foreign_key.table)? {
+                let values = foreign_key_values(&child, &child_definition, &foreign_key.columns)?;
+                if values.iter().any(|value| matches!(value, Value::Null)) {
+                    continue;
+                }
+                if values != required {
+                    continue;
+                }
+                match foreign_key.on_delete {
+                    crate::relational::ReferentialAction::Restrict => {}
+                    crate::relational::ReferentialAction::SetNull => {
+                        let mut updated = child.clone();
+                        for column in &foreign_key.columns {
+                            updated.set_value(&child_definition, *column, Value::Null)?;
+                        }
+                        let identity =
+                            row_identity_bytes(&self.catalog, &child_definition, &updated)?;
+                        self.update(foreign_key.table, updated)?;
+                        drop(identity);
+                    }
+                    crate::relational::ReferentialAction::Cascade => {
+                        let identity =
+                            row_identity_bytes(&self.catalog, &child_definition, &child)?;
+                        self.expand_referential_actions(foreign_key.table, &child, depth + 1)?;
+                        self.delete(foreign_key.table, &identity)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn stage_indexes_for(
@@ -514,11 +791,11 @@ impl<'a> DirectTransaction<'a> {
         identity: &[u8],
         insert: bool,
     ) -> Result<()> {
-        for index in self.store.catalog.indexes_for(table) {
+        for index in self.catalog.indexes_for(table) {
             let Some(values) = row_index_key(definition, index, row)? else {
                 continue;
             };
-            let tree = self.store.index_tree(index.id)?;
+            let tree = self.index_tree(index.id)?;
             let key = encode_index_entry(&values, identity)?;
             if insert && index.unique {
                 for (entry, existing_identity) in self
@@ -548,12 +825,73 @@ impl<'a> DirectTransaction<'a> {
         Ok(())
     }
 
-    /// Publish every staged change atomically.
+    /// Publish every staged change atomically after validating immediate
+    /// foreign-key constraints against the transaction's own final state.
     pub(crate) fn commit(mut self) -> Result<CommitSeq> {
+        self.validate_referential_integrity()?;
         self.transaction
             .commit()
             .map_err(map_seer_error)
             .map(|p| p.csn)
+    }
+
+    /// Validate every foreign key in the catalog against the transaction's
+    /// snapshot-plus-staged state. Every non-null child reference must have
+    /// a matching entry in the referenced table's unique covering index.
+    fn validate_referential_integrity(&self) -> Result<()> {
+        if self.catalog.foreign_keys().next().is_none() {
+            return Ok(());
+        }
+        for foreign_key in self.catalog.foreign_keys() {
+            let child_definition = self.catalog.table(foreign_key.table)?;
+            let referenced_definition = self.catalog.table(foreign_key.referenced_table)?;
+            let referenced_index = self
+                .catalog
+                .indexes_for(foreign_key.referenced_table)
+                .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
+                .ok_or_else(|| {
+                    DbError::InvalidState(format!(
+                        "foreign key {} has no unique referenced index",
+                        foreign_key.id.0
+                    ))
+                })?;
+            let referenced_values: std::collections::HashSet<Vec<u8>> = self
+                .transaction
+                .scan(self.index_tree(referenced_index.id)?, &[], None, usize::MAX)
+                .map_err(map_seer_error)?
+                .into_iter()
+                .filter_map(|(entry, existing_identity)| {
+                    decode_index_entry(&entry, &existing_identity)
+                        .ok()
+                        .map(|(values, _)| values)
+                })
+                .collect();
+            let child_rows = self
+                .transaction
+                .scan(self.table_tree(foreign_key.table)?, &[], None, usize::MAX)
+                .map_err(map_seer_error)?;
+            for (identity_bytes, bytes) in child_rows {
+                let row = row_from_storage_identity(
+                    &self.catalog,
+                    child_definition,
+                    &identity_bytes,
+                    &bytes,
+                )?;
+                let values = foreign_key_values(&row, child_definition, &foreign_key.columns)?;
+                if values.iter().any(|value| matches!(value, Value::Null)) {
+                    continue;
+                }
+                let encoded = index_values_key(referenced_definition, referenced_index, &values)?;
+                if !referenced_values.contains(&encoded) {
+                    return Err(DbError::ForeignKeyViolation {
+                        constraint: foreign_key.id.0,
+                        table: foreign_key.table.0,
+                        referenced_table: foreign_key.referenced_table.0,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
