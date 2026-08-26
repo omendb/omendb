@@ -603,12 +603,39 @@ impl DirectTransaction {
     pub(crate) fn scan(&mut self, table: TableId) -> Result<Vec<Row>> {
         let definition = self.catalog.table(table)?.clone();
         let tree = self.table_tree(table)?;
+        self.scan_tree(tree, &definition)
+    }
+
+    /// Scan all rows of one table and register the full table range as a
+    /// transactional read dependency. A concurrent commit that writes any
+    /// row into this table after our snapshot makes our commit fail with a
+    /// serialization conflict, giving repeatable-read scans.
+    pub(crate) fn serializable_scan(&mut self, table: TableId) -> Result<Vec<Row>> {
+        let definition = self.catalog.table(table)?.clone();
+        let tree = self.table_tree(table)?;
+        let mut cursor = self
+            .transaction
+            .cursor(tree, &[], None)
+            .map_err(map_seer_error)?;
+        let mut rows = Vec::new();
+        while let Some((identity, bytes)) = cursor.next().transpose().map_err(map_seer_error)? {
+            rows.push(row_from_storage_identity(
+                &self.catalog,
+                &definition,
+                &identity,
+                &bytes,
+            )?);
+        }
+        Ok(rows)
+    }
+
+    fn scan_tree(&mut self, tree: TreeId, definition: &TableDefinition) -> Result<Vec<Row>> {
         self.transaction
             .scan(tree, &[], None, usize::MAX)
             .map_err(map_seer_error)?
             .into_iter()
             .map(|(identity, bytes)| {
-                row_from_storage_identity(&self.catalog, &definition, &identity, &bytes)
+                row_from_storage_identity(&self.catalog, definition, &identity, &bytes)
             })
             .collect()
     }
@@ -1419,6 +1446,48 @@ mod tests {
             // Dropping without committing discards the staged delete.
         }
         assert_eq!(store.scan(TableId(1)).expect("scan survives drop").len(), 1);
+    }
+
+    #[test]
+    fn serializable_scan_rejects_phantom_inserts() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .insert(TableId(1), row(1, "a@example.com"))
+            .expect("seed");
+
+        let mut reader = store.begin_transaction().expect("begin reader");
+        let rows = reader
+            .serializable_scan(TableId(1))
+            .expect("serializable scan");
+        assert_eq!(rows.len(), 1);
+
+        // The reader stages a write of its own, so its publication must be
+        // validated against concurrent history. (A read-only transaction
+        // publishes nothing and needs no phantom check.)
+        let mut updated = rows[0].clone();
+        if let Some(Value::U64(balance)) = updated.values.last_mut() {
+            *balance += 1;
+        }
+        reader
+            .update(TableId(1), updated)
+            .expect("reader stages update");
+
+        // A concurrent transaction inserts into the scanned table and commits.
+        let mut writer = store.begin_transaction().expect("begin writer");
+        writer
+            .insert(TableId(1), row(2, "phantom@example.com"))
+            .expect("stage insert");
+        writer.commit().expect("writer commits");
+
+        // The reader's commit must now fail: its scan saw a snapshot that a
+        // committed peer has since invalidated inside the registered range.
+        match reader.commit() {
+            Err(DbError::SerializationConflict { .. }) => {}
+            other => panic!("phantom insert must fail the serializable reader, got {other:?}"),
+        }
     }
 
     #[test]

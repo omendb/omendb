@@ -51,5 +51,7 @@ engineering baselines, not marketing claims.
 
 - Pipelined publication in SeerDB (staging must not block behind an
   in-flight wave sync) to unlock group-commit write throughput.
-- Serializable isolation on top of SeerDB cursor range dependencies for
-  scan-based transactions (plain scans stay snapshot-isolated).
+- Serializable scan transactions: `RelationalDatabaseTransaction::
+  scan_serializable` registers the table range as a read dependency, so
+  mixed read-write transactions fail on phantom inserts. Plain `scan`
+  remains snapshot-isolated by design.

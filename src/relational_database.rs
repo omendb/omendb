@@ -825,6 +825,9 @@ impl RelationalDatabaseTransaction {
     }
 
     /// Read up to `limit` rows of one table including staged mutations.
+    ///
+    /// The scan is snapshot-isolated: rows inserted by concurrent commits
+    /// after this transaction began are not observed and do not conflict.
     pub fn scan(
         &mut self,
         store: &RelationalDatabase,
@@ -836,6 +839,23 @@ impl RelationalDatabaseTransaction {
         let mut rows = self.backend.as_mut().expect("checked active").scan(table)?;
         rows.truncate(limit);
         Ok(rows)
+    }
+
+    /// Read all rows of one table under serializable semantics: the full
+    /// table range is registered as a read dependency, so a concurrent
+    /// commit inserting into the table after our snapshot fails our commit
+    /// with a serialization conflict instead of silently forking history.
+    pub fn scan_serializable(
+        &mut self,
+        store: &RelationalDatabase,
+        table: TableId,
+    ) -> Result<Vec<Row>> {
+        self.ensure_owner(store)?;
+        self.ensure_active()?;
+        self.backend
+            .as_mut()
+            .expect("checked active")
+            .serializable_scan(table)
     }
 
     /// Exact-value lookup through one secondary index including staged state.
