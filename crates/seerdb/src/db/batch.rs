@@ -67,6 +67,170 @@ impl DB {
         self.install_batch(prepared)
     }
 
+    /// Publish several logical commits as one durable generation.
+    ///
+    /// Each entry is an independently validated logical batch with its own
+    /// assigned commit sequence number. The group installs one chained
+    /// candidate state, appends every record, syncs the WAL once, and
+    /// publishes a single authority frame whose `commit_seq` advances by
+    /// `batches.len()`, so logical visibility order matches assignment order.
+    /// Recovery treats the frame as one atomic outcome: either every member
+    /// committed or none did. The returned status names the last member's
+    /// position.
+    pub fn commit_group_at(
+        &mut self,
+        expected_commit: CommitId,
+        batches: &[Vec<BatchMutation>],
+    ) -> Result<DurabilityStatus> {
+        self.check_writable()?;
+        self.check_maintenance_idle()?;
+        if self.commit_id != expected_commit {
+            return Err(Error::SerializationConflict {
+                expected: expected_commit,
+                current: self.commit_id,
+            });
+        }
+        if self.pending_mutations != 0 {
+            return Err(Error::InvalidArgument(
+                "commit_group requires a clean pending generation; flush or discard pending mutations first".into(),
+            ));
+        }
+        let members = batches.len();
+        if members == 0 {
+            return Ok(self.durability_status());
+        }
+
+        let candidate_started = Instant::now();
+        let mut chain_tree = self.engine.btree().clone();
+        let mut chain_blobs = self.blobs.clone();
+        let mut chain_blob_changed = false;
+        let mut total_bytes = 0u64;
+        let mut digest = self.pending_digest;
+        let mut all_records = Vec::new();
+        for batch in batches {
+            let mut records = Vec::with_capacity(batch.len());
+            for mutation in batch {
+                let record = match mutation {
+                    BatchMutation::Put { key, value } => {
+                        validate_wal_put_lengths(key, value)?;
+                        WalRecord::put(key, value)
+                    }
+                    BatchMutation::Delete { key } => {
+                        validate_wal_key_length(key)?;
+                        WalRecord::delete(key)
+                    }
+                };
+                total_bytes = total_bytes
+                    .checked_add(record.to_bytes().len() as u64)
+                    .ok_or(Error::DiskFull)?;
+                records.push(record);
+            }
+            for mutation in batch {
+                let key = match mutation {
+                    BatchMutation::Put { key, .. } | BatchMutation::Delete { key } => key,
+                };
+                self.engine.prepare_mutation(key)?;
+            }
+            for mutation in batch {
+                let outcome = match mutation {
+                    BatchMutation::Put { key, value } => apply_mutation(
+                        Mutation::Put { key, value },
+                        &mut chain_tree,
+                        &mut chain_blobs,
+                    )?,
+                    BatchMutation::Delete { key } => {
+                        apply_mutation(Mutation::Delete { key }, &mut chain_tree, &mut chain_blobs)?
+                    }
+                };
+                require_blob_deletion(outcome, "group mutation")?;
+                chain_blob_changed |= outcome.blob_changed;
+            }
+            digest = records.iter().fold(digest, extend_digest);
+            all_records.extend(records);
+        }
+
+        let required_wal = total_bytes
+            .checked_add(WAL_COMMIT_RECORD_BYTES)
+            .ok_or(Error::DiskFull)?;
+        let available_wal = self
+            .options
+            .max_wal_bytes
+            .saturating_sub(self.pending_wal_bytes);
+        if required_wal > available_wal {
+            self.wal_admission_failures = self.wal_admission_failures.saturating_add(1);
+            return Err(Error::Backpressure {
+                required: required_wal,
+                available: available_wal,
+            });
+        }
+        let projected_blobs = if chain_blob_changed {
+            let projected = Self::blob_publication_size(&chain_blobs)?;
+            self.engine.check_artifact_capacity(projected)?;
+            Some(projected)
+        } else {
+            None
+        };
+
+        self.publication_timing.candidate_prepare_ns = self
+            .publication_timing
+            .candidate_prepare_ns
+            .saturating_add(elapsed_nanos(candidate_started));
+
+        self.ensure_wal_reservation()?;
+        if let Some(projected) = projected_blobs
+            && !chain_blobs.is_segmented()
+        {
+            self.reserve_blob_image(projected)?;
+        }
+
+        let next_pending_mutations = u64::try_from(all_records.len())
+            .ok()
+            .and_then(|count| self.pending_mutations.checked_add(count))
+            .ok_or(Error::Wal("mutation count overflow".into()))?;
+        let next_pending_bytes = self
+            .pending_wal_bytes
+            .checked_add(total_bytes)
+            .ok_or(Error::Wal("WAL byte count overflow".into()))?;
+
+        for record in &all_records {
+            self.wal.append(record);
+        }
+        if let Err(error) = self.write_wal_to_disk(self.wal.sync_policy() != SyncPolicy::None) {
+            self.write_fenced = true;
+            return Err(error);
+        }
+
+        *self.engine.btree_mut() = chain_tree;
+        self.blobs = chain_blobs;
+        self.pending_blob_changes = chain_blob_changed;
+        self.pending_blob_frame |= chain_blob_changed;
+        self.pending_mutations = next_pending_mutations;
+        self.pending_wal_bytes = next_pending_bytes;
+        self.pending_digest = digest;
+
+        // One authority frame covers all members; its sequence lands on the
+        // last member so durability_status reports the logical head.
+        self.next_commit_seq = CommitSeq::new(
+            self.next_commit_seq
+                .get()
+                .checked_add(members as u64 - 1)
+                .ok_or_else(|| Error::Wal("commit sequence overflow".into()))?,
+        );
+
+        if self.options.wal_first_commits {
+            if let Err(error) = self.publish_envelope_group_wal_first() {
+                self.write_fenced = true;
+                return Err(error);
+            }
+            if self.materialize_bound_reached() {
+                self.flush()?;
+            }
+            return Ok(self.durability_status());
+        }
+        self.flush()?;
+        Ok(self.durability_status())
+    }
+
     pub(super) fn prepare_batch(&mut self, mutations: &[BatchMutation]) -> Result<PreparedBatch> {
         let candidate_started = Instant::now();
         let mut records = Vec::with_capacity(mutations.len());

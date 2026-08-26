@@ -206,11 +206,11 @@ relational consumer:
    design-gated by [ADR 0002](adr/0002-seerdb-mvcc-version-storage.md) and
    [ADR 0003](adr/0003-seerdb-commit-recovery-state-machine.md); the initial
    transaction-status table and active-snapshot registry now exist, with
-   bounded logical version GC respecting active snapshots. Status freezing,
-   durable retained-snapshot/change-consumer leases, and physical multi-writer
-   publication remain the next correctness layers. Ordered cursor handles,
-   range dependencies, physical multi-writer WAL/page publication, and
-   zero-gap committed-change export remain open.
+   bounded logical version GC respecting active snapshots. Ordered cursors
+   with read-range phantom protection, durable retention leases, the zero-gap
+   `{CSN, restart LSN}` committed-change stream, and group-commit publication
+   ([ADR 0004](adr/0004-group-commit-publication-lane.md)) are implemented.
+   Status freezing and page-level multi-writer installation remain open.
 3. **OmenDB direct integration — qualification path started:**
    `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
    per index without using `StorageKernel`. Next, expand its relational

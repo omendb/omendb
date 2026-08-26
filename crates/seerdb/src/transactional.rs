@@ -19,7 +19,7 @@ use crate::mvcc::{
     CurrentRecord, VersionStore, decode_current, encode_current, resolve_commit, visible_current,
 };
 use crate::storage::format::{CommitId, CommitPosition, CommitSeq, Lsn, TreeId, TxnId};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -153,14 +153,14 @@ impl RetentionLease {
     /// returns the unchanged floor.
     pub fn advance(&self, csn: CommitSeq) -> Result<CommitSeq> {
         self.check_active()?;
-        let mut db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        // Floor moves consume a commit sequence number; join the lane first.
+        let _lane = lock_publish(&self.runtime);
+        let staged = take_staged(&self.runtime);
+        let mut db = lock_db(&self.runtime);
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, &self.runtime, staged)?;
         let mut leases = self
             .runtime
             .leases
@@ -181,14 +181,13 @@ impl RetentionLease {
     /// touching storage.
     pub fn release(&self) -> Result<()> {
         self.check_active()?;
-        let mut db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let _lane = lock_publish(&self.runtime);
+        let staged = take_staged(&self.runtime);
+        let mut db = lock_db(&self.runtime);
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, &self.runtime, staged)?;
         let mut leases = self
             .runtime
             .leases
@@ -248,6 +247,35 @@ struct ControlState {
     max_tree: u64,
 }
 
+/// A commit staged for publication: validated against published state and
+/// queued work, carrying data mutations only. The publish lane assigns the
+/// commit sequence number when it installs the wave, so assignment can never
+/// collide with an in-flight publication.
+struct StagedCommit {
+    transaction: TxnId,
+    /// Snapshot the transaction began at; recorded in the change record.
+    snapshot: CommitSeq,
+    /// Data mutations over tree/current records, built at stage time.
+    mutations: Vec<BatchMutation>,
+    changed_trees: BTreeSet<TreeId>,
+    writes: BTreeSet<(TreeId, Vec<u8>)>,
+    /// Filled by the publisher immediately before installation.
+    assigned: CommitSeq,
+    outcome: std::sync::mpsc::Sender<std::result::Result<CommitPosition, Arc<Error>>>,
+}
+
+/// Pending unpublished commits plus derived conflict indexes. Guarded by its
+/// own mutex so validation runs concurrently with physical publication.
+#[derive(Default)]
+struct PrepareState {
+    queue: VecDeque<StagedCommit>,
+    /// Keys written by queued commits, for first-committer-wins against
+    /// work that is not yet visible in storage.
+    keys: BTreeSet<(TreeId, Vec<u8>)>,
+    /// Trees with queued lifecycle or data changes.
+    trees: BTreeSet<TreeId>,
+}
+
 struct Runtime {
     db: Mutex<DB>,
     versions: Mutex<VersionStore>,
@@ -255,6 +283,10 @@ struct Runtime {
     changes: Mutex<BTreeMap<CommitSeq, CommittedChange>>,
     leases: Mutex<BTreeMap<Vec<u8>, CommitSeq>>,
     active_snapshots: Mutex<ActiveSnapshots>,
+    prepare: Mutex<PrepareState>,
+    /// Publish lane: the holder drains staged commits before its own
+    /// physical publication, keeping assign order equal to publish order.
+    publish: Mutex<()>,
     next_transaction: AtomicU64,
     next_tree: AtomicU64,
     closed: AtomicBool,
@@ -344,6 +376,8 @@ impl TransactionDatabase {
                 changes: Mutex::new(changes),
                 leases: Mutex::new(leases),
                 active_snapshots: Mutex::new(ActiveSnapshots::new()),
+                prepare: Mutex::new(PrepareState::default()),
+                publish: Mutex::new(()),
                 next_transaction: AtomicU64::new(next_transaction),
                 next_tree: AtomicU64::new(next_tree),
                 closed: AtomicBool::new(false),
@@ -354,22 +388,26 @@ impl TransactionDatabase {
     /// Begin a fixed-snapshot transaction.
     pub fn begin(&self) -> Result<Transaction> {
         let id = allocate_id(&self.runtime.next_transaction, "transaction ID")?;
-        let db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
-        if self.runtime.closed.load(Ordering::Acquire) {
-            return Err(Error::InvalidArgument("database is closed".into()));
-        }
-        let durability = db.durability_status();
-        if durability.write_fenced {
-            return Err(Error::NeedsRecovery(
-                "transaction database is fenced; reopen required".into(),
-            ));
-        }
-        let snapshot_position = durability.commit_position;
-        let snapshot = snapshot_position.csn;
+        // The snapshot registry is taken after the database guard's scope so
+        // begin never holds the database lock while acquiring it; GC paths
+        // lock in the opposite order.
+        let (snapshot, snapshot_position) = {
+            let db =
+                self.runtime.db.lock().map_err(|_| {
+                    Error::Corruption("transaction database mutex is poisoned".into())
+                })?;
+            if self.runtime.closed.load(Ordering::Acquire) {
+                return Err(Error::InvalidArgument("database is closed".into()));
+            }
+            let durability = db.durability_status();
+            if durability.write_fenced {
+                return Err(Error::NeedsRecovery(
+                    "transaction database is fenced; reopen required".into(),
+                ));
+            }
+            let position = durability.commit_position;
+            (position.csn, position)
+        };
         self.runtime
             .active_snapshots
             .lock()
@@ -417,14 +455,15 @@ impl TransactionDatabase {
 
     /// Compact logical MVCC history while preserving every active snapshot.
     pub fn gc_versions(&self) -> Result<VersionGcReport> {
-        let mut db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        // GC rewrites current records, consuming a commit sequence number;
+        // join the publish lane and settle staged commits first.
+        let _lane = lock_publish(&self.runtime);
+        let staged = take_staged(&self.runtime);
+        let mut db = lock_db(&self.runtime);
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, &self.runtime, staged)?;
         let mut version_store = self
             .runtime
             .versions
@@ -531,14 +570,13 @@ impl TransactionDatabase {
                 "lease start must be a nonzero commit sequence".into(),
             ));
         }
-        let mut db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        let _lane = lock_publish(&self.runtime);
+        let staged = take_staged(&self.runtime);
+        let mut db = lock_db(&self.runtime);
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, &self.runtime, staged)?;
         let mut leases = self
             .runtime
             .leases
@@ -616,14 +654,15 @@ impl TransactionDatabase {
     /// retention-lease floor. With no leases nothing is pruned, keeping the
     /// full history available until a consumer takes responsibility for it.
     pub fn gc_changes(&self) -> Result<ChangeGcReport> {
-        let mut db = self
-            .runtime
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        // Pruning consumes a commit sequence number for its system record;
+        // join the publish lane and settle staged commits first.
+        let _lane = lock_publish(&self.runtime);
+        let staged = take_staged(&self.runtime);
+        let mut db = lock_db(&self.runtime);
         if self.runtime.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, &self.runtime, staged)?;
         let leases = self
             .runtime
             .leases
@@ -672,7 +711,8 @@ impl TransactionDatabase {
             key: change_record_key(next),
             value: encode_change(&change)?,
         });
-        let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+        let expected = db.durability_status().commit_id;
+        let status = db.commit_batch_at(expected, &mutations)?;
         let committed = status.commit_position.csn;
         if committed != next {
             return Err(Error::Corruption(format!(
@@ -725,13 +765,15 @@ impl Runtime {
     }
 
     fn reserve_tree(&self, owner: TxnId, tree: TreeId) -> Result<CommitSeq> {
-        let mut db = self
-            .db
-            .lock()
-            .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
+        // Tree reservations consume a commit sequence number, so they join
+        // the publish lane ahead of their inline publication.
+        let _lane = lock_publish(self);
+        let staged = take_staged(self);
+        let mut db = lock_db(self);
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
+        publish_drained(&mut db, self, staged)?;
         let mut versions = self
             .versions
             .lock()
@@ -777,7 +819,8 @@ impl Runtime {
                 value: encode_change(&change)?,
             },
         ];
-        let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+        let expected = db.durability_status().commit_id;
+        let status = db.commit_batch_at(expected, &mutations)?;
         let committed = status.commit_position.csn;
         if committed != next {
             return Err(Error::NeedsRecovery(format!(
@@ -1298,7 +1341,47 @@ impl Drop for Transaction {
 }
 
 fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
-    let mut db = transaction
+    let receiver = stage_commit(transaction)?;
+    // Opportunistically become the group-commit leader; every committer
+    // drains the queue, so staged work always reaches the publish lane.
+    let _ = publish_staged(&transaction.runtime);
+    match receiver.recv() {
+        Ok(outcome) => outcome.map_err(materialize_failure),
+        Err(_) => Err(Error::Corruption(
+            "commit publisher dropped the transaction outcome".into(),
+        )),
+    }
+}
+
+/// Reconstruct an owned error for a waiter from the shared publisher
+/// failure. String-carrying variants survive exactly; the rest degrade to a
+/// corruption report because publication failures are terminal for the group.
+fn materialize_failure(failure: Arc<Error>) -> Error {
+    match &*failure {
+        Error::NeedsRecovery(message) => Error::NeedsRecovery(message.clone()),
+        Error::InvalidArgument(message) => Error::InvalidArgument(message.clone()),
+        Error::Wal(message) => Error::Wal(message.clone()),
+        Error::Corruption(message) => Error::Corruption(message.clone()),
+        Error::Backpressure {
+            required,
+            available,
+        } => Error::Backpressure {
+            required: *required,
+            available: *available,
+        },
+        other => Error::Corruption(format!("publication failed: {other:?}")),
+    }
+}
+
+/// Validate the transaction against published state and queued-but-
+/// unpublished work, assign the next commit sequence number, and enqueue the
+/// physical batch. Locks are held only for validation and staging, never for
+/// WAL or version-store syncs.
+fn stage_commit(
+    transaction: &Transaction,
+) -> Result<std::sync::mpsc::Receiver<std::result::Result<CommitPosition, Arc<Error>>>> {
+    let mut prepare = lock_prepare(&transaction.runtime);
+    let db = transaction
         .runtime
         .db
         .lock()
@@ -1311,20 +1394,15 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
         .versions
         .lock()
         .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
-    let mut statuses = transaction
+    let statuses = transaction
         .runtime
         .statuses
         .lock()
         .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
     let current = db.durability_status().commit_position.csn;
     validate_conflicts(transaction, &db, &statuses, current)?;
+    reject_queued_conflicts(transaction, &prepare)?;
 
-    let next = CommitSeq::new(
-        current
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
-    );
     let mut mutations = Vec::new();
     let mut writes = BTreeSet::new();
     for ((tree, key), value) in &transaction.writes {
@@ -1368,33 +1446,253 @@ fn commit_transaction(transaction: &Transaction) -> Result<CommitPosition> {
         });
     }
 
-    let change = CommittedChange {
-        commit: next,
+    // Status and change records are built by the publisher once the wave's
+    // sequence numbers are assigned; staged mutations stay data-only.
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    prepare.keys.extend(writes.iter().cloned());
+    prepare.trees.extend(changed_trees.iter().copied());
+    prepare.trees.extend(writes.iter().map(|(tree, _)| *tree));
+    prepare.queue.push_back(StagedCommit {
         transaction: transaction.id,
         snapshot: transaction.snapshot,
-        changed_trees: changed_trees.clone(),
-        writes: writes.clone(),
-    };
-    mutations.push(BatchMutation::Put {
-        key: status_record_key(transaction.id),
-        value: encode_status(next),
+        mutations,
+        changed_trees,
+        writes,
+        assigned: CommitSeq::new(0),
+        outcome: sender,
     });
-    mutations.push(BatchMutation::Put {
-        key: change_record_key(next),
-        value: encode_change(&change)?,
-    });
-    version_store.sync()?;
-    let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
-    let committed = status.commit_position.csn;
-    if committed != next {
-        return Err(Error::Corruption(format!(
-            "transaction expected commit {:?}, storage published {:?}",
-            next, committed
-        )));
+    Ok(receiver)
+}
+
+/// Reject conflicts against commits that are validated and CSN-assigned but
+/// not yet installed. Without this pass two transactions could both win the
+/// same key against published state; first-committer-wins is decided in
+/// assignment order instead.
+fn reject_queued_conflicts(transaction: &Transaction, prepare: &PrepareState) -> Result<()> {
+    for (tree, key) in transaction.writes.keys() {
+        if prepare.keys.contains(&(*tree, key.clone())) {
+            return Err(Error::WriteConflict {
+                tree: *tree,
+                key: key.clone(),
+            });
+        }
     }
-    statuses.insert(transaction.id, committed);
-    lock_changes(&transaction.runtime).insert(committed, change);
-    Ok(status.commit_position)
+    for tree in &transaction.dropped {
+        if prepare.trees.contains(tree) {
+            return Err(Error::TreeConflict(*tree));
+        }
+    }
+    for staged in &prepare.queue {
+        for (tree, start, end) in &transaction.read_ranges {
+            for (changed_tree, changed_key) in &staged.writes {
+                if *changed_tree == *tree
+                    && changed_key.as_slice() >= start.as_slice()
+                    && end
+                        .as_ref()
+                        .is_none_or(|end| changed_key.as_slice() < end.as_slice())
+                {
+                    // The queued writer has no assigned sequence yet; the
+                    // transaction's own snapshot names the visibility point
+                    // the phantom appeared after.
+                    return Err(Error::SerializationConflict {
+                        expected: CommitId::new(transaction.snapshot.get()),
+                        current: CommitId::new(transaction.snapshot.get()),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Publish everything staged so far as one atomic durable batch. The publish
+/// lane serializes install order to match assignment order; control-plane
+/// writers call this before their own inline publication.
+fn publish_staged(runtime: &Runtime) -> Result<()> {
+    let _lane = lock_publish(runtime);
+    // Swap the queue before touching the database handle: staging holds the
+    // prepare mutex while waiting for the database lock, so taking the
+    // database lock first would deadlock against an in-flight staging.
+    let staged = take_staged(runtime);
+    if staged.queue.is_empty() {
+        return Ok(());
+    }
+    let mut db = lock_db(runtime);
+    publish_drained(&mut db, runtime, staged)
+}
+
+/// Take the staged-commit queue and its conflict indexes, resetting them for
+/// the next assignment wave. Must run before any caller acquires the database
+/// lock; staging holds the prepare mutex across its own database-lock wait.
+fn take_staged(runtime: &Runtime) -> PrepareState {
+    let mut prepare = lock_prepare(runtime);
+    std::mem::take(&mut *prepare)
+}
+
+/// Publish previously staged commits while both the publish lane and the
+/// database handle are held by the caller. Control-plane writers run this
+/// before their own inline publication so every consumer of a commit sequence
+/// number passes through one ordered lane.
+fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: PrepareState) -> Result<()> {
+    if queue.queue.is_empty() {
+        return Ok(());
+    }
+
+    let head = db.durability_status().commit_position;
+    // Assignment happens here, under the lane with the database handle held:
+    // wave members take head+1..=head+n in queue order, so published
+    // sequence numbers are contiguous and collision-free by construction.
+    for (position, staged) in queue.queue.iter_mut().enumerate() {
+        let assigned = head
+            .csn
+            .get()
+            .checked_add(position as u64 + 1)
+            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?;
+        staged.assigned = CommitSeq::new(assigned);
+    }
+    let expected = db.durability_status().commit_id;
+    let assigned_last = queue.queue.back().expect("non-empty queue").assigned;
+    let batches: Vec<Vec<BatchMutation>> = queue
+        .queue
+        .iter()
+        .map(|staged| {
+            let mut batch = staged.mutations.clone();
+            batch.push(BatchMutation::Put {
+                key: status_record_key(staged.transaction),
+                value: encode_status(staged.assigned),
+            });
+            let change = CommittedChange {
+                commit: staged.assigned,
+                transaction: staged.transaction,
+                snapshot: staged.snapshot,
+                changed_trees: staged.changed_trees.clone(),
+                writes: staged.writes.clone(),
+            };
+            batch.push(BatchMutation::Put {
+                key: change_record_key(staged.assigned),
+                value: encode_change(&change).expect("change record fits"),
+            });
+            batch
+        })
+        .collect();
+
+    // Before-images must reach disk before any current record names them.
+    // A sync failure here precedes all publication, so it is a certain
+    // abort: retryable, no fence.
+    let sync_outcome = lock_versions(runtime).sync();
+    if let Err(error) = sync_outcome {
+        resolve_group(queue.queue.make_contiguous(), None, Arc::new(error));
+        return Ok(());
+    }
+
+    match db.commit_group_at(expected, &batches) {
+        Ok(status) => {
+            if status.commit_position.csn != assigned_last {
+                let error = Arc::new(Error::Corruption(format!(
+                    "group publication expected {:?}, storage published {:?}",
+                    assigned_last, status.commit_position.csn
+                )));
+                db.fence_writes();
+                resolve_group(queue.queue.make_contiguous(), None, error);
+                return Ok(());
+            }
+            {
+                let mut statuses = lock_statuses(runtime);
+                let mut changes = lock_changes(runtime);
+                for staged in &queue.queue {
+                    statuses.insert(staged.transaction, staged.assigned);
+                    changes.insert(
+                        staged.assigned,
+                        CommittedChange {
+                            commit: staged.assigned,
+                            transaction: staged.transaction,
+                            snapshot: staged.snapshot,
+                            changed_trees: staged.changed_trees.clone(),
+                            writes: staged.writes.clone(),
+                        },
+                    );
+                }
+            }
+            for staged in &queue.queue {
+                let position = CommitPosition::new(staged.assigned, status.commit_position.lsn);
+                let _ = staged.outcome.send(Ok(position));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // The engine owns fence semantics; forward the shared outcome.
+            let uncertain =
+                matches!(error, Error::NeedsRecovery(_)) || db.durability_status().write_fenced;
+            let failure = Arc::new(error);
+            let members = queue.queue.make_contiguous();
+            if uncertain {
+                resolve_group_uncertain(members, failure);
+            } else {
+                resolve_group(members, None, failure);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Settle every member with `position` on success or the shared failure.
+fn resolve_group(queue: &[StagedCommit], position: Option<CommitPosition>, failure: Arc<Error>) {
+    for staged in queue {
+        let _ = match position {
+            Some(position) => staged.outcome.send(Ok(position)),
+            None => staged.outcome.send(Err(Arc::clone(&failure))),
+        };
+    }
+}
+
+/// Uncertain publication: each transaction may have committed at its
+/// assigned sequence; reopen resolves the single atomic group outcome.
+fn resolve_group_uncertain(queue: &[StagedCommit], failure: Arc<Error>) {
+    for staged in queue {
+        let message = format!(
+            "transaction {:?} may have committed at {:?}: {failure}",
+            staged.transaction, staged.assigned
+        );
+        let _ = staged
+            .outcome
+            .send(Err(Arc::new(Error::NeedsRecovery(message))));
+    }
+}
+
+fn lock_prepare(runtime: &Runtime) -> std::sync::MutexGuard<'_, PrepareState> {
+    match runtime.prepare.lock() {
+        Ok(prepare) => prepare,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_publish(runtime: &Runtime) -> std::sync::MutexGuard<'_, ()> {
+    match runtime.publish.lock() {
+        Ok(lane) => lane,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_statuses(runtime: &Runtime) -> std::sync::MutexGuard<'_, BTreeMap<TxnId, CommitSeq>> {
+    match runtime.statuses.lock() {
+        Ok(statuses) => statuses,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_db(runtime: &Runtime) -> std::sync::MutexGuard<'_, DB> {
+    match runtime.db.lock() {
+        Ok(db) => db,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_versions(runtime: &Runtime) -> std::sync::MutexGuard<'_, VersionStore> {
+    match runtime.versions.lock() {
+        Ok(versions) => versions,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 struct GcContext<'a> {
@@ -1931,7 +2229,7 @@ fn publish_lease_write(
             value: encode_change(&change)?,
         },
     ];
-    let status = db.commit_batch_at(CommitId::new(current.get()), &mutations)?;
+    let status = db.commit_batch_at(db.durability_status().commit_id, &mutations)?;
     let committed = status.commit_position.csn;
     if committed != next {
         return Err(Error::Corruption(format!(
@@ -2281,6 +2579,86 @@ mod tests {
             reader.get(tree, b"b").expect("read b"),
             Some(b"two".to_vec())
         );
+    }
+
+    #[test]
+    fn group_commit_keeps_stream_contiguous_under_load() {
+        const THREADS: usize = 4;
+        const WRITES_PER_THREAD: usize = 25;
+        let (_directory, database) = database();
+        let database = Arc::new(database);
+        let shared = tree(&database);
+        let mut handles = Vec::new();
+        for worker in 0..THREADS {
+            let database = Arc::clone(&database);
+            handles.push(std::thread::spawn(move || {
+                for step in 0..WRITES_PER_THREAD {
+                    let key = format!("w{worker}-k{step}");
+                    let mut transaction = database.begin().expect("begin");
+                    transaction
+                        .put(shared, key.as_bytes(), key.as_bytes())
+                        .expect("put");
+                    transaction.commit().expect("commit");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker");
+        }
+
+        let head = database.snapshot_export().expect("export").csn;
+        let changes = database
+            .read_changes(CommitSeq::new(1), usize::MAX)
+            .expect("stream read");
+        assert_eq!(changes.len(), head.get() as usize);
+        for (position, change) in changes.iter().enumerate() {
+            assert_eq!(change.commit.get(), (position + 1) as u64);
+        }
+        // Every write is visible exactly once at the final state.
+        let mut reader = database.begin().expect("reader");
+        for worker in 0..THREADS {
+            for step in 0..WRITES_PER_THREAD {
+                let key = format!("w{worker}-k{step}");
+                assert_eq!(
+                    reader.get(shared, key.as_bytes()).expect("read"),
+                    Some(key.clone().into_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_conflicting_writers_pick_one_winner() {
+        let (_directory, database) = database();
+        let database = Arc::new(database);
+        let shared = tree(&database);
+        let mut seed = database.begin().expect("seed");
+        seed.put(shared, b"contested", b"base").expect("seed put");
+        seed.commit().expect("seed commit");
+
+        let mut handles = Vec::new();
+        // Every transaction must begin before any commits so all four share
+        // one snapshot; only then does first-committer-wins allow one winner.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        for worker in 0..4usize {
+            let database = Arc::clone(&database);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut transaction = database.begin().expect("begin");
+                barrier.wait();
+                transaction
+                    .put(shared, b"contested", format!("w{worker}").as_bytes())
+                    .expect("put");
+                transaction.commit()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("join").ok())
+            .count();
+        assert_eq!(winners, 1, "first-committer-wins allows exactly one winner");
+        let reader = database.begin().expect("reader");
+        assert!(reader.get(shared, b"contested").expect("read").is_some());
     }
 
     #[test]

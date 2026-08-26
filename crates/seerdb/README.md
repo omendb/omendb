@@ -29,8 +29,10 @@ foundation beneath a database server:
   conflict checking, ordered cursor handles with read-range phantom
   protection, and bounded `gc_versions` maintenance that respects
   active snapshots. Its durable conflict records and version history survive
-  reopen; publication is still serialized
-  by the current physical engine.
+  reopen. Commits pipeline through a group-commit lane (ADR 0004 in the
+  repository docs): staging and validation run concurrently, and each publish
+  wave installs many logical commits under one authority frame with a single
+  sync pair.
 - **Committed-change stream**: every commit sequence number has exactly one
   durable change record, so `read_changes` walks gap-free history from any
   retained position. Durable retention leases (`acquire_change_lease`,
