@@ -208,9 +208,11 @@ relational consumer:
    transaction-status table and active-snapshot registry now exist, with
    bounded logical version GC respecting active snapshots. Ordered cursors
    with read-range phantom protection, durable retention leases, the zero-gap
-   `{CSN, restart LSN}` committed-change stream, and group-commit publication
-   ([ADR 0004](adr/0004-group-commit-publication-lane.md)) are implemented.
-   Status freezing and page-level multi-writer installation remain open.
+   `{CSN, restart LSN}` committed-change stream, group-commit publication
+   ([ADR 0004](adr/0004-group-commit-publication-lane.md)), and durable status
+   freezing (GC rewrites current records to carry their resolved CSN and prunes
+   status entries no retained reference needs) are implemented.
+   Page-level multi-writer installation remains open.
 3. **OmenDB direct integration — qualification path started:**
    `src/seer_direct.rs` maps one catalog tree, one tree per table, and one tree
    per index without using `StorageKernel`. Next, expand its relational

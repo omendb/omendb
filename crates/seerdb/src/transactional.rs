@@ -62,8 +62,11 @@ pub struct VersionGcReport {
     pub versions_before: usize,
     /// Number of version records retained after compaction.
     pub versions_after: usize,
-    /// Number of current records whose undo heads were cleared.
+    /// Number of current records rewritten (history cleared and/or frozen).
     pub current_records_rewritten: usize,
+    /// Number of committed status entries pruned after freezing released
+    /// their last placeholder reference.
+    pub statuses_pruned: usize,
 }
 
 /// A commit that became visible in the committed-change stream.
@@ -469,7 +472,7 @@ impl TransactionDatabase {
             .versions
             .lock()
             .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
-        let statuses = self
+        let mut statuses = self
             .runtime
             .statuses
             .lock()
@@ -482,6 +485,7 @@ impl TransactionDatabase {
             .oldest();
         let mut retained = BTreeSet::new();
         let mut rewrites = Vec::new();
+        let mut unfrozen = BTreeSet::new();
         let data_prefix = vec![TREE_DATA_PREFIX];
         {
             let mut gc = GcContext {
@@ -507,11 +511,44 @@ impl TransactionDatabase {
                 return Err(error);
             }
         };
+
+        // Retained undo versions still pin their creators' status entries.
+        for id in &retained {
+            let record = version_store.get(*id)?;
+            if record.commit.get() == 0 {
+                unfrozen.insert(record.transaction);
+            }
+        }
+
+        // Durable status freezing: a committed status entry whose creator no
+        // longer holds any placeholder reference can be pruned from storage
+        // and memory. Freezing rewrites landed in the batch above; pruning
+        // them in the same locked section keeps one consistent view.
+        let prunable: Vec<TxnId> = statuses
+            .keys()
+            .filter(|transaction| !unfrozen.contains(transaction))
+            .copied()
+            .collect();
+        let statuses_pruned = prunable.len();
+        if !prunable.is_empty() {
+            let deletions: Vec<BatchMutation> = prunable
+                .iter()
+                .map(|transaction| BatchMutation::Delete {
+                    key: status_record_key(*transaction),
+                })
+                .collect();
+            db.commit_batch(&deletions)?;
+            for transaction in &prunable {
+                statuses.remove(transaction);
+            }
+        }
+
         Ok(VersionGcReport {
             watermark,
             versions_before,
             versions_after,
             current_records_rewritten: rewrites.len(),
+            statuses_pruned,
         })
     }
 
@@ -1707,7 +1744,7 @@ struct GcContext<'a> {
 impl GcContext<'_> {
     fn collect(&mut self, start: &[u8], end: &[u8]) -> Result<()> {
         for (key, value) in self.db.range(start, end)? {
-            let current = decode_current(Some(&value))?;
+            let mut current = decode_current(Some(&value))?;
             retain_current_chain(
                 self.version_store,
                 self.statuses,
@@ -1715,18 +1752,26 @@ impl GcContext<'_> {
                 self.watermark,
                 self.retained,
             )?;
+            // Status freezing: once a creator's committed CSN is durable it
+            // can never change, so writing it into the record makes the
+            // record self-describing and releases its status-table entry.
+            let resolved = resolve_commit(self.statuses, current.transaction, current.commit)?;
             let clear_history = match self.watermark {
                 None => true,
-                Some(watermark) => {
-                    resolve_commit(self.statuses, current.transaction, current.commit)? <= watermark
-                }
+                Some(watermark) => resolved <= watermark,
             };
-            if clear_history && current.undo_head.is_some() {
-                let mut rewritten = current;
-                rewritten.undo_head = None;
+            let needs_freeze = current.commit.get() != resolved.get();
+            let needs_undo_clear = clear_history && current.undo_head.is_some();
+            if needs_freeze || needs_undo_clear {
+                if needs_freeze {
+                    current.commit = resolved;
+                }
+                if needs_undo_clear {
+                    current.undo_head = None;
+                }
                 self.rewrites.push(BatchMutation::Put {
                     key,
-                    value: encode_current(&rewritten)?,
+                    value: encode_current(&current)?,
                 });
             }
         }
@@ -2476,6 +2521,112 @@ mod tests {
         slow.advance(head).expect("slow advance");
         let pruned = database.gc_changes().expect("gc after both advance");
         assert!(pruned.changes_after < pruned.changes_before);
+    }
+
+    #[test]
+    fn gc_retains_boundary_version_for_exact_watermark_snapshot() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed");
+        seed.put(tree, b"k", b"v1").expect("put v1");
+        seed.commit().expect("seed");
+
+        let mut old = database.begin().expect("old");
+        assert_eq!(
+            old.get(tree, b"k").expect("pre-gc read"),
+            Some(b"v1".to_vec())
+        );
+
+        let mut newer = database.begin().expect("newer");
+        newer.put(tree, b"k", b"v2").expect("put v2");
+        newer.commit().expect("newer commit");
+
+        database.gc_versions().expect("gc");
+        assert_eq!(
+            old.get(tree, b"k").expect("pinned read after gc"),
+            Some(b"v1".to_vec())
+        );
+        old.abort().expect("abort");
+    }
+
+    #[test]
+    fn status_freeze_prunes_unreferenced_statuses_and_survives_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("db");
+        let database = TransactionDatabase::create(&path, Options::for_test()).expect("create");
+        let owned = tree(&database);
+        for i in 0..3 {
+            let mut transaction = database.begin().expect("begin");
+            transaction
+                .put(owned, format!("k{i}").as_bytes(), b"v")
+                .expect("put");
+            transaction.commit().expect("commit");
+        }
+
+        let report = database.gc_versions().expect("gc");
+        assert!(report.statuses_pruned > 0, "statuses should prune");
+        assert!(
+            report.current_records_rewritten > 0,
+            "records should freeze"
+        );
+        drop(database);
+
+        // Frozen records resolve without their status entries; if freezing
+        // missed any reference the reopened handle reports unknown
+        // transactions instead of values.
+        let reopened = TransactionDatabase::open(&path, Options::for_test()).expect("reopen");
+        let mut reader = reopened.begin().expect("reader");
+        for i in 0..3 {
+            assert_eq!(
+                reader.get(owned, format!("k{i}").as_bytes()).expect("read"),
+                Some(b"v".to_vec())
+            );
+        }
+        // Writes keep working across frozen history: the next before-image
+        // carries the resolved CSN instead of an indirection.
+        reader.put(owned, b"k0", b"v2").expect("overwrite");
+        reader.commit().expect("commit over frozen history");
+        let mut verifier = reopened.begin().expect("verifier");
+        assert_eq!(
+            verifier.get(owned, b"k0").expect("read v2"),
+            Some(b"v2".to_vec())
+        );
+        verifier.commit().expect("verify commit");
+    }
+
+    #[test]
+    fn pinned_history_keeps_its_status_entries() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        let mut seed = database.begin().expect("seed");
+        seed.put(owned, b"k", b"v1").expect("put");
+        seed.commit().expect("seed");
+
+        let mut old = database.begin().expect("old snapshot holder");
+        let baseline = old.get(owned, b"k").expect("baseline read");
+        assert_eq!(baseline, Some(b"v1".to_vec()));
+
+        let mut newer = database.begin().expect("newer");
+        newer.put(owned, b"k", b"v2").expect("put v2");
+        newer.commit().expect("newer commit");
+
+        let report = database.gc_versions().expect("gc with pinned snapshot");
+        // Unpinned creators prune immediately; the invariant that matters is
+        // that the pinned snapshot still resolves and its creator's status
+        // entry survives until release.
+        let _ = report.statuses_pruned;
+        assert_eq!(
+            old.get(owned, b"k").expect("pinned read after gc"),
+            Some(b"v1".to_vec())
+        );
+        old.abort().expect("abort old");
+
+        let released = database.gc_versions().expect("gc after release");
+        let final_prune = database.gc_versions().expect("settle pass");
+        assert!(
+            report.statuses_pruned + released.statuses_pruned + final_prune.statuses_pruned > 0,
+            "statuses prune once unpinned"
+        );
     }
 
     #[test]

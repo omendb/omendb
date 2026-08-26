@@ -28,7 +28,9 @@ foundation beneath a database server:
   indirection, ordered scans, atomic multi-tree batches, snapshot-isolation
   conflict checking, ordered cursor handles with read-range phantom
   protection, and bounded `gc_versions` maintenance that respects
-  active snapshots. Its durable conflict records and version history survive
+  active snapshots, which also freezes resolved commit sequences into current
+  records and prunes status entries nothing references anymore. Its durable
+  conflict records and version history survive
   reopen. Commits pipeline through a group-commit lane (ADR 0004 in the
   repository docs): staging and validation run concurrently, and each publish
   wave installs many logical commits under one authority frame with a single
