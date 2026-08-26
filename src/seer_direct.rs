@@ -323,6 +323,11 @@ impl DirectSeerStore {
         Ok(rows)
     }
 
+    /// Begin an explicit multi-statement transaction over the mapped trees.
+    pub(crate) fn begin_transaction(&self) -> Result<DirectTransaction<'_>> {
+        DirectTransaction::begin(self)
+    }
+
     fn stage_indexes(
         &self,
         transaction: &mut Transaction,
@@ -367,6 +372,188 @@ impl DirectSeerStore {
             }
         }
         Ok(())
+    }
+}
+
+/// An explicit multi-operation transaction over the direct store's mapped
+/// trees. Reads resolve at one fixed snapshot and observe the transaction's
+/// own staged writes; `commit` publishes every staged row, index, and catalog
+/// change as one atomic SeerDB commit.
+pub(crate) struct DirectTransaction<'a> {
+    store: &'a DirectSeerStore,
+    transaction: Transaction,
+}
+
+impl<'a> DirectTransaction<'a> {
+    fn begin(store: &'a DirectSeerStore) -> Result<Self> {
+        let transaction = store.database.begin().map_err(map_seer_error)?;
+        Ok(Self { store, transaction })
+    }
+
+    /// Read one row at this transaction's snapshot.
+    pub(crate) fn get(&mut self, table: TableId, identity: &[u8]) -> Result<Option<Row>> {
+        let definition = self.store.catalog.table(table)?.clone();
+        let tree = self.store.table_tree(table)?;
+        self.transaction
+            .get(tree, identity)
+            .map_err(map_seer_error)?
+            .map(|bytes| {
+                row_from_storage_identity(&self.store.catalog, &definition, identity, &bytes)
+            })
+            .transpose()
+    }
+
+    /// Scan all rows of one table at this transaction's snapshot.
+    pub(crate) fn scan(&mut self, table: TableId) -> Result<Vec<Row>> {
+        let definition = self.store.catalog.table(table)?.clone();
+        let tree = self.store.table_tree(table)?;
+        self.transaction
+            .scan(tree, &[], None, usize::MAX)
+            .map_err(map_seer_error)?
+            .into_iter()
+            .map(|(identity, bytes)| {
+                row_from_storage_identity(&self.store.catalog, &definition, &identity, &bytes)
+            })
+            .collect()
+    }
+
+    /// Exact-value lookup through one secondary index.
+    pub(crate) fn index_get(
+        &mut self,
+        table: TableId,
+        index: IndexId,
+        values: &[crate::Value],
+    ) -> Result<Vec<Row>> {
+        let definition = self.store.catalog.table(table)?.clone();
+        let index_definition =
+            self.store.catalog.index(index).ok_or_else(|| {
+                DbError::InvalidState(format!("index {} does not exist", index.0))
+            })?;
+        if index_definition.table != table {
+            return Err(DbError::InvalidState(format!(
+                "index {} does not belong to table {}",
+                index.0, table.0
+            )));
+        }
+        let value_key = index_values_key(&definition, index_definition, values)?;
+        let index_tree = self.store.index_tree(index)?;
+        let table_tree = self.store.table_tree(table)?;
+        let mut rows = Vec::new();
+        for (entry, identity) in self
+            .transaction
+            .scan(index_tree, &[], None, usize::MAX)
+            .map_err(map_seer_error)?
+        {
+            let (entry_values, entry_identity) = decode_index_entry(&entry, &identity)?;
+            if entry_values != value_key {
+                continue;
+            }
+            let row_bytes = self
+                .transaction
+                .get(table_tree, &entry_identity)
+                .map_err(map_seer_error)?
+                .ok_or_else(|| DbError::Corruption {
+                    artifact: "direct SeerDB index",
+                    reason: "index entry references a missing row".to_owned(),
+                })?;
+            rows.push(row_from_storage_identity(
+                &self.store.catalog,
+                &definition,
+                &entry_identity,
+                &row_bytes,
+            )?);
+        }
+        Ok(rows)
+    }
+
+    /// Stage a row insert plus its derived index entries; uniqueness is
+    /// checked against the snapshot and this transaction's staged state.
+    pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<()> {
+        let definition = self.store.catalog.table(table)?.clone();
+        row.validate(&definition)?;
+        let identity = row_identity_bytes(&self.store.catalog, &definition, &row)?;
+        let tree = self.store.table_tree(table)?;
+        if self
+            .transaction
+            .get(tree, &identity)
+            .map_err(map_seer_error)?
+            .is_some()
+        {
+            return Err(DbError::InvalidState(format!(
+                "row {:?} already exists in table {}",
+                identity, table.0
+            )));
+        }
+        self.transaction
+            .put(tree, &identity, &encode_row(&row)?)
+            .map_err(map_seer_error)?;
+        self.stage_indexes_for(table, &definition, &row, &identity, true)
+    }
+
+    /// Stage a row delete plus its derived index entries.
+    pub(crate) fn delete(&mut self, table: TableId, identity: &[u8]) -> Result<()> {
+        let definition = self.store.catalog.table(table)?.clone();
+        let tree = self.store.table_tree(table)?;
+        let bytes = self
+            .transaction
+            .get(tree, identity)
+            .map_err(map_seer_error)?
+            .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
+        let row = row_from_storage_identity(&self.store.catalog, &definition, identity, &bytes)?;
+        self.transaction
+            .delete(tree, identity)
+            .map_err(map_seer_error)?;
+        self.stage_indexes_for(table, &definition, &row, identity, false)
+    }
+
+    fn stage_indexes_for(
+        &mut self,
+        table: TableId,
+        definition: &TableDefinition,
+        row: &Row,
+        identity: &[u8],
+        insert: bool,
+    ) -> Result<()> {
+        for index in self.store.catalog.indexes_for(table) {
+            let Some(values) = row_index_key(definition, index, row)? else {
+                continue;
+            };
+            let tree = self.store.index_tree(index.id)?;
+            let key = encode_index_entry(&values, identity)?;
+            if insert && index.unique {
+                for (entry, existing_identity) in self
+                    .transaction
+                    .scan(tree, &[], None, usize::MAX)
+                    .map_err(map_seer_error)?
+                {
+                    let (existing_values, _) = decode_index_entry(&entry, &existing_identity)?;
+                    if existing_values == values {
+                        return Err(DbError::UniqueViolation {
+                            index: index.id.0,
+                            key: values,
+                        });
+                    }
+                }
+            }
+            if insert {
+                self.transaction
+                    .put(tree, &key, identity)
+                    .map_err(map_seer_error)?;
+            } else {
+                self.transaction
+                    .delete(tree, &key)
+                    .map_err(map_seer_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish every staged change atomically.
+    pub(crate) fn commit(mut self) -> Result<CommitSeq> {
+        self.transaction
+            .commit()
+            .map_err(map_seer_error)
+            .map(|p| p.csn)
     }
 }
 
@@ -697,6 +884,126 @@ mod tests {
     }
 
     #[test]
+    fn explicit_transaction_batches_reads_and_writes_atomically() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(1),
+                table: TableId(1),
+                columns: vec![ColumnId(2)],
+                unique: false,
+            })
+            .expect("create index");
+        store
+            .insert(TableId(1), row(1, "a@example.com"))
+            .expect("seed");
+
+        // Reads inside an open transaction see staged writes; the store's
+        // committed view does not.
+        let mut transaction = store.begin_transaction().expect("begin");
+        assert_eq!(
+            transaction
+                .get(
+                    TableId(1),
+                    &row_identity_bytes(
+                        store.catalog(),
+                        store.catalog().table(TableId(1)).expect("def"),
+                        &row(2, "b@example.com")
+                    )
+                    .expect("identity")
+                )
+                .expect("staged get"),
+            None
+        );
+        let staged_row = row(2, "b@example.com");
+        transaction
+            .insert(TableId(1), staged_row)
+            .expect("stage insert");
+        let scanned = transaction.scan(TableId(1)).expect("scan with staging");
+        assert_eq!(scanned.len(), 2);
+
+        // A duplicate primary key inside the same transaction must be
+        // caught against staged state before any commit.
+        let dup = row(2, "c@example.com");
+        assert!(transaction.insert(TableId(1), dup).is_err());
+        transaction.commit().expect("commit");
+
+        assert_eq!(store.scan(TableId(1)).expect("committed scan").len(), 2);
+        let matches = store
+            .index_get(
+                TableId(1),
+                IndexId(1),
+                &[Value::Text("b@example.com".into())],
+            )
+            .expect("index after commit");
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn uncommitted_transaction_is_invisible_and_aborts_cleanly() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .insert(TableId(1), row(1, "a@example.com"))
+            .expect("seed");
+
+        {
+            let mut transaction = store.begin_transaction().expect("begin");
+            transaction
+                .delete(
+                    TableId(1),
+                    &row_identity_bytes(
+                        store.catalog(),
+                        store.catalog().table(TableId(1)).expect("def"),
+                        &row(1, "a@example.com"),
+                    )
+                    .expect("identity"),
+                )
+                .expect("stage delete");
+            // Dropping without committing discards the staged delete.
+        }
+        assert_eq!(store.scan(TableId(1)).expect("scan survives drop").len(), 1);
+    }
+
+    #[test]
+    fn overlapping_transactions_conflict_on_the_same_key() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .insert(TableId(1), row(1, "a@example.com"))
+            .expect("seed");
+
+        let identity_one = row_identity_bytes(
+            store.catalog(),
+            store.catalog().table(TableId(1)).expect("def"),
+            &row(1, "a@example.com"),
+        )
+        .expect("identity one");
+        let mut first = store.begin_transaction().expect("first begin");
+        first
+            .delete(TableId(1), &identity_one)
+            .expect("first stage");
+
+        let mut second = store.begin_transaction().expect("second begin");
+        second
+            .delete(TableId(1), &identity_one)
+            .expect("second stage");
+        second.commit().expect("second commits first");
+
+        match first.commit() {
+            Err(DbError::SerializationConflict { .. } | DbError::SeerWriteConflict { .. }) => {}
+            other => panic!("overlapping delete must conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn catalog_table_index_and_rows_reopen_through_direct_trees() {
         let (directory, mut store) = store();
         store
@@ -871,12 +1178,16 @@ mod tests {
 
         let first_db = std::sync::Arc::clone(&database);
         let second_db = std::sync::Arc::clone(&database);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier_one = std::sync::Arc::clone(&barrier);
+        let barrier_two = std::sync::Arc::clone(&barrier);
         let first = std::thread::spawn(move || {
             let mut transaction = first_db.begin().expect("first begin");
             transaction.put(tree, b"shared", b"one").expect("stage one");
             transaction
                 .put(tree, b"extra-a", b"a")
                 .expect("stage extra");
+            barrier_one.wait();
             transaction.commit()
         });
         let second = std::thread::spawn(move || {
@@ -885,6 +1196,7 @@ mod tests {
             transaction
                 .put(tree, b"extra-b", b"b")
                 .expect("stage other");
+            barrier_two.wait();
             transaction.commit()
         });
         let outcomes = [first.join().expect("join"), second.join().expect("join")];
