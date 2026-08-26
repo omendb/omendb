@@ -755,6 +755,338 @@ mod tests {
     }
 
     #[test]
+    fn multi_table_multi_index_conformance_with_reopen() {
+        let (directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create users");
+        let mut orders = table();
+        orders.id = TableId(2);
+        orders.name = "orders".to_owned();
+        store
+            .create_table(orders.clone(), Some(vec![ColumnId(1)]))
+            .expect("create orders");
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(1),
+                table: TableId(1),
+                columns: vec![ColumnId(2)],
+                unique: false,
+            })
+            .expect("create non-unique email index");
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(2),
+                table: TableId(2),
+                columns: vec![ColumnId(1)],
+                unique: true,
+            })
+            .expect("create unique order index");
+
+        // Two rows share an email in the non-unique index; each order is
+        // unique by id.
+        store
+            .insert(TableId(1), row(1, "shared@example.com"))
+            .expect("insert 1");
+        store
+            .insert(TableId(1), row(2, "shared@example.com"))
+            .expect("insert 2");
+        let mut order_row = row(10, "order@example.com");
+        order_row.primary = Key::new(1, 10);
+        store
+            .insert(TableId(2), order_row.clone())
+            .expect("insert order");
+
+        // Non-unique index returns both matches; tables stay isolated.
+        let matches = store
+            .index_get(
+                TableId(1),
+                IndexId(1),
+                &[Value::Text("shared@example.com".into())],
+            )
+            .expect("email lookup");
+        assert_eq!(matches.len(), 2);
+        assert!(store.scan(TableId(2)).expect("orders scan").len() == 1);
+
+        store.close().expect("close");
+        let reopened = DirectSeerStore::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen");
+        assert_eq!(reopened.catalog().tables().count(), 2);
+        assert_eq!(reopened.catalog().indexes().count(), 2);
+        let matches = reopened
+            .index_get(
+                TableId(1),
+                IndexId(1),
+                &[Value::Text("shared@example.com".into())],
+            )
+            .expect("reopened email lookup");
+        assert_eq!(matches.len(), 2);
+        let orders_after = reopened.scan(TableId(2)).expect("reopened orders");
+        assert_eq!(orders_after.len(), 1);
+        assert_eq!(orders_after[0].values, order_row.values);
+    }
+
+    #[test]
+    fn old_snapshot_reads_stay_stable_across_store_commits() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .insert(TableId(1), row(1, "a@example.com"))
+            .expect("insert");
+
+        // A raw fixed-snapshot transaction over the same mapped tree holds
+        // its read even while the store publishes newer commits.
+        let tree = store.table_tree(TableId(1)).expect("tree");
+        let mut reader = store.database.begin().expect("reader begin");
+        let before = reader
+            .scan(tree, &[], None, usize::MAX)
+            .expect("snapshot scan");
+        assert_eq!(before.len(), 1);
+
+        store
+            .insert(TableId(1), row(2, "b@example.com"))
+            .expect("second insert");
+
+        let after = reader
+            .scan(tree, &[], None, usize::MAX)
+            .expect("stable scan");
+        assert_eq!(after.len(), before.len());
+        reader.abort().expect("abort reader");
+
+        assert_eq!(store.scan(TableId(1)).expect("live scan").len(), 2);
+    }
+
+    #[test]
+    fn controlled_concurrency_maps_write_conflicts() {
+        let (_directory, store) = store();
+        let database = std::sync::Arc::new(store.database);
+        let tree = {
+            let mut transaction = database.begin().expect("begin");
+            let tree = transaction.create_tree().expect("tree");
+            transaction.commit().expect("commit tree");
+            tree
+        };
+
+        let first_db = std::sync::Arc::clone(&database);
+        let second_db = std::sync::Arc::clone(&database);
+        let first = std::thread::spawn(move || {
+            let mut transaction = first_db.begin().expect("first begin");
+            transaction.put(tree, b"shared", b"one").expect("stage one");
+            transaction
+                .put(tree, b"extra-a", b"a")
+                .expect("stage extra");
+            transaction.commit()
+        });
+        let second = std::thread::spawn(move || {
+            let mut transaction = second_db.begin().expect("second begin");
+            transaction.delete(tree, b"shared").expect("stage delete");
+            transaction
+                .put(tree, b"extra-b", b"b")
+                .expect("stage other");
+            transaction.commit()
+        });
+        let outcomes = [first.join().expect("join"), second.join().expect("join")];
+        let winners = outcomes.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(winners, 1, "exactly one overlapping writer commits");
+        let loser = outcomes
+            .into_iter()
+            .find(|r| r.is_err())
+            .expect("loser")
+            .unwrap_err();
+        match map_seer_error(loser) {
+            DbError::SeerWriteConflict { .. } => {}
+            other => panic!("expected a mapped write conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_operations_leave_no_partial_state() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(1),
+                table: TableId(1),
+                columns: vec![ColumnId(2)],
+                unique: true,
+            })
+            .expect("create unique index");
+        store
+            .insert(TableId(1), row(1, "dupe@example.com"))
+            .expect("insert");
+
+        // A duplicate insert must not leave the new row or either index
+        // entry behind.
+        assert!(
+            store
+                .insert(TableId(1), row(2, "dupe@example.com"))
+                .is_err()
+        );
+        let rows = store.scan(TableId(1)).expect("scan after violation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            store
+                .index_get(
+                    TableId(1),
+                    IndexId(1),
+                    &[Value::Text("dupe@example.com".into())]
+                )
+                .expect("index after violation")
+                .len(),
+            1
+        );
+
+        // An index build that hits duplicates mid-scan leaves the catalog,
+        // mappings, and live-tree set untouched.
+        let mut orders = table();
+        orders.id = TableId(2);
+        orders.name = "orders".to_owned();
+        store
+            .create_table(orders.clone(), Some(vec![ColumnId(1)]))
+            .expect("create orders");
+        let mut order_one = row(10, "same@example.com");
+        order_one.primary = Key::new(1, 10);
+        let mut order_two = row(11, "same@example.com");
+        order_two.primary = Key::new(1, 11);
+        store.insert(TableId(2), order_one).expect("order one");
+        store.insert(TableId(2), order_two).expect("order two");
+
+        let trees_before = {
+            let transaction = store.database.begin().expect("begin");
+            transaction.list_trees().expect("list trees").len()
+        };
+        let duplicate_index = IndexDefinition {
+            id: IndexId(9),
+            table: TableId(2),
+            columns: vec![ColumnId(2)],
+            unique: true,
+        };
+        assert!(
+            store.create_index(duplicate_index).is_err(),
+            "building a unique index over duplicate values must fail"
+        );
+        assert!(store.catalog().index(IndexId(9)).is_none());
+        let mut transaction = store.database.begin().expect("begin after failure");
+        assert_eq!(
+            transaction.list_trees().expect("trees unchanged").len(),
+            trees_before
+        );
+        transaction.abort().expect("abort probe");
+    }
+
+    #[test]
+    fn malformed_catalog_states_are_rejected_on_open() {
+        // Missing marker.
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("missing");
+        TransactionDatabase::create(&path, Options::for_test()).expect("bare create");
+        assert!(DirectSeerStore::open(&path, Options::for_test()).is_err());
+
+        // Corrupt marker payload.
+        let corrupt_path = directory.path().join("corrupt");
+        let database = TransactionDatabase::create(&corrupt_path, Options::for_test()).expect("db");
+        let mut transaction = database.begin().expect("begin");
+        let tree = transaction.create_tree().expect("tree");
+        transaction
+            .put(tree, DIRECT_CATALOG_MARKER, b"not-a-catalog-state")
+            .expect("put garbage marker");
+        transaction.commit().expect("commit");
+        drop(transaction);
+        drop(database);
+        match DirectSeerStore::open(&corrupt_path, Options::for_test()) {
+            Err(
+                err @ (DbError::Corruption {
+                    artifact: "direct SeerDB catalog",
+                    ..
+                }
+                | DbError::StorageCorruption { .. }),
+            ) => {
+                assert!(err.to_string().contains("header"));
+            }
+            other => panic!(
+                "corrupt state must be rejected, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+
+        // Duplicate markers across two trees.
+        let duplicate_path = directory.path().join("duplicate");
+        let database =
+            TransactionDatabase::create(&duplicate_path, Options::for_test()).expect("db");
+        let mut transaction = database.begin().expect("begin");
+        let first_tree = transaction.create_tree().expect("first tree");
+        let second_tree = transaction.create_tree().expect("second tree");
+        let state = encode_catalog_state(&Catalog::default(), &BTreeMap::new(), &BTreeMap::new())
+            .expect("encode empty state");
+        transaction
+            .put(first_tree, DIRECT_CATALOG_MARKER, &state)
+            .expect("marker 1");
+        transaction
+            .put(second_tree, DIRECT_CATALOG_MARKER, &state)
+            .expect("marker 2");
+        transaction.commit().expect("commit");
+        drop(transaction);
+        drop(database);
+        match DirectSeerStore::open(&duplicate_path, Options::for_test()) {
+            Err(DbError::Corruption { reason, .. }) => {
+                assert!(reason.contains("multiple catalog"), "{reason}");
+            }
+            other => panic!(
+                "duplicate markers must be rejected, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+
+        // Orphan live tree: two live trees but the mapping names only one.
+        let orphan_path = directory.path().join("orphan");
+        let database = TransactionDatabase::create(&orphan_path, Options::for_test()).expect("db");
+        let mut transaction = database.begin().expect("begin");
+        let catalog_tree = transaction.create_tree().expect("catalog tree");
+        let _orphan_tree = transaction.create_tree().expect("orphan tree");
+        let state = encode_catalog_state(&Catalog::default(), &BTreeMap::new(), &BTreeMap::new())
+            .expect("encode");
+        transaction
+            .put(catalog_tree, DIRECT_CATALOG_MARKER, &state)
+            .expect("marker");
+        transaction.commit().expect("commit");
+        drop(transaction);
+        drop(database);
+        assert!(DirectSeerStore::open(&orphan_path, Options::for_test()).is_err());
+
+        // Catalog claims a table whose tree mapping is absent.
+        let unmapped_path = directory.path().join("unmapped");
+        let database =
+            TransactionDatabase::create(&unmapped_path, Options::for_test()).expect("db");
+        let mut candidate = Catalog::default();
+        candidate
+            .create_table_with_primary_key(table(), Some(vec![ColumnId(1)]))
+            .expect("candidate table");
+        let mut transaction = database.begin().expect("begin");
+        let catalog_tree = transaction.create_tree().expect("catalog tree");
+        let state = encode_catalog_state(&candidate, &BTreeMap::new(), &BTreeMap::new())
+            .expect("encode with missing mapping");
+        transaction
+            .put(catalog_tree, DIRECT_CATALOG_MARKER, &state)
+            .expect("marker");
+        transaction.commit().expect("commit");
+        drop(transaction);
+        drop(database);
+        match DirectSeerStore::open(&unmapped_path, Options::for_test()) {
+            Err(DbError::Corruption { reason, .. }) => {
+                assert!(reason.contains("no tree mapping"), "{reason}");
+            }
+            other => panic!(
+                "unmapped table must be rejected, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+
+    #[test]
     fn row_and_unique_index_are_atomic_on_conflict() {
         let (_directory, mut store) = store();
         store
