@@ -17,9 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use omendb::{
-    DatabaseConfig, DbError, RelationalBackendConfig, RelationalDatabase, SeerKernelConfig, Value,
-};
+use omendb::{DbError, RelationalBackendConfig, RelationalDatabase, Value};
 use rusqlite::{Connection, params};
 use serde_json::json;
 
@@ -36,25 +34,22 @@ const SQLITE_UPDATE: &str = "UPDATE accounts SET balance = ?2 WHERE id = ?1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
-    Temporary,
-    Seer,
+    Omendb,
     Sqlite,
 }
 
 impl Backend {
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "temporary" => Ok(Self::Temporary),
-            "seer" => Ok(Self::Seer),
+            "omendb" | "temporary" | "seer" => Ok(Self::Omendb),
             "sqlite" => Ok(Self::Sqlite),
-            other => bail!("unsupported backend {other}; use temporary, seer, sqlite, or all"),
+            other => bail!("unsupported backend {other}; use omendb or sqlite"),
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Temporary => "temporary",
-            Self::Seer => "seer",
+            Self::Omendb => "omendb",
             Self::Sqlite => "sqlite",
         }
     }
@@ -87,23 +82,15 @@ fn main() -> Result<()> {
     let temp = tempfile::tempdir().context("create benchmark directory")?;
 
     let backends = match backend {
-        None => vec![Backend::Temporary, Backend::Seer, Backend::Sqlite],
+        None => vec![Backend::Omendb, Backend::Sqlite],
         Some(backend) => vec![backend],
     };
     for (index, backend) in backends.iter().copied().enumerate() {
         let result = match backend {
-            Backend::Temporary => run_omendb(
-                Backend::Temporary,
-                RelationalBackendConfig::Temporary(DatabaseConfig {
-                    directory: temp.path().join("temporary"),
-                }),
-                temp.path().join("temporary"),
-                workload,
-            )?,
-            Backend::Seer => run_omendb(
-                Backend::Seer,
-                RelationalBackendConfig::Seer(SeerKernelConfig::new(temp.path().join("seer"))),
-                temp.path().join("seer"),
+            Backend::Omendb => run_omendb(
+                Backend::Omendb,
+                RelationalBackendConfig::new(temp.path().join("omendb")),
+                temp.path().join("omendb"),
                 workload,
             )?,
             Backend::Sqlite => run_sqlite(temp.path().join("sqlite.db"), workload)?,
@@ -470,7 +457,7 @@ fn parse_arguments() -> Result<(Option<Backend>, Workload)> {
             "--seed" => workload.seed = value()?.parse().context("invalid --seed")?,
             "--help" => {
                 println!(
-                    "usage: alpha_oltp [--backend all|temporary|seer|sqlite] [--rows N] [--operations N] [--read-percent N] [--batch-size N] [--seed N]"
+                    "usage: alpha_oltp [--backend all|omendb|sqlite] [--rows N] [--operations N] [--read-percent N] [--batch-size N] [--seed N]"
                 );
                 std::process::exit(0);
             }

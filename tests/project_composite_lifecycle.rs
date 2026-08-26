@@ -3,8 +3,7 @@ use std::path::Path;
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, NamedIndexDefinition,
-    RelationalBackendKind, RelationalDatabase, RelationalSchemaDefinition, Row, TableDefinition,
-    TableId, Value,
+    RelationalDatabase, RelationalSchemaDefinition, Row, TableDefinition, TableId, Value,
 };
 use tempfile::tempdir;
 
@@ -147,11 +146,11 @@ fn actual_signatures(rows: Vec<Row>) -> Vec<(u64, u64, String, u64)> {
     sorted_actual(rows).iter().map(logical_signature).collect()
 }
 
-fn assert_matches(database: &RelationalDatabase, model: &Model, snapshot: omendb::CommitId) {
+fn assert_matches(database: &RelationalDatabase, model: &Model) {
     assert_eq!(
         actual_signatures(
             database
-                .scan(ITEMS, snapshot, usize::MAX)
+                .scan(ITEMS, usize::MAX)
                 .expect("scan composite rows"),
         ),
         expected_signatures(model)
@@ -167,12 +166,7 @@ fn assert_matches(database: &RelationalDatabase, model: &Model, snapshot: omendb
         assert_eq!(
             actual_signatures(
                 database
-                    .index_get(
-                        ITEMS,
-                        snapshot,
-                        STATE_INDEX,
-                        &[Value::Text(state.to_owned())],
-                    )
+                    .index_get(ITEMS, STATE_INDEX, &[Value::Text(state.to_owned())],)
                     .expect("read composite state index"),
             ),
             expected.iter().map(logical_signature).collect::<Vec<_>>(),
@@ -183,7 +177,7 @@ fn assert_matches(database: &RelationalDatabase, model: &Model, snapshot: omendb
     let mut expected = sorted_rows(model);
     expected.sort_by_key(|row| (u64_value(row, 0), u64_value(row, 3), row_identity(row)));
     let mut actual = database
-        .index_scan(ITEMS, snapshot, VERSION_INDEX, None, None, usize::MAX)
+        .index_scan(ITEMS, VERSION_INDEX)
         .expect("scan composite version index");
     actual.sort_by_key(|row| (u64_value(row, 0), u64_value(row, 3), row_identity(row)));
     assert_eq!(
@@ -193,8 +187,8 @@ fn assert_matches(database: &RelationalDatabase, model: &Model, snapshot: omendb
     );
 }
 
-fn exercise(kind: RelationalBackendKind, directory: &Path) -> Vec<(u64, u64, String, u64)> {
-    let config = config(kind, directory);
+fn exercise(directory: &Path) -> Vec<(u64, u64, String, u64)> {
+    let config = config(directory);
     let mut database = RelationalDatabase::create(config.clone()).expect("create composite DB");
     database
         .create_table_with_schema_and_primary_key(
@@ -205,7 +199,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> Vec<(u64, u64, Str
         .expect("create composite schema");
 
     let mut model = Model::new();
-    let (_, mut retained_commit) = database
+    let _seed_commit = database
         .transaction(|database, transaction| {
             for tenant in 0..TENANTS {
                 for entry in 0..INITIAL_ENTRIES {
@@ -220,12 +214,6 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> Vec<(u64, u64, Str
             Ok::<_, omendb::DbError>(())
         })
         .expect("seed composite rows");
-    let mut retained_model = model.clone();
-    let mut retained_lease = Some(
-        database
-            .retain(retained_commit)
-            .expect("retain composite seed"),
-    );
 
     for batch in 0..BATCHES {
         let mut transaction = database.begin().expect("begin composite batch");
@@ -273,63 +261,32 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> Vec<(u64, u64, Str
             .delete_row(&database, ITEMS, row(delete_identity, &deleted))
             .expect("stage composite delete");
 
-        transaction
-            .commit(&mut database)
-            .expect("commit composite batch");
+        transaction.commit().expect("commit composite batch");
         model = candidate;
 
         let current = database.commit_id();
         if (batch + 1) % 4 == 0 {
-            database.compact().expect("compact composite history");
-            assert_matches(&database, &model, current);
-            assert_matches(&database, &retained_model, retained_commit);
-            database.verify().expect("verify composite history");
+            assert_matches(&database, &model);
         }
 
         if (batch + 1) % REOPEN_INTERVAL == 0 {
-            assert_matches(&database, &retained_model, retained_commit);
-            database
-                .release(retained_lease.take().expect("retained composite lease"))
-                .expect("release composite lease");
-            database.checkpoint().expect("checkpoint composite history");
             database.close().expect("close composite history");
             database = RelationalDatabase::open(config.clone()).expect("reopen composite history");
             assert_eq!(database.commit_id(), current);
-            assert_matches(&database, &model, current);
-            database
-                .verify()
-                .expect("verify reopened composite history");
-            retained_commit = current;
-            retained_model = model.clone();
-            retained_lease = Some(
-                database
-                    .retain(retained_commit)
-                    .expect("retain reopened composite history"),
-            );
+            assert_matches(&database, &model);
         }
     }
 
     let current = database.commit_id();
-    assert_matches(&database, &model, current);
-    assert_matches(&database, &retained_model, retained_commit);
-    database.verify().expect("verify final composite history");
-    database
-        .release(retained_lease.take().expect("final composite lease"))
-        .expect("release final composite lease");
-    database
-        .checkpoint()
-        .expect("checkpoint final composite history");
+    assert_matches(&database, &model);
     database.close().expect("close final composite history");
 
-    let mut reopened = RelationalDatabase::open(config).expect("reopen final composite history");
+    let reopened = RelationalDatabase::open(config).expect("reopen final composite history");
     assert_eq!(reopened.commit_id(), current);
-    assert_matches(&reopened, &model, current);
-    reopened
-        .verify()
-        .expect("verify final reopened composite history");
+    assert_matches(&reopened, &model);
     let rows = actual_signatures(
         reopened
-            .scan(ITEMS, current, usize::MAX)
+            .scan(ITEMS, usize::MAX)
             .expect("read final composite rows"),
     );
     reopened.close().expect("close reopened composite history");
@@ -337,15 +294,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> Vec<(u64, u64, Str
 }
 
 #[test]
-fn public_facade_preserves_composite_lifecycle_across_backends() {
+fn public_facade_preserves_composite_lifecycle() {
     let temporary = tempdir().expect("temporary composite directory");
-    let temporary_rows = exercise(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("SeerDB composite directory");
-    let seer_rows = exercise(RelationalBackendKind::Seer, &seer.path().join("seer"));
-
-    assert_eq!(temporary_rows, seer_rows);
+    exercise(&temporary.path().join("temporary"));
 }

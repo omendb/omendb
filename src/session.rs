@@ -614,7 +614,6 @@ impl RelationalDatabaseSession {
         })
     }
 
-    #[must_use]
     /// Return admission/lifecycle state without consuming an operation slot.
     pub fn admission_status(&self) -> Result<RelationalSessionStatus> {
         self.admission.status()
@@ -661,7 +660,9 @@ impl RelationalDatabaseSession {
         table: TableId,
         identity: &RowIdentity,
     ) -> Result<Option<Row>> {
-        self.read(control, |database| database.get_by_identity(table, identity))
+        self.read(control, |database| {
+            database.get_by_identity(table, identity)
+        })
     }
 
     /// Scan rows at the current state under bounded admission.

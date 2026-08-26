@@ -12,17 +12,15 @@ use std::sync::{Arc, RwLock};
 
 use omendb::pgwire_server;
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, RelationalBackendConfig,
-    RelationalDatabase, TableDefinition, TableId,
+    ColumnDefinition, ColumnId, ColumnType, RelationalBackendConfig, RelationalDatabase,
+    TableDefinition, TableId,
 };
 
 fn main() -> anyhow::Result<()> {
     let port: u16 = std::env::args().nth(1).unwrap_or_default().parse()?;
     let directory = tempfile::tempdir()?;
     let mut database =
-        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.path().to_path_buf(),
-        }))?;
+        RelationalDatabase::create(RelationalBackendConfig::new(directory.path().join("db")))?;
     database.create_table(TableDefinition {
         id: TableId(7),
         name: "users".to_owned(),

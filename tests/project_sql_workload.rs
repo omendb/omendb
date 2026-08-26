@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use omendb::{
-    DatabaseConfig, DbError, RelationalBackendConfig, RelationalBackendKind, RelationalDatabase,
-    SeerKernelConfig, Value,
-};
+use omendb::{DbError, RelationalBackendConfig, RelationalDatabase, Value};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -18,15 +15,8 @@ struct WorkItem {
 
 type Model = BTreeMap<u64, WorkItem>;
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn item_values(id: u64, item: &WorkItem) -> Vec<Value> {
@@ -86,8 +76,8 @@ fn model_digest_from_rows(rows: &[Vec<Value>]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn exercise_workload(kind: RelationalBackendKind, directory: &Path) -> [u8; 32] {
-    let database_config = config(kind, directory);
+fn exercise_workload(directory: &Path) {
+    let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");
     database
         .execute_sql(
@@ -295,24 +285,14 @@ fn exercise_workload(kind: RelationalBackendKind, directory: &Path) -> [u8; 32] 
     model.retain(|_, item| !(item.tenant_id == 2 && item.state == "closed"));
     assert_state(&mut database, &model);
 
-    let expected_digest = model_digest(&model);
     database.close().expect("close");
     let mut reopened = RelationalDatabase::open(database_config).expect("reopen");
     assert_state(&mut reopened, &model);
     reopened.close().expect("close reopened");
-    expected_digest
 }
 
 #[test]
 fn named_sql_ordinary_workload_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
-    let temporary_digest = exercise_workload(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    let seer_digest = exercise_workload(RelationalBackendKind::Seer, &seer.path().join("seer"));
-
-    assert_eq!(temporary_digest, seer_digest);
+    exercise_workload(&temporary.path().join("temporary"));
 }

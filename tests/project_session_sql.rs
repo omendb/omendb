@@ -1,29 +1,21 @@
 use std::path::Path;
 
 use omendb::{
-    DatabaseConfig, OperationControl, RelationalBackendConfig, RelationalBackendKind,
-    RelationalDatabaseConfig, RelationalDatabaseSession, RelationalSessionConfig, SeerKernelConfig,
-    Value,
+    OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
+    RelationalSessionConfig, Value,
 };
 use tempfile::tempdir;
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalDatabaseConfig {
-    let backend = match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    };
+fn config(directory: &Path) -> RelationalDatabaseConfig {
+    let backend = RelationalBackendConfig::new(directory.to_owned());
     RelationalDatabaseConfig::new(backend).with_session_config(RelationalSessionConfig {
         max_in_flight: 2,
         ..RelationalSessionConfig::default()
     })
 }
 
-fn exercise_session_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>> {
-    let database_config = config(kind, directory);
+fn exercise_session_sql(directory: &Path) -> Vec<Vec<Value>> {
+    let database_config = config(directory);
     let session = RelationalDatabaseSession::create(database_config.clone()).expect("create");
     let control = OperationControl::default();
 
@@ -159,13 +151,5 @@ fn exercise_session_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Ve
 #[test]
 fn public_session_sql_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
-    let temporary_rows = exercise_session_sql(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    let seer_rows = exercise_session_sql(RelationalBackendKind::Seer, &seer.path().join("seer"));
-
-    assert_eq!(temporary_rows, seer_rows);
+    exercise_session_sql(&temporary.path().join("temporary"));
 }

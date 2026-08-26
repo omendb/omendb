@@ -6,18 +6,16 @@ use std::sync::{Arc, RwLock};
 
 use omendb::pgwire_server;
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, RelationalBackendConfig,
-    RelationalDatabase, TableDefinition, TableId,
+    ColumnDefinition, ColumnId, ColumnType, RelationalBackendConfig, RelationalDatabase,
+    TableDefinition, TableId,
 };
 use tempfile::tempdir;
 use tokio_postgres::error::SqlState;
 
 fn seed_database(directory: &std::path::Path) -> Arc<RwLock<RelationalDatabase>> {
     let mut database =
-        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_path_buf(),
-        }))
-        .expect("create database");
+        RelationalDatabase::create(RelationalBackendConfig::new(directory.join("db")))
+            .expect("create database");
     database
         .create_table(TableDefinition {
             id: TableId(7),
@@ -573,10 +571,8 @@ async fn wire_seeded_ids_visible_serially() {
 fn facade_sequential_autocommit_inserts_all_visible() {
     let directory = tempdir().expect("tempdir");
     let database = std::sync::Arc::new(std::sync::RwLock::new(
-        RelationalDatabase::create(RelationalBackendConfig::Temporary(omendb::DatabaseConfig {
-            directory: directory.path().to_path_buf(),
-        }))
-        .expect("create"),
+        RelationalDatabase::create(RelationalBackendConfig::new(directory.path().join("db")))
+            .expect("create"),
     ));
     let database = &mut *database.write().expect("lock");
     database

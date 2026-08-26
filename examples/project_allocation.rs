@@ -15,10 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, DbError, IndexDefinition, IndexId, Key,
-    OperationControl, RelationalBackendConfig, RelationalBackendKind, RelationalDatabaseConfig,
-    RelationalDatabaseSession, RelationalMetrics, RelationalPublicationMetrics,
-    RelationalSessionConfig, Row, SeerKernelConfig, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId, Key,
+    OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
+    RelationalSessionConfig, Row, TableDefinition, TableId, Value,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -35,7 +34,6 @@ const DEFAULT_SEED: u64 = 0xDB0E_2026_0814;
 
 #[derive(Clone, Copy, Debug)]
 struct WorkloadConfig {
-    backend: RelationalBackendKind,
     workers: usize,
     operations_per_worker: usize,
     max_quantity: u64,
@@ -72,11 +70,12 @@ fn main() -> Result<()> {
     let directory = tempfile::tempdir().context("create allocation workload directory")?;
     let database_directory = directory.path().join("database");
     let session = RelationalDatabaseSession::create(
-        RelationalDatabaseConfig::new(config(workload.backend, &database_directory))
-            .with_session_config(RelationalSessionConfig {
+        RelationalDatabaseConfig::new(config(&database_directory)).with_session_config(
+            RelationalSessionConfig {
                 max_in_flight: workload.workers,
                 admission_timeout: Duration::from_secs(300),
-            }),
+            },
+        ),
     )
     .context("create allocation session")?;
     let session = Arc::new(session);
@@ -96,9 +95,6 @@ fn main() -> Result<()> {
         )
         .context("create allocation state index")?;
     seed(&session, expected_units)?;
-    let metrics_before_workload = session
-        .metrics(&control)
-        .context("read allocation metrics before workload")?;
 
     let first_wave = Arc::new(Barrier::new(workload.workers + 1));
     let started = Instant::now();
@@ -147,7 +143,7 @@ fn main() -> Result<()> {
         .commit_id(&control)
         .context("read allocation commit frontier")?;
     let final_rows = session
-        .scan(&control, TABLE, final_commit, usize::MAX)
+        .scan(&control, TABLE, usize::MAX)
         .context("scan final allocation state")?;
     let actual_allocations = validate_final_state(&final_rows, expected_units)?;
     let actual_allocation_digest = digest_allocations(&actual_allocations);
@@ -176,9 +172,6 @@ fn main() -> Result<()> {
     let status = session
         .admission_status()
         .context("read final allocation admission status")?;
-    let metrics_after_workload = session
-        .metrics(&control)
-        .context("read allocation metrics after workload")?;
     if status.active_operations != 0 || status.waiting_operations != 0 {
         bail!("allocation session did not drain: {status:?}");
     }
@@ -200,7 +193,6 @@ fn main() -> Result<()> {
             "evidence_class": "project_api_contended_allocation_diagnostic",
             "hardware_benchmark": false,
             "parallel_writer_claim": false,
-            "backend": format!("{:?}", workload.backend),
             "workers": workload.workers,
             "operations_per_worker": workload.operations_per_worker,
             "max_quantity": workload.max_quantity,
@@ -236,10 +228,6 @@ fn main() -> Result<()> {
                 "total_operation_seconds": status.total_operation_time.as_secs_f64(),
                 "max_operation_seconds": status.max_operation_time.as_secs_f64(),
             },
-            "metrics": {
-                "before_workload": metrics_json(&metrics_before_workload),
-                "after_workload": metrics_json(&metrics_after_workload),
-            },
         }))?
     );
     Ok(())
@@ -263,45 +251,36 @@ fn spawn_worker(
                 let synchronize_first_wave = !first_wave_complete && attempts == 1;
                 let control = OperationControl::default();
                 let wave = Arc::clone(&first_wave);
-                let result = session.transaction_with_parallel_preparation(
-                    &control,
-                    move |database, transaction| {
-                        let start = [Value::U64(AVAILABLE)];
-                        let end = [Value::U64(RESERVED)];
-                        let selected = transaction.index_scan(
-                            database,
-                            TABLE,
-                            STATE_INDEX,
-                            Some(&start),
-                            Some(&end),
-                            request.quantity as usize,
-                        );
-                        if synchronize_first_wave {
-                            wave.wait();
+                let result = session.transaction(&control, move |database, transaction| {
+                    let start = [Value::U64(AVAILABLE)];
+                    let end = [Value::U64(RESERVED)];
+                    let _ = (&start, &end);
+                    let selected = transaction.index_scan(database, TABLE, STATE_INDEX);
+                    if synchronize_first_wave {
+                        wave.wait();
+                    }
+                    let selected = selected?;
+                    if selected.len() != request.quantity as usize {
+                        return Err(DbError::InvalidState(format!(
+                            "allocation pool exhausted for reservation {}: needed {}, found {}",
+                            request.reservation_id,
+                            request.quantity,
+                            selected.len()
+                        )));
+                    }
+                    for mut row in selected {
+                        if row.values.get(1) != Some(&Value::U64(AVAILABLE)) {
+                            return Err(DbError::InvalidState(
+                                "state index returned a non-available row".to_owned(),
+                            ));
                         }
-                        let selected = selected?;
-                        if selected.len() != request.quantity as usize {
-                            return Err(DbError::InvalidState(format!(
-                                "allocation pool exhausted for reservation {}: needed {}, found {}",
-                                request.reservation_id,
-                                request.quantity,
-                                selected.len()
-                            )));
-                        }
-                        for mut row in selected {
-                            if row.values.get(1) != Some(&Value::U64(AVAILABLE)) {
-                                return Err(DbError::InvalidState(
-                                    "state index returned a non-available row".to_owned(),
-                                ));
-                            }
-                            row.values[1] = Value::U64(RESERVED);
-                            row.values[2] = Value::U64(request.reservation_id);
-                            row.values[3] = Value::U64(worker_id as u64);
-                            transaction.update(database, TABLE, row)?;
-                        }
-                        Ok(request.quantity)
-                    },
-                );
+                        row.values[1] = Value::U64(RESERVED);
+                        row.values[2] = Value::U64(request.reservation_id);
+                        row.values[3] = Value::U64(worker_id as u64);
+                        transaction.update(database, TABLE, row)?;
+                    }
+                    Ok(request.quantity)
+                });
                 stats.attempts += 1;
                 first_wave_complete = true;
                 match result {
@@ -439,43 +418,6 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-fn metrics_json(metrics: &RelationalMetrics) -> serde_json::Value {
-    json!({
-        "backend": format!("{:?}", metrics.backend),
-        "commit": metrics.commit.0,
-        "wal_bytes": metrics.wal_bytes,
-        "syncs": metrics.syncs,
-        "logical_page_reads": metrics.logical_page_reads,
-        "physical_page_reads": metrics.physical_page_reads,
-        "physical_page_writes": metrics.physical_page_writes,
-        "data_bytes": metrics.data_bytes,
-        "blob_bytes": metrics.blob_bytes,
-        "publication": metrics.publication.map(publication_metrics_json),
-    })
-}
-
-fn publication_metrics_json(metrics: RelationalPublicationMetrics) -> serde_json::Value {
-    json!({
-        "wal_bytes_written": metrics.wal_bytes_written,
-        "data_bytes_written": metrics.data_bytes_written,
-        "metadata_bytes_written": metrics.metadata_bytes_written,
-        "blob_bytes_written": metrics.blob_bytes_written,
-        "history_bytes_written": metrics.history_bytes_written,
-        "manifest_bytes_written": metrics.manifest_bytes_written,
-        "candidate_prepare_ns": metrics.candidate_prepare_ns,
-        "wal_write_ns": metrics.wal_write_ns,
-        "admission_ns": metrics.admission_ns,
-        "data_flush_ns": metrics.data_flush_ns,
-        "metadata_write_ns": metrics.metadata_write_ns,
-        "blob_write_ns": metrics.blob_write_ns,
-        "history_write_ns": metrics.history_write_ns,
-        "directory_sync_ns": metrics.directory_sync_ns,
-        "manifest_write_ns": metrics.manifest_write_ns,
-        "manifest_mirror_ns": metrics.manifest_mirror_ns,
-        "cleanup_ns": metrics.cleanup_ns,
-    })
-}
-
 fn latency_summary(samples: &mut [u64]) -> serde_json::Value {
     samples.sort_unstable();
     let seconds = |nanos: u64| nanos as f64 / 1_000_000_000.0;
@@ -546,15 +488,8 @@ fn unit_row(unit: u64) -> Row {
     }
 }
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn next_random(state: &mut u64) -> u64 {
@@ -583,7 +518,6 @@ fn retry_backoff(attempt: usize, workload: WorkloadConfig) -> Duration {
 
 fn parse_arguments() -> Result<WorkloadConfig> {
     let mut workload = WorkloadConfig {
-        backend: RelationalBackendKind::Seer,
         workers: DEFAULT_WORKERS,
         operations_per_worker: DEFAULT_OPERATIONS_PER_WORKER,
         max_quantity: DEFAULT_MAX_QUANTITY,
@@ -600,13 +534,6 @@ fn parse_arguments() -> Result<WorkloadConfig> {
                 .with_context(|| format!("{argument} requires a value"))
         };
         match argument.as_str() {
-            "--backend" => {
-                workload.backend = match value()?.as_str() {
-                    "temporary" => RelationalBackendKind::Temporary,
-                    "seer" => RelationalBackendKind::Seer,
-                    other => bail!("unsupported backend {other}"),
-                };
-            }
             "--workers" => workload.workers = value()?.parse().context("invalid --workers")?,
             "--operations" => {
                 workload.operations_per_worker = value()?.parse().context("invalid --operations")?
@@ -629,7 +556,7 @@ fn parse_arguments() -> Result<WorkloadConfig> {
             "--seed" => workload.seed = value()?.parse().context("invalid --seed")?,
             "--help" => {
                 println!(
-                    "usage: project_allocation [--backend temporary|seer] [--workers N] [--operations N] [--max-quantity N] [--max-retries N] [--retry-backoff-micros N] [--retry-backoff-max-micros N] [--seed N]"
+                    "usage: project_allocation [--workers N] [--operations N] [--max-quantity N] [--max-retries N] [--retry-backoff-micros N] [--retry-backoff-max-micros N] [--seed N]"
                 );
                 std::process::exit(0);
             }
@@ -661,7 +588,6 @@ mod tests {
     #[test]
     fn generated_requests_and_oracle_are_stable() {
         let workload = WorkloadConfig {
-            backend: RelationalBackendKind::Temporary,
             workers: 3,
             operations_per_worker: 4,
             max_quantity: 2,
@@ -693,7 +619,6 @@ mod tests {
     #[test]
     fn retry_backoff_is_exponential_and_capped() {
         let workload = WorkloadConfig {
-            backend: RelationalBackendKind::Temporary,
             workers: 2,
             operations_per_worker: 1,
             max_quantity: 1,

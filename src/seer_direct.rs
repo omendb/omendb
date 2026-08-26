@@ -15,8 +15,7 @@ use seerdb::{CommitSeq, Error as SeerError, Options, Transaction, TransactionDat
 use crate::relational::{
     Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, RelationalSchemaDefinition, Row,
     TableDefinition, TableId, Value, encode_catalog, encode_row, foreign_key_values,
-    index_values_key, row_from_storage_identity, row_identity_bytes,
-    row_index_key,
+    index_values_key, row_from_storage_identity, row_identity_bytes, row_index_key,
 };
 use crate::{DbError, IndexId, Result};
 
@@ -441,15 +440,13 @@ impl DirectSeerStore {
 
     /// Return the latest published commit sequence number.
     pub(crate) fn commit_seq(&self) -> CommitSeq {
-        self.database.commit_sequence().expect("open database reports its CSN")
+        self.database
+            .commit_sequence()
+            .expect("open database reports its CSN")
     }
 
     /// Look up one row through its encoded composite identity.
-    pub(crate) fn get_by_identity(
-        &self,
-        table: TableId,
-        identity: &[u8],
-    ) -> Result<Option<Row>> {
+    pub(crate) fn get_by_identity(&self, table: TableId, identity: &[u8]) -> Result<Option<Row>> {
         self.get(table, identity)
     }
 
@@ -828,7 +825,12 @@ impl DirectTransaction {
                     artifact: "direct SeerDB index",
                     reason: "index entry references a missing row".to_owned(),
                 })?;
-            rows.push(row_from_storage_identity(&self.catalog, &definition, &row_identity, &bytes)?);
+            rows.push(row_from_storage_identity(
+                &self.catalog,
+                &definition,
+                &row_identity,
+                &bytes,
+            )?);
         }
         Ok(rows)
     }
@@ -943,7 +945,6 @@ impl DirectTransaction {
         }
         Ok(())
     }
-
 }
 fn validate_mapping(
     transaction: &Transaction,

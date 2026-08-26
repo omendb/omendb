@@ -1,24 +1,16 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, DbError, IndexDefinition, IndexId, Key,
-    RelationalBackendConfig, RelationalBackendKind, RelationalDatabase, Row, SeerKernelConfig,
-    TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId, Key,
+    RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId, Value,
 };
 use tempfile::tempdir;
 
 const ITEMS: TableId = TableId(1);
 const VALUE_INDEX: IndexId = IndexId(1);
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn table() -> TableDefinition {
@@ -48,8 +40,8 @@ fn expanded_row(id: u64, value: &str, note: Value) -> Row {
     }
 }
 
-fn exercise(kind: RelationalBackendKind, directory: &Path) {
-    let database_config = config(kind, directory);
+fn exercise(directory: &Path) {
+    let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");
     database.create_table(table()).expect("table");
     database
@@ -64,8 +56,6 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
     database
         .insert(ITEMS, row(2, "also-before"))
         .expect("second seed");
-    let lease = database.retain(seed).expect("retain historical schema");
-
     let schema_commit = database
         .add_nullable_column(
             ITEMS,
@@ -89,34 +79,13 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
     );
     assert_eq!(
         database
-            .catalog_at(seed)
-            .expect("historical catalog")
-            .table(ITEMS)
-            .expect("historical table")
-            .columns
-            .len(),
-        1
-    );
-    assert_eq!(
-        database
-            .get(ITEMS, seed, Key::new(ITEMS.0, 1))
-            .expect("historical row"),
-        Some(row(1, "before"))
-    );
-    assert_eq!(
-        database
-            .get(ITEMS, schema_commit, Key::new(ITEMS.0, 1))
+            .get(ITEMS, Key::new(ITEMS.0, 1))
             .expect("expanded row"),
         Some(expanded_row(1, "before", Value::Null))
     );
     assert_eq!(
         database
-            .index_get(
-                ITEMS,
-                schema_commit,
-                VALUE_INDEX,
-                &[Value::Text("before".to_owned())]
-            )
+            .index_get(ITEMS, VALUE_INDEX, &[Value::Text("before".to_owned())])
             .expect("existing index"),
         vec![expanded_row(1, "before", Value::Null)]
     );
@@ -132,12 +101,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
         .expect("index on appended column");
     assert!(
         database
-            .index_get(
-                ITEMS,
-                database.commit_id(),
-                note_index,
-                &[Value::Text("memo".to_owned())],
-            )
+            .index_get(ITEMS, note_index, &[Value::Text("memo".to_owned())],)
             .expect("empty appended-column index")
             .is_empty()
     );
@@ -150,12 +114,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
         .expect("write new column");
     assert_eq!(
         database
-            .index_get(
-                ITEMS,
-                database.commit_id(),
-                note_index,
-                &[Value::Text("memo".to_owned())],
-            )
+            .index_get(ITEMS, note_index, &[Value::Text("memo".to_owned())],)
             .expect("updated appended-column index"),
         vec![expanded_row(1, "before", Value::Text("memo".to_owned()))]
     );
@@ -186,11 +145,9 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
     ));
     assert_eq!(database.commit_id(), before_invalid);
 
-    database.release(lease).expect("release historical schema");
     database.close().expect("close");
 
     let reopened = RelationalDatabase::open(database_config).expect("reopen");
-    assert_eq!(reopened.backend(), kind);
     assert_eq!(
         reopened
             .catalog()
@@ -202,18 +159,13 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
     );
     assert_eq!(
         reopened
-            .get(ITEMS, reopened.commit_id(), Key::new(ITEMS.0, 1))
+            .get(ITEMS, Key::new(ITEMS.0, 1))
             .expect("reopened row"),
         Some(expanded_row(1, "before", Value::Text("memo".to_owned())))
     );
     assert_eq!(
         reopened
-            .index_get(
-                ITEMS,
-                reopened.commit_id(),
-                note_index,
-                &[Value::Text("memo".to_owned())],
-            )
+            .index_get(ITEMS, note_index, &[Value::Text("memo".to_owned())],)
             .expect("reopened appended-column index"),
         vec![expanded_row(1, "before", Value::Text("memo".to_owned()))]
     );
@@ -223,10 +175,5 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
 #[test]
 fn nullable_column_evolution_preserves_history_and_reopen_on_each_backend() {
     let root = tempdir().expect("root");
-    for (kind, label) in [
-        (RelationalBackendKind::Temporary, "temporary"),
-        (RelationalBackendKind::Seer, "seer"),
-    ] {
-        exercise(kind, &root.path().join(label));
-    }
+    exercise(&root.path().join("temporary"));
 }

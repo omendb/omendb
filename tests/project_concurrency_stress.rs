@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use omendb::pgwire_server;
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, RelationalBackendConfig,
-    RelationalDatabase, TableDefinition, TableId,
+    ColumnDefinition, ColumnId, ColumnType, RelationalBackendConfig, RelationalDatabase,
+    TableDefinition, TableId,
 };
 use tokio_postgres::{NoTls, error::SqlState};
 
@@ -59,10 +59,8 @@ async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
 async fn concurrent_rmw_transactions_never_lose_updates() {
     let directory = tempfile::tempdir().expect("tempdir");
     let mut database =
-        RelationalDatabase::create(RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.path().to_path_buf(),
-        }))
-        .expect("database");
+        RelationalDatabase::create(RelationalBackendConfig::new(directory.path().join("db")))
+            .expect("database");
     database
         .create_table(TableDefinition {
             id: TableId(9),

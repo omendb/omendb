@@ -1,10 +1,10 @@
 //! Exercise the project-facing session with concurrent callers using an
 //! independent update/delete oracle.
 //!
-//! This runner qualifies concurrent callers, admission, retained snapshots,
-//! indexed reads, and maintenance interference. The current OmenDB profile
-//! still gives writes one exclusive publication lane; this is not evidence for
-//! parallel-writer isolation or a production benchmark.
+//! This runner qualifies concurrent callers, admission, and indexed reads.
+//! The current OmenDB profile still gives writes one exclusive publication
+//! lane; this is not evidence for parallel-writer isolation or a production
+//! benchmark.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use omendb::{
-    ColumnId, CommitId, DbError, IndexDefinition, IndexId, IndexScanRequest, Key, OperationControl,
-    RelationalBackendKind, RelationalCompactionBudget, RelationalDatabaseConfig,
+    ColumnId, DbError, IndexDefinition, IndexId, Key, OperationControl, RelationalDatabaseConfig,
     RelationalDatabaseSession, Row, TableId, Value,
 };
 use serde_json::json;
@@ -24,12 +23,10 @@ use sha2::{Digest, Sha256};
 mod support;
 
 use support::{
-    config, control_row, control_table, elapsed_nanos, latency_summary, next_random,
-    parse_arguments, row, table, validate,
+    config, elapsed_nanos, latency_summary, next_random, parse_arguments, row, table, validate,
 };
 
 const TABLE: TableId = TableId(70);
-const CONTROL_TABLE: TableId = TableId(71);
 const VALUE_INDEX: IndexId = IndexId(70);
 const OWNER_INDEX: IndexId = IndexId(71);
 const PAYLOAD_INDEX: IndexId = IndexId(72);
@@ -38,37 +35,19 @@ const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_OPERATIONS_PER_WORKER: usize = 128;
 const DEFAULT_ROWS: u64 = 4_096;
 const DEFAULT_HOT_ROWS: u64 = 256;
-const DEFAULT_RETAINED_SNAPSHOTS: usize = 4;
-const DEFAULT_RETAINED_SCAN_LIMIT: usize = 64;
 const DEFAULT_INDEXED_READ_LIMIT: usize = 64;
 const DEFAULT_SEED: u64 = 0xDB0E_2026_0813;
 const DEFAULT_ADMISSION_TIMEOUT_SECONDS: u64 = 300;
-const DEFAULT_MAINTENANCE_DELAY_MILLIS: u64 = 10;
-const DEFAULT_MAINTENANCE_WORK_UNITS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 struct WorkloadConfig {
-    backend: RelationalBackendKind,
     workers: usize,
     operations_per_worker: usize,
     rows: u64,
     hot_rows: u64,
-    retained_snapshots: usize,
-    retained_scan_limit: usize,
     indexed_read_limit: usize,
     seed: u64,
     admission_timeout: Duration,
-    maintenance: bool,
-    maintenance_delay: Duration,
-    maintenance_work_units: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OperationKind {
-    Update,
-    Delete,
-    IndexedRead,
-    RetainedScan,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +55,13 @@ struct Operation {
     kind: OperationKind,
     key: u64,
     delta: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationKind {
+    Update,
+    Delete,
+    IndexedRead,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,17 +76,8 @@ struct WorkerStats {
     updates: u64,
     deletes: u64,
     indexed_reads: u64,
-    retained_scans: u64,
     read_latencies_ns: Vec<u64>,
     write_latencies_ns: Vec<u64>,
-}
-
-#[derive(Debug)]
-struct MaintenanceStats {
-    attempted: bool,
-    completed: bool,
-    elapsed: Duration,
-    report: Option<serde_json::Value>,
 }
 
 fn main() -> Result<()> {
@@ -113,12 +90,11 @@ fn main() -> Result<()> {
 
     let directory = tempfile::tempdir().context("create concurrent workload directory")?;
     let database_directory = directory.path().join("database");
-    let database_config =
-        RelationalDatabaseConfig::new(config(workload.backend, &database_directory))
-            .with_session_config(omendb::RelationalSessionConfig {
-                max_in_flight: workload.workers.max(2),
-                admission_timeout: workload.admission_timeout,
-            });
+    let database_config = RelationalDatabaseConfig::new(config(&database_directory))
+        .with_session_config(omendb::RelationalSessionConfig {
+            max_in_flight: workload.workers.max(2),
+            admission_timeout: workload.admission_timeout,
+        });
     let session = RelationalDatabaseSession::create(database_config.clone())
         .context("create project-facing concurrent session")?;
     let session = Arc::new(session);
@@ -126,36 +102,17 @@ fn main() -> Result<()> {
     create_schema(&session, &control)?;
     seed(&session, workload.rows)?;
 
-    let (leases, retained_commits) =
-        prepare_retained_snapshots(&session, &control, workload.retained_snapshots)?;
-    let retained_commits = Arc::new(retained_commits);
-    let initial_prefix_digest = digest_expected_prefix(workload.rows, workload.retained_scan_limit);
-    let barrier = Arc::new(Barrier::new(
-        workload.workers + usize::from(workload.maintenance) + 1,
-    ));
+    let barrier = Arc::new(Barrier::new(workload.workers + 1));
     let started = Instant::now();
     let mut workers = Vec::with_capacity(workload.workers);
-    for (worker_id, worker_operations) in operations.iter().enumerate() {
+    for worker_operations in operations.iter() {
         workers.push(spawn_worker(
             Arc::clone(&session),
             Arc::clone(&barrier),
-            Arc::clone(&retained_commits),
-            worker_id,
             workload,
             worker_operations.clone(),
-            initial_prefix_digest.clone(),
         ));
     }
-    let maintenance = if workload.maintenance {
-        Some(spawn_maintenance(
-            Arc::clone(&session),
-            Arc::clone(&barrier),
-            workload.maintenance_delay,
-            workload.maintenance_work_units,
-        ))
-    } else {
-        None
-    };
     barrier.wait();
 
     let mut stats = WorkerStats::default();
@@ -168,7 +125,6 @@ fn main() -> Result<()> {
                 stats.updates += worker_stats.updates;
                 stats.deletes += worker_stats.deletes;
                 stats.indexed_reads += worker_stats.indexed_reads;
-                stats.retained_scans += worker_stats.retained_scans;
                 read_latencies_ns.extend(worker_stats.read_latencies_ns);
                 write_latencies_ns.extend(worker_stats.write_latencies_ns);
             }
@@ -184,24 +140,6 @@ fn main() -> Result<()> {
             }
         }
     }
-    let maintenance = match maintenance {
-        Some(worker) => match worker.join() {
-            Ok(Ok(stats)) => Some(stats),
-            Ok(Err(error)) => {
-                if workload_error.is_none() {
-                    workload_error = Some(error);
-                }
-                None
-            }
-            Err(_) => {
-                if workload_error.is_none() {
-                    workload_error = Some(anyhow::anyhow!("maintenance worker panicked"));
-                }
-                None
-            }
-        },
-        None => None,
-    };
     if let Some(error) = workload_error {
         return Err(error);
     }
@@ -211,7 +149,7 @@ fn main() -> Result<()> {
         .commit_id(&control)
         .context("read final concurrent commit frontier")?;
     let final_rows = session
-        .scan(&control, TABLE, final_commit, usize::MAX)
+        .scan(&control, TABLE, usize::MAX)
         .context("scan final concurrent state")?;
     assert_expected_state(&final_rows, &expected)?;
     if stats.updates != expected_update_count(&operations)
@@ -224,21 +162,6 @@ fn main() -> Result<()> {
             expected_update_count(&operations),
             expected_delete_count(&operations)
         );
-    }
-    let verification = session
-        .verify(&control)
-        .context("verify concurrent state")?;
-    let before_release = verify_retained_prefixes(
-        &session,
-        &control,
-        &retained_commits,
-        workload.retained_scan_limit,
-        &initial_prefix_digest,
-    )?;
-    for lease in leases {
-        session
-            .release(&control, lease)
-            .context("release retained snapshot")?;
     }
     let admission = session
         .admission_status()
@@ -254,31 +177,17 @@ fn main() -> Result<()> {
         .context("close concurrent workload session")?;
     let reopened = RelationalDatabaseSession::open(database_config)
         .context("reopen concurrent workload session")?;
-    let reopened = Arc::new(reopened);
     let reopened_commit = reopened
         .commit_id(&control)
         .context("read reopened concurrent frontier")?;
     let reopened_rows = reopened
-        .scan(&control, TABLE, reopened_commit, usize::MAX)
+        .scan(&control, TABLE, usize::MAX)
         .context("scan reopened concurrent state")?;
     assert_expected_state(&reopened_rows, &expected)?;
-    let reopened_verification = reopened
-        .verify(&control)
-        .context("verify reopened concurrent state")?;
-    let reopened = Arc::try_unwrap(reopened)
-        .map_err(|_| anyhow::anyhow!("reopened concurrent session still has references"))?;
     reopened
         .close()
         .context("close reopened concurrent session")?;
 
-    let maintenance_json = maintenance.as_ref().map(|maintenance| {
-        json!({
-            "attempted": maintenance.attempted,
-            "completed": maintenance.completed,
-            "elapsed_seconds": maintenance.elapsed.as_secs_f64(),
-            "report": maintenance.report,
-        })
-    });
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -287,14 +196,11 @@ fn main() -> Result<()> {
             "hardware_benchmark": false,
             "parallel_writer_claim": false,
             "serialized_write_lane": true,
-            "backend": format!("{:?}", workload.backend),
             "workers": workload.workers,
             "operations_per_worker": workload.operations_per_worker,
             "total_operation_attempts": total_operations(&operations),
             "rows": workload.rows,
             "hot_rows": workload.hot_rows,
-            "retained_snapshots": workload.retained_snapshots,
-            "retained_scan_limit": workload.retained_scan_limit,
             "indexed_read_limit": workload.indexed_read_limit,
             "seed": workload.seed,
             "operation_trace_sha256": operation_digest,
@@ -302,33 +208,25 @@ fn main() -> Result<()> {
                 "updates": expected_update_count(&operations),
                 "deletes": expected_delete_count(&operations),
                 "indexed_reads": expected_indexed_read_count(&operations),
-                "retained_scans": expected_retained_scan_count(&operations),
             },
             "elapsed_seconds": elapsed.as_secs_f64(),
             "successful_operations": {
                 "updates": stats.updates,
                 "deletes": stats.deletes,
                 "indexed_reads": stats.indexed_reads,
-                "retained_scans": stats.retained_scans,
             },
             "expected": {
                 "initial_digest": initial_digest,
                 "final_digest": digest_expected_rows(&expected),
                 "final_row_count": expected.len(),
-                "retained_prefix_digest": initial_prefix_digest,
-                "retained_prefix_checks": before_release,
             },
             "actual": {
                 "final_commit": final_commit.0,
                 "final_digest": digest_rows(&final_rows)?,
                 "final_row_count": final_rows.len(),
-                "verification": verification_json(&verification),
                 "reopened_commit": reopened_commit.0,
                 "reopened_digest": digest_rows(&reopened_rows)?,
-                "reopened_verification": verification_json(&reopened_verification),
             },
-            "maintenance": maintenance_json,
-            "maintenance_work_units": workload.maintenance_work_units,
             "latency": {
                 "reads": latency_summary(&mut read_latencies_ns),
                 "writes": latency_summary(&mut write_latencies_ns),
@@ -356,9 +254,6 @@ fn create_schema(session: &RelationalDatabaseSession, control: &OperationControl
     session
         .create_table(control, table())
         .context("create R2 concurrent table")?;
-    session
-        .create_table(control, control_table())
-        .context("create R2 retention control table")?;
     for index in [
         IndexDefinition {
             id: VALUE_INDEX,
@@ -393,46 +288,22 @@ fn seed(session: &RelationalDatabaseSession, rows: u64) -> Result<()> {
             for key in 0..rows {
                 transaction.insert(database, TABLE, row(key, 0, key % 32, key))?;
             }
-            transaction.insert(database, CONTROL_TABLE, control_row(0))?;
             Ok(())
         })
         .context("seed R2 concurrent rows")?;
     Ok(())
 }
 
-fn prepare_retained_snapshots(
-    session: &RelationalDatabaseSession,
-    control: &OperationControl,
-    count: usize,
-) -> Result<(Vec<omendb::RelationalSnapshotLease>, Vec<CommitId>)> {
-    let mut leases = Vec::with_capacity(count);
-    let mut commits = Vec::with_capacity(count);
-    let seed_commit = session.commit_id(control)?;
-    leases.push(session.retain(control, seed_commit)?);
-    commits.push(seed_commit);
-    for marker in 1..count {
-        let commit = session
-            .update(control, CONTROL_TABLE, control_row(marker as u64))
-            .context("publish retained-snapshot marker")?;
-        leases.push(session.retain(control, commit)?);
-        commits.push(commit);
-    }
-    Ok((leases, commits))
-}
-
 fn spawn_worker(
     session: Arc<RelationalDatabaseSession>,
     barrier: Arc<Barrier>,
-    retained_commits: Arc<Vec<CommitId>>,
-    worker_id: usize,
     workload: WorkloadConfig,
     operations: Vec<Operation>,
-    initial_prefix_digest: String,
 ) -> thread::JoinHandle<Result<WorkerStats>> {
     thread::spawn(move || {
         barrier.wait();
         let mut stats = WorkerStats::default();
-        for (operation_index, operation) in operations.iter().copied().enumerate() {
+        for operation in operations.iter().copied() {
             let control = OperationControl::default();
             let started = Instant::now();
             match operation.kind {
@@ -449,38 +320,10 @@ fn spawn_worker(
                     stats.write_latencies_ns.push(elapsed_nanos(started));
                 }
                 OperationKind::IndexedRead => {
-                    let lease = session.retain_current(&control)?;
-                    let snapshot = lease.snapshot();
-                    let rows = session.index_scan(
-                        &control,
-                        IndexScanRequest {
-                            table: TABLE,
-                            snapshot,
-                            index: VALUE_INDEX,
-                            start: Some(vec![Value::U64(0)]),
-                            end: Some(vec![Value::U64(u64::MAX)]),
-                            limit: workload.indexed_read_limit,
-                        },
-                    );
-                    let release = session.release(&control, lease);
-                    let rows = rows?;
-                    release?;
-                    validate_index_read(&rows)?;
+                    let rows = session.index_scan(&control, TABLE, VALUE_INDEX)?;
+                    let rows = &rows[..rows.len().min(workload.indexed_read_limit)];
+                    validate_index_read(rows)?;
                     stats.indexed_reads += 1;
-                    stats.read_latencies_ns.push(elapsed_nanos(started));
-                }
-                OperationKind::RetainedScan => {
-                    let snapshot = retained_commits[operation_index % retained_commits.len()];
-                    let rows =
-                        session.scan(&control, TABLE, snapshot, workload.retained_scan_limit)?;
-                    if rows.len() != workload.retained_scan_limit
-                        || digest_rows(&rows)? != initial_prefix_digest
-                    {
-                        bail!(
-                            "worker {worker_id} retained snapshot {snapshot:?} changed at operation {operation_index}"
-                        );
-                    }
-                    stats.retained_scans += 1;
                     stats.read_latencies_ns.push(elapsed_nanos(started));
                 }
             }
@@ -518,60 +361,6 @@ fn update_one(
     Ok(())
 }
 
-fn spawn_maintenance(
-    session: Arc<RelationalDatabaseSession>,
-    barrier: Arc<Barrier>,
-    delay: Duration,
-    max_work_units: usize,
-) -> thread::JoinHandle<Result<MaintenanceStats>> {
-    thread::spawn(move || {
-        barrier.wait();
-        thread::sleep(delay);
-        let started = Instant::now();
-        let report = session
-            .compact_with_budget(
-                &OperationControl::default(),
-                RelationalCompactionBudget::new(max_work_units),
-            )
-            .context("R2 concurrent maintenance")?;
-        Ok(MaintenanceStats {
-            attempted: true,
-            completed: true,
-            elapsed: started.elapsed(),
-            report: Some(json!({
-                "before_commit": report.before.commit.0,
-                "after_commit": report.after.commit.0,
-                "budget_work_units": report.budget.max_work_units,
-                "work_units_consumed": report.work_units_consumed,
-                "row_keys_considered": report.row_keys_considered,
-                "index_keys_considered": report.index_keys_considered,
-                "row_fragments_reclaimed": report.row_fragments_reclaimed,
-                "index_fragments_reclaimed": report.index_fragments_reclaimed,
-                "data_bytes_before": report.data_bytes_before,
-                "data_bytes_after": report.data_bytes_after,
-                "reclaimed_pages": report.reclaimed_pages,
-                "relocated_pages": report.relocated_pages,
-            })),
-        })
-    })
-}
-
-fn verify_retained_prefixes(
-    session: &RelationalDatabaseSession,
-    control: &OperationControl,
-    commits: &[CommitId],
-    limit: usize,
-    expected_digest: &str,
-) -> Result<usize> {
-    for commit in commits {
-        let rows = session.scan(control, TABLE, *commit, limit)?;
-        if rows.len() != limit || digest_rows(&rows)? != expected_digest {
-            bail!("retained snapshot {commit:?} failed post-maintenance verification");
-        }
-    }
-    Ok(commits.len())
-}
-
 fn generate_operations(workload: &WorkloadConfig) -> Vec<Vec<Operation>> {
     (0..workload.workers)
         .map(|worker_id| {
@@ -587,7 +376,7 @@ fn generate_operations(workload: &WorkloadConfig) -> Vec<Vec<Operation>> {
                             key: next_random(&mut random) % workload.hot_rows,
                             delta: 1 + next_random(&mut random) % 3,
                         }
-                    } else if sample < 75 {
+                    } else if sample < 80 {
                         let global = worker_id * workload.operations_per_worker + operation_index;
                         Operation {
                             kind: OperationKind::Delete,
@@ -596,15 +385,9 @@ fn generate_operations(workload: &WorkloadConfig) -> Vec<Vec<Operation>> {
                                 + global as u64,
                             delta: 0,
                         }
-                    } else if sample < 90 {
-                        Operation {
-                            kind: OperationKind::IndexedRead,
-                            key: 0,
-                            delta: 0,
-                        }
                     } else {
                         Operation {
-                            kind: OperationKind::RetainedScan,
+                            kind: OperationKind::IndexedRead,
                             key: 0,
                             delta: 0,
                         }
@@ -636,7 +419,7 @@ fn expected_rows(
                 OperationKind::Delete => {
                     rows.remove(&operation.key);
                 }
-                OperationKind::IndexedRead | OperationKind::RetainedScan => {}
+                OperationKind::IndexedRead => {}
             }
         }
     }
@@ -713,10 +496,6 @@ fn expected_indexed_read_count(operations: &[Vec<Operation>]) -> u64 {
     count_kind(operations, OperationKind::IndexedRead)
 }
 
-fn expected_retained_scan_count(operations: &[Vec<Operation>]) -> u64 {
-    count_kind(operations, OperationKind::RetainedScan)
-}
-
 fn count_kind(operations: &[Vec<Operation>], expected: OperationKind) -> u64 {
     operations
         .iter()
@@ -727,12 +506,6 @@ fn count_kind(operations: &[Vec<Operation>], expected: OperationKind) -> u64 {
 
 fn total_operations(operations: &[Vec<Operation>]) -> u64 {
     operations.iter().map(Vec::len).sum::<usize>() as u64
-}
-
-fn digest_expected_prefix(rows: u64, limit: usize) -> String {
-    let initial = initial_rows(rows);
-    let prefix = initial.into_iter().take(limit).collect::<BTreeMap<_, _>>();
-    digest_expected_rows(&prefix)
 }
 
 fn digest_expected_rows(rows: &BTreeMap<u64, ExpectedRow>) -> String {
@@ -771,22 +544,6 @@ fn record_key(key: Key) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn verification_json(report: &omendb::RelationalVerificationReport) -> serde_json::Value {
-    json!({
-        "backend": format!("{:?}", report.backend),
-        "commit": report.commit.0,
-        "catalog_generation": report.catalog_generation,
-        "verified_tables": report.verified_tables,
-        "verified_indexes": report.verified_indexes,
-        "verified_rows": report.verified_rows,
-        "verified_index_entries": report.verified_index_entries,
-        "physical_pages": report.physical_pages,
-        "data_bytes": report.data_bytes,
-        "blob_bytes": report.blob_bytes,
-        "wal_bytes": report.wal_bytes,
-    })
-}
-
 fn digest_operations(operations: &[Vec<Operation>]) -> String {
     let mut digest = Sha256::new();
     for worker in operations {
@@ -795,7 +552,6 @@ fn digest_operations(operations: &[Vec<Operation>]) -> String {
                 OperationKind::Update => 0,
                 OperationKind::Delete => 1,
                 OperationKind::IndexedRead => 2,
-                OperationKind::RetainedScan => 3,
             }]);
             digest.update(operation.key.to_le_bytes());
             digest.update(operation.delta.to_le_bytes());
@@ -817,25 +573,18 @@ mod tests {
     use super::{
         OperationKind, WorkloadConfig, digest_operations, expected_rows, generate_operations,
     };
-    use omendb::RelationalBackendKind;
     use std::time::Duration;
 
     #[test]
     fn generated_trace_is_stable_and_mutations_are_disjoint() {
         let workload = WorkloadConfig {
-            backend: RelationalBackendKind::Temporary,
             workers: 4,
             operations_per_worker: 32,
             rows: 512,
             hot_rows: 32,
-            retained_snapshots: 2,
-            retained_scan_limit: 8,
             indexed_read_limit: 8,
             seed: 7,
             admission_timeout: Duration::from_secs(1),
-            maintenance: false,
-            maintenance_delay: Duration::ZERO,
-            maintenance_work_units: 64,
         };
         let first = generate_operations(&workload);
         let second = generate_operations(&workload);

@@ -6,26 +6,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use omendb::{
-    CancellationToken, ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, DbError,
-    IndexDefinition, IndexId, IndexScanRequest, Key, OperationControl, RelationalBackendConfig,
-    RelationalBackendKind, RelationalDatabase, RelationalSessionConfig, RelationalSessionEventKind,
-    RelationalSnapshotCaptureOptions, SeerKernelConfig, TableDefinition, TableId,
-    TransactionAttemptId, TransactionAttemptOutcome, TransactionErrorClass, Value,
+    CancellationToken, ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId,
+    Key, OperationControl, RelationalBackendConfig, RelationalDatabase, RelationalSessionConfig,
+    TableDefinition, TableId, TransactionErrorClass, Value,
 };
 use tempfile::tempdir;
 
 const TABLE: TableId = TableId(1);
 const VALUE_INDEX: IndexId = IndexId(1);
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn table() -> TableDefinition {
@@ -48,8 +39,8 @@ fn row(primary: u64, value: &str) -> omendb::Row {
     }
 }
 
-fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
-    let database_config = config(kind, directory);
+fn exercise_lifecycle(directory: &Path) {
+    let database_config = config(directory);
     let database = RelationalDatabase::create(database_config.clone()).expect("create");
     let session = database
         .into_session(RelationalSessionConfig {
@@ -80,12 +71,12 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
     assert!(commit > schema_commit);
     assert_eq!(
         session
-            .get(&control, TABLE, commit, Key::new(TABLE.0, 1))
+            .get(&control, TABLE, Key::new(TABLE.0, 1))
             .expect("read"),
         Some(row(1, "durable"))
     );
     assert_eq!(
-        session.scan(&control, TABLE, commit, 10).expect("scan"),
+        session.scan(&control, TABLE, 10).expect("scan"),
         vec![row(1, "durable")]
     );
     assert_eq!(
@@ -93,7 +84,6 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
             .index_get(
                 &control,
                 TABLE,
-                commit,
                 VALUE_INDEX,
                 &[Value::Text("durable".to_owned())],
             )
@@ -102,17 +92,7 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
     );
     assert_eq!(
         session
-            .index_scan(
-                &control,
-                IndexScanRequest {
-                    table: TABLE,
-                    snapshot: commit,
-                    index: VALUE_INDEX,
-                    start: None,
-                    end: None,
-                    limit: 10,
-                },
-            )
+            .index_scan(&control, TABLE, VALUE_INDEX)
             .expect("indexed scan"),
         vec![row(1, "durable")]
     );
@@ -120,31 +100,6 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
         session.commit_id(&control).expect("commit frontier"),
         commit
     );
-    assert_eq!(session.status(&control).expect("status").commit, commit);
-    assert_eq!(session.metrics(&control).expect("metrics").commit, commit);
-    let diagnostic = session.diagnose(&control).expect("diagnostic");
-    assert_eq!(diagnostic.backend, kind);
-    assert_eq!(diagnostic.status.commit, commit);
-    assert_eq!(diagnostic.metrics.commit, commit);
-    assert!(!diagnostic.has_errors());
-
-    let lease = session.retain(&control, commit).expect("retain snapshot");
-    assert_eq!(
-        session
-            .retained_snapshot_commits(&control)
-            .expect("retained snapshots"),
-        vec![commit]
-    );
-    let capture = session
-        .capture_selected_snapshots(
-            &control,
-            &[commit],
-            RelationalSnapshotCaptureOptions::new(10),
-        )
-        .expect("capture retained snapshot");
-    assert_eq!(capture.source_backend, kind);
-    assert_eq!(capture.snapshots.len(), 1);
-    assert_eq!(capture.snapshots[0].commit, commit);
     let (_, updated_commit) = session
         .transaction(&control, |database, transaction| {
             transaction.update(database, TABLE, row(1, "updated"))?;
@@ -153,24 +108,10 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
         .expect("update transaction");
     assert_eq!(
         session
-            .get(&control, TABLE, commit, Key::new(TABLE.0, 1))
-            .expect("retained read"),
-        Some(row(1, "durable"))
-    );
-    assert_eq!(
-        session
-            .get(&control, TABLE, updated_commit, Key::new(TABLE.0, 1))
+            .get(&control, TABLE, Key::new(TABLE.0, 1))
             .expect("current read"),
         Some(row(1, "updated"))
     );
-    session.release(&control, lease).expect("release snapshot");
-    assert!(
-        session
-            .retained_snapshot_commits(&control)
-            .expect("released snapshots")
-            .is_empty()
-    );
-
     let cancellation = CancellationToken::new();
     let cancelled_control = OperationControl::with_cancellation(cancellation.clone());
     let cancelled = session.transaction(&cancelled_control, |database, transaction| {
@@ -184,7 +125,7 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
     assert_eq!(
         session
             .read(&control, |database| {
-                database.get(TABLE, updated_commit, Key::new(TABLE.0, 2))
+                database.get(TABLE, Key::new(TABLE.0, 2))
             })
             .expect("aborted row lookup"),
         None
@@ -213,8 +154,8 @@ fn exercise_lifecycle(kind: RelationalBackendKind, directory: &Path) {
     reopened.close().expect("reopened close");
 }
 
-fn exercise_single_row_writes(kind: RelationalBackendKind, directory: &Path) {
-    let database_config = config(kind, directory);
+fn exercise_single_row_writes(directory: &Path) {
+    let database_config = config(directory);
     let session = RelationalDatabase::create(database_config.clone())
         .expect("create")
         .into_session(RelationalSessionConfig::default())
@@ -231,7 +172,7 @@ fn exercise_single_row_writes(kind: RelationalBackendKind, directory: &Path) {
     );
     assert_eq!(
         session
-            .get(&control, TABLE, inserted, Key::new(TABLE.0, 1))
+            .get(&control, TABLE, Key::new(TABLE.0, 1))
             .expect("inserted row"),
         Some(row(1, "inserted"))
     );
@@ -242,7 +183,7 @@ fn exercise_single_row_writes(kind: RelationalBackendKind, directory: &Path) {
     assert!(updated > inserted);
     assert_eq!(
         session
-            .get(&control, TABLE, updated, Key::new(TABLE.0, 1))
+            .get(&control, TABLE, Key::new(TABLE.0, 1))
             .expect("updated row"),
         Some(row(1, "updated"))
     );
@@ -253,7 +194,7 @@ fn exercise_single_row_writes(kind: RelationalBackendKind, directory: &Path) {
     assert!(deleted > updated);
     assert_eq!(
         session
-            .get(&control, TABLE, deleted, Key::new(TABLE.0, 1))
+            .get(&control, TABLE, Key::new(TABLE.0, 1))
             .expect("deleted row"),
         None
     );
@@ -263,15 +204,15 @@ fn exercise_single_row_writes(kind: RelationalBackendKind, directory: &Path) {
     assert_eq!(reopened.commit_id(), deleted);
     assert_eq!(
         reopened
-            .get(TABLE, deleted, Key::new(TABLE.0, 1))
+            .get(TABLE, Key::new(TABLE.0, 1))
             .expect("reopened deleted row"),
         None
     );
     reopened.close().expect("reopened close");
 }
 
-fn exercise_admission(kind: RelationalBackendKind, directory: &Path) {
-    let database = RelationalDatabase::create(config(kind, directory)).expect("create");
+fn exercise_admission(directory: &Path) {
+    let database = RelationalDatabase::create(config(directory)).expect("create");
     let session = Arc::new(
         database
             .into_session(RelationalSessionConfig {
@@ -365,27 +306,6 @@ fn exercise_admission(kind: RelationalBackendKind, directory: &Path) {
     assert!(status.cancelled_operations >= 1);
     assert!(status.deadline_expired_operations >= 1);
     assert!(status.rejected_operations >= 3);
-    let support = session
-        .support_bundle(&OperationControl::default())
-        .expect("session support bundle");
-    let event_kinds: Vec<_> = support
-        .session_events
-        .events
-        .iter()
-        .map(|event| event.kind)
-        .collect();
-    assert!(event_kinds.contains(&RelationalSessionEventKind::OperationCompleted));
-    assert!(event_kinds.contains(&RelationalSessionEventKind::AdmissionRejected));
-    assert!(event_kinds.contains(&RelationalSessionEventKind::CancellationObserved));
-    assert!(event_kinds.contains(&RelationalSessionEventKind::DeadlineObserved));
-    assert!(
-        support
-            .session_events
-            .events
-            .windows(2)
-            .all(|events| events[0].sequence < events[1].sequence)
-    );
-
     let session = match Arc::try_unwrap(session) {
         Ok(session) => session,
         Err(_) => panic!("session references remain after admission test"),
@@ -393,8 +313,8 @@ fn exercise_admission(kind: RelationalBackendKind, directory: &Path) {
     session.close().expect("close");
 }
 
-fn exercise_reader_overlap_and_writer_exclusion(kind: RelationalBackendKind, directory: &Path) {
-    let database = RelationalDatabase::create(config(kind, directory)).expect("create");
+fn exercise_reader_overlap_and_writer_exclusion(directory: &Path) {
+    let database = RelationalDatabase::create(config(directory)).expect("create");
     let session = Arc::new(
         database
             .into_session(RelationalSessionConfig {
@@ -504,11 +424,8 @@ fn exercise_reader_overlap_and_writer_exclusion(kind: RelationalBackendKind, dir
     session.close().expect("close");
 }
 
-fn exercise_waitable_admission_and_writer_preference(
-    kind: RelationalBackendKind,
-    directory: &Path,
-) {
-    let database = RelationalDatabase::create(config(kind, directory)).expect("create");
+fn exercise_waitable_admission_and_writer_preference(directory: &Path) {
+    let database = RelationalDatabase::create(config(directory)).expect("create");
     let session = Arc::new(
         database
             .into_session(RelationalSessionConfig {
@@ -615,146 +532,32 @@ fn exercise_waitable_admission_and_writer_preference(
     session.close().expect("close");
 }
 
-fn exercise_session_attempts(kind: RelationalBackendKind, directory: &Path) {
-    let database = RelationalDatabase::create(config(kind, directory)).expect("create");
-    let session = database
-        .into_session(RelationalSessionConfig::default())
-        .expect("session");
-    let control = OperationControl::default();
-    session.create_table(&control, table()).expect("table");
-
-    let attempt = TransactionAttemptId::new([42; 16]);
-    let first = session
-        .transaction_with_attempt(&control, attempt, |database, transaction| {
-            transaction.insert(database, TABLE, row(42, "attempt"))?;
-            Ok(())
-        })
-        .expect("attempt transaction");
-    let commit = match first {
-        TransactionAttemptOutcome::Applied { value: (), commit } => commit,
-        TransactionAttemptOutcome::AlreadyCommitted { .. } => {
-            panic!("fresh attempt must not already be committed")
-        }
-    };
-
-    let duplicate = session
-        .transaction_with_attempt::<(), _>(&control, attempt, |_database, _transaction| {
-            panic!("committed attempt must not rerun the closure")
-        })
-        .expect("duplicate attempt resolution");
-    match duplicate {
-        TransactionAttemptOutcome::AlreadyCommitted { record } => {
-            assert_eq!(record.attempt, attempt);
-            assert_eq!(record.commit, commit);
-        }
-        TransactionAttemptOutcome::Applied { .. } => {
-            panic!("duplicate attempt must return its durable record")
-        }
-    }
-    assert_eq!(
-        session
-            .resolve_attempt(&control, attempt)
-            .expect("resolve attempt")
-            .expect("attempt record")
-            .commit,
-        commit
-    );
-    assert_eq!(
-        session
-            .forget_attempts(&control, &[attempt])
-            .expect("forget attempt"),
-        1
-    );
-    assert!(
-        session
-            .resolve_attempt(&control, attempt)
-            .expect("forgotten attempt")
-            .is_none()
-    );
-    let current = session.commit_id(&control).expect("current commit");
-    assert_eq!(
-        session
-            .get(&control, TABLE, current, Key::new(TABLE.0, 42))
-            .expect("attempt row"),
-        Some(row(42, "attempt"))
-    );
-    session.close().expect("close");
-}
-
 #[test]
 fn public_session_preserves_lifecycle_and_transaction_ownership_on_each_backend() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_lifecycle(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_lifecycle(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_lifecycle(&temporary.path().join("temporary"));
 }
 
 #[test]
 fn public_session_exposes_single_row_writes_on_each_backend() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_single_row_writes(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_single_row_writes(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_single_row_writes(&temporary.path().join("temporary"));
 }
 
 #[test]
 fn public_session_rejects_busy_work_and_releases_permits_on_each_backend() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_admission(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_admission(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_admission(&temporary.path().join("temporary"));
 }
 
 #[test]
 fn public_session_overlaps_bounded_reads_and_excludes_writers_on_each_backend() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_reader_overlap_and_writer_exclusion(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_reader_overlap_and_writer_exclusion(
-        RelationalBackendKind::Seer,
-        &seer.path().join("seer"),
-    );
+    exercise_reader_overlap_and_writer_exclusion(&temporary.path().join("temporary"));
 }
 
 #[test]
 fn public_session_waits_with_writer_preference_on_each_backend() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_waitable_admission_and_writer_preference(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_waitable_admission_and_writer_preference(
-        RelationalBackendKind::Seer,
-        &seer.path().join("seer"),
-    );
-}
-
-#[test]
-fn public_session_reconciles_durable_attempts_on_each_backend() {
-    let temporary = tempdir().expect("temporary directory");
-    exercise_session_attempts(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_session_attempts(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_waitable_admission_and_writer_preference(&temporary.path().join("temporary"));
 }

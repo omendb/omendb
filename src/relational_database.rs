@@ -10,14 +10,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::relational::{
-    Catalog, ForeignKeyDefinition, IndexDefinition, RelationalMutation,
-    RelationalSchemaDefinition, Row, row_identity_bytes,
+    Catalog, ForeignKeyDefinition, IndexDefinition, RelationalMutation, RelationalSchemaDefinition,
+    Row, row_identity_bytes,
 };
 use crate::row_identity::encode_legacy_key;
 use crate::seer_direct::{DirectSeerStore, DirectTransaction};
-use crate::{
-    CommitId, DbError, Key, Result, RowIdentity, TableId, Value,
-};
+use crate::{CommitId, DbError, Key, Result, RowIdentity, TableId, Value};
 
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -271,8 +269,7 @@ pub struct RelationalDatabase {
 impl RelationalDatabase {
     /// Create an empty database at the configured path.
     pub fn create(config: RelationalBackendConfig) -> Result<Self> {
-        let store =
-            DirectSeerStore::create(&config.path, seerdb::db::Options::default())?;
+        let store = DirectSeerStore::create(&config.path, seerdb::db::Options::default())?;
         Ok(Self {
             store,
             handle_id: NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed),
@@ -361,20 +358,13 @@ impl RelationalDatabase {
     }
 
     /// Publish one named secondary index built from existing rows.
-    pub fn create_named_index(
-        &mut self,
-        index: IndexDefinition,
-        name: String,
-    ) -> Result<CommitId> {
+    pub fn create_named_index(&mut self, index: IndexDefinition, name: String) -> Result<CommitId> {
         let commit = self.store.create_named_index(index, name)?;
         Ok(CommitId(commit.get()))
     }
 
     /// Publish one anonymous foreign-key constraint.
-    pub fn create_foreign_key(
-        &mut self,
-        foreign_key: ForeignKeyDefinition,
-    ) -> Result<CommitId> {
+    pub fn create_foreign_key(&mut self, foreign_key: ForeignKeyDefinition) -> Result<CommitId> {
         let commit = self.store.create_foreign_key(foreign_key)?;
         Ok(CommitId(commit.get()))
     }
@@ -409,8 +399,7 @@ impl RelationalDatabase {
         validate_legacy_key(table, primary)?;
         if self.catalog().primary_key(table).is_some() {
             return Err(DbError::InvalidState(
-                "legacy key delete requires a legacy primary-key table; use delete_row"
-                    .to_owned(),
+                "legacy key delete requires a legacy primary-key table; use delete_row".to_owned(),
             ));
         }
         let identity = encode_legacy_key(table, primary)?;
@@ -452,16 +441,9 @@ impl RelationalDatabase {
     }
 
     /// Look up one row through the catalog-owned composite primary-key identity.
-    pub fn get_by_identity(
-        &self,
-        table: TableId,
-        identity: &RowIdentity,
-    ) -> Result<Option<Row>> {
-        let bytes = crate::relational::row_identity_bytes_for_lookup(
-            self.catalog(),
-            table,
-            identity,
-        )?;
+    pub fn get_by_identity(&self, table: TableId, identity: &RowIdentity) -> Result<Option<Row>> {
+        let bytes =
+            crate::relational::row_identity_bytes_for_lookup(self.catalog(), table, identity)?;
         self.store.get(table, &bytes)
     }
 
@@ -553,8 +535,8 @@ impl RelationalDatabase {
             transaction.ensure_active()?;
             return Ok((value, transaction.snapshot()));
         }
-        let commit = std::mem::replace(transaction, RelationalDatabaseTransaction::empty())
-            .commit()?;
+        let commit =
+            std::mem::replace(transaction, RelationalDatabaseTransaction::empty()).commit()?;
         Ok((value, commit))
     }
 
@@ -668,9 +650,9 @@ impl RelationalDatabaseTransaction {
         if let Some(control) = &self.control {
             control.check()?;
         }
-        self.backend.as_mut().ok_or_else(|| {
-            DbError::InvalidState("transaction is no longer active".to_owned())
-        })
+        self.backend
+            .as_mut()
+            .ok_or_else(|| DbError::InvalidState("transaction is no longer active".to_owned()))
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -678,7 +660,9 @@ impl RelationalDatabaseTransaction {
             control.check()?;
         }
         if self.backend.is_none() {
-            return Err(DbError::InvalidState("transaction is no longer active".to_owned()));
+            return Err(DbError::InvalidState(
+                "transaction is no longer active".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -700,9 +684,7 @@ impl RelationalDatabaseTransaction {
             RelationalMutation::Insert { table, row } => self.insert(store, table, row),
             RelationalMutation::Update { table, row } => self.update(store, table, row),
             RelationalMutation::Delete { table, primary } => self.delete(store, table, primary),
-            RelationalMutation::DeleteRow { table, row } => {
-                self.delete_row(store, table, row)
-            }
+            RelationalMutation::DeleteRow { table, row } => self.delete_row(store, table, row),
         }
     }
 
@@ -711,7 +693,9 @@ impl RelationalDatabaseTransaction {
     pub fn snapshot(&self) -> CommitId {
         self.backend
             .as_ref()
-            .map_or(CommitId::default(), |backend| CommitId(backend.snapshot_csn().get()))
+            .map_or(CommitId::default(), |backend| {
+                CommitId(backend.snapshot_csn().get())
+            })
     }
 
     /// Return whether no writes have been staged.
@@ -721,24 +705,14 @@ impl RelationalDatabaseTransaction {
     }
 
     /// Stage one row insert plus derived index entries.
-    pub fn insert(
-        &mut self,
-        store: &RelationalDatabase,
-        table: TableId,
-        row: Row,
-    ) -> Result<()> {
+    pub fn insert(&mut self, store: &RelationalDatabase, table: TableId, row: Row) -> Result<()> {
         self.backend(store)?.insert(table, row)?;
         self.wrote = true;
         Ok(())
     }
 
     /// Stage one row replacement plus derived index refreshes.
-    pub fn update(
-        &mut self,
-        store: &RelationalDatabase,
-        table: TableId,
-        row: Row,
-    ) -> Result<()> {
+    pub fn update(&mut self, store: &RelationalDatabase, table: TableId, row: Row) -> Result<()> {
         self.backend(store)?.update(table, row)?;
         self.wrote = true;
         Ok(())
@@ -756,8 +730,7 @@ impl RelationalDatabaseTransaction {
         validate_legacy_key(table, primary)?;
         if store.catalog().primary_key(table).is_some() {
             return Err(DbError::InvalidState(
-                "legacy key delete requires a legacy primary-key table; use delete_row"
-                    .to_owned(),
+                "legacy key delete requires a legacy primary-key table; use delete_row".to_owned(),
             ));
         }
         drop(definition);
@@ -800,7 +773,10 @@ impl RelationalDatabaseTransaction {
         }
         drop(definition);
         let identity = encode_legacy_key(table, primary)?;
-        self.backend.as_mut().expect("checked active").get(table, &identity)
+        self.backend
+            .as_mut()
+            .expect("checked active")
+            .get(table, &identity)
     }
 
     /// Read one row by composite identity including staged mutations.
@@ -812,12 +788,12 @@ impl RelationalDatabaseTransaction {
     ) -> Result<Option<Row>> {
         self.ensure_owner(store)?;
         self.ensure_active()?;
-        let bytes = crate::relational::row_identity_bytes_for_lookup(
-            store.catalog(),
-            table,
-            identity,
-        )?;
-        self.backend.as_mut().expect("checked active").get(table, &bytes)
+        let bytes =
+            crate::relational::row_identity_bytes_for_lookup(store.catalog(), table, identity)?;
+        self.backend
+            .as_mut()
+            .expect("checked active")
+            .get(table, &bytes)
     }
 
     /// Read up to `limit` rows of one table including staged mutations.

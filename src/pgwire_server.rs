@@ -587,7 +587,10 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
         crate::DbError::ForeignKeyViolation { .. }
         | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
-        crate::DbError::SerializationConflict { .. } => ("40001", error.to_string()),
+        crate::DbError::SerializationConflict { .. }
+        | crate::DbError::SeerWriteConflict { .. }
+        | crate::DbError::SeerTreeConflict { .. }
+        | crate::DbError::WriteWriteConflict { .. } => ("40001", error.to_string()),
         crate::DbError::SqlUnsupported { .. } => {
             ("0A000", format!("feature not supported: {error}"))
         }
@@ -873,10 +876,7 @@ impl OmenDbHandler {
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
                 let _database = write_lock(&self.database)?;
-                block
-                    .transaction
-                    .commit()
-                    .map_err(map_db_error)?;
+                block.transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
             Some(TransactionCommand::Rollback) => {

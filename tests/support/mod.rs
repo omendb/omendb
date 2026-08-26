@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, ConstraintId, DatabaseConfig, ForeignKeyDefinition,
-    IndexDefinition, IndexId, Key, RelationalBackendConfig, RelationalBackendKind,
-    RelationalDatabase, Row, SeerKernelConfig, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
+    IndexId, Key, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId,
+    Value,
 };
 
 pub const USERS_TABLE: TableId = TableId(1);
@@ -17,15 +17,8 @@ pub const PROJECT_OWNER_FK: ConstraintId = ConstraintId(1);
 pub const MEMBERSHIP_PROJECT_FK: ConstraintId = ConstraintId(2);
 pub const MEMBERSHIP_USER_FK: ConstraintId = ConstraintId(3);
 
-pub fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+pub fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn users_table() -> TableDefinition {

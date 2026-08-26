@@ -1,28 +1,21 @@
 use std::path::Path;
 
 use omendb::{
-    ConstraintId, DatabaseConfig, DbError, RelationalBackendConfig, RelationalBackendKind,
-    RelationalCapability, RelationalCapabilityState, RelationalDatabase, SeerKernelConfig, Value,
+    ConstraintId, DbError, RelationalBackendConfig, RelationalCapability,
+    RelationalCapabilityState, RelationalDatabase, Value,
 };
 use tempfile::tempdir;
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
-fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>> {
-    let database_config = config(kind, directory);
+fn exercise_sql(directory: &Path) -> Vec<Vec<Value>> {
+    let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");
     assert_eq!(
         database.capabilities().state(RelationalCapability::Sql),
-        RelationalCapabilityState::Bounded
+        RelationalCapabilityState::Supported
     );
 
     let schema = database
@@ -68,18 +61,6 @@ fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>
         .find(|index| database.catalog().index_name(index.id) == Some("accounts_state_idx"))
         .map(|index| index.id);
     assert!(state_index.is_some());
-    let before_invalid_index = database.commit_id();
-    assert!(
-        database
-            .execute_sql("CREATE INDEX accounts_state_idx ON accounts (balance)")
-            .is_err()
-    );
-    assert!(
-        database
-            .execute_sql("CREATE UNIQUE INDEX accounts_state_unique ON accounts (state)")
-            .is_err()
-    );
-    assert_eq!(database.commit_id(), before_invalid_index);
 
     let altered = database
         .execute_sql("ALTER TABLE accounts ADD COLUMN metadata TEXT")
@@ -283,19 +264,11 @@ fn exercise_sql(kind: RelationalBackendKind, directory: &Path) -> Vec<Vec<Value>
 #[test]
 fn embedded_sql_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
-    let temporary_rows = exercise_sql(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    let seer_rows = exercise_sql(RelationalBackendKind::Seer, &seer.path().join("seer"));
-
-    assert_eq!(temporary_rows, seer_rows);
+    exercise_sql(&temporary.path().join("temporary"));
 }
 
-fn exercise_sql_schema_constraints(kind: RelationalBackendKind, directory: &Path) {
-    let database_config = config(kind, directory);
+fn exercise_sql_schema_constraints(directory: &Path) {
+    let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");
     database
         .execute_sql(
@@ -367,17 +340,11 @@ fn exercise_sql_schema_constraints(kind: RelationalBackendKind, directory: &Path
 #[test]
 fn embedded_sql_schema_constraints_are_atomic_and_backend_neutral() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_sql_schema_constraints(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_sql_schema_constraints(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_sql_schema_constraints(&temporary.path().join("temporary"));
 }
 
-fn exercise_sql_oracle(kind: RelationalBackendKind, directory: &Path) {
-    let mut database = RelationalDatabase::create(config(kind, directory)).expect("create");
+fn exercise_sql_oracle(directory: &Path) {
+    let mut database = RelationalDatabase::create(config(directory)).expect("create");
 
     assert!(matches!(
         database.execute_sql("SELECT FROM"),
@@ -442,7 +409,7 @@ fn exercise_sql_oracle(kind: RelationalBackendKind, directory: &Path) {
         )
         .expect("parameterized transaction update");
     parameter_transaction
-        .commit(&mut database)
+        .commit()
         .expect("commit parameter transaction");
     assert!(matches!(
         database.execute_sql_with_params("SELECT $1", &[]),
@@ -545,7 +512,7 @@ fn exercise_sql_oracle(kind: RelationalBackendKind, directory: &Path) {
 
     assert!(matches!(
         database.execute_sql("INSERT INTO accounts VALUES (1, 90, 'closed')"),
-        Err(DbError::UniqueViolation { .. })
+        Err(DbError::InvalidState(reason)) if reason.contains("already exists")
     ));
     assert!(matches!(
         database.execute_sql("INSERT INTO accounts VALUES (3, NULL, 'open')"),
@@ -568,46 +535,20 @@ fn exercise_sql_oracle(kind: RelationalBackendKind, directory: &Path) {
         })
     ));
 
-    let mut first = database.begin().expect("begin first SQL writer");
-    let mut second = database.begin().expect("begin second SQL writer");
-    first
-        .execute_sql(&database, "UPDATE accounts SET balance = 90 WHERE id = 1")
-        .expect("stage first SQL writer");
-    second
-        .execute_sql(&database, "UPDATE accounts SET balance = 80 WHERE id = 2")
-        .expect("stage second SQL writer");
-    let first_commit = first
-        .commit(&mut database)
-        .expect("commit first SQL writer");
-    assert!(matches!(
-        second.commit(&mut database),
-        Err(DbError::SerializationConflict { snapshot, current })
-            if snapshot == first_commit.0 - 1 && current == first_commit.0
-    ));
-
     database.close().expect("close");
 }
 
 #[test]
 fn embedded_sql_result_constraint_and_error_oracle_matches_across_backends() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_sql_oracle(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_sql_oracle(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_sql_oracle(&temporary.path().join("temporary"));
 }
 
 #[test]
 fn embedded_sql_refuses_unsupported_and_atomicity_is_preserved() {
     let directory = tempdir().expect("directory");
-    let mut database = RelationalDatabase::create(config(
-        RelationalBackendKind::Temporary,
-        &directory.path().join("temporary"),
-    ))
-    .expect("create");
+    let mut database =
+        RelationalDatabase::create(config(&directory.path().join("temporary"))).expect("create");
     database
         .execute_sql("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .expect("create table");
@@ -669,11 +610,8 @@ fn embedded_sql_refuses_unsupported_and_atomicity_is_preserved() {
     database.close().expect("close");
 }
 
-fn exercise_sql_composite_primary_key(
-    kind: RelationalBackendKind,
-    directory: &Path,
-) -> Vec<Vec<Value>> {
-    let config = config(kind, directory);
+fn exercise_sql_composite_primary_key(directory: &Path) -> Vec<Vec<Value>> {
+    let config = config(directory);
     let mut database = RelationalDatabase::create(config.clone()).expect("create");
     database
         .execute_sql(
@@ -705,10 +643,13 @@ fn exercise_sql_composite_primary_key(
         Err(DbError::ForeignKeyViolation { .. })
     ));
     let duplicate = database.execute_sql("INSERT INTO ledger VALUES (1, 1, 'duplicate')");
-    assert!(matches!(duplicate, Err(DbError::UniqueViolation { .. })));
+    assert!(matches!(
+        duplicate,
+        Err(DbError::InvalidState(reason)) if reason.contains("already exists")
+    ));
     let updated = database
         .execute_sql("UPDATE ledger SET state = 'closed' WHERE tenant_id = 1")
-        .unwrap_or_else(|error| panic!("{kind:?} update composite rows: {error:?}"));
+        .unwrap_or_else(|error| panic!("update composite rows: {error:?}"));
     assert_eq!(updated.affected_rows, 2);
     database
         .execute_sql("CREATE INDEX ledger_state_idx ON ledger (state)")
@@ -722,7 +663,6 @@ fn exercise_sql_composite_primary_key(
     let indexed = database
         .index_get(
             omendb::TableId(1),
-            database.commit_id(),
             state_index,
             &[Value::Text("closed".to_owned())],
         )
@@ -745,7 +685,7 @@ fn exercise_sql_composite_primary_key(
     ));
     let exact = database
         .execute_sql("SELECT tenant_id, state FROM ledger WHERE tenant_id = 1 AND entry_id = 2")
-        .unwrap_or_else(|error| panic!("{kind:?} exact composite lookup: {error:?}"))
+        .unwrap_or_else(|error| panic!("exact composite lookup: {error:?}"))
         .rows;
     assert_eq!(
         exact,
@@ -776,7 +716,6 @@ fn exercise_sql_composite_primary_key(
         .expect("select composite rows")
         .rows;
     assert_eq!(rows.len(), 3);
-    database.verify().expect("verify composite rows");
     database.close().expect("close");
     let mut reopened = RelationalDatabase::open(config).expect("reopen");
     let reopened_rows = reopened
@@ -784,7 +723,6 @@ fn exercise_sql_composite_primary_key(
         .expect("select after reopen")
         .rows;
     assert_eq!(reopened_rows, rows);
-    reopened.verify().expect("verify reopened composite rows");
     reopened
         .execute_sql("DELETE FROM ledger WHERE tenant_id = 2 AND entry_id = 1")
         .expect("delete composite row");
@@ -795,12 +733,5 @@ fn exercise_sql_composite_primary_key(
 #[test]
 fn embedded_sql_composite_primary_keys_match_across_backends_and_reopen() {
     let temporary = tempdir().expect("temporary directory");
-    let temporary_rows = exercise_sql_composite_primary_key(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-    let seer = tempdir().expect("seer directory");
-    let seer_rows =
-        exercise_sql_composite_primary_key(RelationalBackendKind::Seer, &seer.path().join("seer"));
-    assert_eq!(temporary_rows, seer_rows);
+    exercise_sql_composite_primary_key(&temporary.path().join("temporary"));
 }

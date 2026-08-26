@@ -2,23 +2,16 @@ use std::cell::Cell;
 use std::path::Path;
 
 use omendb::{
-    CancellationToken, ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, DbError, Key,
-    RelationalBackendConfig, RelationalBackendKind, RelationalDatabase, Row, SeerKernelConfig,
-    TableDefinition, TableId, TransactionErrorClass, Value,
+    CancellationToken, ColumnDefinition, ColumnId, ColumnType, DbError, Key,
+    RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId,
+    TransactionErrorClass, Value,
 };
 use tempfile::tempdir;
 
 const TABLE: TableId = TableId(1);
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn table() -> TableDefinition {
@@ -41,8 +34,8 @@ fn row(primary: u64, value: &str) -> Row {
     }
 }
 
-fn exercise(kind: RelationalBackendKind, directory: &Path) {
-    let config = config(kind, directory);
+fn exercise(directory: &Path) {
+    let config = config(directory);
     let mut database = RelationalDatabase::create(config).expect("create");
     let schema_commit = database.create_table(table()).expect("table");
 
@@ -71,7 +64,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
     assert_eq!(database.commit_id(), schema_commit);
     assert_eq!(
         database
-            .get(TABLE, schema_commit, Key::new(TABLE.0, 1))
+            .get(TABLE, Key::new(TABLE.0, 1))
             .expect("cancelled row lookup"),
         None
     );
@@ -91,13 +84,7 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) {
 }
 
 #[test]
-fn public_transactions_cancel_before_publication_on_each_backend() {
+fn public_transactions_cancel_before_publication() {
     let temporary = tempdir().expect("temporary directory");
-    exercise(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise(&temporary.path().join("temporary"));
 }

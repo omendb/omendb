@@ -1,9 +1,8 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, GovernorConfig, IndexDefinition,
-    IndexId, Key, OverloadPolicy, Reactor, ReactorConfig, RelationalBackendConfig,
-    RelationalBackendKind, RelationalCompactionBudget, RelationalDatabase, Row, SeerKernelConfig,
+    ColumnDefinition, ColumnId, ColumnType, GovernorConfig, IndexDefinition, IndexId, Key,
+    OverloadPolicy, Reactor, ReactorConfig, RelationalBackendConfig, RelationalDatabase, Row,
     TableDefinition, TableId, Value, WorkClass,
 };
 use tempfile::tempdir;
@@ -67,27 +66,18 @@ fn order_row(order_id: u64, status: &str) -> Row {
     }
 }
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 enum DatabaseTask {
     OltpUpdate { item_id: u64, decrement: u64 },
     ScanOrders { status: String },
-    ReclaimCompaction { units: usize },
     SchemaAddColumn,
-    WalCheckpoint,
 }
 
-fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &Path) {
-    let db_config = config(kind, directory);
+fn exercise_governed_database_workload(directory: &Path) {
+    let db_config = config(directory);
     let mut database = RelationalDatabase::create(db_config.clone()).expect("create database");
 
     database
@@ -134,7 +124,6 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
     let mut now: u64 = 0;
     let mut completed_oltp = 0;
     let mut completed_scans = 0;
-    let mut completed_reclaim = 0;
     let mut schema_added = false;
 
     // Schedule mixed batch of tasks
@@ -164,25 +153,11 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
             );
         }
 
-        // 3. Reclaim compaction
-        if i % 6 == 0
-            && let Ok(reclaim_id) = reactor.submit(WorkClass::Reclaim, 4, Some(now + 30))
-        {
-            task_map.insert(reclaim_id, DatabaseTask::ReclaimCompaction { units: 5 });
-        }
-
         // 4. Schema modification
         if i == 15
             && let Ok(schema_id) = reactor.submit(WorkClass::Schema, 6, Some(now + 50))
         {
             task_map.insert(schema_id, DatabaseTask::SchemaAddColumn);
-        }
-
-        // 5. WAL checkpoint
-        if i % 10 == 0
-            && let Ok(wal_id) = reactor.submit(WorkClass::Wal, 4, Some(now + 30))
-        {
-            task_map.insert(wal_id, DatabaseTask::WalCheckpoint);
         }
 
         // Dispatch and execute ready workers
@@ -192,9 +167,8 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
             match task {
                 DatabaseTask::OltpUpdate { item_id, decrement } => {
                     let key = Key::new(INVENTORY_TABLE.0, item_id);
-                    let commit = database.commit_id();
                     let existing = database
-                        .get(INVENTORY_TABLE, commit, key)
+                        .get(INVENTORY_TABLE, key)
                         .expect("get item")
                         .expect("item exists");
                     let current_qty = match existing.values.get(1) {
@@ -210,24 +184,11 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                     completed_oltp += 1;
                 }
                 DatabaseTask::ScanOrders { status } => {
-                    let commit = database.commit_id();
                     let matching = database
-                        .index_get(
-                            ORDERS_TABLE,
-                            commit,
-                            ORDER_STATUS_INDEX,
-                            &[Value::Text(status)],
-                        )
+                        .index_get(ORDERS_TABLE, ORDER_STATUS_INDEX, &[Value::Text(status)])
                         .expect("index get orders");
                     assert!(!matching.is_empty());
                     completed_scans += 1;
-                }
-                DatabaseTask::ReclaimCompaction { units } => {
-                    let report = database
-                        .compact_with_budget(RelationalCompactionBudget::new(units))
-                        .expect("compact with budget");
-                    assert_eq!(report.before.backend, kind);
-                    completed_reclaim += 1;
                 }
                 DatabaseTask::SchemaAddColumn => {
                     database
@@ -243,9 +204,6 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                         .expect("add notes column");
                     schema_added = true;
                 }
-                DatabaseTask::WalCheckpoint => {
-                    database.checkpoint().expect("checkpoint");
-                }
             }
             reactor.complete(dispatch.worker).expect("complete worker");
         }
@@ -260,9 +218,8 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
             match task {
                 DatabaseTask::OltpUpdate { item_id, decrement } => {
                     let key = Key::new(INVENTORY_TABLE.0, item_id);
-                    let commit = database.commit_id();
                     let existing = database
-                        .get(INVENTORY_TABLE, commit, key)
+                        .get(INVENTORY_TABLE, key)
                         .expect("get item")
                         .expect("item exists");
                     let current_qty = match existing.values.get(1) {
@@ -278,23 +235,11 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                     completed_oltp += 1;
                 }
                 DatabaseTask::ScanOrders { status } => {
-                    let commit = database.commit_id();
                     let matching = database
-                        .index_get(
-                            ORDERS_TABLE,
-                            commit,
-                            ORDER_STATUS_INDEX,
-                            &[Value::Text(status)],
-                        )
+                        .index_get(ORDERS_TABLE, ORDER_STATUS_INDEX, &[Value::Text(status)])
                         .expect("index get orders");
                     assert!(!matching.is_empty());
                     completed_scans += 1;
-                }
-                DatabaseTask::ReclaimCompaction { units } => {
-                    let _ = database
-                        .compact_with_budget(RelationalCompactionBudget::new(units))
-                        .expect("compact with budget");
-                    completed_reclaim += 1;
                 }
                 DatabaseTask::SchemaAddColumn => {
                     if !schema_added {
@@ -312,9 +257,6 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
                         schema_added = true;
                     }
                 }
-                DatabaseTask::WalCheckpoint => {
-                    database.checkpoint().expect("checkpoint");
-                }
             }
             reactor.complete(dispatch.worker).expect("complete worker");
         }
@@ -322,7 +264,6 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
 
     assert_eq!(completed_oltp, 30);
     assert!(completed_scans > 0);
-    assert!(completed_reclaim > 0);
     assert!(schema_added);
 
     // Verify governor invariants
@@ -332,24 +273,15 @@ fn exercise_governed_database_workload(kind: RelationalBackendKind, directory: &
     assert_eq!(stats.in_flight, 0);
     assert_eq!(stats.expired, 0);
 
-    database.verify().expect("verify database");
-    database.checkpoint().expect("checkpoint final");
     database.close().expect("close database");
 
-    // Reopen and re-verify
-    let mut reopened = RelationalDatabase::open(db_config).expect("reopen");
-    reopened.verify().expect("verify reopened");
+    // Reopen
+    let reopened = RelationalDatabase::open(db_config).expect("reopen");
     reopened.close().expect("close reopened");
 }
 
 #[test]
 fn mixed_reactor_governor_executes_database_workload_across_backends() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_governed_database_workload(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_governed_database_workload(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_governed_database_workload(&temporary.path().join("temporary"));
 }

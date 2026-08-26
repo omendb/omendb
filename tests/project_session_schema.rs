@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, ConstraintId, DatabaseConfig, DbError,
-    ForeignKeyDefinition, IndexDefinition, IndexId, Key, NamedForeignKeyDefinition,
-    NamedIndexDefinition, OperationControl, RelationalBackendConfig, RelationalBackendKind,
-    RelationalDatabaseConfig, RelationalDatabaseSession, RelationalSchemaDefinition,
-    RelationalSessionConfig, RowIdentity, SeerKernelConfig, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, ConstraintId, DbError, ForeignKeyDefinition,
+    IndexDefinition, IndexId, Key, NamedForeignKeyDefinition, NamedIndexDefinition,
+    OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
+    RelationalSchemaDefinition, RelationalSessionConfig, RowIdentity, TableDefinition, TableId,
+    Value,
 };
 use tempfile::tempdir;
 
@@ -26,15 +26,8 @@ type SchemaObservation = (
     Option<omendb::Row>,
 );
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalDatabaseConfig {
-    let backend = match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    };
+fn config(directory: &Path) -> RelationalDatabaseConfig {
+    let backend = RelationalBackendConfig::new(directory.to_owned());
     RelationalDatabaseConfig::new(backend).with_session_config(RelationalSessionConfig {
         max_in_flight: 2,
         ..RelationalSessionConfig::default()
@@ -205,21 +198,19 @@ fn observe(session: &RelationalDatabaseSession, control: &OperationControl) -> S
             ))
         })
         .expect("read schema metadata");
-    let snapshot = session.commit_id(control).expect("read commit");
     let child_rows = session
-        .scan(control, CHILDREN, snapshot, usize::MAX)
+        .scan(control, CHILDREN, usize::MAX)
         .expect("scan children");
     let available_rows = session
         .index_get(
             control,
             CHILDREN,
-            snapshot,
             CHILD_STATE_INDEX,
             &[Value::Text("available".to_owned())],
         )
         .expect("read child state index");
     let identity_row = session
-        .get_by_identity(control, CHILDREN, snapshot, &child_identity())
+        .get_by_identity(control, CHILDREN, &child_identity())
         .expect("read child identity");
     (
         metadata.0,
@@ -230,8 +221,8 @@ fn observe(session: &RelationalDatabaseSession, control: &OperationControl) -> S
     )
 }
 
-fn exercise(kind: RelationalBackendKind, directory: &Path) -> SchemaObservation {
-    let database_config = config(kind, directory);
+fn exercise(directory: &Path) -> SchemaObservation {
+    let database_config = config(directory);
     let session = RelationalDatabaseSession::create(database_config.clone()).expect("create");
     let control = OperationControl::default();
 
@@ -303,7 +294,6 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> SchemaObservation 
         session.get_by_identity(
             &control,
             CHILDREN,
-            session.commit_id(&control).expect("read commit"),
             &RowIdentity::new(PARENTS, vec![ColumnId(1)], vec![Value::U64(7)])
                 .expect("wrong-table identity"),
         ),
@@ -321,13 +311,5 @@ fn exercise(kind: RelationalBackendKind, directory: &Path) -> SchemaObservation 
 #[test]
 fn public_session_schema_publication_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
-    let temporary_observation = exercise(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    let seer_observation = exercise(RelationalBackendKind::Seer, &seer.path().join("seer"));
-
-    assert_eq!(temporary_observation, seer_observation);
+    exercise(&temporary.path().join("temporary"));
 }

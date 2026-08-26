@@ -8,23 +8,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use omendb::{
-    DatabaseConfig, RelationalBackendConfig, RelationalBackendKind, RelationalDatabase,
-    SeerKernelConfig, Value,
-};
+use omendb::{RelationalBackendConfig, RelationalDatabase, Value};
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, params_from_iter};
 use tempfile::tempdir;
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn sqlite_value(value: &Value) -> rusqlite::types::Value {
@@ -206,11 +196,11 @@ fn next_random(state: &mut u64) -> u64 {
     *state
 }
 
-fn exercise(kind: RelationalBackendKind) -> Result<()> {
+fn exercise() -> Result<()> {
     let directory = tempdir().context("create oracle directory")?;
     let sqlite_path = directory.path().join("oracle.sqlite");
     let connection = Connection::open(&sqlite_path).context("open SQLite oracle")?;
-    let mut database = RelationalDatabase::create(config(kind, &directory.path().join("omendb")))
+    let mut database = RelationalDatabase::create(config(&directory.path().join("omendb")))
         .context("create OmenDB oracle subject")?;
 
     let schema =
@@ -293,7 +283,7 @@ fn exercise(kind: RelationalBackendKind) -> Result<()> {
     randomized_trace(&mut database, &connection)?;
 
     database.close().context("close OmenDB oracle subject")?;
-    let mut reopened = RelationalDatabase::open(config(kind, &directory.path().join("omendb")))
+    let mut reopened = RelationalDatabase::open(config(&directory.path().join("omendb")))
         .context("reopen OmenDB oracle subject")?;
     compare_query(
         &mut reopened,
@@ -307,10 +297,5 @@ fn exercise(kind: RelationalBackendKind) -> Result<()> {
 
 #[test]
 fn bounded_sql_matches_sqlite_on_temporary_backend() -> Result<()> {
-    exercise(RelationalBackendKind::Temporary)
-}
-
-#[test]
-fn bounded_sql_matches_sqlite_on_seer_backend() -> Result<()> {
-    exercise(RelationalBackendKind::Seer)
+    exercise()
 }

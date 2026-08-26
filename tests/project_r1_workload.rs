@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use omendb::{
-    CommitId, RelationalBackendKind, RelationalDatabase, RelationalDatabaseTransaction,
-    RelationalSnapshotLease, Row, Value,
-};
+use omendb::{RelationalDatabase, RelationalDatabaseTransaction, Row, Value};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -232,25 +229,22 @@ fn model_digest(model: &Model) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn assert_database_matches(database: &RelationalDatabase, model: &Model, snapshot: CommitId) {
+fn assert_database_matches(database: &RelationalDatabase, model: &Model) {
     for table in [USERS_TABLE, PROJECTS_TABLE, MEMBERSHIPS_TABLE] {
         assert_eq!(
-            database.scan(table, snapshot, usize::MAX).expect("scan"),
+            database.scan(table, usize::MAX).expect("scan"),
             model_rows(model, table),
-            "table {table:?} diverged at snapshot {snapshot:?}"
+            "table {table:?} diverged"
         );
     }
 }
 
-fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
-    let database_config = config(kind, directory);
+fn exercise_public_r1(directory: &Path) {
+    let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");
     install_schema(&mut database);
 
     let mut model = Model::default();
-    let mut retained_model = None;
-    let mut retained_lease: Option<RelationalSnapshotLease> = None;
-    let mut retained_commit = None;
     let mut expected_seq = 1;
 
     for line in R1_TRACE.lines().filter(|line| !line.trim().is_empty()) {
@@ -265,7 +259,7 @@ fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
                 for operation in operations {
                     apply_model(&mut candidate, tenant, operation);
                 }
-                let (_, commit) = database
+                let (_, _commit) = database
                     .transaction(|database, transaction| {
                         for operation in operations {
                             stage_operation(database, transaction, tenant, operation);
@@ -274,12 +268,7 @@ fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
                     })
                     .expect("commit R1 event");
                 model = candidate;
-                assert_database_matches(&database, &model, commit);
-                if retained_lease.is_none() {
-                    retained_model = Some(model.clone());
-                    retained_commit = Some(commit);
-                    retained_lease = Some(database.retain(commit).expect("retain seed"));
-                }
+                assert_database_matches(&database, &model);
             }
             "read" => {
                 assert_eq!(event.query.as_deref(), Some("project_by_slug"));
@@ -288,7 +277,6 @@ fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
                 let rows = database
                     .index_get(
                         PROJECTS_TABLE,
-                        database.commit_id(),
                         PROJECT_SLUG_INDEX,
                         &[Value::U64(tenant), Value::Text(slug.to_owned())],
                     )
@@ -318,35 +306,17 @@ fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
     assert_eq!(expected_seq - 1, 6);
     assert_eq!(model_digest(&model), EXPECTED_R1_DIGEST);
     let current = database.commit_id();
-    assert_database_matches(&database, &model, current);
-    let retained_model = retained_model.expect("retained model");
-    let retained_commit = retained_commit.expect("retained commit");
-    assert_database_matches(&database, &retained_model, retained_commit);
-
-    database.verify().expect("logical verification");
-    database.checkpoint().expect("checkpoint");
-    database.compact().expect("compact");
-    assert_database_matches(&database, &model, current);
-    assert_database_matches(&database, &retained_model, retained_commit);
-    database
-        .release(retained_lease.take().expect("release lease"))
-        .expect("release retained snapshot");
-    assert!(
-        database
-            .scan(PROJECTS_TABLE, retained_commit, usize::MAX)
-            .is_err()
-    );
+    assert_database_matches(&database, &model);
     database.close().expect("close");
 
-    let mut reopened = RelationalDatabase::open(database_config).expect("reopen");
+    let reopened = RelationalDatabase::open(database_config).expect("reopen");
     assert_eq!(reopened.commit_id(), current);
-    assert_database_matches(&reopened, &model, current);
+    assert_database_matches(&reopened, &model);
     assert_eq!(model_digest(&model), EXPECTED_R1_DIGEST);
     assert_eq!(
         reopened
             .index_get(
                 PROJECTS_TABLE,
-                current,
                 PROJECT_SLUG_INDEX,
                 &[Value::U64(1), Value::Text("beta".to_owned())],
             )
@@ -354,18 +324,11 @@ fn exercise_public_r1(kind: RelationalBackendKind, directory: &Path) {
             .len(),
         1
     );
-    reopened.verify().expect("reopened verification");
     reopened.close().expect("reopened close");
 }
 
 #[test]
 fn public_facade_replays_canonical_r1_across_selected_backends() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_public_r1(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_public_r1(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_public_r1(&temporary.path().join("temporary"));
 }

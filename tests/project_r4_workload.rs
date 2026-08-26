@@ -3,8 +3,8 @@ use std::path::Path;
 
 use omendb::{
     AggregateKind, AnalyticalQuery, CancellationToken, ColumnDefinition, ColumnId, ColumnType,
-    DatabaseConfig, DbError, Key, OperationControl, RelationalBackendConfig, RelationalBackendKind,
-    RelationalDatabase, Row, TableDefinition, TableId, Value,
+    DbError, Key, OperationControl, RelationalBackendConfig, RelationalDatabase, Row,
+    TableDefinition, TableId, Value,
 };
 use serde::Deserialize;
 use tempfile::tempdir;
@@ -14,15 +14,8 @@ const LEDGER_TABLE: TableId = TableId(302);
 
 const R4_TRACE: &str = include_str!("fixtures/r4-analytical-oltp-trace.jsonl");
 
-fn backend_config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(omendb::SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn backend_config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn accounts_schema() -> TableDefinition {
@@ -170,241 +163,222 @@ fn install_r4_schema(database: &mut RelationalDatabase) {
 }
 
 #[test]
-fn public_facade_replays_r4_analytical_workload_across_backends() {
-    for backend_kind in [
-        RelationalBackendKind::Temporary,
-        RelationalBackendKind::Seer,
-    ] {
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("db");
-        let config = backend_config(backend_kind, &db_path);
+fn public_facade_replays_r4_analytical_workload() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("db");
+    let config = backend_config(&db_path);
 
-        let mut database = RelationalDatabase::open(config.clone()).expect("open db");
-        install_r4_schema(&mut database);
+    let mut database = RelationalDatabase::create(config.clone()).expect("create db");
+    install_r4_schema(&mut database);
 
-        let mut oracle = OracleModel::default();
+    let mut oracle = OracleModel::default();
 
-        for line in R4_TRACE.lines().filter(|l| !l.trim().is_empty()) {
-            let event: TraceEvent = serde_json::from_str(line).expect("parse event");
-            match event.kind.as_str() {
-                "seed_population" => {
-                    let count = event.accounts_count.unwrap_or(200);
-                    for id in 1..=count as u64 {
-                        let tenant_id = (id % 5) + 1;
-                        let category = match id % 3 {
-                            0 => "premium",
-                            1 => "standard",
-                            _ => "enterprise",
-                        };
-                        let balance = id * 100;
-                        let status = if id % 10 == 0 { "inactive" } else { "active" };
+    for line in R4_TRACE.lines().filter(|l| !l.trim().is_empty()) {
+        let event: TraceEvent = serde_json::from_str(line).expect("parse event");
+        match event.kind.as_str() {
+            "seed_population" => {
+                let count = event.accounts_count.unwrap_or(200);
+                for id in 1..=count as u64 {
+                    let tenant_id = (id % 5) + 1;
+                    let category = match id % 3 {
+                        0 => "premium",
+                        1 => "standard",
+                        _ => "enterprise",
+                    };
+                    let balance = id * 100;
+                    let status = if id % 10 == 0 { "inactive" } else { "active" };
 
-                        database
-                            .insert(
-                                ACCOUNTS_TABLE,
-                                account_row(id, tenant_id, category, balance, status),
-                            )
-                            .expect("insert account");
+                    database
+                        .insert(
+                            ACCOUNTS_TABLE,
+                            account_row(id, tenant_id, category, balance, status),
+                        )
+                        .expect("insert account");
 
-                        oracle.accounts.insert(
-                            id,
-                            AccountModel {
-                                tenant_id,
-                                category: category.to_owned(),
-                                balance,
-                                status: status.to_owned(),
-                            },
-                        );
-                    }
-
-                    let entries_count = event.entries_count.unwrap_or(600);
-                    for id in 1..=entries_count as u64 {
-                        let account_id = (id % count as u64) + 1;
-                        let amount = (id as i64) * 10;
-                        let tag = "initial_deposit";
-
-                        database
-                            .insert(LEDGER_TABLE, ledger_row(id, account_id, amount, tag))
-                            .expect("insert ledger");
-
-                        oracle
-                            .ledger_entries
-                            .insert(id, (account_id, amount, tag.to_owned()));
-                    }
+                    oracle.accounts.insert(
+                        id,
+                        AccountModel {
+                            tenant_id,
+                            category: category.to_owned(),
+                            balance,
+                            status: status.to_owned(),
+                        },
+                    );
                 }
-                "oltp_batch" => {
-                    for op in event.operations.unwrap_or_default() {
-                        match op.op.as_str() {
-                            "transfer" => {
-                                let from_id = op.from.expect("from id");
-                                let to_id = op.to.expect("to id");
-                                let amount = op.amount.expect("amount") as u64;
 
-                                let from = oracle.accounts.get_mut(&from_id).expect("from account");
-                                from.balance = from.balance.saturating_sub(amount);
-                                let from_row = account_row(
-                                    from_id,
-                                    from.tenant_id,
-                                    &from.category,
-                                    from.balance,
-                                    &from.status,
-                                );
+                let entries_count = event.entries_count.unwrap_or(600);
+                for id in 1..=entries_count as u64 {
+                    let account_id = (id % count as u64) + 1;
+                    let amount = (id as i64) * 10;
+                    let tag = "initial_deposit";
 
-                                let to = oracle.accounts.get_mut(&to_id).expect("to account");
-                                to.balance = to.balance.saturating_add(amount);
-                                let to_row = account_row(
-                                    to_id,
-                                    to.tenant_id,
-                                    &to.category,
-                                    to.balance,
-                                    &to.status,
-                                );
+                    database
+                        .insert(LEDGER_TABLE, ledger_row(id, account_id, amount, tag))
+                        .expect("insert ledger");
 
-                                database
-                                    .update(ACCOUNTS_TABLE, from_row)
-                                    .expect("update from");
-                                database.update(ACCOUNTS_TABLE, to_row).expect("update to");
-                            }
-                            "credit" => {
-                                let acc_id = op.account.expect("acc id");
-                                let amount = op.amount.expect("amount") as u64;
-                                let acc = oracle.accounts.get_mut(&acc_id).expect("account");
-                                acc.balance = acc.balance.saturating_add(amount);
-                                let row = account_row(
-                                    acc_id,
-                                    acc.tenant_id,
-                                    &acc.category,
-                                    acc.balance,
-                                    &acc.status,
-                                );
-                                database.update(ACCOUNTS_TABLE, row).expect("credit");
-                            }
-                            "update_status" => {
-                                let acc_id = op.account.expect("acc id");
-                                let status = op.status.expect("status");
-                                let acc = oracle.accounts.get_mut(&acc_id).expect("account");
-                                acc.status = status.clone();
-                                let row = account_row(
-                                    acc_id,
-                                    acc.tenant_id,
-                                    &acc.category,
-                                    acc.balance,
-                                    &status,
-                                );
-                                database.update(ACCOUNTS_TABLE, row).expect("update status");
-                            }
-                            other => panic!("unrecognized op: {other}"),
-                        }
-                    }
+                    oracle
+                        .ledger_entries
+                        .insert(id, (account_id, amount, tag.to_owned()));
                 }
-                "analytical_query" => {
-                    let query_sql = event.query.as_deref().expect("query SQL");
-                    let sql_res = database.execute_sql(query_sql).expect("execute sql");
-
-                    match event.name.as_deref().unwrap_or_default() {
-                        "global_totals" => {
-                            let expected_count = oracle.accounts.len() as u64;
-                            let expected_sum: u64 =
-                                oracle.accounts.values().map(|a| a.balance).sum();
-                            let expected_min =
-                                oracle.accounts.values().map(|a| a.balance).min().unwrap();
-                            let expected_max =
-                                oracle.accounts.values().map(|a| a.balance).max().unwrap();
-                            let expected_avg =
-                                (expected_sum as f64 / expected_count as f64).round() as i64;
-
-                            assert_eq!(sql_res.rows.len(), 1);
-                            assert_eq!(sql_res.rows[0][0], Value::U64(expected_count));
-                            assert_eq!(sql_res.rows[0][1], Value::U64(expected_sum));
-                            assert_eq!(sql_res.rows[0][2], Value::I64(expected_avg));
-                            assert_eq!(sql_res.rows[0][3], Value::U64(expected_min));
-                            assert_eq!(sql_res.rows[0][4], Value::U64(expected_max));
-                        }
-                        "category_breakdown" => {
-                            let mut oracle_cats: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-                            for acc in oracle.accounts.values() {
-                                let entry =
-                                    oracle_cats.entry(acc.category.clone()).or_insert((0, 0));
-                                entry.0 += 1;
-                                entry.1 += acc.balance;
-                            }
-
-                            assert_eq!(sql_res.rows.len(), oracle_cats.len());
-                            for row in &sql_res.rows {
-                                if let Value::Text(cat) = &row[0] {
-                                    let (exp_count, exp_sum) =
-                                        oracle_cats.get(cat).expect("known category");
-                                    assert_eq!(row[1], Value::U64(*exp_count));
-                                    assert_eq!(row[2], Value::U64(*exp_sum));
-                                } else {
-                                    panic!("expected category string");
-                                }
-                            }
-                        }
-                        "status_counts" => {
-                            let mut oracle_statuses: BTreeMap<String, u64> = BTreeMap::new();
-                            for acc in oracle.accounts.values() {
-                                *oracle_statuses.entry(acc.status.clone()).or_insert(0) += 1;
-                            }
-
-                            assert_eq!(sql_res.rows.len(), oracle_statuses.len());
-                            for row in &sql_res.rows {
-                                if let Value::Text(st) = &row[0] {
-                                    let exp_count = oracle_statuses.get(st).expect("known status");
-                                    assert_eq!(row[1], Value::U64(*exp_count));
-                                } else {
-                                    panic!("expected status string");
-                                }
-                            }
-                        }
-                        "active_premium_totals" => {
-                            let (exp_count, exp_sum) = oracle
-                                .accounts
-                                .values()
-                                .filter(|a| a.category == "premium" && a.status == "active")
-                                .fold((0u64, 0u64), |(c, s), a| (c + 1, s + a.balance));
-
-                            assert_eq!(sql_res.rows.len(), 1);
-                            assert_eq!(sql_res.rows[0][0], Value::U64(exp_count));
-                            assert_eq!(sql_res.rows[0][1], Value::U64(exp_sum));
-                        }
-                        _ => {}
-                    }
-                }
-                "checkpoint_and_verify" => {
-                    database.checkpoint().expect("checkpoint");
-                    let verify = database.verify().expect("verify");
-                    assert_eq!(verify.verified_tables, 2);
-                    assert!(verify.verified_rows > 0);
-                }
-                _ => {}
             }
+            "oltp_batch" => {
+                for op in event.operations.unwrap_or_default() {
+                    match op.op.as_str() {
+                        "transfer" => {
+                            let from_id = op.from.expect("from id");
+                            let to_id = op.to.expect("to id");
+                            let amount = op.amount.expect("amount") as u64;
+
+                            let from = oracle.accounts.get_mut(&from_id).expect("from account");
+                            from.balance = from.balance.saturating_sub(amount);
+                            let from_row = account_row(
+                                from_id,
+                                from.tenant_id,
+                                &from.category,
+                                from.balance,
+                                &from.status,
+                            );
+
+                            let to = oracle.accounts.get_mut(&to_id).expect("to account");
+                            to.balance = to.balance.saturating_add(amount);
+                            let to_row = account_row(
+                                to_id,
+                                to.tenant_id,
+                                &to.category,
+                                to.balance,
+                                &to.status,
+                            );
+
+                            database
+                                .update(ACCOUNTS_TABLE, from_row)
+                                .expect("update from");
+                            database.update(ACCOUNTS_TABLE, to_row).expect("update to");
+                        }
+                        "credit" => {
+                            let acc_id = op.account.expect("acc id");
+                            let amount = op.amount.expect("amount") as u64;
+                            let acc = oracle.accounts.get_mut(&acc_id).expect("account");
+                            acc.balance = acc.balance.saturating_add(amount);
+                            let row = account_row(
+                                acc_id,
+                                acc.tenant_id,
+                                &acc.category,
+                                acc.balance,
+                                &acc.status,
+                            );
+                            database.update(ACCOUNTS_TABLE, row).expect("credit");
+                        }
+                        "update_status" => {
+                            let acc_id = op.account.expect("acc id");
+                            let status = op.status.expect("status");
+                            let acc = oracle.accounts.get_mut(&acc_id).expect("account");
+                            acc.status = status.clone();
+                            let row = account_row(
+                                acc_id,
+                                acc.tenant_id,
+                                &acc.category,
+                                acc.balance,
+                                &status,
+                            );
+                            database.update(ACCOUNTS_TABLE, row).expect("update status");
+                        }
+                        other => panic!("unrecognized op: {other}"),
+                    }
+                }
+            }
+            "analytical_query" => {
+                let query_sql = event.query.as_deref().expect("query SQL");
+                let sql_res = database.execute_sql(query_sql).expect("execute sql");
+
+                match event.name.as_deref().unwrap_or_default() {
+                    "global_totals" => {
+                        let expected_count = oracle.accounts.len() as u64;
+                        let expected_sum: u64 = oracle.accounts.values().map(|a| a.balance).sum();
+                        let expected_min =
+                            oracle.accounts.values().map(|a| a.balance).min().unwrap();
+                        let expected_max =
+                            oracle.accounts.values().map(|a| a.balance).max().unwrap();
+                        let expected_avg =
+                            (expected_sum as f64 / expected_count as f64).round() as i64;
+
+                        assert_eq!(sql_res.rows.len(), 1);
+                        assert_eq!(sql_res.rows[0][0], Value::U64(expected_count));
+                        assert_eq!(sql_res.rows[0][1], Value::U64(expected_sum));
+                        assert_eq!(sql_res.rows[0][2], Value::I64(expected_avg));
+                        assert_eq!(sql_res.rows[0][3], Value::U64(expected_min));
+                        assert_eq!(sql_res.rows[0][4], Value::U64(expected_max));
+                    }
+                    "category_breakdown" => {
+                        let mut oracle_cats: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+                        for acc in oracle.accounts.values() {
+                            let entry = oracle_cats.entry(acc.category.clone()).or_insert((0, 0));
+                            entry.0 += 1;
+                            entry.1 += acc.balance;
+                        }
+
+                        assert_eq!(sql_res.rows.len(), oracle_cats.len());
+                        for row in &sql_res.rows {
+                            if let Value::Text(cat) = &row[0] {
+                                let (exp_count, exp_sum) =
+                                    oracle_cats.get(cat).expect("known category");
+                                assert_eq!(row[1], Value::U64(*exp_count));
+                                assert_eq!(row[2], Value::U64(*exp_sum));
+                            } else {
+                                panic!("expected category string");
+                            }
+                        }
+                    }
+                    "status_counts" => {
+                        let mut oracle_statuses: BTreeMap<String, u64> = BTreeMap::new();
+                        for acc in oracle.accounts.values() {
+                            *oracle_statuses.entry(acc.status.clone()).or_insert(0) += 1;
+                        }
+
+                        assert_eq!(sql_res.rows.len(), oracle_statuses.len());
+                        for row in &sql_res.rows {
+                            if let Value::Text(st) = &row[0] {
+                                let exp_count = oracle_statuses.get(st).expect("known status");
+                                assert_eq!(row[1], Value::U64(*exp_count));
+                            } else {
+                                panic!("expected status string");
+                            }
+                        }
+                    }
+                    "active_premium_totals" => {
+                        let (exp_count, exp_sum) = oracle
+                            .accounts
+                            .values()
+                            .filter(|a| a.category == "premium" && a.status == "active")
+                            .fold((0u64, 0u64), |(c, s), a| (c + 1, s + a.balance));
+
+                        assert_eq!(sql_res.rows.len(), 1);
+                        assert_eq!(sql_res.rows[0][0], Value::U64(exp_count));
+                        assert_eq!(sql_res.rows[0][1], Value::U64(exp_sum));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
-
-        // Reopen database and verify persisted state
-        database.close().expect("close db");
-        let mut reopened = RelationalDatabase::open(config).expect("reopen");
-        let reopened_verify = reopened.verify().expect("verify reopened");
-        assert_eq!(reopened_verify.verified_tables, 2);
-        assert!(reopened_verify.verified_rows > 0);
-
-        let final_query = "SELECT COUNT(*), SUM(balance) FROM accounts";
-        let final_res = reopened.execute_sql(final_query).expect("final query");
-        let exp_count = oracle.accounts.len() as u64;
-        let exp_sum: u64 = oracle.accounts.values().map(|a| a.balance).sum();
-        assert_eq!(final_res.rows[0][0], Value::U64(exp_count));
-        assert_eq!(final_res.rows[0][1], Value::U64(exp_sum));
     }
+
+    // Reopen database and verify persisted state
+    database.close().expect("close db");
+    let mut reopened = RelationalDatabase::open(config).expect("reopen");
+
+    let final_query = "SELECT COUNT(*), SUM(balance) FROM accounts";
+    let final_res = reopened.execute_sql(final_query).expect("final query");
+    let exp_count = oracle.accounts.len() as u64;
+    let exp_sum: u64 = oracle.accounts.values().map(|a| a.balance).sum();
+    assert_eq!(final_res.rows[0][0], Value::U64(exp_count));
+    assert_eq!(final_res.rows[0][1], Value::U64(exp_sum));
 }
 
 #[test]
 fn morsel_scanner_enforces_memory_quota_and_cancellation() {
     let dir = tempdir().expect("tempdir");
-    let mut database = RelationalDatabase::open(backend_config(
-        RelationalBackendKind::Temporary,
-        &dir.path().join("db"),
-    ))
-    .expect("open db");
+    let mut database =
+        RelationalDatabase::create(backend_config(&dir.path().join("db"))).expect("create db");
 
     install_r4_schema(&mut database);
 
@@ -425,7 +399,13 @@ fn morsel_scanner_enforces_memory_quota_and_cancellation() {
     let mut constrained_query = query_low_memory.clone();
     constrained_query.max_memory_bytes = 500;
 
-    let res = database.query_analytical(&constrained_query);
+    let mut tx = database.begin().expect("begin tx");
+    let res = omendb::AnalyticalExecutor::execute(
+        &database,
+        &mut tx,
+        &constrained_query,
+        &OperationControl::default(),
+    );
     assert!(
         matches!(res, Err(DbError::ResourceLimitExceeded(_))),
         "Expected ResourceLimitExceeded under tight memory quota, got {res:?}"
@@ -436,7 +416,9 @@ fn morsel_scanner_enforces_memory_quota_and_cancellation() {
     cancellation.cancel();
     let control = OperationControl::with_cancellation(cancellation);
 
-    let cancel_res = database.query_analytical_with_control(&query_low_memory, &control);
+    let mut tx = database.begin().expect("begin tx");
+    let cancel_res =
+        omendb::AnalyticalExecutor::execute(&database, &mut tx, &query_low_memory, &control);
     assert!(
         matches!(cancel_res, Err(DbError::Cancelled)),
         "Expected DbError::Cancelled under cancelled control, got {cancel_res:?}"

@@ -13,10 +13,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DatabaseConfig, DbError, IndexDefinition, IndexId, Key,
-    OperationControl, RelationalBackendConfig, RelationalBackendKind, RelationalDatabaseConfig,
-    RelationalDatabaseSession, RelationalSessionConfig, Row, SeerKernelConfig, TableDefinition,
-    TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId, Key,
+    OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
+    RelationalSessionConfig, Row, TableDefinition, TableId, Value,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -33,7 +32,6 @@ const DEFAULT_SEED: u64 = 0xDB0E_2026_0812;
 
 #[derive(Clone, Copy, Debug)]
 struct WorkloadConfig {
-    backend: RelationalBackendKind,
     readers: usize,
     writers: usize,
     operations: usize,
@@ -59,11 +57,12 @@ fn main() -> Result<()> {
     let directory = tempfile::tempdir().context("create temporary workload directory")?;
     let database_directory = directory.path().join("database");
     let session = RelationalDatabaseSession::create(
-        RelationalDatabaseConfig::new(config(workload.backend, &database_directory))
-            .with_session_config(RelationalSessionConfig {
+        RelationalDatabaseConfig::new(config(&database_directory)).with_session_config(
+            RelationalSessionConfig {
                 max_in_flight: workload.readers.max(2),
                 admission_timeout: Duration::from_secs(60),
-            }),
+            },
+        ),
     )
     .context("create project-facing session")?;
     let session = Arc::new(session);
@@ -124,9 +123,7 @@ fn main() -> Result<()> {
         .commit_id(&control)
         .context("read final commit frontier")?;
     let final_rows = session
-        .read(&control, |database| {
-            database.scan(TABLE, final_commit, usize::MAX)
-        })
+        .read(&control, |database| database.scan(TABLE, usize::MAX))
         .context("scan final contention state")?;
     if final_rows.len() != workload.keys as usize {
         bail!(
@@ -168,7 +165,6 @@ fn main() -> Result<()> {
             "evidence_class": "project_api_resource_diagnostic",
             "hardware_benchmark": false,
             "parallel_writer_claim": false,
-            "backend": format!("{:?}", workload.backend),
             "readers": workload.readers,
             "writers": workload.writers,
             "operations_per_worker": workload.operations,
@@ -222,19 +218,14 @@ fn spawn_reader(
             let key = choose_key(&mut random, workload.keys, workload.hot_keys);
             let started = Instant::now();
             if operation % 4 == 0 {
-                let start = [Value::U64(0)];
                 session
-                    .read(&control, |database| {
-                        let snapshot = database.commit_id();
-                        database.index_scan(TABLE, snapshot, VALUE_INDEX, Some(&start), None, 16)
-                    })
+                    .read(&control, |database| database.index_scan(TABLE, VALUE_INDEX))
                     .context("indexed range read")?;
                 stats.range_reads += 1;
             } else {
                 session
                     .read(&control, |database| {
-                        let snapshot = database.commit_id();
-                        database.get(TABLE, snapshot, Key::new(TABLE.0, key))
+                        database.get(TABLE, Key::new(TABLE.0, key))
                     })
                     .context("hot-key point read")?;
                 stats.point_reads += 1;
@@ -394,20 +385,12 @@ fn digest_rows(rows: &[Row]) -> Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn config(kind: RelationalBackendKind, directory: &Path) -> RelationalBackendConfig {
-    match kind {
-        RelationalBackendKind::Temporary => RelationalBackendConfig::Temporary(DatabaseConfig {
-            directory: directory.to_owned(),
-        }),
-        RelationalBackendKind::Seer => {
-            RelationalBackendConfig::Seer(SeerKernelConfig::new(directory.to_owned()))
-        }
-    }
+fn config(directory: &Path) -> RelationalBackendConfig {
+    RelationalBackendConfig::new(directory.to_owned())
 }
 
 fn parse_arguments() -> Result<WorkloadConfig> {
     let mut workload = WorkloadConfig {
-        backend: RelationalBackendKind::Seer,
         readers: DEFAULT_READERS,
         writers: DEFAULT_WRITERS,
         operations: DEFAULT_OPERATIONS,
@@ -424,13 +407,6 @@ fn parse_arguments() -> Result<WorkloadConfig> {
                 .with_context(|| format!("{argument} requires a value"))
         };
         match argument.as_str() {
-            "--backend" => {
-                workload.backend = match value()?.as_str() {
-                    "temporary" => RelationalBackendKind::Temporary,
-                    "seer" => RelationalBackendKind::Seer,
-                    other => bail!("unsupported backend {other}"),
-                };
-            }
             "--readers" => workload.readers = value()?.parse().context("invalid --readers")?,
             "--writers" => workload.writers = value()?.parse().context("invalid --writers")?,
             "--operations" => {

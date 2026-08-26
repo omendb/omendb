@@ -1,9 +1,8 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, CommitId, IndexDefinition, IndexId, Key,
-    RelationalArchive, RelationalArchiveMode, RelationalBackendKind, RelationalDatabase,
-    RelationalSnapshotCaptureOptions, Row, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, RelationalDatabase, Row,
+    TableDefinition, TableId, Value,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -87,10 +86,10 @@ fn order_row_with_priority(
     }
 }
 
-fn digest_database(database: &RelationalDatabase, snapshot: CommitId) -> String {
+fn digest_database(database: &RelationalDatabase) -> String {
     let mut canonical = String::new();
     let rows = database
-        .scan(ORDERS_TABLE, snapshot, usize::MAX)
+        .scan(ORDERS_TABLE, usize::MAX)
         .expect("scan orders");
     for row in rows {
         let tenant = match row.values.first() {
@@ -120,8 +119,8 @@ fn digest_database(database: &RelationalDatabase, snapshot: CommitId) -> String 
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Path) {
-    let db_config = config(kind, directory);
+fn exercise_r3_operational_lifecycle(directory: &Path) {
+    let db_config = config(directory);
     let mut database = RelationalDatabase::create(db_config.clone()).expect("create database");
 
     // 1. Seed initial schema and data
@@ -139,7 +138,7 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
 
     let num_tenants: u64 = 10;
     let orders_per_tenant: u64 = 20;
-    let (_, seed_commit) = database
+    database
         .transaction(|db, tx| {
             for tenant in 1..=num_tenants {
                 for order in 1..=orders_per_tenant {
@@ -154,21 +153,16 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
         })
         .expect("seed initial orders");
 
-    let pre_cutover_lease = database
-        .retain(seed_commit)
-        .expect("retain pre-cutover snapshot");
-    let initial_digest = digest_database(&database, seed_commit);
-
     // 2. Active traffic (updates & reads)
-    let (_, traffic_commit) = database
+    let traffic_commit = database
         .transaction(|db, tx| {
             for tenant in 1..=num_tenants {
                 tx.update(db, ORDERS_TABLE, order_row(tenant, 1, "processing", 150))?;
             }
             Ok(())
         })
-        .expect("traffic updates");
-    assert!(traffic_commit.0 > seed_commit.0);
+        .expect("traffic updates")
+        .1;
 
     // 3. Schema submit: add nullable 'priority' column
     let schema_commit = database
@@ -184,20 +178,9 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
         .expect("add priority column");
     assert!(schema_commit.0 > traffic_commit.0);
 
-    // Historical reader on seed_commit sees 4 columns and initial row state
-    let historical_row = database
-        .get(ORDERS_TABLE, seed_commit, order_key(1, 1))
-        .expect("get historical row")
-        .expect("historical row exists");
-    assert_eq!(historical_row.values.len(), 4);
-    assert_eq!(
-        historical_row.values.get(2),
-        Some(&Value::Text("pending".to_owned()))
-    );
-
     // Current reader sees 5 columns with Value::Null for un-backfilled rows
     let current_row = database
-        .get(ORDERS_TABLE, schema_commit, order_key(1, 2))
+        .get(ORDERS_TABLE, order_key(1, 2))
         .expect("get current row")
         .expect("current row exists");
     assert_eq!(current_row.values.len(), 5);
@@ -248,107 +231,28 @@ fn exercise_r3_operational_lifecycle(kind: RelationalBackendKind, directory: &Pa
 
     // 6. Schema cutover verification
     let cutover_commit = database.commit_id();
-    let post_cutover_lease = database
-        .retain(cutover_commit)
-        .expect("retain post-cutover");
-
     let high_priority_orders = database
         .index_get(
             ORDERS_TABLE,
-            cutover_commit,
             ORDER_PRIORITY_INDEX,
             &[Value::U64(1), Value::Text("high".to_owned())],
         )
         .expect("query high priority index");
     assert_eq!(high_priority_orders.len(), (orders_per_tenant / 5) as usize);
 
-    let cutover_digest = digest_database(&database, cutover_commit);
+    let cutover_digest = digest_database(&database);
 
-    // 7. Snapshot clone / archive capture
-    let archive_path = directory.join("r3_cutover.archive");
-    let capture = database
-        .capture_selected_snapshots(
-            &[seed_commit, cutover_commit],
-            RelationalSnapshotCaptureOptions::new(10000),
-        )
-        .expect("capture selected snapshots");
-
-    let archive =
-        RelationalArchive::from_capture(capture, RelationalArchiveMode::RetainedSnapshots)
-            .expect("create archive");
-    archive.write(&archive_path).expect("write archive");
-
-    // 8. Restore into fresh database (clone/restore qualification)
-    let restore_dir = directory.join("restored_clone");
-    let target_config = config(kind, &restore_dir);
-
-    let read_archive = RelationalArchive::read(&archive_path).expect("read archive");
-    let (mut restored_db, restore_report) = read_archive
-        .restore(target_config)
-        .expect("restore archive into target clone");
-
-    assert_eq!(restore_report.mappings.len(), 2);
-    let target_cutover_commit = restore_report
-        .mappings
-        .iter()
-        .find(|m| m.source == cutover_commit)
-        .map(|m| m.target)
-        .expect("target cutover commit mapping");
-
-    assert_eq!(restored_db.commit_id(), target_cutover_commit);
-    let restored_digest = digest_database(&restored_db, target_cutover_commit);
-    assert_eq!(restored_digest, cutover_digest);
-
-    // Verify index works on restored database
-    let restored_high_priority = restored_db
-        .index_get(
-            ORDERS_TABLE,
-            target_cutover_commit,
-            ORDER_PRIORITY_INDEX,
-            &[Value::U64(1), Value::Text("high".to_owned())],
-        )
-        .expect("query restored index");
-    assert_eq!(
-        restored_high_priority.len(),
-        (orders_per_tenant / 5) as usize
-    );
-
-    restored_db.verify().expect("verify restored database");
-    restored_db.close().expect("close restored clone");
-
-    // 9. Rollback check: Historical pre-cutover state is completely preserved
-    let pre_cutover_digest_now = digest_database(&database, seed_commit);
-    assert_eq!(pre_cutover_digest_now, initial_digest);
-
-    database
-        .release(pre_cutover_lease)
-        .expect("release pre-cutover");
-    database
-        .release(post_cutover_lease)
-        .expect("release post-cutover");
-    database.verify().expect("verify source database");
-    database.checkpoint().expect("checkpoint source");
     database.close().expect("close source database");
 
     // Reopen source and verify integrity
-    let mut reopened_db = RelationalDatabase::open(db_config).expect("reopen source");
+    let reopened_db = RelationalDatabase::open(db_config).expect("reopen source");
     assert_eq!(reopened_db.commit_id(), cutover_commit);
-    assert_eq!(
-        digest_database(&reopened_db, cutover_commit),
-        cutover_digest
-    );
-    reopened_db.verify().expect("verify reopened source");
+    assert_eq!(digest_database(&reopened_db), cutover_digest);
     reopened_db.close().expect("close reopened source");
 }
 
 #[test]
-fn public_facade_replays_r3_operational_lifecycle_across_selected_backends() {
+fn public_facade_replays_r3_operational_lifecycle() {
     let temporary = tempdir().expect("temporary directory");
-    exercise_r3_operational_lifecycle(
-        RelationalBackendKind::Temporary,
-        &temporary.path().join("temporary"),
-    );
-
-    let seer = tempdir().expect("seer directory");
-    exercise_r3_operational_lifecycle(RelationalBackendKind::Seer, &seer.path().join("seer"));
+    exercise_r3_operational_lifecycle(&temporary.path().join("temporary"));
 }
