@@ -16,6 +16,7 @@ engineering baselines, not marketing claims.
 | Unique secondary-index lookup | ~195k ops/s |
 | Full scan (20k rows) | ~1.3M rows/s |
 | Read-modify-write update | ~65 ops/s |
+| SQL point SELECT via secondary index | ~44k queries/s |
 
 ## What the numbers mean
 
@@ -50,6 +51,5 @@ engineering baselines, not marketing claims.
 
 - Pipelined publication in SeerDB (staging must not block behind an
   in-flight wave sync) to unlock group-commit write throughput.
-- SQL planner: equality predicates do not select secondary indexes yet, so
-  point SELECTs through the SQL path scan the table (~60 queries/s at 20k
-  rows) while the typed API does ~195k/s.
+- Serializable isolation on top of SeerDB cursor range dependencies for
+  scan-based transactions (plain scans stay snapshot-isolated).

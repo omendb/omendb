@@ -128,6 +128,14 @@ fn main() {
             unique: true,
         })
         .expect("create index");
+    database
+        .create_index(IndexDefinition {
+            id: omendb::IndexId(2),
+            table: TableId(1),
+            columns: vec![ColumnId(2)],
+            unique: false,
+        })
+        .expect("create user_id index");
 
     let mut bench = Bench {
         name: "",
