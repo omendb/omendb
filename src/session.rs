@@ -1,21 +1,69 @@
 //! Synchronous project-facing ownership and admission.
 
-use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::relational_database::{
     OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT, RelationalBackendConfig,
     RelationalCapabilityReport, RelationalDatabase, RelationalDatabaseTransaction,
-    RelationalSessionEvent, RelationalSessionEventHistory, RelationalSessionEventKind,
-    RelationalSessionOperationKind, RelationalSupportBundle, TransactionAttemptOutcome,
 };
 use crate::{
     ColumnId, CommitId, DbError, ForeignKeyDefinition, IndexDefinition, IndexId, Key,
-    RelationalMetrics, RelationalSchemaDefinition, RelationalSnapshotCapture,
-    RelationalSnapshotCaptureOptions, RelationalSnapshotLease, Result, Row, RowIdentity,
-    TableDefinition, TableId, TransactionAttemptId, TransactionErrorClass, Value,
+    RelationalSchemaDefinition, Result, Row, RowIdentity, TableDefinition, TableId, Value,
 };
+
+/// The kind of operation observed by a project-facing session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationalSessionOperationKind {
+    Read,
+    Write,
+}
+
+/// Stable, redacted event kinds emitted by session admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationalSessionEventKind {
+    /// An operation acquired and released its session permit.
+    OperationCompleted,
+    /// An operation could not acquire admission within its configured bound.
+    AdmissionRejected,
+    /// Cancellation prevented admission.
+    CancellationObserved,
+    /// A deadline prevented admission.
+    DeadlineObserved,
+}
+
+/// A bounded, non-sensitive event emitted by one project-facing session.
+///
+/// The durations describe only session admission and permit ownership. They
+/// contain no query, row, key, path, or caller identity information.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationalSessionEvent {
+    /// Monotonic sequence within the owning session.
+    pub sequence: u64,
+    pub kind: RelationalSessionEventKind,
+    pub operation: RelationalSessionOperationKind,
+    pub admission_wait: Duration,
+    pub operation_time: Duration,
+}
+
+/// A bounded event-history projection for session admission.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RelationalSessionEventHistory {
+    /// Events retained in sequence order. The oldest events may be omitted
+    /// when `dropped` is non-zero.
+    pub events: Vec<RelationalSessionEvent>,
+    /// Number of older events evicted from the bounded history.
+    pub dropped: u64,
+}
+
+impl RelationalSessionEventHistory {
+    /// Return whether the history no longer contains its complete prefix.
+    #[must_use]
+    #[allow(dead_code)]
+    pub const fn is_truncated(&self) -> bool {
+        self.dropped != 0
+    }
+}
 
 /// Bounds for one project-facing database session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,11 +118,7 @@ impl Default for RelationalSessionConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexScanRequest {
     pub table: TableId,
-    pub snapshot: CommitId,
     pub index: IndexId,
-    pub start: Option<Vec<Value>>,
-    pub end: Option<Vec<Value>>,
-    pub limit: usize,
 }
 
 /// Admission and lifecycle counters for a project-facing session.
@@ -106,32 +150,22 @@ enum OperationKind {
     Write,
 }
 
-#[derive(Debug)]
-struct AdmissionState {
-    active_operations: usize,
-    active_writers: usize,
-    waiting_operations: usize,
-    waiting_writers: usize,
-    closing: bool,
-    completed_operations: u64,
-    total_admission_wait: Duration,
-    max_admission_wait: Duration,
-    total_operation_time: Duration,
-    max_operation_time: Duration,
-    rejected_operations: u64,
-    cancelled_operations: u64,
-    deadline_expired_operations: u64,
-    events: RelationalSessionEventLog,
-}
-
 #[derive(Debug, Default)]
 struct RelationalSessionEventLog {
     next_sequence: u64,
     dropped: u64,
-    events: VecDeque<RelationalSessionEvent>,
+    events: std::collections::VecDeque<RelationalSessionEvent>,
 }
 
 impl RelationalSessionEventLog {
+    #[allow(dead_code)]
+    fn snapshot(&self) -> RelationalSessionEventHistory {
+        RelationalSessionEventHistory {
+            events: self.events.iter().copied().collect(),
+            dropped: self.dropped,
+        }
+    }
+
     fn record(
         &mut self,
         kind: RelationalSessionEventKind,
@@ -152,13 +186,24 @@ impl RelationalSessionEventLog {
             self.dropped = self.dropped.saturating_add(1);
         }
     }
+}
 
-    fn snapshot(&self) -> RelationalSessionEventHistory {
-        RelationalSessionEventHistory {
-            events: self.events.iter().copied().collect(),
-            dropped: self.dropped,
-        }
-    }
+#[derive(Debug)]
+struct AdmissionState {
+    events: RelationalSessionEventLog,
+    active_operations: usize,
+    active_writers: usize,
+    waiting_operations: usize,
+    waiting_writers: usize,
+    closing: bool,
+    completed_operations: u64,
+    total_admission_wait: Duration,
+    max_admission_wait: Duration,
+    total_operation_time: Duration,
+    max_operation_time: Duration,
+    rejected_operations: u64,
+    cancelled_operations: u64,
+    deadline_expired_operations: u64,
 }
 
 struct OperationAdmission {
@@ -283,6 +328,7 @@ impl OperationAdmission {
         }
     }
 
+    #[allow(dead_code)]
     fn promote_to_write(
         &self,
         permit: &mut OperationPermit<'_>,
@@ -457,6 +503,7 @@ impl OperationAdmission {
         })
     }
 
+    #[allow(dead_code)]
     fn event_history(&self) -> Result<RelationalSessionEventHistory> {
         let state = self
             .state
@@ -544,7 +591,6 @@ fn session_lock_poisoned(resource: &'static str) -> DbError {
 pub struct RelationalDatabaseSession {
     database: RwLock<Option<RelationalDatabase>>,
     admission: OperationAdmission,
-    group_commit: crate::group_commit::GroupCommitPipeline,
 }
 
 impl RelationalDatabaseSession {
@@ -565,26 +611,13 @@ impl RelationalDatabaseSession {
         Ok(Self {
             database: RwLock::new(Some(database)),
             admission: OperationAdmission::new(config)?,
-            group_commit: crate::group_commit::GroupCommitPipeline::new(
-                crate::group_commit::GroupCommitConfig::default(),
-            ),
         })
     }
 
-    /// Return group commit performance metrics.
     #[must_use]
-    pub fn group_commit_metrics(&self) -> crate::group_commit::GroupCommitMetrics {
-        self.group_commit.metrics()
-    }
-
     /// Return admission/lifecycle state without consuming an operation slot.
     pub fn admission_status(&self) -> Result<RelationalSessionStatus> {
         self.admission.status()
-    }
-
-    /// Read the selected backend's lifecycle state under session admission.
-    pub fn status(&self, control: &OperationControl) -> Result<crate::RelationalDatabaseStatus> {
-        self.read(control, RelationalDatabase::status)
     }
 
     /// Read the backend-neutral capability/refusal report under admission.
@@ -592,79 +625,9 @@ impl RelationalDatabaseSession {
         self.read(control, |database| Ok(database.capabilities()))
     }
 
-    /// Read a correlated operational diagnostic snapshot under bounded
-    /// admission. The report does not run integrity verification.
-    pub fn diagnose(
-        &self,
-        control: &OperationControl,
-    ) -> Result<crate::RelationalDiagnosticReport> {
-        self.read(control, RelationalDatabase::diagnose)
-    }
-
-    /// Read a bounded, redacted support snapshot under session admission.
-    ///
-    /// The bundle contains handle-lifetime events and does not run integrity
-    /// verification or repair. Use [`Self::verify`] separately for that
-    /// evidence.
-    pub fn support_bundle(&self, control: &OperationControl) -> Result<RelationalSupportBundle> {
-        let mut bundle = self.read(control, RelationalDatabase::support_bundle)?;
-        bundle.session_events = self.admission.event_history()?;
-        Ok(bundle)
-    }
-
-    /// Read backend-neutral operational metrics under session admission.
-    pub fn metrics(&self, control: &OperationControl) -> Result<RelationalMetrics> {
-        self.read(control, RelationalDatabase::metrics)
-    }
-
     /// Return the current commit frontier under session admission.
     pub fn commit_id(&self, control: &OperationControl) -> Result<CommitId> {
         self.read(control, |database| Ok(database.commit_id()))
-    }
-
-    /// Return explicitly retained snapshot commits under bounded read
-    /// admission. The result is sorted and does not acquire or extend a
-    /// retention lease.
-    pub fn retained_snapshot_commits(&self, control: &OperationControl) -> Result<Vec<CommitId>> {
-        self.read(control, |database| Ok(database.retained_snapshot_commits()))
-    }
-
-    /// Return the selected backend's authoritative complete commit catalog
-    /// under bounded read admission.
-    pub fn published_commit_ids(&self, control: &OperationControl) -> Result<Vec<CommitId>> {
-        self.read(control, RelationalDatabase::published_commit_ids)
-    }
-
-    /// Capture selected current or explicitly retained snapshots under
-    /// exclusive session admission and the caller's operation control.
-    pub fn capture_selected_snapshots(
-        &self,
-        control: &OperationControl,
-        snapshots: &[CommitId],
-        options: RelationalSnapshotCaptureOptions,
-    ) -> Result<RelationalSnapshotCapture> {
-        self.exclusive(control, |database| {
-            database.capture_selected_snapshots(snapshots, options)
-        })
-    }
-
-    /// Capture every backend-proven logical commit boundary under exclusive
-    /// session admission.
-    pub fn capture_full_history(
-        &self,
-        control: &OperationControl,
-        options: RelationalSnapshotCaptureOptions,
-    ) -> Result<RelationalSnapshotCapture> {
-        self.exclusive(control, |database| database.capture_full_history(options))
-    }
-
-    /// Resolve a durable transaction attempt under read admission.
-    pub fn resolve_attempt(
-        &self,
-        control: &OperationControl,
-        attempt: TransactionAttemptId,
-    ) -> Result<Option<crate::AttemptRecord>> {
-        self.read(control, |database| database.resolve_attempt(attempt))
     }
 
     /// Run a read-only operation under bounded admission.
@@ -680,15 +643,15 @@ impl RelationalDatabaseSession {
         Ok(value)
     }
 
-    /// Read one row from a selected snapshot under bounded admission.
+    /// Read one legacy single-key row at the current state under bounded
+    /// admission.
     pub fn get(
         &self,
         control: &OperationControl,
         table: TableId,
-        snapshot: CommitId,
         primary: Key,
     ) -> Result<Option<Row>> {
-        self.read(control, |database| database.get(table, snapshot, primary))
+        self.read(control, |database| database.get(table, primary))
     }
 
     /// Read a row through the catalog-owned composite primary-key identity.
@@ -696,23 +659,19 @@ impl RelationalDatabaseSession {
         &self,
         control: &OperationControl,
         table: TableId,
-        snapshot: CommitId,
         identity: &RowIdentity,
     ) -> Result<Option<Row>> {
-        self.read(control, |database| {
-            database.get_by_identity(table, snapshot, identity)
-        })
+        self.read(control, |database| database.get_by_identity(table, identity))
     }
 
-    /// Scan rows from a selected snapshot under bounded admission.
+    /// Scan rows at the current state under bounded admission.
     pub fn scan(
         &self,
         control: &OperationControl,
         table: TableId,
-        snapshot: CommitId,
         limit: usize,
     ) -> Result<Vec<Row>> {
-        self.read(control, |database| database.scan(table, snapshot, limit))
+        self.read(control, |database| database.scan(table, limit))
     }
 
     /// Read rows matching an exact secondary-index key under bounded admission.
@@ -720,39 +679,21 @@ impl RelationalDatabaseSession {
         &self,
         control: &OperationControl,
         table: TableId,
-        snapshot: CommitId,
         index: crate::IndexId,
         values: &[Value],
     ) -> Result<Vec<Row>> {
-        self.read(control, |database| {
-            database.index_get(table, snapshot, index, values)
-        })
+        self.read(control, |database| database.index_get(table, index, values))
     }
 
-    /// Scan a secondary-index range under bounded admission.
+    /// Read all rows of one secondary index in key order under bounded
+    /// admission.
     pub fn index_scan(
         &self,
         control: &OperationControl,
-        request: IndexScanRequest,
+        table: TableId,
+        index: crate::IndexId,
     ) -> Result<Vec<Row>> {
-        let IndexScanRequest {
-            table,
-            snapshot,
-            index,
-            start,
-            end,
-            limit,
-        } = request;
-        self.read(control, |database| {
-            database.index_scan(
-                table,
-                snapshot,
-                index,
-                start.as_deref(),
-                end.as_deref(),
-                limit,
-            )
-        })
+        self.read(control, |database| database.index_scan(table, index))
     }
 
     /// Execute one statement in the bounded embedded SQL tier under
@@ -932,63 +873,6 @@ impl RelationalDatabaseSession {
         })
     }
 
-    /// Run backend checkpoint work under exclusive admission.
-    pub fn checkpoint(
-        &self,
-        control: &OperationControl,
-    ) -> Result<crate::RelationalCheckpointReport> {
-        self.exclusive(control, RelationalDatabase::checkpoint)
-    }
-
-    /// Run unbounded backend compaction under exclusive admission.
-    pub fn compact(&self, control: &OperationControl) -> Result<crate::RelationalCompactionReport> {
-        self.exclusive(control, RelationalDatabase::compact)
-    }
-
-    /// Run one bounded backend-neutral compaction pass under exclusive
-    /// admission. The budget bounds the backend's core reclaim iteration; it
-    /// is not a wall-clock or I/O guarantee.
-    pub fn compact_with_budget(
-        &self,
-        control: &OperationControl,
-        budget: crate::RelationalCompactionBudget,
-    ) -> Result<crate::RelationalCompactionReport> {
-        self.exclusive(control, |database| database.compact_with_budget(budget))
-    }
-
-    /// Run the logical/physical integrity check under exclusive admission.
-    pub fn verify(
-        &self,
-        control: &OperationControl,
-    ) -> Result<crate::RelationalVerificationReport> {
-        self.exclusive(control, RelationalDatabase::verify)
-    }
-
-    /// Retain a historical snapshot through the session's owning handle.
-    pub fn retain(
-        &self,
-        control: &OperationControl,
-        snapshot: CommitId,
-    ) -> Result<RelationalSnapshotLease> {
-        self.exclusive(control, |database| database.retain(snapshot))
-    }
-
-    /// Retain the current published root atomically with the session's
-    /// exclusive admission. Use this when a caller needs a current snapshot
-    /// for a later read and another writer or maintenance operation may race.
-    pub fn retain_current(&self, control: &OperationControl) -> Result<RelationalSnapshotLease> {
-        self.exclusive(control, RelationalDatabase::retain_current)
-    }
-
-    /// Release a historical snapshot retained through this session.
-    pub fn release(
-        &self,
-        control: &OperationControl,
-        lease: RelationalSnapshotLease,
-    ) -> Result<()> {
-        self.exclusive(control, |database| database.release(lease))
-    }
-
     /// Insert one row in an exclusive single-statement transaction.
     pub fn insert(&self, control: &OperationControl, table: TableId, row: Row) -> Result<CommitId> {
         self.transaction(control, |database, transaction| {
@@ -1046,238 +930,6 @@ impl RelationalDatabaseSession {
         let mut database = self.write_database()?;
         let database = database.as_mut().ok_or(DbError::SessionClosed)?;
         database.transaction_with_control(control, operation)
-    }
-
-    /// Run a typed transaction with overlapping preparation and exclusive
-    /// publication.
-    ///
-    /// The closure may run concurrently with other transaction preparations
-    /// and immutable reads. Publication still upgrades to the one serialized
-    /// writer lane; if another transaction publishes first, this transaction
-    /// returns [`DbError::SerializationConflict`] rather than silently
-    /// retrying or claiming parallel-writer isolation. The admission permit
-    /// remains held across both phases, so close and support metrics account
-    /// for the complete transaction lifetime.
-    pub fn transaction_with_parallel_preparation<T, F>(
-        &self,
-        control: &OperationControl,
-        operation: F,
-    ) -> Result<(T, CommitId)>
-    where
-        F: FnOnce(&RelationalDatabase, &mut RelationalDatabaseTransaction) -> Result<T>,
-    {
-        let mut permit = self.admission.acquire(control, OperationKind::Read)?;
-        let (value, transaction) = {
-            let database = self.read_database()?;
-            let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-            let mut transaction = database.begin_with_control(control)?;
-            let value = operation(database, &mut transaction)?;
-            (value, transaction)
-        };
-        if transaction.is_read_only() {
-            control.check()?;
-            return Ok((value, transaction.snapshot()));
-        }
-        self.admission.promote_to_write(&mut permit, control)?;
-        let mut database = self.write_database()?;
-        let database = database.as_mut().ok_or(DbError::SessionClosed)?;
-        let commit = transaction.commit(database)?;
-        Ok((value, commit))
-    }
-
-    /// Run a transaction closure concurrently under a shared read permit and
-    /// validate serializability (fine-grained point/range anti-dependency
-    /// checking) upon promotion to the write lane. Disjoint concurrent writers
-    /// commit successfully without false serialization aborts.
-    pub fn transaction_with_validated_parallel_preparation<T, F>(
-        &self,
-        control: &OperationControl,
-        operation: F,
-    ) -> Result<(T, CommitId)>
-    where
-        F: FnOnce(&RelationalDatabase, &mut RelationalDatabaseTransaction) -> Result<T>,
-    {
-        let mut permit = self.admission.acquire(control, OperationKind::Read)?;
-        let (value, transaction) = {
-            let database = self.read_database()?;
-            let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-            let mut transaction = database.begin_with_control(control)?;
-            let value = operation(database, &mut transaction)?;
-            (value, transaction)
-        };
-        if transaction.is_read_only() {
-            control.check()?;
-            return Ok((value, transaction.snapshot()));
-        }
-        self.admission.promote_to_write(&mut permit, control)?;
-        let mut database = self.write_database()?;
-        let database = database.as_mut().ok_or(DbError::SessionClosed)?;
-        let commit = transaction.commit_validated(database)?;
-        Ok((value, commit))
-    }
-
-    /// Run a transaction closure concurrently under shared read admission and
-    /// publish through the pipelined group commit coordinator.
-    ///
-    /// Multiple concurrent workers coalesce their durable publications into a
-    /// single kernel batch. Transactions prepared on an older snapshot that
-    /// lose the race to a newer publication retry the closure on a fresh
-    /// snapshot, standard optimistic concurrency; the closure must therefore
-    /// be idempotent in its staged effects until publication.
-    pub fn transaction_with_group_commit<T, F>(
-        &self,
-        control: &OperationControl,
-        mut operation: F,
-    ) -> Result<(T, CommitId)>
-    where
-        F: FnMut(&RelationalDatabase, &mut RelationalDatabaseTransaction) -> Result<T>,
-    {
-        let _permit = self.admission.acquire(control, OperationKind::Read)?;
-        const MAX_GROUP_COMMIT_RETRIES: usize = 64;
-        let mut attempt = 0;
-        loop {
-            let (value, transaction) = {
-                let database = self.read_database()?;
-                let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-                let mut transaction = database.begin_with_control(control)?;
-                let value = operation(database, &mut transaction)?;
-                (value, transaction)
-            };
-            if transaction.is_read_only() {
-                control.check()?;
-                return Ok((value, transaction.snapshot()));
-            }
-            match self
-                .group_commit
-                .submit_and_await(&self.database, control, transaction)
-            {
-                Ok(commit) => return Ok((value, commit)),
-                Err(error)
-                    if error.transaction_class() == TransactionErrorClass::SerializationRetry =>
-                {
-                    attempt += 1;
-                    if attempt >= MAX_GROUP_COMMIT_RETRIES {
-                        return Err(error);
-                    }
-                    // Wait for the publication queue to drain before
-                    // re-beginning. Under sustained contention a fresh
-                    // snapshot is stale by its batch drain whenever another
-                    // publication is always in flight (the commit ladder);
-                    // retrying only into an empty queue guarantees the
-                    // next submission publishes immediately.
-                    while self.group_commit.pending_count() > 0 {
-                        if control.check().is_err() {
-                            return Err(DbError::Cancelled);
-                        }
-                        std::thread::sleep(Duration::from_micros(200));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// Run an attempt-aware typed transaction through the group-commit
-    /// pipeline.
-    ///
-    /// A duplicate committed attempt returns an explicit durable record and
-    /// does not rerun the caller closure. Otherwise this behaves exactly like
-    /// [`Self::transaction_with_group_commit`]: the same
-    /// attempt identity survives serialization retries, and the durable
-    /// idempotency record publishes inside the shared coalesced envelope.
-    pub fn transaction_with_group_commit_attempt<T, F>(
-        &self,
-        control: &OperationControl,
-        attempt: TransactionAttemptId,
-        mut operation: F,
-    ) -> Result<TransactionAttemptOutcome<T>>
-    where
-        F: FnMut(&RelationalDatabase, &mut RelationalDatabaseTransaction) -> Result<T>,
-    {
-        let _permit = self.admission.acquire(control, OperationKind::Read)?;
-        control.check()?;
-        let resolved = {
-            let database = self.read_database()?;
-            let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-            database.resolve_attempt(attempt)?
-        };
-        if let Some(record) = resolved {
-            let database = self.write_database()?;
-            let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-            database.record_already_committed_event(record.commit);
-            return Ok(TransactionAttemptOutcome::AlreadyCommitted { record });
-        }
-        const MAX_GROUP_COMMIT_RETRIES: usize = 64;
-        let mut retries = 0;
-        loop {
-            let (value, transaction) = {
-                let database = self.read_database()?;
-                let database = database.as_ref().ok_or(DbError::SessionClosed)?;
-                let mut transaction = database.begin_with_control(control)?;
-                transaction.set_attempt(attempt);
-                let value = operation(database, &mut transaction)?;
-                (value, transaction)
-            };
-            if transaction.is_read_only() {
-                control.check()?;
-                return Ok(TransactionAttemptOutcome::Applied {
-                    value,
-                    commit: transaction.snapshot(),
-                });
-            }
-            match self
-                .group_commit
-                .submit_and_await(&self.database, control, transaction)
-            {
-                Ok(commit) => return Ok(TransactionAttemptOutcome::Applied { value, commit }),
-                Err(error)
-                    if error.transaction_class() == TransactionErrorClass::SerializationRetry =>
-                {
-                    retries += 1;
-                    if retries >= MAX_GROUP_COMMIT_RETRIES {
-                        return Err(error);
-                    }
-                    // Wait for the publication queue to drain before
-                    // re-beginning; see transaction_with_group_commit.
-                    while self.group_commit.pending_count() > 0 {
-                        if control.check().is_err() {
-                            return Err(DbError::Cancelled);
-                        }
-                        std::thread::sleep(Duration::from_micros(200));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// Run an attempt-aware typed transaction under exclusive admission.
-    ///
-    /// A duplicate committed attempt returns an explicit durable record and
-    /// does not rerun the caller closure.
-    pub fn transaction_with_attempt<T, F>(
-        &self,
-        control: &OperationControl,
-        attempt: TransactionAttemptId,
-        operation: F,
-    ) -> Result<TransactionAttemptOutcome<T>>
-    where
-        F: FnOnce(&RelationalDatabase, &mut RelationalDatabaseTransaction) -> Result<T>,
-    {
-        let _permit = self.admission.acquire(control, OperationKind::Write)?;
-        let mut database = self.write_database()?;
-        let database = database.as_mut().ok_or(DbError::SessionClosed)?;
-        database.transaction_with_attempt_and_control(attempt, control, operation)
-    }
-
-    /// Forget caller-selected durable attempt records under exclusive
-    /// admission. Forgotten identities must never be reused.
-    pub fn forget_attempts(
-        &self,
-        control: &OperationControl,
-        attempts: &[TransactionAttemptId],
-    ) -> Result<usize> {
-        self.exclusive(control, |database| database.forget_attempts(attempts))
     }
 
     /// Consume the session after all operations have returned and close the

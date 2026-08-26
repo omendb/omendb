@@ -872,10 +872,10 @@ impl OmenDbHandler {
                 }
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
-                let mut database = write_lock(&self.database)?;
+                let _database = write_lock(&self.database)?;
                 block
                     .transaction
-                    .commit(&mut database)
+                    .commit()
                     .map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }

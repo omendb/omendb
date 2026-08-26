@@ -85,17 +85,4 @@ pub enum Mutation {
         index_key: Vec<u8>,
         primary: Vec<u8>,
     },
-    /// Durable transaction-attempt metadata. This is consumed by the
-    /// storage kernel and is not part of the relational row/index model.
-    #[doc(hidden)]
-    RecordAttempt {
-        attempt: crate::TransactionAttemptId,
-        digest: [u8; 32],
-    },
-    /// Durable deletion of transaction-attempt metadata after the caller has
-    /// decided that no retry may use the identity again.
-    #[doc(hidden)]
-    ForgetAttempt {
-        attempt: crate::TransactionAttemptId,
-    },
 }

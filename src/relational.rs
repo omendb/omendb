@@ -2,11 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
-use crate::fault::FaultInjector;
-use crate::kernel::StorageKernel;
-use crate::model::{CommitId, IndexId, Key};
+use crate::model::{IndexId, Key};
 use crate::row_identity::{RowIdentity, decode_legacy_key, encode_legacy_key};
-use crate::store::DatabaseConfig;
 use crate::{DbError, Result};
 
 const ROW_MAGIC: [u8; 4] = *b"DBRW";
@@ -104,75 +101,6 @@ pub struct Catalog {
     index_names: BTreeMap<IndexId, String>,
     foreign_keys: BTreeMap<ConstraintId, ForeignKeyDefinition>,
     foreign_key_names: BTreeMap<ConstraintId, String>,
-}
-
-/// Bounds for one in-memory logical snapshot capture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RelationalSnapshotCaptureOptions {
-    /// Maximum number of rows across all snapshots in one capture.
-    pub max_rows: usize,
-    /// Maximum number of snapshots in one capture.
-    pub max_snapshots: usize,
-    /// Maximum number of durable transaction-attempt records observed in one
-    /// capture. Archives currently refuse captures that contain any records,
-    /// but the bound keeps the source observation finite for future transfer
-    /// policies.
-    pub max_attempts: usize,
-}
-
-impl RelationalSnapshotCaptureOptions {
-    #[must_use]
-    pub const fn new(max_rows: usize) -> Self {
-        Self {
-            max_rows,
-            max_snapshots: 1_000_000,
-            max_attempts: 1_024,
-        }
-    }
-
-    /// Set the maximum number of logical snapshots observed by capture.
-    #[must_use]
-    pub const fn with_max_snapshots(mut self, max_snapshots: usize) -> Self {
-        self.max_snapshots = max_snapshots;
-        self
-    }
-
-    /// Set the maximum number of durable attempt records observed by capture.
-    #[must_use]
-    pub const fn with_max_attempts(mut self, max_attempts: usize) -> Self {
-        self.max_attempts = max_attempts;
-        self
-    }
-}
-
-/// Rows belonging to one table in a captured logical snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RelationalSnapshotTable {
-    pub table: TableId,
-    pub rows: Vec<Row>,
-}
-
-/// One backend-neutral logical snapshot suitable for later archive assembly.
-///
-/// Catalog definitions and rows are authoritative. Secondary indexes are
-/// intentionally represented only by catalog definitions and their derived
-/// membership is rebuilt and verified by a future target importer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RelationalSnapshot {
-    pub commit: CommitId,
-    pub catalog: Catalog,
-    pub tables: Vec<RelationalSnapshotTable>,
-    pub catalog_digest: [u8; 32],
-    pub logical_digest: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct LogicalVerification {
-    pub catalog_generation: u64,
-    pub table_count: usize,
-    pub index_count: usize,
-    pub row_count: usize,
-    pub index_entry_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -844,97 +772,6 @@ pub fn decode_row(primary: Key, bytes: &[u8]) -> Result<Row> {
         });
     }
     Ok(Row { primary, values })
-}
-
-/// Temporary/reference backend: the shared relational implementation over
-/// the legacy durable kernel adapter. The adapter is kept for compatibility
-/// and differential conformance while the production path moves to SeerDB's
-/// capability-rich transaction API. This is not an invitation to add a
-/// first-party backend matrix.
-pub type RelationalStore = crate::SeerRelationalStore<crate::temporary_kernel::TemporaryKernel>;
-pub type RelationalTransaction =
-    crate::SeerRelationalTransaction<crate::temporary_kernel::TemporaryKernel>;
-
-impl crate::SeerRelationalStore<crate::temporary_kernel::TemporaryKernel> {
-    pub fn create(config: DatabaseConfig) -> Result<Self> {
-        let kernel = crate::temporary_kernel::TemporaryKernel::create(config)?;
-        Self::from_kernel(kernel)
-    }
-
-    pub fn open(config: DatabaseConfig, _faults: &mut dyn FaultInjector) -> Result<Self> {
-        let kernel = crate::temporary_kernel::TemporaryKernel::open(config)?;
-        Self::from_kernel(kernel)
-    }
-
-    pub(crate) fn requires_recovery(&self) -> bool {
-        self.kernel_requires_recovery()
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.kernel_generation()
-    }
-
-    pub fn compact_with_key_budget(
-        &mut self,
-        max_work_units: usize,
-    ) -> Result<crate::store::CompactionReport> {
-        StorageKernel::compact_with_limit(&mut self.kernel, max_work_units)
-    }
-
-    pub fn compact_with_budget(
-        &mut self,
-        budget: crate::store::CompactionBudget,
-    ) -> Result<crate::store::CompactionReport> {
-        self.compact_with_key_budget(budget.max_row_keys.max(budget.max_index_keys))
-    }
-
-    pub fn compact_with_budget_and_faults(
-        &mut self,
-        budget: crate::store::CompactionBudget,
-        _faults: &mut dyn FaultInjector,
-    ) -> Result<crate::store::CompactionReport> {
-        self.compact_with_budget(budget)
-    }
-
-    fn kernel_requires_recovery(&self) -> bool {
-        self.kernel.requires_recovery()
-    }
-
-    fn kernel_generation(&self) -> u64 {
-        self.kernel.generation()
-    }
-}
-
-pub(crate) fn build_snapshot_capture(
-    commit: CommitId,
-    catalog: Catalog,
-    tables: Vec<RelationalSnapshotTable>,
-) -> Result<RelationalSnapshot> {
-    let catalog_bytes = encode_catalog(&catalog)?;
-    let catalog_digest = Sha256::digest(&catalog_bytes).into();
-    let mut logical = Sha256::new();
-    logical.update(b"OMENDB/relational-snapshot/v1");
-    logical.update((catalog_bytes.len() as u64).to_le_bytes());
-    logical.update(&catalog_bytes);
-    for table in &tables {
-        logical.update(table.table.0.to_le_bytes());
-        logical.update((table.rows.len() as u64).to_le_bytes());
-        for row in &table.rows {
-            let encoded = encode_row(row)?;
-            let identity = row_identity_bytes(&catalog, catalog.table(table.table)?, row)?;
-            logical.update((identity.len() as u64).to_le_bytes());
-            logical.update(identity);
-            logical.update((encoded.len() as u64).to_le_bytes());
-            logical.update(encoded);
-        }
-    }
-    Ok(RelationalSnapshot {
-        commit,
-        catalog,
-        tables,
-        catalog_digest,
-        logical_digest: logical.finalize().into(),
-    })
 }
 
 fn ensure_table_key(table: TableId, key: Key) -> Result<()> {

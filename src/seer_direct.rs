@@ -15,7 +15,7 @@ use seerdb::{CommitSeq, Error as SeerError, Options, Transaction, TransactionDat
 use crate::relational::{
     Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, RelationalSchemaDefinition, Row,
     TableDefinition, TableId, Value, encode_catalog, encode_row, foreign_key_values,
-    index_values_key, row_from_storage_identity, row_identity_bytes, row_identity_bytes_for_lookup,
+    index_values_key, row_from_storage_identity, row_identity_bytes,
     row_index_key,
 };
 use crate::{DbError, IndexId, Result};
@@ -439,6 +439,26 @@ impl DirectSeerStore {
         DirectTransaction::begin(self)
     }
 
+    /// Return the latest published commit sequence number.
+    pub(crate) fn commit_seq(&self) -> CommitSeq {
+        self.database.commit_sequence().expect("open database reports its CSN")
+    }
+
+    /// Look up one row through its encoded composite identity.
+    pub(crate) fn get_by_identity(
+        &self,
+        table: TableId,
+        identity: &[u8],
+    ) -> Result<Option<Row>> {
+        self.get(table, identity)
+    }
+
+    /// Read all rows reachable through one index in index-key order.
+    pub(crate) fn index_scan(&self, table: TableId, index: IndexId) -> Result<Vec<Row>> {
+        let mut transaction = self.begin_transaction()?;
+        transaction.index_scan(table, index)
+    }
+
     fn stage_indexes(
         &self,
         transaction: &mut Transaction,
@@ -783,6 +803,36 @@ impl DirectTransaction {
         Ok(())
     }
 
+    /// Return the transaction's fixed read snapshot.
+    pub(crate) fn snapshot_csn(&self) -> CommitSeq {
+        self.transaction.snapshot()
+    }
+
+    /// Read all rows reachable through one index in index-key order,
+    /// including this transaction's staged state.
+    pub(crate) fn index_scan(&mut self, table: TableId, index: IndexId) -> Result<Vec<Row>> {
+        let definition = self.catalog.table(table)?.clone();
+        let tree = self.index_tree(index)?;
+        let mut rows = Vec::new();
+        for (entry, identity) in self
+            .transaction
+            .scan(tree, &[], None, usize::MAX)
+            .map_err(map_seer_error)?
+        {
+            let (_, row_identity) = decode_index_entry(&entry, &identity)?;
+            let bytes = self
+                .transaction
+                .get(self.table_tree(table)?, &row_identity)
+                .map_err(map_seer_error)?
+                .ok_or_else(|| DbError::Corruption {
+                    artifact: "direct SeerDB index",
+                    reason: "index entry references a missing row".to_owned(),
+                })?;
+            rows.push(row_from_storage_identity(&self.catalog, &definition, &row_identity, &bytes)?);
+        }
+        Ok(rows)
+    }
+
     fn stage_indexes_for(
         &mut self,
         table: TableId,
@@ -893,8 +943,8 @@ impl DirectTransaction {
         }
         Ok(())
     }
-}
 
+}
 fn validate_mapping(
     transaction: &Transaction,
     catalog_tree: TreeId,

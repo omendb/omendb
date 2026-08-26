@@ -6,43 +6,23 @@
 //! deterministic corruption behavior without claiming PostgreSQL protocol or
 //! SQL compatibility.
 
-mod archive;
-mod artifact;
-mod attempt;
 mod fault;
-mod group_commit;
-mod kernel;
 mod model;
 mod morsel;
 mod packed;
 mod relational;
 mod relational_database;
-mod replication;
 mod row_identity;
 mod runtime;
 // This direct path is a qualification surface until historical retention and
 // durability-position results are ready to replace the transitional facade.
 #[allow(dead_code, clippy::type_complexity)]
 mod seer_direct;
-mod seer_kernel;
-mod seer_relational;
 mod serializable;
 mod session;
 mod sql;
-mod store;
-pub mod temporary_kernel;
-mod wal;
 
-pub use archive::{
-    RelationalArchive, RelationalArchiveAttemptDisposition, RelationalArchiveAttemptMapping,
-    RelationalArchiveAttemptPolicy, RelationalArchiveManifest, RelationalArchiveMode,
-    RelationalArchiveRestoreReport, RelationalArchiveSnapshotManifest,
-    RelationalArchiveSnapshotMapping,
-};
-pub use attempt::{AttemptRecord, TransactionAttemptId};
 pub use fault::{FailOnce, FaultInjector, FaultPoint, NoFaults};
-pub use group_commit::{GroupCommitConfig, GroupCommitMetrics, GroupCommitPipeline};
-pub use kernel::{InMemoryKernel, StorageKernel};
 pub use model::{CommitId, IndexId, Key, Mutation, StorageIdentity};
 pub use morsel::{
     AggregateAccumulator, AggregateKind, AggregateSpec, AnalyticalExecutor, AnalyticalQuery,
@@ -52,40 +32,19 @@ pub use packed::{PACKED_PAGE_BYTES, PackBudget, PackReport, PackedPage, PackedRa
 pub use relational::{
     Catalog, ColumnDefinition, ColumnId, ColumnType, ConstraintId, ConstraintTiming,
     ForeignKeyDefinition, IndexDefinition, NamedForeignKeyDefinition, NamedIndexDefinition,
-    ReferentialAction, RelationalMutation, RelationalSchemaDefinition, RelationalSnapshot,
-    RelationalSnapshotCaptureOptions, RelationalSnapshotTable, RelationalStore,
-    RelationalTransaction, Row, TableDefinition, TableId, Value, decode_row, encode_row,
+    ReferentialAction, RelationalMutation, RelationalSchemaDefinition, Row, TableDefinition,
+    TableId, Value, decode_row, encode_row,
 };
 pub use relational_database::{
     CancellationToken, OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT,
-    RELATIONAL_SQL_BATCH_LIMIT, RELATIONAL_SUPPORT_BUNDLE_VERSION, RelationalBackendConfig,
-    RelationalBackendKind, RelationalCapability, RelationalCapabilityInfo,
-    RelationalCapabilityReport, RelationalCapabilityState, RelationalCheckpointReport,
-    RelationalCompactionBudget, RelationalCompactionReport, RelationalDatabase,
-    RelationalDatabaseStatus, RelationalDatabaseTransaction, RelationalDiagnosticCode,
-    RelationalDiagnosticComponent, RelationalDiagnosticFinding, RelationalDiagnosticReport,
-    RelationalDiagnosticSeverity, RelationalEvent, RelationalEventHistory, RelationalEventKind,
-    RelationalLifecycleState, RelationalMetrics, RelationalPublicationMetrics,
-    RelationalSessionEvent, RelationalSessionEventHistory, RelationalSessionEventKind,
-    RelationalSessionOperationKind, RelationalSnapshotCapture, RelationalSnapshotLease,
-    RelationalSupportBundle, RelationalVerificationReport, TransactionAttemptOutcome,
-    TransactionProfile,
-};
-pub use replication::{
-    ReplicatedMutation, ReplicationBatch, ReplicationLagReport, ReplicationRecord, ReplicationRole,
-    ReplicationStream, StandbyReplica,
+    RELATIONAL_SQL_BATCH_LIMIT, RelationalBackendConfig, RelationalCapability,
+    RelationalCapabilityInfo, RelationalCapabilityReport, RelationalCapabilityState,
+    RelationalDatabase, RelationalDatabaseTransaction,
 };
 pub use row_identity::RowIdentity;
 pub use runtime::{
     Dispatch, GovernorConfig, GovernorError, GovernorStats, OverloadPolicy, Reactor, ReactorConfig,
     ReactorError, ResourceGovernor, WorkClass, WorkId, WorkItem, WorkerId,
-};
-pub use seer_kernel::{
-    CommitOutcome, DurabilityStatus, KvMutation, SeerKernel, SeerKernelConfig, SnapshotIdentity,
-    SnapshotLease,
-};
-pub use seer_relational::{
-    LegacyMigrationOptions, LegacyMigrationReport, SeerRelationalStore, SeerRelationalTransaction,
 };
 pub use serializable::{
     CertificationConflict, CertifierAlgorithm, CertifierMetrics, SerializableCertifier,
@@ -96,14 +55,8 @@ pub use session::{
     RelationalSessionStatus,
 };
 pub use sql::{SqlColumn, SqlResult};
-pub use temporary_kernel::{TemporaryKernel, TemporaryReadView};
 #[cfg(feature = "pgwire")]
 pub mod pgwire_server;
-pub use store::{
-    CompactionBudget, CompactionReport, CompactionWork, Database, DatabaseConfig, DatabaseMetrics,
-    MaintenanceError, Transaction,
-};
-
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Stable application-facing classification for a failed transaction
@@ -249,12 +202,6 @@ pub enum DbError {
     SessionBusy,
     #[error("database session has been closed")]
     SessionClosed,
-    #[error("transaction attempt {attempt:?} was reused with different mutations")]
-    IdempotencyConflict {
-        attempt: TransactionAttemptId,
-        existing_digest: [u8; 32],
-        requested_digest: [u8; 32],
-    },
     #[error("migration published at {destination}, but reopening failed: {reason}")]
     MigrationPublished { destination: String, reason: String },
 }
@@ -290,7 +237,6 @@ impl DbError {
             | Self::NonMonotonicCommit { .. }
             | Self::ValueTooLarge(_)
             | Self::FragmentDebtExceeded { .. }
-            | Self::IdempotencyConflict { .. }
             | Self::SqlParse(_)
             | Self::SqlParameter(_)
             | Self::SqlUnsupported { .. }
