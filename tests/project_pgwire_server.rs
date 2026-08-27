@@ -438,7 +438,7 @@ async fn wire_client_selects_seeds_and_reads_typed_rows() {
 }
 
 #[tokio::test]
-async fn wire_client_gets_clean_error_for_unsupported_sql() {
+async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
     let (addr, _server) = pgwire_server::spawn(database, "127.0.0.1:0".parse().expect("addr"))
@@ -474,6 +474,15 @@ async fn wire_client_gets_clean_error_for_unsupported_sql() {
         .await
         .expect("connection survives a failed statement");
     assert_eq!(recovered.get::<_, i64>(0), 1);
+
+    let unsupported = client
+        .query("VACUUM", &[])
+        .await
+        .expect_err("unsupported statement must fail");
+    assert_eq!(
+        unsupported.code(),
+        Some(&tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+    );
 }
 
 async fn wire_client(database: Arc<RwLock<RelationalDatabase>>) -> tokio_postgres::Client {

@@ -29,7 +29,10 @@ All notable changes to OmenDB are documented here. Format follows
   format change via `generate_current_format_fixtures`.
 - Operator runbook (`docs/runbook.md`): health checks, verification,
   maintenance, recovery-required reconciliation, platform/filesystem
-  assumptions.
+  assumptions, and current diagnostic/quota semantics.
+- Development PostgreSQL wire compatibility matrix
+  (`docs/pgwire-compatibility.md`) listing tested protocol/authentication/
+  authorization behavior and explicit compatibility gaps.
 - Release contract and gates: `docs/alpha-release-gates.md`.
 - Reproducible single-client OLTP baseline `examples/alpha_oltp.rs` with
   workload metadata, latency percentiles, peak RSS, and SQLite comparison.

@@ -89,6 +89,9 @@ independent evidence.
       diagnostics have an explicit documented baseline;
 - [ ] the supported PostgreSQL protocol/SQL subset has differential and
       negative compatibility tests; unsupported behavior fails explicitly.
+      Current development evidence is catalogued in
+      [`docs/pgwire-compatibility.md`](pgwire-compatibility.md), but its live
+      PostgreSQL differential and wider-session gaps remain open.
 
 ### Correctness and isolation
 

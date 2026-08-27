@@ -91,8 +91,10 @@ messages are routed to the database's cooperative cancellation checkpoints;
 connection admission is bounded with `--max-connections`.
 
 The supported SQL and wire surface is deliberate and bounded, not a claim of
-PostgreSQL compatibility. The throwaway seeded example remains available for
-client experiments:
+PostgreSQL compatibility. See the
+[`docs/pgwire-compatibility.md`](docs/pgwire-compatibility.md) development
+matrix for tested behavior and explicit gaps. The throwaway seeded example
+remains available for client experiments:
 
 ```bash
 cargo run --features pgwire --example pgwire_serve -- 5432
