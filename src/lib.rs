@@ -135,6 +135,10 @@ pub enum DbError {
     SqlParse(String),
     #[error("invalid SQL parameters: {0}")]
     SqlParameter(String),
+    #[error("table {name} does not exist")]
+    SqlUndefinedTable { name: String },
+    #[error("column {name} does not exist")]
+    SqlUndefinedColumn { name: String },
     #[error("unsupported SQL {statement}: {reason}")]
     SqlUnsupported {
         statement: &'static str,
@@ -241,6 +245,8 @@ impl DbError {
             | Self::FragmentDebtExceeded { .. }
             | Self::SqlParse(_)
             | Self::SqlParameter(_)
+            | Self::SqlUndefinedTable { .. }
+            | Self::SqlUndefinedColumn { .. }
             | Self::SqlUnsupported { .. }
             | Self::SessionClosing
             | Self::SessionClosed => TransactionErrorClass::InvalidRequest,

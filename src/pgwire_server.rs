@@ -1256,6 +1256,8 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         | crate::DbError::SeerTreeConflict { .. }
         | crate::DbError::WriteWriteConflict { .. } => ("40001", error.to_string()),
         crate::DbError::SqlParse(_) => ("42601", error.to_string()),
+        crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
+        crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
         crate::DbError::SqlUnsupported { .. } => {
             ("0A000", format!("feature not supported: {error}"))
         }

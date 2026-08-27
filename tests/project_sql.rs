@@ -290,7 +290,7 @@ fn exercise_sql_schema_constraints(directory: &Path) {
         database.execute_sql(
             "CREATE TABLE invalid_children (id BIGINT PRIMARY KEY, parent_id BIGINT NOT NULL, FOREIGN KEY (parent_id) REFERENCES missing (id))"
         ),
-        Err(DbError::InvalidState(reason)) if reason.contains("table missing")
+        Err(DbError::SqlUndefinedTable { name }) if name == "missing"
     ));
     assert_eq!(database.commit_id(), before_invalid);
 

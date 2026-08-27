@@ -531,7 +531,9 @@ pub(super) fn column_position_by_name(table: &TableDefinition, name: &str) -> Re
         .columns
         .iter()
         .position(|column| column.name == name)
-        .ok_or_else(|| DbError::InvalidState(format!("column {name} does not exist")))
+        .ok_or_else(|| DbError::SqlUndefinedColumn {
+            name: name.to_owned(),
+        })
 }
 
 pub(super) fn table_from_join<'a>(
@@ -554,7 +556,9 @@ pub(super) fn find_table<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a Tab
     catalog
         .tables()
         .find(|table| table.name == name)
-        .ok_or_else(|| DbError::InvalidState(format!("table {name} does not exist")))
+        .ok_or_else(|| DbError::SqlUndefinedTable {
+            name: name.to_owned(),
+        })
 }
 
 pub(super) fn simple_object_name<'a>(

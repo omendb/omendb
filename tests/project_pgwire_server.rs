@@ -462,11 +462,9 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         .expect_err("unsupported query errors cleanly");
     // A clean PostgreSQL-style error with a mapped SQLSTATE - the connection
     // stays usable rather than dying on an unhandled failure.
-    assert!(
-        matches!(
-            error.code(),
-            Some(&tokio_postgres::error::SqlState::INTERNAL_ERROR)
-        ),
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_TABLE),
         "unexpected error shape: {error:?}"
     );
     let recovered = client
@@ -482,6 +480,15 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
     assert_eq!(
         syntax.code(),
         Some(&tokio_postgres::error::SqlState::SYNTAX_ERROR)
+    );
+
+    let column = client
+        .execute("UPDATE users SET missing = 'x'", &[])
+        .await
+        .expect_err("undefined columns must be reported");
+    assert_eq!(
+        column.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)
     );
 
     let unsupported = client
