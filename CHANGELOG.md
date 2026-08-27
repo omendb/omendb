@@ -46,6 +46,9 @@ All notable changes to OmenDB are documented here. Format follows
   tables and columns map to `42P01` and `42703`, respectively. Regression
   coverage remains alongside the existing `0A000` unsupported-feature
   assertion.
+- Persistent wire servers accept an optional cooperative per-statement
+  timeout through `ServerConfig` and `--statement-timeout-ms`; expiry maps to
+  SQLSTATE `57014`.
 - Seer read views are cached strongly and invalidated under the publication
   lock; transaction begins capture frontier and view atomically, removing a
   race that surfaced as spurious `StorageSnapshotUnavailable` under

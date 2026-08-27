@@ -88,7 +88,8 @@ catalogs use trust mode on loopback only. Provision a SCRAM user through
 `pgwire_server::provision_wire_user` before starting the daemon; once a user
 exists, startup requires SCRAM authentication. PostgreSQL `CancelRequest`
 messages are routed to the database's cooperative cancellation checkpoints;
-connection admission is bounded with `--max-connections`.
+connection admission is bounded with `--max-connections`, and
+`--statement-timeout-ms` adds a cooperative per-statement deadline.
 
 The supported SQL and wire surface is deliberate and bounded, not a claim of
 PostgreSQL compatibility. See the

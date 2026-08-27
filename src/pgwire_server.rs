@@ -78,19 +78,17 @@ fn write_lock(
         .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
 }
 
-fn read_lock_with_cancellation<'a>(
+fn read_lock_with_control<'a>(
     database: &'a SharedDatabase,
-    cancellation: &CancellationToken,
+    control: &OperationControl,
 ) -> PgWireResult<std::sync::RwLockReadGuard<'a, RelationalDatabase>> {
     loop {
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        control.check().map_err(map_db_error)?;
         match database.try_read() {
             Ok(guard) => {
-                if cancellation.is_cancelled() {
+                if let Err(error) = control.check() {
                     drop(guard);
-                    return Err(map_db_error(DbError::Cancelled));
+                    return Err(map_db_error(error));
                 }
                 return Ok(guard);
             }
@@ -104,19 +102,17 @@ fn read_lock_with_cancellation<'a>(
     }
 }
 
-fn write_lock_with_cancellation<'a>(
+fn write_lock_with_control<'a>(
     database: &'a SharedDatabase,
-    cancellation: &CancellationToken,
+    control: &OperationControl,
 ) -> PgWireResult<std::sync::RwLockWriteGuard<'a, RelationalDatabase>> {
     loop {
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        control.check().map_err(map_db_error)?;
         match database.try_write() {
             Ok(guard) => {
-                if cancellation.is_cancelled() {
+                if let Err(error) = control.check() {
                     drop(guard);
-                    return Err(map_db_error(DbError::Cancelled));
+                    return Err(map_db_error(error));
                 }
                 return Ok(guard);
             }
@@ -141,6 +137,9 @@ pub struct ServerConfig {
     pub create_if_missing: bool,
     /// Maximum number of connection tasks admitted at once.
     pub max_connections: usize,
+    /// Optional cooperative deadline for each wire statement and describe.
+    /// `None` disables the deadline; zero is an immediate deadline.
+    pub statement_timeout: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -152,6 +151,7 @@ impl ServerConfig {
             bind_addr,
             create_if_missing: true,
             max_connections: 128,
+            statement_timeout: None,
         }
     }
 
@@ -166,6 +166,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections;
+        self
+    }
+
+    /// Set the cooperative statement and describe deadline.
+    #[must_use]
+    pub fn with_statement_timeout(mut self, statement_timeout: Option<Duration>) -> Self {
+        self.statement_timeout = statement_timeout;
         self
     }
 }
@@ -414,7 +421,12 @@ impl RunningServer {
         };
         let shared = Arc::new(RwLock::new(database));
         let state = Arc::new(ServerState::new(config.max_connections));
-        let factory = match build_factory(&shared, address, Arc::clone(&state.query_workers)) {
+        let factory = match build_factory(
+            &shared,
+            address,
+            Arc::clone(&state.query_workers),
+            config.statement_timeout,
+        ) {
             Ok(factory) => factory,
             Err(error) => {
                 close_shared_database(shared)?;
@@ -507,6 +519,7 @@ pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::
         &database,
         listener.local_addr()?,
         Arc::clone(&state.query_workers),
+        None,
     )?;
     run_accept_loop(listener, factory, state, Semaphore::MAX_PERMITS).await
 }
@@ -589,6 +602,7 @@ fn build_factory(
     database: &SharedDatabase,
     listener_addr: std::net::SocketAddr,
     query_workers: Arc<QueryWorkers>,
+    statement_timeout: Option<Duration>,
 ) -> std::io::Result<Arc<HandlerFactory>> {
     {
         let mut database =
@@ -640,6 +654,7 @@ fn build_factory(
             schema_probes: Arc::new(Mutex::new(HashMap::new())),
             identities: Arc::clone(&identities),
             query_workers,
+            statement_timeout,
         }),
         auth: auth.map(|auth_source| {
             Arc::new(ScramComponents {
@@ -1231,6 +1246,7 @@ struct OmenDbHandler {
     /// re-probing.
     schema_probes: Arc<Mutex<ProbeCache>>,
     query_workers: Arc<QueryWorkers>,
+    statement_timeout: Option<Duration>,
 }
 
 fn pg_error(code: &str, message: String) -> PgWireError {
@@ -1247,7 +1263,6 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
             "57014",
             "canceling statement due to user request".to_owned(),
         ),
-        crate::DbError::DeadlineExceeded => ("57014", error.to_string()),
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
         crate::DbError::ForeignKeyViolation { .. }
         | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
@@ -1255,6 +1270,10 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         | crate::DbError::SeerWriteConflict { .. }
         | crate::DbError::SeerTreeConflict { .. }
         | crate::DbError::WriteWriteConflict { .. } => ("40001", error.to_string()),
+        crate::DbError::DeadlineExceeded => (
+            "57014",
+            "canceling statement due to statement timeout".to_owned(),
+        ),
         crate::DbError::SqlParse(_) => ("42601", error.to_string()),
         crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
@@ -1349,10 +1368,10 @@ impl OmenDbHandler {
     fn resolved_parameter_types(
         &self,
         statement: &ParsedStatement,
-        cancellation: &CancellationToken,
+        control: &OperationControl,
     ) -> PgWireResult<Vec<Type>> {
         let count = ParsedStatement::placeholder_count(&statement.sql);
-        let database = read_lock_with_cancellation(&self.database, cancellation)?;
+        let database = read_lock_with_control(&self.database, control)?;
         let inferred = database
             .sql_parameter_types(&statement.sql)
             .map_err(map_db_error)?;
@@ -1473,6 +1492,17 @@ impl OmenDbHandler {
         )
     }
 
+    fn operation_control(&self, cancellation: &CancellationToken) -> OperationControl {
+        let control = OperationControl::with_cancellation(cancellation.clone());
+        match self
+            .statement_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+        {
+            Some(deadline) => control.with_deadline(deadline),
+            None => control,
+        }
+    }
+
     fn lock_transactions(
         &self,
     ) -> PgWireResult<std::sync::MutexGuard<'_, HashMap<std::net::SocketAddr, TransactionBlock>>>
@@ -1497,11 +1527,9 @@ impl OmenDbHandler {
         sql: &str,
         params: &[Value],
         format: &pgwire::api::portal::Format,
-        cancellation: &CancellationToken,
+        control: &OperationControl,
     ) -> PgWireResult<Response> {
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        control.check().map_err(map_db_error)?;
         if Self::is_schema_statement(sql)
             && let Ok(mut cache) = self.schema_probes.lock()
         {
@@ -1516,10 +1544,8 @@ impl OmenDbHandler {
             let mut blocks = self.lock_transactions()?;
             self.reap_idle_blocks(&mut blocks);
         }
-        self.enforce_grants(client_addr, sql, cancellation)?;
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        self.enforce_grants(client_addr, sql, control)?;
+        control.check().map_err(map_db_error)?;
         match transaction_command(sql) {
             Some(TransactionCommand::Begin) => {
                 let mut blocks = self.lock_transactions()?;
@@ -1536,13 +1562,10 @@ impl OmenDbHandler {
                 drop(blocks);
                 // begin() only needs &self: opening a block takes no write
                 // access and publishes nothing.
-                let control = OperationControl::with_cancellation(cancellation.clone());
-                let transaction = read_lock_with_cancellation(&self.database, cancellation)?
-                    .begin_with_control(&control)
+                let transaction = read_lock_with_control(&self.database, control)?
+                    .begin_with_control(control)
                     .map_err(map_db_error)?;
-                if cancellation.is_cancelled() {
-                    return Err(map_db_error(DbError::Cancelled));
-                }
+                control.check().map_err(map_db_error)?;
                 let mut blocks = self.lock_transactions()?;
                 blocks.insert(
                     client_addr,
@@ -1568,9 +1591,8 @@ impl OmenDbHandler {
                 }
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
-                let control = OperationControl::with_cancellation(cancellation.clone());
-                block.transaction.set_operation_control(&control);
-                let _database = write_lock_with_cancellation(&self.database, cancellation)?;
+                block.transaction.set_operation_control(control);
+                let _database = write_lock_with_control(&self.database, control)?;
                 block.transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
@@ -1588,7 +1610,7 @@ impl OmenDbHandler {
                 // Membership check under the lock; execution outside it.
                 let in_block = { self.lock_transactions()?.contains_key(&client_addr) };
                 if !in_block {
-                    return self.run_autocommit(sql, params, format, cancellation);
+                    return self.run_autocommit(sql, params, format, control);
                 }
 
                 // Take this connection's block out so other connections
@@ -1606,12 +1628,11 @@ impl OmenDbHandler {
                     ));
                 }
                 block.last_used = Instant::now();
-                let control = OperationControl::with_cancellation(cancellation.clone());
-                block.transaction.set_operation_control(&control);
+                block.transaction.set_operation_control(control);
                 // Buffered into the transaction; publication happens at
                 // COMMIT under the write lock, so execution only needs
                 // shared access.
-                let database = read_lock_with_cancellation(&self.database, cancellation)?;
+                let database = read_lock_with_control(&self.database, control)?;
                 let outcome = block
                     .transaction
                     .execute_sql_with_params(&database, sql, params);
@@ -1639,7 +1660,7 @@ impl OmenDbHandler {
         &self,
         client_addr: std::net::SocketAddr,
         sql: &str,
-        cancellation: &CancellationToken,
+        control: &OperationControl,
     ) -> PgWireResult<()> {
         let Some(role) = self
             .identities
@@ -1650,7 +1671,7 @@ impl OmenDbHandler {
             return Ok(());
         };
 
-        let database = read_lock_with_cancellation(&self.database, cancellation)?;
+        let database = read_lock_with_control(&self.database, control)?;
         if !database
             .catalog()
             .tables()
@@ -1658,7 +1679,7 @@ impl OmenDbHandler {
         {
             return Ok(());
         }
-        let mut transaction = database.begin().map_err(map_db_error)?;
+        let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
         let result = transaction.execute_sql_with_params(
             &database,
             "SELECT table_name, can_read, can_write FROM pgwire_grants WHERE role = $1",
@@ -1666,18 +1687,14 @@ impl OmenDbHandler {
         );
         drop(transaction);
         let result = result.map_err(map_db_error)?;
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        control.check().map_err(map_db_error)?;
 
         // No rows at all means grants exist only for other roles; this
         // role still defaults to deny.
         let mut admin = false;
         let mut table_grants: HashMap<String, (bool, bool)> = HashMap::new();
         for row in &result.rows {
-            if cancellation.is_cancelled() {
-                return Err(map_db_error(DbError::Cancelled));
-            }
+            control.check().map_err(map_db_error)?;
             let Some(Value::Text(table_name)) = row.first() else {
                 continue;
             };
@@ -1739,19 +1756,15 @@ impl OmenDbHandler {
         sql: &str,
         params: &[Value],
         format: &pgwire::api::portal::Format,
-        cancellation: &CancellationToken,
+        control: &OperationControl,
     ) -> PgWireResult<Response> {
         if Self::is_schema_statement(sql) {
             // Schema changes are owned by the direct database method rather
             // than a relational transaction. Cancellation is therefore a
             // preflight check for this non-interruptible publication.
-            if cancellation.is_cancelled() {
-                return Err(map_db_error(DbError::Cancelled));
-            }
-            let mut database = write_lock_with_cancellation(&self.database, cancellation)?;
-            if cancellation.is_cancelled() {
-                return Err(map_db_error(DbError::Cancelled));
-            }
+            control.check().map_err(map_db_error)?;
+            let mut database = write_lock_with_control(&self.database, control)?;
+            control.check().map_err(map_db_error)?;
             return Ok(encode_response_with_format(
                 database
                     .execute_sql_with_params(sql, params)
@@ -1759,14 +1772,12 @@ impl OmenDbHandler {
                 format,
             ));
         }
-        let control = OperationControl::with_cancellation(cancellation.clone());
+        control.check().map_err(map_db_error)?;
         if Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             // Reads scale: snapshot query under shared access via an
             // autocommit transaction that aborts on completion.
-            let database = read_lock_with_cancellation(&self.database, cancellation)?;
-            let mut transaction = database
-                .begin_with_control(&control)
-                .map_err(map_db_error)?;
+            let database = read_lock_with_control(&self.database, control)?;
+            let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
             let result = transaction.execute_sql_with_params(&database, sql, params);
             drop(transaction);
             return Ok(encode_response_with_format(
@@ -1774,9 +1785,9 @@ impl OmenDbHandler {
                 format,
             ));
         }
-        let mut database = write_lock_with_cancellation(&self.database, cancellation)?;
+        let mut database = write_lock_with_control(&self.database, control)?;
         let (result, _) = database
-            .transaction_with_control(&control, |database, transaction| {
+            .transaction_with_control(control, |database, transaction| {
                 transaction.execute_sql_with_params(database, sql, params)
             })
             .map_err(map_db_error)?;
@@ -1830,8 +1841,9 @@ impl OmenDbHandler {
         sql: &str,
         resolved: &[Type],
         format: &pgwire::api::portal::Format,
-        cancellation: &CancellationToken,
+        control: &OperationControl,
     ) -> PgWireResult<Arc<Vec<FieldInfo>>> {
+        control.check().map_err(map_db_error)?;
         if !Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             return Ok(Arc::new(Vec::new()));
         }
@@ -1868,17 +1880,12 @@ impl OmenDbHandler {
                     .collect(),
             ));
         }
-        let database = read_lock_with_cancellation(&self.database, cancellation)?;
-        let control = OperationControl::with_cancellation(cancellation.clone());
-        let mut transaction = database
-            .begin_with_control(&control)
-            .map_err(map_db_error)?;
+        let database = read_lock_with_control(&self.database, control)?;
+        let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
         let result = transaction.execute_sql_with_params(&database, sql, &probe_params);
         drop(transaction);
         let result = result.map_err(map_db_error)?;
-        if cancellation.is_cancelled() {
-            return Err(map_db_error(DbError::Cancelled));
-        }
+        control.check().map_err(map_db_error)?;
         let sample = result.rows.first();
         let columns: Arc<Vec<(String, Type)>> = Arc::new(
             result
@@ -1940,12 +1947,13 @@ impl SimpleQueryHandler for OmenDbHandler {
                     if statement.is_empty() {
                         continue;
                     }
+                    let control = handler.operation_control(&cancellation);
                     responses.push(handler.run_statement(
                         client_addr,
                         statement,
                         &[],
                         &pgwire::api::portal::Format::UnifiedText,
-                        &cancellation,
+                        &control,
                     )?);
                 }
                 if responses.is_empty() {
@@ -1989,9 +1997,10 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let client_addr = _client.socket_addr();
         self.query_workers
             .spawn_operation(cancellation.clone(), move || {
-                let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
+                let control = handler.operation_control(&cancellation);
+                let resolved = handler.resolved_parameter_types(&statement, &control)?;
                 let params = decode_parameters(&parameters, &parameter_format, &resolved)?;
-                handler.run_statement(client_addr, &statement.sql, &params, &format, &cancellation)
+                handler.run_statement(client_addr, &statement.sql, &params, &format, &control)
             })
             .await
             .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
@@ -2011,13 +2020,13 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let (parameter_types, fields) = self
             .query_workers
             .spawn_operation(cancellation.clone(), move || {
-                let parameter_types =
-                    handler.resolved_parameter_types(&statement, &cancellation)?;
+                let control = handler.operation_control(&cancellation);
+                let parameter_types = handler.resolved_parameter_types(&statement, &control)?;
                 let fields = handler.describe_schema(
                     &statement.sql,
                     &parameter_types,
                     &pgwire::api::portal::Format::UnifiedBinary,
-                    &cancellation,
+                    &control,
                 )?;
                 Ok::<_, PgWireError>((parameter_types, fields))
             })
@@ -2045,8 +2054,9 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let fields = self
             .query_workers
             .spawn_operation(cancellation.clone(), move || {
-                let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
-                handler.describe_schema(&statement.sql, &resolved, &format, &cancellation)
+                let control = handler.operation_control(&cancellation);
+                let resolved = handler.resolved_parameter_types(&statement, &control)?;
+                handler.describe_schema(&statement.sql, &resolved, &format, &control)
             })
             .await
             .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??;

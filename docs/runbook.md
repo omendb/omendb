@@ -29,7 +29,8 @@ Start the daemon with an explicit durable path:
 
 ```bash
 cargo run --features pgwire --bin omendbd -- \
-  --path ./omendb-data --bind 127.0.0.1:5432 --max-connections 128
+  --path ./omendb-data --bind 127.0.0.1:5432 --max-connections 128 \
+  --statement-timeout-ms 30000
 ```
 
 The daemon creates a missing path by default, binds the listener, and keeps one
@@ -44,11 +45,13 @@ Empty `pgwire_auth` catalogs enable trust authentication only on loopback. A
 provisioned user switches startup to SCRAM-SHA-256; provision users while the
 database is closed, then restart the daemon. `--max-connections` bounds
 connection tasks; rejected sockets are counted in `RunningServer::status()`.
-PostgreSQL `CancelRequest` messages cancel the active database operation at
-its cooperative checkpoints; synchronous query work runs in server-tracked
-blocking workers so awaited shutdown drains it before closing the database.
-Schema publication remains a non-interruptible operation and checks
-cancellation before it starts.
+`--statement-timeout-ms` applies a cooperative deadline to each statement and
+`Describe`; zero rejects execution immediately. PostgreSQL `CancelRequest`
+messages cancel the active database operation at its cooperative checkpoints;
+synchronous query work runs in server-tracked blocking workers so awaited
+shutdown drains it before closing the database. Schema publication remains a
+non-interruptible operation and checks cancellation and the statement deadline
+before it starts.
 
 ## Health checks
 
@@ -61,10 +64,10 @@ workers whose cancellation token was observed. The failed and cancelled
 counters may overlap. A `RelationalDatabaseSession` exposes
 `admission_status()` with active operations, writer counts, admission waits,
 and rejections. `commit_id()` returns the visible commit frontier (the SeerDB
-commit sequence number). The current hard wire-server quota is admitted
-connection count; query result memory, statement time, and bytes-per-query
-quotas are not yet implemented. A failed durable write fences writes until
-reopen, and reopen failure surfaces as an open error.
+commit sequence number). The current hard wire-server quotas are admitted
+connection count and cooperative statement time; query-result memory and
+bytes-per-query quotas are not yet implemented. A failed durable write fences
+writes until reopen, and reopen failure surfaces as an open error.
 
 ## Routine maintenance
 

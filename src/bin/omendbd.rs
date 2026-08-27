@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N]
+//!         [--statement-timeout-ms N]
 //! ```
 
 #![cfg(feature = "pgwire")]
@@ -11,10 +12,11 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use omendb::pgwire_server::{RunningServer, ServerConfig};
 
-type ParsedArgs = Option<(PathBuf, SocketAddr, usize)>;
+type ParsedArgs = Option<(PathBuf, SocketAddr, usize, Option<Duration>)>;
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -27,7 +29,9 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some((path, bind, max_connections)) = parse_args(std::env::args().skip(1))? else {
+    let Some((path, bind, max_connections, statement_timeout)) =
+        parse_args(std::env::args().skip(1))?
+    else {
         return Ok(());
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -35,7 +39,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     runtime.block_on(async move {
         let server = RunningServer::start(
-            ServerConfig::new(path, bind).with_max_connections(max_connections),
+            ServerConfig::new(path, bind)
+                .with_max_connections(max_connections)
+                .with_statement_timeout(statement_timeout),
         )
         .await?;
         println!("omendbd listening on {}", server.local_addr());
@@ -52,6 +58,7 @@ fn parse_args(
     let mut path = None;
     let mut bind = "127.0.0.1:5432".parse::<SocketAddr>()?;
     let mut max_connections = 128;
+    let mut statement_timeout = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--path" => path = Some(PathBuf::from(required_value(&mut args, "--path")?)),
@@ -59,15 +66,22 @@ fn parse_args(
             "--max-connections" => {
                 max_connections = required_value(&mut args, "--max-connections")?.parse()?;
             }
+            "--statement-timeout-ms" => {
+                statement_timeout = Some(Duration::from_millis(
+                    required_value(&mut args, "--statement-timeout-ms")?.parse()?,
+                ));
+            }
             "--help" | "-h" => {
-                println!("usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N]");
+                println!(
+                    "usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N] [--statement-timeout-ms N]"
+                );
                 return Ok(None);
             }
             unknown => return Err(format!("unknown argument: {unknown}").into()),
         }
     }
     let path = path.ok_or("--path is required")?;
-    Ok(Some((path, bind, max_connections)))
+    Ok(Some((path, bind, max_connections, statement_timeout)))
 }
 
 fn required_value(

@@ -16,6 +16,7 @@ cargo test --features pgwire --test project_pgwire_server
 | Persistent ownership | One `omendbd` process owns one durable database and listener; shutdown drains connections and workers before close. | `persistent_server_reopens_durable_database_after_shutdown`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Process loss | A daemon killed with `SIGKILL` can be followed by durable reopen with committed data intact. | `omendbd_process_kill_reopens_durable_database` (Unix) |
 | Connection admission | `ServerConfig::max_connections` is a hard bound; excess sockets are rejected and counted. | `persistent_server_rejects_connections_over_bound` |
+| Statement deadline | `ServerConfig::statement_timeout` and `--statement-timeout-ms` apply a cooperative deadline to each statement and describe; expiry maps to `57014`. Schema publication remains non-interruptible after its preflight. | `persistent_server_statement_timeout_cancels_before_execution` |
 | Trust startup | Empty auth catalogs use trust only on loopback. | `wire_trust_mode_refuses_non_loopback_listener` |
 | SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
 | Authorization | Provisioned grants distinguish read, write, and schema-admin access; ungranted tables deny access. | `wire_grant_enforcement_reader_writer_admin` |
@@ -63,5 +64,5 @@ gates:
 - exhaustive SQLSTATE mapping (for example, some execution-time `InvalidState`
   errors such as division by zero still report a generic internal wire error
   rather than their PostgreSQL-specific SQLSTATE);
-- query-result memory, statement-time, and bytes-per-query quotas; and
+- query-result memory and bytes-per-query quotas; and
 - process-level kill/reopen coverage at each durable publication seam.
