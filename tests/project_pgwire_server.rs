@@ -120,6 +120,95 @@ async fn persistent_server_reopens_durable_database_after_shutdown() {
     let _ = connection_task.await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_server_shutdown_cancels_query_before_database_close() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let mut database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database
+        .create_table(TableDefinition {
+            id: TableId(7),
+            name: "items".to_owned(),
+            columns: vec![ColumnDefinition {
+                id: ColumnId(1),
+                name: "id".to_owned(),
+                data_type: ColumnType::U64,
+                nullable: false,
+            }],
+        })
+        .expect("create table");
+    let values = (1..=5_000)
+        .map(|id| format!("({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    database
+        .execute_sql(&format!("INSERT INTO items (id) VALUES {values}"))
+        .expect("seed rows");
+    database.close().expect("close seed database");
+
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_create_if_missing(false);
+    let server = pgwire_server::RunningServer::start(config.clone())
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+    let query = tokio::spawn(async move {
+        client
+            .query(
+                "SELECT lhs.id FROM items AS lhs CROSS JOIN items AS rhs LIMIT 1",
+                &[],
+            )
+            .await
+    });
+
+    // The nested-loop query is deliberately larger than the result window:
+    // shutdown must cancel its tracked worker rather than wait for all pairs.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), server.shutdown())
+        .await
+        .expect("shutdown completed")
+        .expect("shutdown cleanly");
+    let query_result = tokio::time::timeout(std::time::Duration::from_secs(5), query)
+        .await
+        .expect("query task completed")
+        .expect("query join completed");
+    assert!(query_result.is_err(), "shutdown query must not succeed");
+    let _ = connection_task.await;
+
+    let reopened = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("reopen after shutdown cancellation");
+    let (check, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            reopened.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("reconnect");
+    let connection_task = tokio::spawn(connection);
+    let row = check
+        .query_one("SELECT count(*) FROM items", &[])
+        .await
+        .expect("read after shutdown cancellation");
+    assert_eq!(row.get::<_, i64>(0), 5_000);
+    drop(check);
+    reopened.shutdown().await.expect("shutdown reopened server");
+    let _ = connection_task.await;
+}
+
 #[tokio::test]
 async fn persistent_server_rejects_unbounded_connection_configuration() {
     let directory = tempdir().expect("tempdir");

@@ -187,9 +187,9 @@ from the durable auth catalog, reports lifecycle counters, and closes the
 handle on explicit shutdown. This is a server foundation, not yet the complete
 alpha contract: protocol coverage, authorization policy, resource quotas, and
 crash-level daemon tests remain open. Wire cancellation now routes
-`CancelRequest` to the transaction API's cooperative checkpoints; a
-representative lock-wait wire test now covers SQLSTATE `57014`, while a
-process-level shutdown/failure test remains open. The direct
+`CancelRequest` to the transaction API's cooperative checkpoints; representative
+lock-wait and shutdown-time wire tests cover SQLSTATE `57014` and worker drain
+before reopen. The direct
 SeerDB qualification path (`src/seer_direct.rs`) remains test-only evidence for
 catalog/table/index-to-tree mapping and is not a second relational backend.
 
@@ -226,8 +226,9 @@ relational consumer:
 4. **Server alpha foundation — in progress:** persistent multi-session
    lifecycle, bounded connection admission, configuration, lifecycle
    diagnostics, and clean shutdown/reopen behavior are implemented. The
-   deliberate PostgreSQL protocol subset, authorization baseline,
-   cancellation, and process-level compatibility/crash tests remain open.
+   deliberate PostgreSQL protocol subset, authorization baseline, resource
+   quotas, and process-level compatibility/crash tests remain open; wire
+   cancellation and tracked worker draining are implemented.
 5. **Correctness and scale:** serializable certification, snapshot plus
    zero-gap logical CDC, physical replication, typed OLTP micro-plans, batch
    execution, and benchmark-led storage/runtime optimization.

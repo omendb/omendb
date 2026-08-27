@@ -27,9 +27,10 @@ pub const RELATIONAL_EVENT_HISTORY_LIMIT: usize = 128;
 /// Cooperative cancellation shared by a project-facing transaction and its
 /// caller.
 ///
-/// Cancellation is observed when the transaction begins, performs a bounded
-/// read or stage operation, and immediately before durable publication. It
-/// cannot interrupt arbitrary user code or an already-started backend write.
+/// Cancellation is observed when the transaction begins, during bounded
+/// reads and SQL execution loops, while staging, and immediately before
+/// durable publication. It cannot interrupt arbitrary user code or an
+/// already-started backend write.
 #[derive(Clone, Debug)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -891,6 +892,12 @@ impl RelationalDatabaseTransaction {
 
     pub(crate) fn set_operation_control(&mut self, control: &OperationControl) {
         self.control = Some(control.clone());
+    }
+
+    pub(crate) fn check_operation_control(&self) -> Result<()> {
+        self.control
+            .as_ref()
+            .map_or(Ok(()), OperationControl::check)
     }
 
     /// Execute one bounded embedded SQL statement inside this transaction.

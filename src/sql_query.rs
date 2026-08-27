@@ -19,6 +19,7 @@ pub(super) fn execute_query(
     query: &Query,
     params: &[Value],
 ) -> Result<SqlResult> {
+    transaction.check_operation_control()?;
     validate_query_shape(query)?;
     if matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
         return execute_set_operation(query, query.body.as_ref(), database, transaction, params);
@@ -100,6 +101,7 @@ pub(super) fn execute_query(
     let can_stop_after_window = order.is_empty() && select.distinct.is_none();
     let mut matching_rows = Vec::new();
     for row in rows {
+        transaction.check_operation_control()?;
         if let Some(selection) = &select.selection
             && predicate(selection, &row, table, params, &subqueries)? != Truth::True
         {
@@ -114,10 +116,11 @@ pub(super) fn execute_query(
         validate_order_rows(&matching_rows, table, &order)?;
         matching_rows.sort_by(|left, right| compare_rows(left, right, &order));
     }
-    let projected_rows = matching_rows
-        .into_iter()
-        .map(|row| project_row(&projection, &row))
-        .collect::<Result<Vec<_>>>()?;
+    let mut projected_rows = Vec::with_capacity(matching_rows.len());
+    for row in matching_rows {
+        transaction.check_operation_control()?;
+        projected_rows.push(project_row(&projection, &row)?);
+    }
     let projected_rows = if select.distinct.is_some() {
         apply_distinct(projected_rows)
     } else {
@@ -160,6 +163,7 @@ fn resolve_subqueries(
     let mut found = Vec::new();
     collect_subqueries(selection, &mut found);
     for expression in found {
+        transaction.check_operation_control()?;
         let (key, query, kind) = match expression {
             Expr::InSubquery { subquery, .. } => (subquery.to_string(), subquery, "IN"),
             Expr::Exists { subquery, .. } => (subquery.to_string(), subquery, "EXISTS"),
@@ -272,6 +276,7 @@ fn execute_set_operation(
             let mut seen = HashSet::new();
             let mut rows = Vec::new();
             for row in left_result.rows {
+                transaction.check_operation_control()?;
                 if right_set.contains(&row) && seen.insert(row.clone()) {
                     rows.push(row);
                 }
@@ -283,6 +288,7 @@ fn execute_set_operation(
             let mut seen = HashSet::new();
             let mut rows = Vec::new();
             for row in left_result.rows {
+                transaction.check_operation_control()?;
                 if !right_set.contains(&row) && seen.insert(row.clone()) {
                     rows.push(row);
                 }
@@ -369,6 +375,7 @@ fn resolve_scalar_subqueries(
         }
     }
     for expression in found {
+        transaction.check_operation_control()?;
         let key = expression.to_string();
         if resolved.contains_key(&key) {
             continue;
@@ -1167,8 +1174,10 @@ fn execute_join_query(
         let mut next_rows = Vec::new();
         let mut right_matched = vec![false; right_rows.len()];
         for left_row in &combined_rows {
+            transaction.check_operation_control()?;
             let mut matched = false;
             for (right_index, right_row) in right_rows.iter().enumerate() {
+                transaction.check_operation_control()?;
                 if !on_terms
                     .iter()
                     .all(|(scope_position, right_position, on_op)| {
@@ -1212,6 +1221,7 @@ fn execute_join_query(
         // emit once with NULLs for the accumulated columns.
         if right_outer || full_outer {
             for (right_index, right_row) in right_rows.iter().enumerate() {
+                transaction.check_operation_control()?;
                 if right_matched[right_index] {
                     continue;
                 }
@@ -2688,6 +2698,7 @@ fn execute_aggregate_query(
     let filtered_rows: Vec<Row> = if let Some(selection) = &select.selection {
         let mut matching = Vec::new();
         for row in rows {
+            transaction.check_operation_control()?;
             if predicate(selection, &row, table, params, &subqueries)? == Truth::True {
                 matching.push(row);
             }
@@ -2708,6 +2719,7 @@ fn execute_aggregate_query(
         .collect();
 
     for row in &filtered_rows {
+        transaction.check_operation_control()?;
         if group_by_col_ids.is_empty() {
             for (acc, spec) in global_accs.iter_mut().zip(&analytical_query.aggregates) {
                 let val = if let Some(col_id) = spec.column {
@@ -2762,6 +2774,7 @@ fn execute_aggregate_query(
         result_rows.push(row_values);
     } else {
         for (group_key, accs) in groups {
+            transaction.check_operation_control()?;
             let mut row_values = Vec::new();
             let mut group_iter = group_key.into_iter();
             let mut acc_iter = accs.into_iter();

@@ -76,6 +76,7 @@ pub(super) fn execute_insert(
                 return Err(unsupported("INSERT", "the VALUES source must be plain"));
             }
             for values in &values.rows {
+                transaction.check_operation_control()?;
                 if values.len() != target_positions.len() {
                     return Err(DbError::InvalidState(format!(
                         "INSERT row has {} values but {} columns were targeted",
@@ -101,6 +102,7 @@ pub(super) fn execute_insert(
                 )));
             }
             for row in result.rows {
+                transaction.check_operation_control()?;
                 let mut row_values = vec![Value::Null; table.columns.len()];
                 for (value, position) in row.into_iter().zip(&target_positions) {
                     row_values[*position] = coerce_value(value, &table.columns[*position])?;
@@ -118,6 +120,7 @@ pub(super) fn execute_insert(
 
     let mut affected = 0;
     for row_values in inserted_rows {
+        transaction.check_operation_control()?;
         let primary = sql_primary_key(table, &row_values)?;
         if let Some((_, positions)) = &returning_plan {
             returned_rows.push(
@@ -248,11 +251,13 @@ pub(super) fn execute_update(
     let mut affected = 0;
     let mut returned_rows: Vec<Vec<Value>> = Vec::new();
     for row in rows {
+        transaction.check_operation_control()?;
         if let Some((from_table, combined_columns)) = &from_scope {
             // FROM-mode rows never fall through to the single-table
             // walker: an unmatched target row is simply not updated.
             let from_rows = transaction.scan(database, from_table.id, usize::MAX)?;
             for source_row in &from_rows {
+                transaction.check_operation_control()?;
                 let mut combined = Vec::with_capacity(row.values.len() + source_row.values.len());
                 combined.extend_from_slice(&row.values);
                 combined.extend_from_slice(&source_row.values);
@@ -454,10 +459,12 @@ pub(super) fn execute_delete(
     let mut affected = 0;
     let mut returned_rows: Vec<Vec<Value>> = Vec::new();
     for row in rows {
+        transaction.check_operation_control()?;
         if let Some((using_table, combined_columns)) = &using_scope {
             let using_rows = transaction.scan(database, using_table.id, usize::MAX)?;
             let mut matched = false;
             for source_row in &using_rows {
+                transaction.check_operation_control()?;
                 let mut combined = Vec::with_capacity(row.values.len() + source_row.values.len());
                 combined.extend_from_slice(&row.values);
                 combined.extend_from_slice(&source_row.values);
