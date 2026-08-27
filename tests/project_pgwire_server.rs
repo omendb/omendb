@@ -2,6 +2,7 @@
 //! against the bounded SQL tier, per TECH_SPEC "Optional Protocol Spike".
 #![cfg(feature = "pgwire")]
 
+use std::io::BufRead;
 use std::sync::{Arc, RwLock};
 
 use omendb::pgwire_server;
@@ -205,6 +206,91 @@ async fn persistent_server_shutdown_cancels_query_before_database_close() {
         .expect("read after shutdown cancellation");
     assert_eq!(row.get::<_, i64>(0), 5_000);
     drop(check);
+    reopened.shutdown().await.expect("shutdown reopened server");
+    let _ = connection_task.await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn omendbd_process_kill_reopens_durable_database() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let mut database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database
+        .create_table(TableDefinition {
+            id: TableId(7),
+            name: "items".to_owned(),
+            columns: vec![ColumnDefinition {
+                id: ColumnId(1),
+                name: "id".to_owned(),
+                data_type: ColumnType::U64,
+                nullable: false,
+            }],
+        })
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO items (id) VALUES (1)")
+        .expect("seed row");
+    database.close().expect("close seed database");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_omendbd"))
+        .args([
+            "--path",
+            database_path.to_str().expect("database path"),
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn omendbd");
+    let stdout = child.stdout.take().expect("daemon stdout");
+    let banner = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut line)?;
+        Ok::<_, std::io::Error>(line)
+    })
+    .await
+    .expect("banner reader task")
+    .expect("daemon banner");
+    assert!(
+        banner.starts_with("omendbd listening on "),
+        "banner: {banner:?}"
+    );
+
+    let pid = i32::try_from(child.id()).expect("daemon pid");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("daemon wait task")
+        .expect("daemon wait");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_create_if_missing(false);
+    let reopened = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("reopen after daemon kill");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            reopened.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect after daemon kill");
+    let connection_task = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT count(*) FROM items", &[])
+        .await
+        .expect("read durable row after daemon kill");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    drop(client);
     reopened.shutdown().await.expect("shutdown reopened server");
     let _ = connection_task.await;
 }

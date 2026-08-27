@@ -77,9 +77,11 @@ PostgreSQL-class comparison where the supported workload overlaps.
 The current development tree has a persistent `omendbd` daemon foundation and
 an integration test for durable shutdown/reopen. Wire `CancelRequest` now
 routes to cooperative transaction checkpoints, with focused registry,
-lock-wait, and shutdown-time wire coverage; the full gate remains open until
-authentication/authorization, protocol compatibility, resource limits,
-diagnostics, and process-level failure behavior have their own evidence.
+lock-wait, and shutdown-time wire coverage. A process-level `omendbd`
+SIGKILL/reopen test also covers clean recovery after daemon loss; the full gate
+remains open until authentication/authorization, protocol compatibility,
+resource limits, diagnostics, and every durable-publication fault seam have
+independent evidence.
 
 - [x] a persistent daemon opens a durable database and supports multiple
       sessions with clean startup, shutdown, cancellation, and reopen;
@@ -101,6 +103,8 @@ diagnostics, and process-level failure behavior have their own evidence.
 - [ ] concurrent transaction tests cover read/write, write/write, unique,
       foreign-key, snapshot, cancellation, and admission outcomes;
 - [ ] every durable publication seam has a process-level kill/reopen test;
+      the daemon-level SIGKILL/reopen path is covered, but storage publication
+      seams still need their own process-level matrix.
 - [x] a versioned on-disk fixture (`tests/fixtures/format-current/`,
       regenerated deliberately per format change) proves the documented
       open/upgrade policy.

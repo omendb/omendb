@@ -8,6 +8,7 @@
 
 #![cfg(feature = "pgwire")]
 
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -38,6 +39,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
         println!("omendbd listening on {}", server.local_addr());
+        std::io::stdout().flush()?;
         tokio::signal::ctrl_c().await?;
         server.shutdown().await?;
         Ok::<(), Box<dyn std::error::Error>>(())
