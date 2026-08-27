@@ -637,6 +637,18 @@ pub(super) fn statement_access(
         {
             collect_expr_tables(where_clause, read);
         }
+        // Table factors in the top-level FROM are handled above. Walk every
+        // expression as well so scalar, EXISTS, and IN subqueries in
+        // projections and join predicates cannot bypass table grants.
+        let _ = visit_expressions(query, |expression| {
+            match expression {
+                SqlExpr::InSubquery { subquery, .. }
+                | SqlExpr::Subquery(subquery)
+                | SqlExpr::Exists { subquery, .. } => collect_query_tables(subquery, read),
+                _ => {}
+            }
+            ControlFlow::<()>::Continue(())
+        });
     }
 
     fn query_body_selection(body: &SqlSetExpr) -> Option<&sqlparser::ast::Select> {

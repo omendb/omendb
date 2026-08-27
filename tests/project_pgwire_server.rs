@@ -3115,4 +3115,14 @@ async fn wire_grant_enforcement_reader_writer_admin() {
     // Ungranted table defaults to deny even for reads.
     let ungranted = reader.query("SELECT * FROM users", &[]).await;
     assert!(ungranted.is_err(), "ungranted tables default to deny");
+
+    // A granted outer table must not hide an ungranted scalar subquery table.
+    let nested_ungranted = reader
+        .query("SELECT (SELECT email FROM users) FROM notes", &[])
+        .await
+        .expect_err("nested reads must enforce their table grants");
+    assert_eq!(
+        nested_ungranted.code(),
+        Some(&SqlState::INSUFFICIENT_PRIVILEGE)
+    );
 }

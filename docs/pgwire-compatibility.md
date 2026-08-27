@@ -20,7 +20,7 @@ cargo test --features pgwire --test project_pgwire_server
 | Result payload bound | `ServerConfig::max_result_bytes` and `--max-result-bytes` reject an estimated materialized result payload above the configured bound with `54000`. This limits response payload admission, not execution memory. | `persistent_server_rejects_result_over_byte_bound` |
 | Trust startup | Empty auth catalogs use trust only on loopback. | `wire_trust_mode_refuses_non_loopback_listener` |
 | SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
-| Authorization | Provisioned grants distinguish read, write, and schema-admin access; ungranted tables deny access. | `wire_grant_enforcement_reader_writer_admin` |
+| Authorization | Provisioned grants distinguish read, write, and schema-admin access; ungranted tables, including tables referenced by nested subqueries, deny access. | `wire_grant_enforcement_reader_writer_admin` |
 | Diagnostics | `RunningServer::status()` reports connection admission and tracked query/describe worker outcomes. | `persistent_server_reopens_durable_database_after_shutdown`, `query_worker_tracker_records_terminal_operation_outcomes` (unit) |
 
 ## Wire protocol

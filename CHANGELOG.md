@@ -52,6 +52,9 @@ All notable changes to OmenDB are documented here. Format follows
   SQLSTATE `57014`. `ServerConfig::max_result_bytes` and
   `--max-result-bytes` reject estimated response payloads above the configured
   bound with SQLSTATE `54000`; this does not yet bound execution memory.
+- Wire grant analysis now includes tables referenced by scalar, `EXISTS`, and
+  `IN` subqueries in expressions, preventing a grant on an outer table from
+  bypassing authorization for nested reads.
 - Seer read views are cached strongly and invalidated under the publication
   lock; transaction begins capture frontier and view atomically, removing a
   race that surfaced as spurious `StorageSnapshotUnavailable` under
