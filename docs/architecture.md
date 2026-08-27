@@ -187,8 +187,9 @@ from the durable auth catalog, reports lifecycle counters, and closes the
 handle on explicit shutdown. This is a server foundation, not yet the complete
 alpha contract: protocol coverage, authorization policy, resource quotas, and
 crash-level daemon tests remain open. Wire cancellation now routes
-`CancelRequest` to the transaction API's cooperative checkpoints; a dedicated
-process-level cancellation/failure test remains open. The direct
+`CancelRequest` to the transaction API's cooperative checkpoints; a
+representative lock-wait wire test now covers SQLSTATE `57014`, while a
+process-level shutdown/failure test remains open. The direct
 SeerDB qualification path (`src/seer_direct.rs`) remains test-only evidence for
 catalog/table/index-to-tree mapping and is not a second relational backend.
 

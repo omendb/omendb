@@ -15,7 +15,7 @@ All notable changes to OmenDB are documented here. Format follows
   persistent server lifecycle in a Tokio application.
 - PostgreSQL `CancelRequest` routing into cooperative database operation
   controls, including cancellation-aware autocommit and wire transaction
-  checkpoints.
+  checkpoints, cancellable lock waits, and server-tracked blocking workers.
 - Bounded embedded SQL batch execution:
   `RelationalDatabase::execute_sql_batch`,
   `execute_sql_batch_with_params`, and the session equivalents, each one

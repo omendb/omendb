@@ -22,7 +22,7 @@ use pgwire::api::auth::{
 use pgwire::api::cancel::CancelHandler;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, ConnectionManager, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::startup::SecretKey;
@@ -60,6 +60,8 @@ const AUTH_FAILURE_DELAY_CAP_MS: u64 = 5_000;
 /// concurrent-reader shape from `design/OLTP_COMPETITIVE_GAPS.md`.
 pub type SharedDatabase = Arc<RwLock<RelationalDatabase>>;
 
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 fn read_lock(
     database: &SharedDatabase,
 ) -> PgWireResult<std::sync::RwLockReadGuard<'_, RelationalDatabase>> {
@@ -74,6 +76,58 @@ fn write_lock(
     database
         .write()
         .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
+}
+
+fn read_lock_with_cancellation<'a>(
+    database: &'a SharedDatabase,
+    cancellation: &CancellationToken,
+) -> PgWireResult<std::sync::RwLockReadGuard<'a, RelationalDatabase>> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
+        match database.try_read() {
+            Ok(guard) => {
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(map_db_error(DbError::Cancelled));
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(pg_error("XX000", "database lock poisoned".to_owned()));
+            }
+        }
+    }
+}
+
+fn write_lock_with_cancellation<'a>(
+    database: &'a SharedDatabase,
+    cancellation: &CancellationToken,
+) -> PgWireResult<std::sync::RwLockWriteGuard<'a, RelationalDatabase>> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
+        match database.try_write() {
+            Ok(guard) => {
+                if cancellation.is_cancelled() {
+                    drop(guard);
+                    return Err(map_db_error(DbError::Cancelled));
+                }
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(pg_error("XX000", "database lock poisoned".to_owned()));
+            }
+        }
+    }
 }
 
 /// A persistent single-node PostgreSQL-wire server configuration.
@@ -150,6 +204,64 @@ struct ServerState {
     accepted_connections: AtomicU64,
     rejected_connections: AtomicU64,
     max_connections: usize,
+    query_workers: Arc<QueryWorkers>,
+}
+
+/// Owns the lifetime accounting for synchronous database work moved off the
+/// Tokio scheduler. Shutdown cancels operation tokens, joins connection tasks,
+/// and waits for this counter to reach zero before closing the database.
+struct QueryWorkers {
+    active: AtomicUsize,
+    notify: Notify,
+}
+
+impl QueryWorkers {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    fn spawn<F, T>(self: &Arc<Self>, work: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let tracker = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _guard = QueryWorkerGuard { tracker };
+            work()
+        })
+    }
+
+    async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn complete(&self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+struct QueryWorkerGuard {
+    tracker: Arc<QueryWorkers>,
+}
+
+impl Drop for QueryWorkerGuard {
+    fn drop(&mut self) {
+        self.tracker.complete();
+    }
 }
 
 impl ServerState {
@@ -161,6 +273,7 @@ impl ServerState {
             accepted_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
             max_connections,
+            query_workers: Arc::new(QueryWorkers::new()),
         }
     }
 
@@ -257,14 +370,14 @@ impl RunningServer {
             }
         };
         let shared = Arc::new(RwLock::new(database));
-        let factory = match build_factory(&shared, address) {
+        let state = Arc::new(ServerState::new(config.max_connections));
+        let factory = match build_factory(&shared, address, Arc::clone(&state.query_workers)) {
             Ok(factory) => factory,
             Err(error) => {
                 close_shared_database(shared)?;
                 return Err(error.into());
             }
         };
-        let state = Arc::new(ServerState::new(config.max_connections));
         let task_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             let serving = run_accept_loop(
@@ -346,8 +459,12 @@ fn close_shared_database(shared: SharedDatabase) -> Result<(), ServerError> {
 /// listener errors. The listener's startup auth policy is derived from the
 /// durable auth catalog; empty credentials are trust-only on loopback.
 pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::Result<()> {
-    let factory = build_factory(&database, listener.local_addr()?)?;
     let state = Arc::new(ServerState::new(Semaphore::MAX_PERMITS));
+    let factory = build_factory(
+        &database,
+        listener.local_addr()?,
+        Arc::clone(&state.query_workers),
+    )?;
     run_accept_loop(listener, factory, state, Semaphore::MAX_PERMITS).await
 }
 
@@ -359,11 +476,14 @@ async fn run_accept_loop(
 ) -> std::io::Result<()> {
     let slots = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
     let mut connections = JoinSet::new();
-    loop {
+    let result = loop {
         tokio::select! {
-            _ = state.wait_for_shutdown() => break,
+            _ = state.wait_for_shutdown() => break Ok(()),
             accepted = listener.accept() => {
-                let (socket, _peer) = accepted?;
+                let (socket, _peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => break Err(error),
+                };
                 state.accepted_connections.fetch_add(1, Ordering::Relaxed);
                 let permit = match Arc::clone(&slots).try_acquire_owned() {
                     Ok(permit) => permit,
@@ -388,11 +508,16 @@ async fn run_accept_loop(
                 });
             }
         }
-    }
+    };
+    // Cancel workers before aborting connection tasks. Blocking workers are
+    // tracked separately because aborting their async joiners cannot stop a
+    // running blocking task.
+    factory.handler.cancellations.cancel_all();
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    factory.handler.query_workers.wait_for_idle().await;
     state.active_connections.store(0, Ordering::Release);
-    Ok(())
+    result
 }
 
 /// Bind a listener and spawn the accept loop on the current tokio runtime,
@@ -420,6 +545,7 @@ const SALT_LEN: usize = 32;
 fn build_factory(
     database: &SharedDatabase,
     listener_addr: std::net::SocketAddr,
+    query_workers: Arc<QueryWorkers>,
 ) -> std::io::Result<Arc<HandlerFactory>> {
     {
         let mut database =
@@ -462,29 +588,25 @@ fn build_factory(
     });
     let identities = Arc::new(Mutex::new(HashMap::new()));
     let failure_delays = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let connection_manager = Arc::new(ConnectionManager::new());
     let cancellations = Arc::new(CancellationRegistry::new());
     Ok(Arc::new(HandlerFactory {
         handler: Arc::new(OmenDbHandler {
             database: Arc::clone(database),
-            transactions: Mutex::new(HashMap::new()),
+            transactions: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::clone(&cancellations),
-            schema_probes: Mutex::new(HashMap::new()),
+            schema_probes: Arc::new(Mutex::new(HashMap::new())),
             identities: Arc::clone(&identities),
+            query_workers,
         }),
         auth: auth.map(|auth_source| {
             Arc::new(ScramComponents {
                 auth_source,
                 identities: Arc::clone(&identities),
                 failure_delays: Arc::clone(&failure_delays),
-                connection_manager: Arc::clone(&connection_manager),
                 cancellations: Arc::clone(&cancellations),
             })
         }),
-        cancel_handler: Arc::new(WireCancelHandler {
-            manager: connection_manager,
-            cancellations,
-        }),
+        cancel_handler: Arc::new(WireCancelHandler { cancellations }),
     }))
 }
 
@@ -646,16 +768,10 @@ impl AuthSource for WireAuthSource {
 
 /// Trust mode: the credential table is absent or empty, so connections
 /// authenticate implicitly (loopback, single-user development).
-struct TrustStartup {
-    connection_manager: Arc<ConnectionManager>,
-}
+struct TrustStartup;
 
 #[async_trait]
-impl pgwire::api::auth::noop::NoopStartupHandler for TrustStartup {
-    fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
-        Some(Arc::clone(&self.connection_manager))
-    }
-}
+impl pgwire::api::auth::noop::NoopStartupHandler for TrustStartup {}
 
 /// Dispatches between trust mode and SCRAM based on what `serve` found at
 /// startup. Mode is fixed for the server's lifetime; provisioning users
@@ -734,8 +850,8 @@ impl StartupHandler for StartupMode {
                 ) =>
             {
                 // Register the protocol cancel identity only after startup
-                // authentication succeeds. pgwire owns the wire-level
-                // ConnectionHandle; the registry owns the database token.
+                // authentication succeeds. The registry owns the wire
+                // identity and the database operation token together.
                 self.cancellations().register(client);
                 // Record the authenticated role for grant enforcement.
                 // The startup packet's user parameter lands in client
@@ -772,7 +888,6 @@ struct ScramComponents {
     auth_source: Arc<WireAuthSource>,
     identities: Arc<IdentityMap>,
     failure_delays: Arc<FailureDelays>,
-    connection_manager: Arc<ConnectionManager>,
     cancellations: Arc<CancellationRegistry>,
 }
 
@@ -803,19 +918,13 @@ impl PgWireServerHandlers for HandlerFactory {
                     SASLAuthStartupHandler::new(
                         Arc::new(DefaultServerParameterProvider::default()),
                     )
-                    .with_scram(ScramAuth::new(components.auth_source))
-                    .with_connection_manager(Arc::clone(&components.connection_manager)),
+                    .with_scram(ScramAuth::new(components.auth_source)),
                     components.identities,
                     components.failure_delays,
                     components.cancellations,
                 )
             }
-            None => StartupMode::Trust(
-                TrustStartup {
-                    connection_manager: Arc::clone(&self.cancel_handler.manager),
-                },
-                self.handler.cancellations.clone(),
-            ),
+            None => StartupMode::Trust(TrustStartup, self.handler.cancellations.clone()),
         })
     }
 }
@@ -1020,19 +1129,38 @@ impl CancellationRegistry {
 
     fn cleanup_connection(&self, address: std::net::SocketAddr) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.retain(|_, entry| entry.address != address);
+            entries.retain(|_, entry| {
+                if entry.address == address {
+                    if let Some(operation) = &entry.active {
+                        operation.token.cancel();
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    fn cancel_all(&self) {
+        if let Ok(entries) = self.entries.lock() {
+            for entry in entries.values() {
+                if let Some(operation) = &entry.active {
+                    operation.token.cancel();
+                }
+            }
         }
     }
 }
 
 impl Drop for QueryCancellationLease {
     fn drop(&mut self) {
+        self.operation.token.cancel();
         self.registry.finish(&self.key, &self.operation);
     }
 }
 
 struct WireCancelHandler {
-    manager: Arc<ConnectionManager>,
     cancellations: Arc<CancellationRegistry>,
 }
 
@@ -1040,13 +1168,13 @@ struct WireCancelHandler {
 impl CancelHandler for WireCancelHandler {
     async fn on_cancel_request(&self, request: CancelRequest) {
         self.cancellations.cancel(request.pid, &request.secret_key);
-        self.manager.cancel(request.pid, &request.secret_key).await;
     }
 }
 
+#[derive(Clone)]
 struct OmenDbHandler {
     database: SharedDatabase,
-    transactions: Mutex<HashMap<std::net::SocketAddr, TransactionBlock>>,
+    transactions: Arc<Mutex<HashMap<std::net::SocketAddr, TransactionBlock>>>,
     cancellations: Arc<CancellationRegistry>,
     /// Authenticated role per connection pid, recorded by the startup
     /// handler after a successful exchange and read per statement for
@@ -1058,7 +1186,8 @@ struct OmenDbHandler {
     /// call with the portal's negotiated format. Cleared wholesale on
     /// any DDL statement - DDL is rare and stale schemas are worse than
     /// re-probing.
-    schema_probes: Mutex<ProbeCache>,
+    schema_probes: Arc<Mutex<ProbeCache>>,
+    query_workers: Arc<QueryWorkers>,
 }
 
 fn pg_error(code: &str, message: String) -> PgWireError {
@@ -1171,15 +1300,17 @@ impl OmenDbHandler {
     /// Resolve the wire type reported for each parameter: client-declared
     /// types win; otherwise statement-context inference from the SQL tier;
     /// otherwise text as the least-lossy fallback.
-    fn resolved_parameter_types(&self, statement: &ParsedStatement) -> Vec<Type> {
+    fn resolved_parameter_types(
+        &self,
+        statement: &ParsedStatement,
+        cancellation: &CancellationToken,
+    ) -> PgWireResult<Vec<Type>> {
         let count = ParsedStatement::placeholder_count(&statement.sql);
-        let inferred = self
-            .database
-            .read()
-            .ok()
-            .and_then(|database| database.sql_parameter_types(&statement.sql).ok())
-            .unwrap_or_default();
-        (0..count)
+        let database = read_lock_with_cancellation(&self.database, cancellation)?;
+        let inferred = database
+            .sql_parameter_types(&statement.sql)
+            .map_err(map_db_error)?;
+        Ok((0..count)
             .map(|index| {
                 statement
                     .parameter_types
@@ -1193,31 +1324,27 @@ impl OmenDbHandler {
                     })
                     .unwrap_or(Type::TEXT)
             })
-            .collect()
+            .collect())
     }
 }
 
-fn decode_parameter(
-    portal: &pgwire::api::portal::Portal<ParsedStatement>,
-    resolved: &[Type],
-    index: usize,
-) -> PgWireResult<Value> {
-    let declared = resolved.get(index).cloned().unwrap_or(Type::TEXT);
-    let Some(raw) = portal.parameters.get(index).and_then(|raw| raw.as_ref()) else {
+fn decode_parameter(raw: Option<&[u8]>, binary: bool, declared: &Type) -> PgWireResult<Value> {
+    let declared = declared.clone();
+    let Some(raw) = raw else {
         return Ok(Value::Null);
     };
-    if portal.parameter_format.is_binary(index) {
+    if binary {
         return Ok(match declared {
             Type::BOOL => Value::Bool(!raw.is_empty() && raw[0] != 0),
-            Type::INT2 => match <[u8; 2]>::try_from(raw.as_ref()) {
+            Type::INT2 => match <[u8; 2]>::try_from(raw) {
                 Ok(inner) => Value::I64(i64::from(i16::from_be_bytes(inner))),
                 Err(_) => return Err(pg_error("22P02", "malformed int2 parameter".to_owned())),
             },
-            Type::INT4 => match <[u8; 4]>::try_from(raw.as_ref()) {
+            Type::INT4 => match <[u8; 4]>::try_from(raw) {
                 Ok(inner) => Value::I64(i64::from(i32::from_be_bytes(inner))),
                 Err(_) => return Err(pg_error("22P02", "malformed int4 parameter".to_owned())),
             },
-            Type::INT8 => match <[u8; 8]>::try_from(raw.as_ref()) {
+            Type::INT8 => match <[u8; 8]>::try_from(raw) {
                 Ok(inner) => Value::I64(i64::from_be_bytes(inner)),
                 Err(_) => return Err(pg_error("22P02", "malformed int8 parameter".to_owned())),
             },
@@ -1243,11 +1370,18 @@ fn decode_parameter(
 }
 
 fn decode_parameters(
-    portal: &pgwire::api::portal::Portal<ParsedStatement>,
+    parameters: &[Option<Vec<u8>>],
+    parameter_format: &pgwire::api::portal::Format,
     resolved: &[Type],
 ) -> PgWireResult<Vec<Value>> {
-    (0..portal.parameter_len())
-        .map(|index| decode_parameter(portal, resolved, index))
+    (0..parameters.len())
+        .map(|index| {
+            decode_parameter(
+                parameters.get(index).and_then(|raw| raw.as_deref()),
+                parameter_format.is_binary(index),
+                resolved.get(index).unwrap_or(&Type::TEXT),
+            )
+        })
         .collect()
 }
 
@@ -1336,7 +1470,7 @@ impl OmenDbHandler {
             let mut blocks = self.lock_transactions()?;
             self.reap_idle_blocks(&mut blocks);
         }
-        self.enforce_grants(client_addr, sql)?;
+        self.enforce_grants(client_addr, sql, cancellation)?;
         if cancellation.is_cancelled() {
             return Err(map_db_error(DbError::Cancelled));
         }
@@ -1357,9 +1491,12 @@ impl OmenDbHandler {
                 // begin() only needs &self: opening a block takes no write
                 // access and publishes nothing.
                 let control = OperationControl::with_cancellation(cancellation.clone());
-                let transaction = read_lock(&self.database)?
+                let transaction = read_lock_with_cancellation(&self.database, cancellation)?
                     .begin_with_control(&control)
                     .map_err(map_db_error)?;
+                if cancellation.is_cancelled() {
+                    return Err(map_db_error(DbError::Cancelled));
+                }
                 let mut blocks = self.lock_transactions()?;
                 blocks.insert(
                     client_addr,
@@ -1387,7 +1524,7 @@ impl OmenDbHandler {
                 // is free while this commit publishes.
                 let control = OperationControl::with_cancellation(cancellation.clone());
                 block.transaction.set_operation_control(&control);
-                let _database = write_lock(&self.database)?;
+                let _database = write_lock_with_cancellation(&self.database, cancellation)?;
                 block.transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
@@ -1428,7 +1565,7 @@ impl OmenDbHandler {
                 // Buffered into the transaction; publication happens at
                 // COMMIT under the write lock, so execution only needs
                 // shared access.
-                let database = read_lock(&self.database)?;
+                let database = read_lock_with_cancellation(&self.database, cancellation)?;
                 let outcome = block
                     .transaction
                     .execute_sql_with_params(&database, sql, params);
@@ -1452,7 +1589,12 @@ impl OmenDbHandler {
     /// access. The wildcard table "*" with can_write is schema
     /// administration (DDL). Trust-mode connections carry no identity
     /// and are loopback-only.
-    fn enforce_grants(&self, client_addr: std::net::SocketAddr, sql: &str) -> PgWireResult<()> {
+    fn enforce_grants(
+        &self,
+        client_addr: std::net::SocketAddr,
+        sql: &str,
+        cancellation: &CancellationToken,
+    ) -> PgWireResult<()> {
         let Some(role) = self
             .identities
             .lock()
@@ -1462,7 +1604,7 @@ impl OmenDbHandler {
             return Ok(());
         };
 
-        let database = read_lock(&self.database)?;
+        let database = read_lock_with_cancellation(&self.database, cancellation)?;
         if !database
             .catalog()
             .tables()
@@ -1478,12 +1620,18 @@ impl OmenDbHandler {
         );
         drop(transaction);
         let result = result.map_err(map_db_error)?;
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
 
         // No rows at all means grants exist only for other roles; this
         // role still defaults to deny.
         let mut admin = false;
         let mut table_grants: HashMap<String, (bool, bool)> = HashMap::new();
         for row in &result.rows {
+            if cancellation.is_cancelled() {
+                return Err(map_db_error(DbError::Cancelled));
+            }
             let Some(Value::Text(table_name)) = row.first() else {
                 continue;
             };
@@ -1554,7 +1702,10 @@ impl OmenDbHandler {
             if cancellation.is_cancelled() {
                 return Err(map_db_error(DbError::Cancelled));
             }
-            let mut database = write_lock(&self.database)?;
+            let mut database = write_lock_with_cancellation(&self.database, cancellation)?;
+            if cancellation.is_cancelled() {
+                return Err(map_db_error(DbError::Cancelled));
+            }
             return Ok(encode_response_with_format(
                 database
                     .execute_sql_with_params(sql, params)
@@ -1566,7 +1717,7 @@ impl OmenDbHandler {
         if Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             // Reads scale: snapshot query under shared access via an
             // autocommit transaction that aborts on completion.
-            let database = read_lock(&self.database)?;
+            let database = read_lock_with_cancellation(&self.database, cancellation)?;
             let mut transaction = database
                 .begin_with_control(&control)
                 .map_err(map_db_error)?;
@@ -1577,7 +1728,7 @@ impl OmenDbHandler {
                 format,
             ));
         }
-        let mut database = write_lock(&self.database)?;
+        let mut database = write_lock_with_cancellation(&self.database, cancellation)?;
         let (result, _) = database
             .transaction_with_control(&control, |database, transaction| {
                 transaction.execute_sql_with_params(database, sql, params)
@@ -1633,6 +1784,7 @@ impl OmenDbHandler {
         sql: &str,
         resolved: &[Type],
         format: &pgwire::api::portal::Format,
+        cancellation: &CancellationToken,
     ) -> PgWireResult<Arc<Vec<FieldInfo>>> {
         if !Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             return Ok(Arc::new(Vec::new()));
@@ -1670,11 +1822,17 @@ impl OmenDbHandler {
                     .collect(),
             ));
         }
-        let database = read_lock(&self.database)?;
-        let mut transaction = database.begin().map_err(map_db_error)?;
+        let database = read_lock_with_cancellation(&self.database, cancellation)?;
+        let control = OperationControl::with_cancellation(cancellation.clone());
+        let mut transaction = database
+            .begin_with_control(&control)
+            .map_err(map_db_error)?;
         let result = transaction.execute_sql_with_params(&database, sql, &probe_params);
         drop(transaction);
         let result = result.map_err(map_db_error)?;
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
         let sample = result.rows.first();
         let columns: Arc<Vec<(String, Type)>> = Arc::new(
             result
@@ -1723,26 +1881,34 @@ impl SimpleQueryHandler for OmenDbHandler {
     {
         let client_addr = _client.socket_addr();
         let (cancellation, _lease) = self.begin_query(_client);
-        let mut responses = Vec::new();
-        // The embedded tier accepts one statement per call; simple-protocol
-        // strings may carry several, so split conservatively on semicolons.
-        for statement in query.split(';') {
-            let statement = statement.trim();
-            if statement.is_empty() {
-                continue;
-            }
-            responses.push(self.run_statement(
-                client_addr,
-                statement,
-                &[],
-                &pgwire::api::portal::Format::UnifiedText,
-                &cancellation,
-            )?);
-        }
-        if responses.is_empty() {
-            responses.push(Response::Execution(Tag::new("OK")));
-        }
-        Ok(responses)
+        let handler = self.clone();
+        let query = query.to_owned();
+        self.query_workers
+            .spawn(move || {
+                let mut responses = Vec::new();
+                // The embedded tier accepts one statement per call;
+                // simple-protocol strings may carry several, so split
+                // conservatively on semicolons.
+                for statement in query.split(';') {
+                    let statement = statement.trim();
+                    if statement.is_empty() {
+                        continue;
+                    }
+                    responses.push(handler.run_statement(
+                        client_addr,
+                        statement,
+                        &[],
+                        &pgwire::api::portal::Format::UnifiedText,
+                        &cancellation,
+                    )?);
+                }
+                if responses.is_empty() {
+                    responses.push(Response::Execution(Tag::new("OK")));
+                }
+                Ok(responses)
+            })
+            .await
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
     }
 }
 
@@ -1765,15 +1931,24 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let (cancellation, _lease) = self.begin_query(_client);
-        let resolved = self.resolved_parameter_types(&portal.statement.statement);
-        let params = decode_parameters(portal, &resolved)?;
-        self.run_statement(
-            _client.socket_addr(),
-            &portal.statement.statement.sql,
-            &params,
-            &portal.result_column_format,
-            &cancellation,
-        )
+        let handler = self.clone();
+        let statement = portal.statement.statement.clone();
+        let parameters = portal
+            .parameters
+            .iter()
+            .map(|raw| raw.as_ref().map(|raw| raw.to_vec()))
+            .collect::<Vec<_>>();
+        let parameter_format = portal.parameter_format.clone();
+        let format = portal.result_column_format.clone();
+        let client_addr = _client.socket_addr();
+        self.query_workers
+            .spawn(move || {
+                let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
+                let params = decode_parameters(&parameters, &parameter_format, &resolved)?;
+                handler.run_statement(client_addr, &statement.sql, &params, &format, &cancellation)
+            })
+            .await
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
     }
 
     async fn do_describe_statement<C>(
@@ -1784,14 +1959,25 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let parameter_types = self.resolved_parameter_types(&statement.statement);
-        let resolved = self.resolved_parameter_types(&statement.statement);
-        let fields = Arc::try_unwrap(self.describe_schema(
-            &statement.statement.sql,
-            &resolved,
-            &pgwire::api::portal::Format::UnifiedBinary,
-        )?)
-        .unwrap_or_default();
+        let (cancellation, _lease) = self.begin_query(_client);
+        let handler = self.clone();
+        let statement = statement.statement.clone();
+        let (parameter_types, fields) = self
+            .query_workers
+            .spawn(move || {
+                let parameter_types =
+                    handler.resolved_parameter_types(&statement, &cancellation)?;
+                let fields = handler.describe_schema(
+                    &statement.sql,
+                    &parameter_types,
+                    &pgwire::api::portal::Format::UnifiedBinary,
+                    &cancellation,
+                )?;
+                Ok::<_, PgWireError>((parameter_types, fields))
+            })
+            .await
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??;
+        let fields = Arc::try_unwrap(fields).unwrap_or_default();
         Ok(pgwire::api::results::DescribeStatementResponse::new(
             parameter_types,
             fields,
@@ -1806,13 +1992,19 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let resolved = self.resolved_parameter_types(&portal.statement.statement);
-        let fields = Arc::try_unwrap(self.describe_schema(
-            &portal.statement.statement.sql,
-            &resolved,
-            &portal.result_column_format,
-        )?)
-        .unwrap_or_default();
+        let (cancellation, _lease) = self.begin_query(_client);
+        let handler = self.clone();
+        let statement = portal.statement.statement.clone();
+        let format = portal.result_column_format.clone();
+        let fields = self
+            .query_workers
+            .spawn(move || {
+                let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
+                handler.describe_schema(&statement.sql, &resolved, &format, &cancellation)
+            })
+            .await
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??;
+        let fields = Arc::try_unwrap(fields).unwrap_or_default();
         Ok(pgwire::api::results::DescribePortalResponse::new(fields))
     }
 }
@@ -1839,5 +2031,29 @@ mod tests {
 
         registry.cleanup_connection(address);
         assert!(registry.begin(&client).is_none());
+    }
+
+    #[tokio::test]
+    async fn query_worker_tracker_drains_dropped_join_handles() {
+        let workers = Arc::new(QueryWorkers::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        drop(workers.spawn(move || {
+            started_tx.send(()).expect("worker start receiver");
+            release_rx.recv().expect("worker release");
+        }));
+        started_rx.await.expect("worker started");
+
+        let waiter = tokio::spawn({
+            let workers = Arc::clone(&workers);
+            async move { workers.wait_for_idle().await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        release_tx.send(()).expect("release worker");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("worker tracker drained")
+            .expect("waiter task");
     }
 }

@@ -76,8 +76,8 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 The current development tree has a persistent `omendbd` daemon foundation and
 an integration test for durable shutdown/reopen. Wire `CancelRequest` now
-routes to cooperative transaction checkpoints, with focused registry coverage;
-the full gate remains open until cancellation under representative work,
+routes to cooperative transaction checkpoints, with focused registry and
+lock-wait wire coverage; the full gate remains open until shutdown cancellation,
 authentication/authorization, protocol compatibility, and process-level
 failure behavior have their own evidence.
 

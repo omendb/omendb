@@ -243,6 +243,70 @@ async fn wire_client(database: Arc<RwLock<RelationalDatabase>>) -> tokio_postgre
     client
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_cancel_request_aborts_lock_wait_before_publication() {
+    let directory = tempdir().expect("tempdir");
+    let database = seed_database(directory.path());
+    let (addr, server) =
+        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("spawn server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let cancel_token = client.cancel_token();
+
+    let (release_lock, wait_for_release) = std::sync::mpsc::channel();
+    let database_for_lock = database.clone();
+    let lock_thread = std::thread::spawn(move || {
+        let _database_guard = database_for_lock.write().expect("database lock");
+        wait_for_release.recv().expect("release publication lock");
+    });
+
+    let query = tokio::spawn(async move {
+        client
+            .execute(
+                "INSERT INTO users (id, email) VALUES (2, 'cancelled@example.com')",
+                &[],
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    cancel_token
+        .cancel_query(tokio_postgres::NoTls)
+        .await
+        .expect("send cancel request");
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), query)
+        .await
+        .expect("cancelled query completed")
+        .expect("query task completed")
+        .expect_err("cancelled query must fail");
+    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED));
+
+    release_lock.send(()).expect("release publication lock");
+    lock_thread.join().expect("lock thread");
+    let (check, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("reconnect after cancellation");
+    tokio::spawn(async move { connection.await.expect("connection") });
+    let row = check
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .expect("read after cancellation");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn wire_transaction_block_rollback_discards_writes() {
     let directory = tempdir().expect("tempdir");
