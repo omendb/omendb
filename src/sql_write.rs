@@ -169,8 +169,8 @@ fn returning_plan(
                     .columns
                     .iter()
                     .position(|column| column.name == identifier.value)
-                    .ok_or_else(|| {
-                        DbError::InvalidState(format!("column {} does not exist", identifier.value))
+                    .ok_or_else(|| DbError::SqlUndefinedColumn {
+                        name: identifier.value.clone(),
                     })?;
                 columns.push(SqlColumn {
                     name: identifier.value.clone(),

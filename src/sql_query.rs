@@ -325,9 +325,7 @@ fn execute_set_operation(
                 .columns
                 .iter()
                 .position(|column| &column.name == name)
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!("unknown column {name} in ORDER BY"))
-                })?;
+                .ok_or_else(|| DbError::SqlUndefinedColumn { name: name.clone() })?;
             terms.push((position, kind.options.asc.unwrap_or(true)));
         }
         let mut sorted = rows;
@@ -786,10 +784,18 @@ fn order_plan(order_by: Option<&OrderBy>, table: &TableDefinition) -> Result<Vec
                 return Err(unsupported("ORDER BY", "WITH FILL is not supported"));
             }
             let position = column_position(table, &expression.expr)?.ok_or_else(|| {
-                unsupported(
-                    "ORDER BY",
-                    "only plain table columns can be used for ordering",
-                )
+                match &expression.expr {
+                    Expr::Identifier(identifier) => DbError::SqlUndefinedColumn {
+                        name: identifier.value.clone(),
+                    },
+                    Expr::CompoundIdentifier(_) => DbError::SqlUndefinedColumn {
+                        name: expression.expr.to_string(),
+                    },
+                    _ => unsupported(
+                        "ORDER BY",
+                        "only plain table columns can be used for ordering",
+                    ),
+                }
             })?;
             let ascending = expression.options.asc.unwrap_or(true);
             Ok(OrderTerm {
@@ -1335,8 +1341,8 @@ fn joined_grouped_aggregates(
             Some(hint) => combined_columns
                 .iter()
                 .position(|column| column.name == format!("{hint}.{name}"))
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!("unknown column {hint}.{name} in join GROUP BY"))
+                .ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: format!("{hint}.{name}"),
                 })?,
             None => {
                 let matches: Vec<usize> = combined_columns
@@ -1350,9 +1356,7 @@ fn joined_grouped_aggregates(
                 match matches.len() {
                     1 => matches[0],
                     0 => {
-                        return Err(DbError::InvalidState(format!(
-                            "unknown column {name} in join GROUP BY"
-                        )));
+                        return Err(DbError::SqlUndefinedColumn { name });
                     }
                     _ => {
                         return Err(unsupported(
@@ -1405,7 +1409,13 @@ fn joined_grouped_aggregates(
                             parts[parts.len() - 1].value
                         )
                 })
-                .ok_or_else(|| DbError::InvalidState("unknown qualified column".to_owned()))?,
+                .ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: format!(
+                        "{}.{}",
+                        parts[parts.len() - 2].value,
+                        parts[parts.len() - 1].value
+                    ),
+                })?,
             _ => {
                 return Err(unsupported(
                     "JOIN",
@@ -1502,9 +1512,7 @@ fn joined_grouped_aggregates(
             let position = final_columns
                 .iter()
                 .position(|column| &column.name == name)
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!("unknown column {name} in join ORDER BY"))
-                })?;
+                .ok_or_else(|| DbError::SqlUndefinedColumn { name: name.clone() })?;
             terms.push((position, kind.options.asc.unwrap_or(true)));
         }
         output_rows.sort_by(|left, right| {
@@ -1949,8 +1957,8 @@ fn sort_joined_rows(
             Some(hint) => combined_columns
                 .iter()
                 .position(|column| column.name == format!("{hint}.{name}"))
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!("unknown column {hint}.{name} in join ORDER BY"))
+                .ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: format!("{hint}.{name}"),
                 })?,
             None => {
                 let matches: Vec<usize> = combined_columns
@@ -1964,9 +1972,7 @@ fn sort_joined_rows(
                 match matches.len() {
                     1 => matches[0],
                     0 => {
-                        return Err(DbError::InvalidState(format!(
-                            "unknown column {name} in join ORDER BY"
-                        )));
+                        return Err(DbError::SqlUndefinedColumn { name });
                     }
                     _ => {
                         return Err(unsupported(
@@ -2292,7 +2298,9 @@ fn combined_value(expression: &Expr, combined: &[Value], columns: &[SqlColumn]) 
     let position = columns
         .iter()
         .position(|column| column.name == name || column.name.ends_with(&format!(".{name}")))
-        .ok_or_else(|| DbError::InvalidState(format!("unknown column {name} in join WHERE")))?;
+        .ok_or_else(|| DbError::SqlUndefinedColumn {
+            name: name.to_owned(),
+        })?;
     Ok(combined[position].clone())
 }
 
@@ -2494,8 +2502,10 @@ fn eval_expression(
             arithmetic(op, &lhs, &rhs)
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            let position = column_position(table, expression)?
-                .ok_or_else(|| DbError::InvalidState(format!("unknown SQL column {expression}")))?;
+            let position =
+                column_position(table, expression)?.ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: expression.to_string(),
+                })?;
             row.values
                 .get(position)
                 .cloned()
@@ -2817,9 +2827,7 @@ fn execute_aggregate_query(
             let position = result_columns
                 .iter()
                 .position(|column| &column.name == name)
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!("unknown column {name} in aggregate ORDER BY"))
-                })?;
+                .ok_or_else(|| DbError::SqlUndefinedColumn { name: name.clone() })?;
             terms.push((position, kind.options.asc.unwrap_or(true)));
         }
         result_rows.sort_by(|left, right| {

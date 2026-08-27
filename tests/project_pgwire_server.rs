@@ -591,6 +591,28 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
     );
 
+    let returning_column = client
+        .query(
+            "INSERT INTO users (id, email) VALUES (4, 'dana@example.com') RETURNING missing",
+            &[],
+        )
+        .await
+        .expect_err("undefined RETURNING columns must be reported");
+    assert_eq!(
+        returning_column.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN),
+        "unexpected RETURNING error: {returning_column:?}"
+    );
+
+    let order_column = client
+        .query("SELECT id FROM users ORDER BY missing", &[])
+        .await
+        .expect_err("undefined ORDER BY columns must be reported");
+    assert_eq!(
+        order_column.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)
+    );
+
     let not_null = client
         .execute("INSERT INTO users (id, email) VALUES (4, NULL)", &[])
         .await

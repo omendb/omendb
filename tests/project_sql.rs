@@ -196,7 +196,7 @@ fn exercise_sql(directory: &Path) -> Vec<Vec<Value>> {
     assert!(empty.rows.is_empty());
     assert!(matches!(
         database.execute_sql("SELECT id FROM accounts WHERE missing = 1"),
-        Err(DbError::InvalidState(reason)) if reason.contains("unknown SQL column")
+        Err(DbError::SqlUndefinedColumn { name }) if name == "missing"
     ));
 
     let updated = database
