@@ -161,6 +161,49 @@ async fn persistent_server_statement_timeout_cancels_before_execution() {
     let _ = connection_task.await;
 }
 
+#[tokio::test]
+async fn persistent_server_rejects_result_over_byte_bound() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_max_result_bytes(Some(1));
+    let server = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+    client
+        .batch_execute("CREATE TABLE tiny (id BIGINT PRIMARY KEY)")
+        .await
+        .expect("create table");
+    let error = client
+        .query("INSERT INTO tiny VALUES (1) RETURNING id", &[])
+        .await
+        .expect_err("result over the configured byte bound must fail");
+    assert_eq!(error.code(), Some(&SqlState::PROGRAM_LIMIT_EXCEEDED));
+    assert!(server.status().failed_operations >= 1);
+    drop(client);
+    server.shutdown().await.expect("shutdown server");
+    let _ = connection_task.await;
+
+    let mut reopened = RelationalDatabase::open(RelationalBackendConfig::new(&database_path))
+        .expect("reopen after result rejection");
+    let count = reopened
+        .execute_sql("SELECT count(*) FROM tiny")
+        .expect("count rows after result rejection");
+    assert_eq!(count.rows, vec![vec![omendb::Value::U64(0)]]);
+    reopened.close().expect("close reopened database");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_server_shutdown_cancels_query_before_database_close() {
     let directory = tempdir().expect("tempdir");

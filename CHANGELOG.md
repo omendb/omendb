@@ -49,7 +49,9 @@ All notable changes to OmenDB are documented here. Format follows
   unsupported-feature assertion.
 - Persistent wire servers accept an optional cooperative per-statement
   timeout through `ServerConfig` and `--statement-timeout-ms`; expiry maps to
-  SQLSTATE `57014`.
+  SQLSTATE `57014`. `ServerConfig::max_result_bytes` and
+  `--max-result-bytes` reject estimated response payloads above the configured
+  bound with SQLSTATE `54000`; this does not yet bound execution memory.
 - Seer read views are cached strongly and invalidated under the publication
   lock; transaction begins capture frontier and view atomically, removing a
   race that surfaced as spurious `StorageSnapshotUnavailable` under

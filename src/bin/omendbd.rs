@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N]
-//!         [--statement-timeout-ms N]
+//!         [--statement-timeout-ms N] [--max-result-bytes N]
 //! ```
 
 #![cfg(feature = "pgwire")]
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use omendb::pgwire_server::{RunningServer, ServerConfig};
 
-type ParsedArgs = Option<(PathBuf, SocketAddr, usize, Option<Duration>)>;
+type ParsedArgs = Option<(PathBuf, SocketAddr, usize, Option<Duration>, Option<usize>)>;
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -29,7 +29,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some((path, bind, max_connections, statement_timeout)) =
+    let Some((path, bind, max_connections, statement_timeout, max_result_bytes)) =
         parse_args(std::env::args().skip(1))?
     else {
         return Ok(());
@@ -41,7 +41,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let server = RunningServer::start(
             ServerConfig::new(path, bind)
                 .with_max_connections(max_connections)
-                .with_statement_timeout(statement_timeout),
+                .with_statement_timeout(statement_timeout)
+                .with_max_result_bytes(max_result_bytes),
         )
         .await?;
         println!("omendbd listening on {}", server.local_addr());
@@ -59,6 +60,7 @@ fn parse_args(
     let mut bind = "127.0.0.1:5432".parse::<SocketAddr>()?;
     let mut max_connections = 128;
     let mut statement_timeout = None;
+    let mut max_result_bytes = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--path" => path = Some(PathBuf::from(required_value(&mut args, "--path")?)),
@@ -71,9 +73,12 @@ fn parse_args(
                     required_value(&mut args, "--statement-timeout-ms")?.parse()?,
                 ));
             }
+            "--max-result-bytes" => {
+                max_result_bytes = Some(required_value(&mut args, "--max-result-bytes")?.parse()?);
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N] [--statement-timeout-ms N]"
+                    "usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N] [--statement-timeout-ms N] [--max-result-bytes N]"
                 );
                 return Ok(None);
             }
@@ -81,7 +86,13 @@ fn parse_args(
         }
     }
     let path = path.ok_or("--path is required")?;
-    Ok(Some((path, bind, max_connections, statement_timeout)))
+    Ok(Some((
+        path,
+        bind,
+        max_connections,
+        statement_timeout,
+        max_result_bytes,
+    )))
 }
 
 fn required_value(

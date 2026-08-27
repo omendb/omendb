@@ -46,8 +46,10 @@ provisioned user switches startup to SCRAM-SHA-256; provision users while the
 database is closed, then restart the daemon. `--max-connections` bounds
 connection tasks; rejected sockets are counted in `RunningServer::status()`.
 `--statement-timeout-ms` applies a cooperative deadline to each statement and
-`Describe`; zero rejects execution immediately. PostgreSQL `CancelRequest`
-messages cancel the active database operation at its cooperative checkpoints;
+`Describe`; zero rejects execution immediately. `--max-result-bytes` rejects
+an estimated materialized result payload above its bound with SQLSTATE `54000`;
+it does not bound execution-time memory. PostgreSQL `CancelRequest` messages
+cancel the active database operation at its cooperative checkpoints;
 synchronous query work runs in server-tracked blocking workers so awaited
 shutdown drains it before closing the database. Schema publication remains a
 non-interruptible operation and checks cancellation and the statement deadline
@@ -65,9 +67,9 @@ counters may overlap. A `RelationalDatabaseSession` exposes
 `admission_status()` with active operations, writer counts, admission waits,
 and rejections. `commit_id()` returns the visible commit frontier (the SeerDB
 commit sequence number). The current hard wire-server quotas are admitted
-connection count and cooperative statement time; query-result memory and
-bytes-per-query quotas are not yet implemented. A failed durable write fences
-writes until reopen, and reopen failure surfaces as an open error.
+connection count, cooperative statement time, and estimated result payload
+bytes. Query execution-memory quotas are not yet implemented. A failed durable
+write fences writes until reopen, and reopen failure surfaces as an open error.
 
 ## Routine maintenance
 

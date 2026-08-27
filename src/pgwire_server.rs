@@ -140,6 +140,8 @@ pub struct ServerConfig {
     /// Optional cooperative deadline for each wire statement and describe.
     /// `None` disables the deadline; zero is an immediate deadline.
     pub statement_timeout: Option<Duration>,
+    /// Optional estimated result-payload byte bound per wire statement.
+    pub max_result_bytes: Option<usize>,
 }
 
 impl ServerConfig {
@@ -152,6 +154,7 @@ impl ServerConfig {
             create_if_missing: true,
             max_connections: 128,
             statement_timeout: None,
+            max_result_bytes: None,
         }
     }
 
@@ -173,6 +176,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_statement_timeout(mut self, statement_timeout: Option<Duration>) -> Self {
         self.statement_timeout = statement_timeout;
+        self
+    }
+
+    /// Set the estimated result-payload byte bound per wire statement.
+    #[must_use]
+    pub fn with_max_result_bytes(mut self, max_result_bytes: Option<usize>) -> Self {
+        self.max_result_bytes = max_result_bytes;
         self
     }
 }
@@ -426,6 +436,7 @@ impl RunningServer {
             address,
             Arc::clone(&state.query_workers),
             config.statement_timeout,
+            config.max_result_bytes,
         ) {
             Ok(factory) => factory,
             Err(error) => {
@@ -520,6 +531,7 @@ pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::
         listener.local_addr()?,
         Arc::clone(&state.query_workers),
         None,
+        None,
     )?;
     run_accept_loop(listener, factory, state, Semaphore::MAX_PERMITS).await
 }
@@ -603,6 +615,7 @@ fn build_factory(
     listener_addr: std::net::SocketAddr,
     query_workers: Arc<QueryWorkers>,
     statement_timeout: Option<Duration>,
+    max_result_bytes: Option<usize>,
 ) -> std::io::Result<Arc<HandlerFactory>> {
     {
         let mut database =
@@ -655,6 +668,7 @@ fn build_factory(
             identities: Arc::clone(&identities),
             query_workers,
             statement_timeout,
+            max_result_bytes,
         }),
         auth: auth.map(|auth_source| {
             Arc::new(ScramComponents {
@@ -1247,6 +1261,7 @@ struct OmenDbHandler {
     schema_probes: Arc<Mutex<ProbeCache>>,
     query_workers: Arc<QueryWorkers>,
     statement_timeout: Option<Duration>,
+    max_result_bytes: Option<usize>,
 }
 
 fn pg_error(code: &str, message: String) -> PgWireError {
@@ -1280,6 +1295,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         crate::DbError::SqlDivisionByZero => ("22012", error.to_string()),
         crate::DbError::SqlNumericValueOutOfRange(_) => ("22003", error.to_string()),
         crate::DbError::SqlNotNullViolation { .. } => ("23502", error.to_string()),
+        crate::DbError::ResourceLimitExceeded(_) => ("54000", error.to_string()),
         crate::DbError::SqlUnsupported { .. } => {
             ("0A000", format!("feature not supported: {error}"))
         }
@@ -1330,12 +1346,49 @@ fn fields_from_result(
     )
 }
 
+fn estimated_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 5,
+        Value::U64(_) | Value::I64(_) => 20,
+        Value::Text(value) => value.len(),
+        Value::Bytes(value) => value.len(),
+    }
+}
+
+fn estimated_result_payload_bytes(result: &crate::SqlResult) -> usize {
+    result.rows.iter().fold(0usize, |total, row| {
+        row.iter().fold(total, |total, value| {
+            total.saturating_add(estimated_value_bytes(value))
+        })
+    })
+}
+
+fn check_result_payload(
+    result: &crate::SqlResult,
+    max_result_bytes: Option<usize>,
+) -> crate::Result<()> {
+    let estimated_bytes = estimated_result_payload_bytes(result);
+    if let Some(limit) = max_result_bytes
+        && estimated_bytes > limit
+    {
+        return Err(crate::DbError::ResourceLimitExceeded(format!(
+            "result payload is estimated at {estimated_bytes} bytes, exceeding the configured limit of {limit}"
+        )));
+    }
+    Ok(())
+}
+
 fn encode_response_with_format(
     result: crate::SqlResult,
     format: &pgwire::api::portal::Format,
-) -> Response {
+    max_result_bytes: Option<usize>,
+) -> PgWireResult<Response> {
+    check_result_payload(&result, max_result_bytes).map_err(map_db_error)?;
     if result.rows.is_empty() && result.columns.is_empty() {
-        return Response::Execution(Tag::new("OK").with_rows(result.affected_rows));
+        return Ok(Response::Execution(
+            Tag::new("OK").with_rows(result.affected_rows),
+        ));
     }
     let schema = fields_from_result(&result, format);
     let rows = result.rows.clone();
@@ -1349,10 +1402,10 @@ fn encode_response_with_format(
             Ok(encoder.take_row())
         }
     });
-    Response::Query(QueryResponse::new(
+    Ok(Response::Query(QueryResponse::new(
         fields_from_result(&result, format),
         data_row_stream,
-    ))
+    )))
 }
 
 fn column_type_to_pg(column_type: crate::ColumnType) -> Type {
@@ -1641,7 +1694,9 @@ impl OmenDbHandler {
                     .execute_sql_with_params(&database, sql, params);
                 drop(database);
                 let response = match outcome {
-                    Ok(result) => Ok(encode_response_with_format(result, format)),
+                    Ok(result) => {
+                        encode_response_with_format(result, format, self.max_result_bytes)
+                    }
                     Err(error) => {
                         block.errored = true;
                         Err(map_db_error(error))
@@ -1768,12 +1823,13 @@ impl OmenDbHandler {
             control.check().map_err(map_db_error)?;
             let mut database = write_lock_with_control(&self.database, control)?;
             control.check().map_err(map_db_error)?;
-            return Ok(encode_response_with_format(
+            return encode_response_with_format(
                 database
                     .execute_sql_with_params(sql, params)
                     .map_err(map_db_error)?,
                 format,
-            ));
+                self.max_result_bytes,
+            );
         }
         control.check().map_err(map_db_error)?;
         if Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
@@ -1783,18 +1839,21 @@ impl OmenDbHandler {
             let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
             let result = transaction.execute_sql_with_params(&database, sql, params);
             drop(transaction);
-            return Ok(encode_response_with_format(
+            return encode_response_with_format(
                 result.map_err(map_db_error)?,
                 format,
-            ));
+                self.max_result_bytes,
+            );
         }
         let mut database = write_lock_with_control(&self.database, control)?;
         let (result, _) = database
             .transaction_with_control(control, |database, transaction| {
-                transaction.execute_sql_with_params(database, sql, params)
+                let result = transaction.execute_sql_with_params(database, sql, params)?;
+                check_result_payload(&result, self.max_result_bytes)?;
+                Ok(result)
             })
             .map_err(map_db_error)?;
-        Ok(encode_response_with_format(result, format))
+        encode_response_with_format(result, format, self.max_result_bytes)
     }
 
     fn is_schema_statement(statement: &str) -> bool {
