@@ -1290,6 +1290,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
             "canceling statement due to statement timeout".to_owned(),
         ),
         crate::DbError::SqlParse(_) => ("42601", error.to_string()),
+        crate::DbError::SqlParameter(_) => ("08P01", error.to_string()),
         crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
         crate::DbError::SqlDivisionByZero => ("22012", error.to_string()),
@@ -2149,6 +2150,17 @@ mod tests {
 
         registry.cleanup_connection(address);
         assert!(registry.begin(&client).is_none());
+    }
+
+    #[test]
+    fn sql_parameter_errors_use_protocol_violation_state() {
+        let error = map_db_error(DbError::SqlParameter(
+            "statement references parameters but none were supplied".to_owned(),
+        ));
+        match error {
+            PgWireError::UserError(info) => assert_eq!(info.code, "08P01"),
+            other => panic!("expected user error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
