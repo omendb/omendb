@@ -74,6 +74,11 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 ### Server and protocol
 
+The current development tree has a persistent `omendbd` daemon foundation and
+an integration test for durable shutdown/reopen. The full gate remains open
+until cancellation, authentication/authorization, protocol compatibility, and
+process-level failure behavior have their own evidence.
+
 - [ ] a persistent daemon opens a durable database and supports multiple
       sessions with clean startup, shutdown, cancellation, and reopen;
 - [ ] authentication, authorization, resource limits, and operational

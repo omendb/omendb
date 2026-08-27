@@ -8,6 +8,8 @@
 //! design note.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,8 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::{
     ColumnDefinition, ColumnId, ColumnType, DbError, RelationalDatabase,
@@ -70,72 +74,323 @@ fn write_lock(
         .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
 }
 
-/// Serve PostgreSQL wire clients on an already-bound listener until the
-/// listener errors. Each connection runs against `database` with trust auth.
-pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::Result<()> {
-    let auth_table_present = {
-        let mut database =
-            write_lock(&database).map_err(|err| std::io::Error::other(err.to_string()))?;
-        if !database
-            .catalog()
-            .tables()
-            .any(|table| table.name == AUTH_TABLE)
-        {
-            database
-                .create_table(auth_table_definition())
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+/// A persistent single-node PostgreSQL-wire server configuration.
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    /// Directory containing the durable OmenDB database.
+    pub database_path: PathBuf,
+    /// Address on which the PostgreSQL wire listener is bound.
+    pub bind_addr: std::net::SocketAddr,
+    /// Create the database directory when it does not exist.
+    pub create_if_missing: bool,
+    /// Maximum number of connection tasks admitted at once.
+    pub max_connections: usize,
+}
+
+impl ServerConfig {
+    /// Build a server configuration with local development defaults.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, bind_addr: std::net::SocketAddr) -> Self {
+        Self {
+            database_path: path.into(),
+            bind_addr,
+            create_if_missing: true,
+            max_connections: 128,
         }
-        true
-    };
-    let _ = auth_table_present;
-    let has_users = {
-        let database =
-            read_lock(&database).map_err(|err| std::io::Error::other(err.to_string()))?;
-        let mut transaction = database
-            .begin()
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-        let result = transaction
-            .execute_sql(&database, "SELECT username FROM pgwire_auth")
-            .map_err(|err| std::io::Error::other(err.to_string()));
-        drop(transaction);
-        !result?.rows.is_empty()
-    };
-
-    // Trust mode authenticates implicitly, so it must never be reachable
-    // from a non-loopback interface.
-    if !has_users && !listener.local_addr()?.ip().is_loopback() {
-        return Err(std::io::Error::other(
-            "trust authentication requires a loopback listener; provision wire users before binding a public interface",
-        ));
     }
 
-    let auth = has_users.then(|| {
-        Arc::new(WireAuthSource {
-            database: database.clone(),
+    /// Set whether a missing database directory is created during startup.
+    #[must_use]
+    pub fn with_create_if_missing(mut self, create_if_missing: bool) -> Self {
+        self.create_if_missing = create_if_missing;
+        self
+    }
+
+    /// Set the connection admission bound.
+    #[must_use]
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+}
+
+/// Errors from server startup, lifecycle, or durable shutdown.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("server configuration is invalid: {0}")]
+    InvalidConfiguration(String),
+    #[error("server database error: {0}")]
+    Database(#[from] DbError),
+    #[error("server I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("server task failed: {0}")]
+    Task(String),
+    #[error("server database handle still has live references during shutdown")]
+    LiveDatabaseReferences,
+    #[error("server database lock is poisoned during shutdown")]
+    DatabaseLockPoisoned,
+}
+
+/// A bounded diagnostic projection of the server lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServerStatus {
+    pub active_connections: usize,
+    pub accepted_connections: u64,
+    pub rejected_connections: u64,
+    pub max_connections: usize,
+    pub shutting_down: bool,
+}
+
+struct ServerState {
+    shutdown: AtomicBool,
+    notify: Notify,
+    active_connections: AtomicUsize,
+    accepted_connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    max_connections: usize,
+}
+
+impl ServerState {
+    fn new(max_connections: usize) -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            notify: Notify::new(),
+            active_connections: AtomicUsize::new(0),
+            accepted_connections: AtomicU64::new(0),
+            rejected_connections: AtomicU64::new(0),
+            max_connections,
+        }
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for_shutdown(&self) {
+        let notified = self.notify.notified();
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn status(&self) -> ServerStatus {
+        ServerStatus {
+            active_connections: self.active_connections.load(Ordering::Acquire),
+            accepted_connections: self.accepted_connections.load(Ordering::Acquire),
+            rejected_connections: self.rejected_connections.load(Ordering::Acquire),
+            max_connections: self.max_connections,
+            shutting_down: self.shutdown.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// A cloneable signal used to request server shutdown from another task.
+#[derive(Clone)]
+pub struct ServerShutdownHandle {
+    state: Arc<ServerState>,
+}
+
+impl ServerShutdownHandle {
+    /// Request shutdown. The call is idempotent and does not wait for cleanup.
+    pub fn shutdown(&self) {
+        self.state.request_shutdown();
+    }
+
+    /// Return whether shutdown has been requested.
+    #[must_use]
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.state.shutdown.load(Ordering::Acquire)
+    }
+}
+
+/// A running persistent OmenDB server. Dropping it requests shutdown; call
+/// [`Self::shutdown`] when the caller must observe the close result.
+pub struct RunningServer {
+    address: std::net::SocketAddr,
+    state: Arc<ServerState>,
+    task: Option<tokio::task::JoinHandle<Result<(), ServerError>>>,
+}
+
+impl RunningServer {
+    /// Open or create the configured database, bind the wire listener, and
+    /// start the bounded accept loop.
+    pub async fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        if config.max_connections == 0 {
+            return Err(ServerError::InvalidConfiguration(
+                "max_connections must be positive".to_owned(),
+            ));
+        }
+        if config.max_connections > Semaphore::MAX_PERMITS {
+            return Err(ServerError::InvalidConfiguration(format!(
+                "max_connections exceeds the runtime limit of {}",
+                Semaphore::MAX_PERMITS
+            )));
+        }
+        let database_path = config.database_path;
+        let backend = crate::RelationalBackendConfig::new(database_path.clone());
+        let database = if database_path_exists(&database_path) {
+            RelationalDatabase::open(backend)?
+        } else if config.create_if_missing {
+            RelationalDatabase::create(backend)?
+        } else {
+            return Err(ServerError::InvalidConfiguration(format!(
+                "database path does not exist: {}",
+                database_path.display()
+            )));
+        };
+        let listener = match TcpListener::bind(config.bind_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                database.close()?;
+                return Err(error.into());
+            }
+        };
+        let address = match listener.local_addr() {
+            Ok(address) => address,
+            Err(error) => {
+                database.close()?;
+                return Err(error.into());
+            }
+        };
+        let shared = Arc::new(RwLock::new(database));
+        let factory = match build_factory(&shared, address) {
+            Ok(factory) => factory,
+            Err(error) => {
+                close_shared_database(shared)?;
+                return Err(error.into());
+            }
+        };
+        let state = Arc::new(ServerState::new(config.max_connections));
+        let task_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            let serving = run_accept_loop(
+                listener,
+                factory,
+                Arc::clone(&task_state),
+                config.max_connections,
+            )
+            .await
+            .map_err(ServerError::Io);
+            let closed = close_shared_database(shared);
+            match (serving, closed) {
+                (Err(error), _) => Err(error),
+                (Ok(()), Ok(())) => Ok(()),
+                (Ok(()), Err(error)) => Err(error),
+            }
+        });
+        Ok(Self {
+            address,
+            state,
+            task: Some(task),
         })
-    });
-    let identities = Arc::new(Mutex::new(HashMap::new()));
-    let failure_delays = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let factory = Arc::new(HandlerFactory {
-        handler: Arc::new(OmenDbHandler {
-            database: database.clone(),
-            transactions: Mutex::new(HashMap::new()),
-            schema_probes: Mutex::new(HashMap::new()),
-            identities: Arc::clone(&identities),
-        }),
-        auth: auth.map(|auth_source| {
-            Arc::new(ScramComponents {
-                auth_source,
-                identities: Arc::clone(&identities),
-                failure_delays: Arc::clone(&failure_delays),
-            })
-        }),
-    });
-    loop {
-        let (socket, _peer) = listener.accept().await?;
-        let factory = factory.clone();
-        tokio::spawn(async move { process_socket(socket, None, factory).await });
     }
+
+    /// Return the address selected by the listener, including an OS-assigned
+    /// port when `bind_addr` used port zero.
+    #[must_use]
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    /// Return a cloneable shutdown signal.
+    #[must_use]
+    pub fn shutdown_handle(&self) -> ServerShutdownHandle {
+        ServerShutdownHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Return current connection and lifecycle counters.
+    #[must_use]
+    pub fn status(&self) -> ServerStatus {
+        self.state.status()
+    }
+
+    /// Request shutdown, abort admitted connections, close the database, and
+    /// report any listener or durable close error.
+    pub async fn shutdown(mut self) -> Result<(), ServerError> {
+        self.state.request_shutdown();
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| ServerError::Task("server shutdown was already awaited".to_owned()))?;
+        task.await
+            .map_err(|error| ServerError::Task(error.to_string()))?
+    }
+}
+
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.state.request_shutdown();
+    }
+}
+
+fn database_path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+fn close_shared_database(shared: SharedDatabase) -> Result<(), ServerError> {
+    let lock = Arc::try_unwrap(shared).map_err(|_| ServerError::LiveDatabaseReferences)?;
+    let database = lock
+        .into_inner()
+        .map_err(|_| ServerError::DatabaseLockPoisoned)?;
+    database.close()?;
+    Ok(())
+}
+
+/// Serve PostgreSQL wire clients on an already-bound listener until the
+/// listener errors. The listener's startup auth policy is derived from the
+/// durable auth catalog; empty credentials are trust-only on loopback.
+pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::Result<()> {
+    let factory = build_factory(&database, listener.local_addr()?)?;
+    let state = Arc::new(ServerState::new(Semaphore::MAX_PERMITS));
+    run_accept_loop(listener, factory, state, Semaphore::MAX_PERMITS).await
+}
+
+async fn run_accept_loop(
+    listener: TcpListener,
+    factory: Arc<HandlerFactory>,
+    state: Arc<ServerState>,
+    max_connections: usize,
+) -> std::io::Result<()> {
+    let slots = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = state.wait_for_shutdown() => break,
+            accepted = listener.accept() => {
+                let (socket, _peer) = accepted?;
+                state.accepted_connections.fetch_add(1, Ordering::Relaxed);
+                let permit = match Arc::clone(&slots).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        drop(socket);
+                        continue;
+                    }
+                };
+                state.active_connections.fetch_add(1, Ordering::AcqRel);
+                let peer = socket.peer_addr().ok();
+                let handler = Arc::clone(&factory.handler);
+                let connection_factory = Arc::clone(&factory);
+                let task_state = Arc::clone(&state);
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _ = process_socket(socket, None, connection_factory).await;
+                    if let Some(peer) = peer {
+                        handler.cleanup_connection(peer);
+                    }
+                    task_state.active_connections.fetch_sub(1, Ordering::AcqRel);
+                });
+            }
+        }
+    }
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    state.active_connections.store(0, Ordering::Release);
+    Ok(())
 }
 
 /// Bind a listener and spawn the accept loop on the current tokio runtime,
@@ -159,6 +414,68 @@ pub async fn spawn(
 const AUTH_TABLE: &str = "pgwire_auth";
 const SCRAM_ITERATIONS: usize = 4096;
 const SALT_LEN: usize = 32;
+
+fn build_factory(
+    database: &SharedDatabase,
+    listener_addr: std::net::SocketAddr,
+) -> std::io::Result<Arc<HandlerFactory>> {
+    {
+        let mut database =
+            write_lock(database).map_err(|error| std::io::Error::other(error.to_string()))?;
+        if !database
+            .catalog()
+            .tables()
+            .any(|table| table.name == AUTH_TABLE)
+        {
+            database
+                .create_table(auth_table_definition())
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+    }
+    let has_users = {
+        let database =
+            read_lock(database).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut transaction = database
+            .begin()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let result = transaction
+            .execute_sql(&database, "SELECT username FROM pgwire_auth")
+            .map_err(|error| std::io::Error::other(error.to_string()));
+        drop(transaction);
+        !result?.rows.is_empty()
+    };
+
+    // Trust mode authenticates implicitly, so it must never be reachable
+    // from a non-loopback interface.
+    if !has_users && !listener_addr.ip().is_loopback() {
+        return Err(std::io::Error::other(
+            "trust authentication requires a loopback listener; provision wire users before binding a public interface",
+        ));
+    }
+
+    let auth = has_users.then(|| {
+        Arc::new(WireAuthSource {
+            database: Arc::clone(database),
+        })
+    });
+    let identities = Arc::new(Mutex::new(HashMap::new()));
+    let failure_delays = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    Ok(Arc::new(HandlerFactory {
+        handler: Arc::new(OmenDbHandler {
+            database: Arc::clone(database),
+            transactions: Mutex::new(HashMap::new()),
+            schema_probes: Mutex::new(HashMap::new()),
+            identities: Arc::clone(&identities),
+        }),
+        auth: auth.map(|auth_source| {
+            Arc::new(ScramComponents {
+                auth_source,
+                identities: Arc::clone(&identities),
+                failure_delays: Arc::clone(&failure_delays),
+            })
+        }),
+    }))
+}
 
 fn auth_table_definition() -> TableDefinition {
     TableDefinition {
@@ -781,6 +1098,15 @@ fn transaction_command(statement: &str) -> Option<TransactionCommand> {
 }
 
 impl OmenDbHandler {
+    fn cleanup_connection(&self, client_addr: std::net::SocketAddr) {
+        if let Ok(mut blocks) = self.transactions.lock() {
+            blocks.remove(&client_addr);
+        }
+        if let Ok(mut identities) = self.identities.lock() {
+            identities.remove(&client_addr);
+        }
+    }
+
     fn lock_transactions(
         &self,
     ) -> PgWireResult<std::sync::MutexGuard<'_, HashMap<std::net::SocketAddr, TransactionBlock>>>

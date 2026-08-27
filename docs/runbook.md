@@ -1,9 +1,9 @@
 # OmenDB operator runbook (development preview)
 
-This runbook covers the current operational surface of one `RelationalDatabase`
-or `RelationalDatabaseSession` handle: health checks, integrity verification,
-maintenance, and recovery after an ambiguous durable write. It is a
-qualification aid for the unreleased development line, not the final
+This runbook covers the current operational surface of one persistent
+`omendbd` process and its `RelationalDatabase` handle: startup, lifecycle,
+health checks, maintenance, and recovery after an ambiguous durable write. It
+is a qualification aid for the unreleased development line, not a final
 server-operations contract; behavior may change before the server-first alpha.
 
 ## Platform and filesystem assumptions
@@ -23,13 +23,37 @@ and local runs.
   fixed; renaming or hand-editing files inside the directory is unsupported
   and will be refused as corruption on open.
 
+## Startup and lifecycle
+
+Start the daemon with an explicit durable path:
+
+```bash
+cargo run --features pgwire --bin omendbd -- \
+  --path ./omendb-data --bind 127.0.0.1:5432 --max-connections 128
+```
+
+The daemon creates a missing path by default, binds the listener, and keeps one
+owning database handle for its lifetime. Ctrl-C requests shutdown; the accept
+loop stops, admitted connections are cancelled, connection-local transaction
+blocks are dropped, and the durable handle is closed before the process exits.
+Call `RunningServer::shutdown` instead of dropping the handle when embedding the
+server and the close result must be observed. A dropped running handle still
+signals shutdown but cannot report a close error.
+
+Empty `pgwire_auth` catalogs enable trust authentication only on loopback. A
+provisioned user switches startup to SCRAM-SHA-256; provision users while the
+database is closed, then restart the daemon. `--max-connections` bounds
+connection tasks; rejected sockets are counted in `RunningServer::status()`.
+
 ## Health checks
 
-Session admission exposes `admission_status()` — active operations, writer
-counts, admission waits, and rejections. `commit_id()` returns the visible
-commit frontier (the SeerDB commit sequence number). There is no separate
-lifecycle-status or diagnostic-report surface; a failed durable write fences
-writes until reopen, and reopen failure surfaces as an open error.
+An embedded `RunningServer` exposes `status()` with active, accepted, and
+rejected connection counts, the configured admission bound, and shutdown state.
+A `RelationalDatabaseSession` exposes `admission_status()` with active
+operations, writer counts, admission waits, and rejections. `commit_id()`
+returns the visible commit frontier (the SeerDB commit sequence number). A
+failed durable write fences writes until reopen, and reopen failure surfaces as
+an open error.
 
 ## Routine maintenance
 

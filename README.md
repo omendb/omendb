@@ -6,29 +6,18 @@ OmenDB is a server-first relational database system in development, written in R
 
 ## Quick start
 
-OmenDB is not currently published to crates.io. Use it as a Git dependency or clone this repository. The direct Rust API is currently the smallest working surface, and this example uses the temporary/reference backend:
+OmenDB is not currently published to crates.io. Use it as a Git dependency or clone this repository. The direct Rust API is currently the smallest working surface, and this example opens the persistent SeerDB-backed engine:
 
 ```rust
-use std::path::PathBuf;
-
-use omendb::{
-    DatabaseConfig, RelationalBackendConfig, RelationalDatabase,
-};
+use omendb::{RelationalBackendConfig, RelationalDatabase};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut database = RelationalDatabase::create(RelationalBackendConfig::Temporary(
-        DatabaseConfig {
-            directory: PathBuf::from("./omendb-data"),
-        },
-    ))?;
-
+    let mut database =
+        RelationalDatabase::create(RelationalBackendConfig::new("./omendb-data"))?;
     database.execute_sql(
         "CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
     )?;
-    database.execute_sql(
-        "INSERT INTO accounts VALUES (1, 'Alice'), (2, 'Bob')",
-    )?;
-
+    database.execute_sql("INSERT INTO accounts VALUES (1, 'Alice'), (2, 'Bob')")?;
     let result = database.execute_sql("SELECT id, name FROM accounts ORDER BY id")?;
     println!("{:?}", result.rows);
     database.close()?;
@@ -51,18 +40,17 @@ control over transaction, snapshot, or backend behavior.
 The roadmap is server-first, with SeerDB and OmenDB advancing as one vertical
 slice rather than as isolated rewrites:
 
-1. **SeerDB foundation:** multi-writer snapshot MVCC, first-class trees,
-   ordered cursors, atomic multi-tree writes, crash-safe WAL, and snapshot plus
-   restart-LSN change positions.
-2. **OmenDB integration:** replace the global-generation storage seam and map
-   catalogs, tables, and indexes directly onto SeerDB capabilities while
-   preserving relational correctness tests.
-3. **Server alpha:** deliver a persistent single-node daemon with multiple
-   sessions, a deliberate PostgreSQL protocol subset, authentication, clean
-   lifecycle, and operational diagnostics.
-4. **Measured acceleration:** add typed OLTP micro-plans, batch execution,
-   replication/CDC, and benchmark-led page, buffer, WAL, and runtime
-   optimizations.
+1. **SeerDB foundation:** the transaction, MVCC, cursor, change-position, and
+   group-commit slices are implemented; page-level multi-writer installation
+   remains open.
+2. **OmenDB integration:** complete. The direct SeerDB store owns the catalog,
+   tables, indexes, and relational transactions.
+3. **Server alpha:** in progress. The persistent daemon now supports multiple
+   wire sessions, bounded connection admission, authentication policy,
+   diagnostics, and clean shutdown/reopen behavior.
+4. **Measured acceleration:** add serializable certification, replication/CDC,
+   typed OLTP micro-plans, batch execution, and benchmark-led page, buffer,
+   WAL, and runtime optimizations.
 
 The current direct Rust API and exploratory wire example are development
 surfaces, not the target alpha product. SeerDB is an independent Apache-2.0
@@ -85,18 +73,29 @@ cargo run --release --example alpha_oltp -- \
 The baseline reports workload metadata and latency but makes no competitive
 performance claim; `--batch-size` measures the explicit transaction trade-off.
 
-## PostgreSQL wire example
+## PostgreSQL wire server
 
-Run the exploratory wire server with:
+Run the persistent daemon with:
+
+```bash
+cargo run --features pgwire --bin omendbd -- \
+  --path ./omendb-data --bind 127.0.0.1:5432
+```
+
+The daemon opens or creates the database, accepts multiple PostgreSQL wire
+sessions, and closes the durable handle on Ctrl-C. Empty authentication
+catalogs use trust mode on loopback only. Provision a SCRAM user through
+`pgwire_server::provision_wire_user` before starting the daemon; once a user
+exists, startup requires SCRAM authentication. Connection admission is
+bounded with `--max-connections`.
+
+The supported SQL and wire surface is deliberate and bounded, not a claim of
+PostgreSQL compatibility. The throwaway seeded example remains available for
+client experiments:
 
 ```bash
 cargo run --features pgwire --example pgwire_serve -- 5432
 ```
-
-It starts a throwaway database on `127.0.0.1`, seeds a `users` table, and
-accepts trust authentication by default. Set `PGWIRE_USER` and
-`PGWIRE_PASSWORD` to provision a SCRAM user instead. The wire server is for
-compatibility checks, not a claim of PostgreSQL protocol or SQL completeness.
 
 ## Development
 

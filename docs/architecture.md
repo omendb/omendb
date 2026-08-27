@@ -178,17 +178,17 @@ into permanence.
 
 ## Current status and roadmap
 
-The current tree has a working transitional Rust relational API, durable
-SeerDB integration, SQL/catalog/index/constraint tests, fault and recovery
-coverage, an experimental PostgreSQL wire example, and a separate direct
-SeerDB qualification path (`src/seer_direct.rs`). The qualification path
-exercises catalog/table/index-to-`TreeId` mapping and transaction-scoped
-snapshot reads without pretending to replace the public facade yet. SeerDB's
-transactional facade now persists and resolves committed per-key version
-chains, while the tree still does **not** provide the server contract described
-here, transaction-status indirection, append-oriented undo storage, a
-production physical multi-writer storage API, production
-authentication/authorization, or a PostgreSQL compatibility claim.
+The current tree has a direct Rust relational API, durable SeerDB integration,
+SQL/catalog/index/constraint tests, fault and recovery coverage, and a
+feature-gated PostgreSQL wire server. `src/pgwire_server.rs` now also exposes a
+persistent `RunningServer` and the `omendbd` binary: one process owns one
+opened database, bounds admitted connection tasks, derives trust/SCRAM policy
+from the durable auth catalog, reports lifecycle counters, and closes the
+handle on explicit shutdown. This is a server foundation, not yet the complete
+alpha contract: protocol coverage, authorization policy, cancellation,
+resource quotas, and crash-level daemon tests remain open. The direct
+SeerDB qualification path (`src/seer_direct.rs`) remains test-only evidence for
+catalog/table/index-to-tree mapping and is not a second relational backend.
 
 The roadmap is intentionally dependency-ordered, but OmenDB follows each
 SeerDB milestone immediately so the storage contract is validated by a real
@@ -220,9 +220,11 @@ relational consumer:
    and ON DELETE CASCADE/SET NULL referential actions at commit time.
    The storage-kernel seam, attempt machinery, coalesced publication,
    archive/restore, and the temporary backend were deleted outright.
-4. **Server alpha foundation:** persistent multi-session lifecycle, deliberate
-   PostgreSQL protocol subset, authentication, cancellation, configuration,
-   diagnostics, and clean shutdown/reopen behavior.
+4. **Server alpha foundation — in progress:** persistent multi-session
+   lifecycle, bounded connection admission, configuration, lifecycle
+   diagnostics, and clean shutdown/reopen behavior are implemented. The
+   deliberate PostgreSQL protocol subset, authorization baseline,
+   cancellation, and process-level compatibility/crash tests remain open.
 5. **Correctness and scale:** serializable certification, snapshot plus
    zero-gap logical CDC, physical replication, typed OLTP micro-plans, batch
    execution, and benchmark-led storage/runtime optimization.

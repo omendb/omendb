@@ -43,6 +43,105 @@ fn seed_database(directory: &std::path::Path) -> Arc<RwLock<RelationalDatabase>>
 }
 
 #[tokio::test]
+async fn persistent_server_reopens_durable_database_after_shutdown() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let mut database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database
+        .create_table(TableDefinition {
+            id: TableId(7),
+            name: "users".to_owned(),
+            columns: vec![ColumnDefinition {
+                id: ColumnId(1),
+                name: "id".to_owned(),
+                data_type: ColumnType::U64,
+                nullable: false,
+            }],
+        })
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO users (id) VALUES (1)")
+        .expect("seed");
+    database.close().expect("close seed database");
+
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_create_if_missing(false);
+    let server = pgwire_server::RunningServer::start(config.clone())
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .expect("read persisted row");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    client.batch_execute("BEGIN").await.expect("begin block");
+    client
+        .batch_execute("INSERT INTO users (id) VALUES (2)")
+        .await
+        .expect("stage block write");
+    assert_eq!(server.status().max_connections, 128);
+    assert!(server.status().accepted_connections >= 1);
+    drop(client);
+    server.shutdown().await.expect("shutdown server");
+    let _ = connection_task.await;
+
+    let reopened = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("reopen persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            reopened.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("reconnect");
+    let connection_task = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .expect("read after reopen");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    drop(client);
+    reopened.shutdown().await.expect("shutdown reopened server");
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
+async fn persistent_server_rejects_unbounded_connection_configuration() {
+    let directory = tempdir().expect("tempdir");
+    let error = match pgwire_server::RunningServer::start(
+        pgwire_server::ServerConfig::new(
+            directory.path().join("db"),
+            "127.0.0.1:0".parse().expect("addr"),
+        )
+        .with_max_connections(0),
+    )
+    .await
+    {
+        Ok(_) => panic!("zero connection bound must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        pgwire_server::ServerError::InvalidConfiguration(_)
+    ));
+}
+
+#[tokio::test]
 async fn wire_client_selects_seeds_and_reads_typed_rows() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
