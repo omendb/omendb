@@ -194,6 +194,14 @@ pub struct ServerStatus {
     pub accepted_connections: u64,
     pub rejected_connections: u64,
     pub max_connections: usize,
+    /// Synchronous query and describe operations currently on tracked workers.
+    pub active_operations: usize,
+    /// Terminal operations whose worker returned a result or error.
+    pub completed_operations: u64,
+    /// Completed operations that returned a wire error.
+    pub failed_operations: u64,
+    /// Completed operations whose cancellation token was observed as cancelled.
+    pub cancelled_operations: u64,
     pub shutting_down: bool,
 }
 
@@ -212,6 +220,9 @@ struct ServerState {
 /// and waits for this counter to reach zero before closing the database.
 struct QueryWorkers {
     active: AtomicUsize,
+    completed: AtomicU64,
+    failed: AtomicU64,
+    cancelled: AtomicU64,
     notify: Notify,
 }
 
@@ -219,21 +230,47 @@ impl QueryWorkers {
     fn new() -> Self {
         Self {
             active: AtomicUsize::new(0),
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
 
-    fn spawn<F, T>(self: &Arc<Self>, work: F) -> tokio::task::JoinHandle<T>
+    fn spawn_operation<F, T>(
+        self: &Arc<Self>,
+        cancellation: CancellationToken,
+        work: F,
+    ) -> tokio::task::JoinHandle<PgWireResult<T>>
     where
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce() -> PgWireResult<T> + Send + 'static,
         T: Send + 'static,
     {
         self.active.fetch_add(1, Ordering::AcqRel);
         let tracker = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            let _guard = QueryWorkerGuard { tracker };
-            work()
+            let _guard = QueryWorkerGuard {
+                tracker: Arc::clone(&tracker),
+            };
+            let result = work();
+            tracker.completed.fetch_add(1, Ordering::Relaxed);
+            if result.is_err() {
+                tracker.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            if cancellation.is_cancelled() {
+                tracker.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            result
         })
+    }
+
+    fn status(&self) -> (usize, u64, u64, u64) {
+        (
+            self.active.load(Ordering::Acquire),
+            self.completed.load(Ordering::Relaxed),
+            self.failed.load(Ordering::Relaxed),
+            self.cancelled.load(Ordering::Relaxed),
+        )
     }
 
     async fn wait_for_idle(&self) {
@@ -291,11 +328,17 @@ impl ServerState {
     }
 
     fn status(&self) -> ServerStatus {
+        let (active_operations, completed_operations, failed_operations, cancelled_operations) =
+            self.query_workers.status();
         ServerStatus {
             active_connections: self.active_connections.load(Ordering::Acquire),
             accepted_connections: self.accepted_connections.load(Ordering::Acquire),
             rejected_connections: self.rejected_connections.load(Ordering::Acquire),
             max_connections: self.max_connections,
+            active_operations,
+            completed_operations,
+            failed_operations,
+            cancelled_operations,
             shutting_down: self.shutdown.load(Ordering::Acquire),
         }
     }
@@ -1884,7 +1927,7 @@ impl SimpleQueryHandler for OmenDbHandler {
         let handler = self.clone();
         let query = query.to_owned();
         self.query_workers
-            .spawn(move || {
+            .spawn_operation(cancellation.clone(), move || {
                 let mut responses = Vec::new();
                 // The embedded tier accepts one statement per call;
                 // simple-protocol strings may carry several, so split
@@ -1942,7 +1985,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let format = portal.result_column_format.clone();
         let client_addr = _client.socket_addr();
         self.query_workers
-            .spawn(move || {
+            .spawn_operation(cancellation.clone(), move || {
                 let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
                 let params = decode_parameters(&parameters, &parameter_format, &resolved)?;
                 handler.run_statement(client_addr, &statement.sql, &params, &format, &cancellation)
@@ -1964,7 +2007,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let statement = statement.statement.clone();
         let (parameter_types, fields) = self
             .query_workers
-            .spawn(move || {
+            .spawn_operation(cancellation.clone(), move || {
                 let parameter_types =
                     handler.resolved_parameter_types(&statement, &cancellation)?;
                 let fields = handler.describe_schema(
@@ -1998,7 +2041,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         let format = portal.result_column_format.clone();
         let fields = self
             .query_workers
-            .spawn(move || {
+            .spawn_operation(cancellation.clone(), move || {
                 let resolved = handler.resolved_parameter_types(&statement, &cancellation)?;
                 handler.describe_schema(&statement.sql, &resolved, &format, &cancellation)
             })
@@ -2034,13 +2077,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_worker_tracker_records_terminal_operation_outcomes() {
+        let workers = Arc::new(QueryWorkers::new());
+        let _ = workers
+            .spawn_operation(CancellationToken::new(), || Ok::<_, PgWireError>(()))
+            .await
+            .expect("successful operation");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        workers
+            .spawn_operation(cancellation, || {
+                Err::<(), _>(pg_error("XX000", "synthetic failure".to_owned()))
+            })
+            .await
+            .expect("worker completed")
+            .expect_err("failed operation");
+        assert_eq!(workers.status(), (0, 2, 1, 1));
+    }
+
+    #[tokio::test]
     async fn query_worker_tracker_drains_dropped_join_handles() {
         let workers = Arc::new(QueryWorkers::new());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        drop(workers.spawn(move || {
+        drop(workers.spawn_operation(CancellationToken::new(), move || {
             started_tx.send(()).expect("worker start receiver");
             release_rx.recv().expect("worker release");
+            Ok::<_, PgWireError>(())
         }));
         started_rx.await.expect("worker started");
 

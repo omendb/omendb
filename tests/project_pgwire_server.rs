@@ -87,6 +87,14 @@ async fn persistent_server_reopens_durable_database_after_shutdown() {
         .await
         .expect("read persisted row");
     assert_eq!(row.get::<_, i64>(0), 1);
+    let status = server.status();
+    assert!(status.completed_operations >= 1);
+    assert_eq!(status.failed_operations, 0);
+    client
+        .query("SELECT * FROM nonexistent_table", &[])
+        .await
+        .expect_err("unsupported query should fail");
+    assert!(server.status().failed_operations >= 1);
     client.batch_execute("BEGIN").await.expect("begin block");
     client
         .batch_execute("INSERT INTO users (id) VALUES (2)")

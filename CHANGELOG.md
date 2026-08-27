@@ -9,8 +9,8 @@ All notable changes to OmenDB are documented here. Format follows
 ### Added
 
 - Persistent `omendbd` PostgreSQL-wire daemon with durable open/create,
-  bounded connection admission, lifecycle status counters, explicit shutdown,
-  and database close on shutdown.
+  bounded connection admission, connection and query/describe operation status
+  counters, explicit shutdown, and database close on shutdown.
 - `pgwire_server::RunningServer` and `ServerConfig` for embedding the same
   persistent server lifecycle in a Tokio application.
 - PostgreSQL `CancelRequest` routing into cooperative database operation

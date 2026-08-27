@@ -53,12 +53,16 @@ cancellation before it starts.
 ## Health checks
 
 An embedded `RunningServer` exposes `status()` with active, accepted, and
-rejected connection counts, the configured admission bound, and shutdown state.
-A `RelationalDatabaseSession` exposes `admission_status()` with active
-operations, writer counts, admission waits, and rejections. `commit_id()`
-returns the visible commit frontier (the SeerDB commit sequence number). A
-failed durable write fences writes until reopen, and reopen failure surfaces as
-an open error.
+rejected connection counts, the configured admission bound, shutdown state,
+and tracked query/describe operation counters. `active_operations` is the
+current worker count; `completed_operations` counts terminal worker results;
+`failed_operations` counts wire errors; and `cancelled_operations` counts
+workers whose cancellation token was observed. The failed and cancelled
+counters may overlap. A `RelationalDatabaseSession` exposes
+`admission_status()` with active operations, writer counts, admission waits,
+and rejections. `commit_id()` returns the visible commit frontier (the SeerDB
+commit sequence number). A failed durable write fences writes until reopen,
+and reopen failure surfaces as an open error.
 
 ## Routine maintenance
 

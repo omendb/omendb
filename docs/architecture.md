@@ -183,8 +183,8 @@ SQL/catalog/index/constraint tests, fault and recovery coverage, and a
 feature-gated PostgreSQL wire server. `src/pgwire_server.rs` now also exposes a
 persistent `RunningServer` and the `omendbd` binary: one process owns one
 opened database, bounds admitted connection tasks, derives trust/SCRAM policy
-from the durable auth catalog, reports lifecycle counters, and closes the
-handle on explicit shutdown. This is a server foundation, not yet the complete
+from the durable auth catalog, reports connection and query/describe lifecycle
+counters, and closes the handle on explicit shutdown. This is a server foundation, not yet the complete
 alpha contract: protocol coverage, authorization policy, resource quotas, and
 the complete crash-level daemon matrix remain open. Wire cancellation now
 routes `CancelRequest` to the transaction API's cooperative checkpoints;
