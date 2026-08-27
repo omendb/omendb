@@ -1293,6 +1293,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         crate::DbError::SqlParameter(_) => ("08P01", error.to_string()),
         crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
+        crate::DbError::SqlDatatypeMismatch { .. } => ("42804", error.to_string()),
         crate::DbError::SqlDivisionByZero => ("22012", error.to_string()),
         crate::DbError::SqlNumericValueOutOfRange(_) => ("22003", error.to_string()),
         crate::DbError::SqlNotNullViolation { .. } => ("23502", error.to_string()),

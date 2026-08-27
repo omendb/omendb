@@ -139,6 +139,8 @@ pub enum DbError {
     SqlUndefinedTable { name: String },
     #[error("column {name} does not exist")]
     SqlUndefinedColumn { name: String },
+    #[error("value does not satisfy SQL column {column}")]
+    SqlDatatypeMismatch { column: String },
     #[error("division by zero")]
     SqlDivisionByZero,
     #[error("numeric value out of range: {0}")]
@@ -253,6 +255,7 @@ impl DbError {
             | Self::SqlParameter(_)
             | Self::SqlUndefinedTable { .. }
             | Self::SqlUndefinedColumn { .. }
+            | Self::SqlDatatypeMismatch { .. }
             | Self::SqlDivisionByZero
             | Self::SqlNumericValueOutOfRange(_)
             | Self::SqlNotNullViolation { .. }

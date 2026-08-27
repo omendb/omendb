@@ -625,6 +625,18 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)
     );
 
+    let datatype = client
+        .execute(
+            "INSERT INTO users (id, email) VALUES ('wrong', 'dana@example.com')",
+            &[],
+        )
+        .await
+        .expect_err("datatype mismatches must be reported");
+    assert_eq!(
+        datatype.code(),
+        Some(&tokio_postgres::error::SqlState::DATATYPE_MISMATCH)
+    );
+
     let not_null = client
         .execute("INSERT INTO users (id, email) VALUES (4, NULL)", &[])
         .await

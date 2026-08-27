@@ -436,7 +436,7 @@ fn exercise_sql_oracle(directory: &Path) {
             "INSERT INTO events VALUES ($1, $2)",
             &[Value::Text("wrong type".to_owned()), Value::Text("bad".to_owned())],
         ),
-        Err(DbError::InvalidState(reason)) if reason.contains("does not satisfy SQL column id")
+        Err(DbError::SqlDatatypeMismatch { column }) if column == "id"
     ));
     assert_eq!(database.commit_id(), before_invalid_parameter);
 

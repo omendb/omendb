@@ -44,9 +44,10 @@ All notable changes to OmenDB are documented here. Format follows
 
 - PostgreSQL-wire syntax errors now map to SQLSTATE `42601`; parameter-shape
   errors map to protocol violation `08P01`; undefined tables and columns map to
-  `42P01` and `42703`, respectively; division by zero, numeric overflow, and
-  not-null violations map to `22012`, `22003`, and `23502`. Regression coverage
-  remains alongside the existing `0A000` unsupported-feature assertion.
+  `42P01` and `42703`, respectively; datatype mismatches map to `42804`; division
+  by zero, numeric overflow, and not-null violations map to `22012`, `22003`,
+  and `23502`. Regression coverage remains alongside the existing `0A000`
+  unsupported-feature assertion.
 - Persistent wire servers accept an optional cooperative per-statement
   timeout through `ServerConfig` and `--statement-timeout-ms`; expiry maps to
   SQLSTATE `57014`. `ServerConfig::max_result_bytes` and
