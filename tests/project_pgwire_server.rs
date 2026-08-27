@@ -475,6 +475,15 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         .expect("connection survives a failed statement");
     assert_eq!(recovered.get::<_, i64>(0), 1);
 
+    let syntax = client
+        .query("SELCT 1", &[])
+        .await
+        .expect_err("syntax errors must be reported");
+    assert_eq!(
+        syntax.code(),
+        Some(&tokio_postgres::error::SqlState::SYNTAX_ERROR)
+    );
+
     let unsupported = client
         .query("VACUUM", &[])
         .await

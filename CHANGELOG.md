@@ -42,6 +42,8 @@ All notable changes to OmenDB are documented here. Format follows
 
 ### Changed
 
+- PostgreSQL-wire syntax errors now map to SQLSTATE `42601`, with regression
+  coverage alongside the existing `0A000` unsupported-feature assertion.
 - Seer read views are cached strongly and invalidated under the publication
   lock; transaction begins capture frontier and view atomically, removing a
   race that surfaced as spurious `StorageSnapshotUnavailable` under
