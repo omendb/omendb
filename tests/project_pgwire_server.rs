@@ -591,6 +591,18 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
     );
 
+    let join_column = client
+        .query(
+            "SELECT missing FROM users AS left_users JOIN users AS right_users ON left_users.id = right_users.id",
+            &[],
+        )
+        .await
+        .expect_err("undefined join projection columns must be reported");
+    assert_eq!(
+        join_column.code(),
+        Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)
+    );
+
     let returning_column = client
         .query(
             "INSERT INTO users (id, email) VALUES (4, 'dana@example.com') RETURNING missing",

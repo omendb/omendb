@@ -1129,9 +1129,7 @@ fn execute_join_query(
                     let Some(right_position) =
                         right.columns.iter().position(|c| c.name == column_name)
                     else {
-                        return Err(DbError::InvalidState(format!(
-                            "USING column {column_name} missing from {right_name}"
-                        )));
+                        return Err(DbError::SqlUndefinedColumn { name: column_name });
                     };
                     merged_incoming.push(right_position);
                     terms.push((scope_position, right_position, BinaryOperator::Eq));
@@ -1648,11 +1646,8 @@ fn joined_aggregates(
                         || column.name.ends_with(&format!(".{}", identifier.value))
                 })
                 .map(Some)
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!(
-                        "unknown column {} in join aggregate",
-                        identifier.value
-                    ))
+                .ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: identifier.value.clone(),
                 }),
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                 let qualified = format!(
@@ -1664,11 +1659,7 @@ fn joined_aggregates(
                     .iter()
                     .position(|column| column.name == qualified)
                     .map(Some)
-                    .ok_or_else(|| {
-                        DbError::InvalidState(format!(
-                            "unknown column {qualified} in join aggregate"
-                        ))
-                    })
+                    .ok_or(DbError::SqlUndefinedColumn { name: qualified })
             }
             _ => Err(unsupported(
                 "JOIN",
@@ -1827,10 +1818,8 @@ fn join_projection_plan(
                 .iter()
                 .position(|column| column.name == format!("{hint}.{name}"))
                 .map(Some)
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!(
-                        "unknown column {hint}.{name} in join projection"
-                    ))
+                .ok_or_else(|| DbError::SqlUndefinedColumn {
+                    name: format!("{hint}.{name}"),
                 }),
             None => {
                 let matches: Vec<usize> = combined_columns
@@ -1843,9 +1832,7 @@ fn join_projection_plan(
                     .collect();
                 match matches.len() {
                     1 => Ok(Some(matches[0])),
-                    0 => Err(DbError::InvalidState(format!(
-                        "unknown column {name} in join projection"
-                    ))),
+                    0 => Err(DbError::SqlUndefinedColumn { name }),
                     _ => Err(unsupported(
                         "JOIN",
                         "ambiguous unqualified column; qualify it with the table name",
@@ -2163,9 +2150,9 @@ fn unique_bare_position(combined_columns: &[SqlColumn], name: &str) -> Result<us
         .collect();
     match matches.len() {
         1 => Ok(matches[0]),
-        0 => Err(DbError::InvalidState(format!(
-            "unknown column {name} in join USING"
-        ))),
+        0 => Err(DbError::SqlUndefinedColumn {
+            name: name.to_owned(),
+        }),
         _ => Err(unsupported(
             "JOIN",
             "ambiguous USING column; qualify it or rename one side",
