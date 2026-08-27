@@ -1,11 +1,10 @@
 //! PostgreSQL wire-protocol serving for the bounded embedded SQL tier.
 //!
-//! V1 scope per `design/PGWIRE_V1.md`: trust authentication (local-only
-//! until real auth lands), simple and extended query protocols with
-//! parameterized execution, and wire transaction blocks (`BEGIN`/`COMMIT`/
-//! `ROLLBACK`) mapped to the typed transaction API with PostgreSQL
-//! aborted-state semantics. Contract details and non-goals live in the
-//! design note.
+//! V1 scope: loopback trust or catalog-backed SCRAM authentication, simple and
+//! extended query protocols with parameterized execution, cooperative query
+//! cancellation, and wire transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`)
+//! mapped to the typed transaction API with PostgreSQL aborted-state semantics.
+//! Contract details and non-goals live in the repository's server documentation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,10 +19,13 @@ use pgwire::api::auth::sasl::scram::{ScramAuth, gen_salted_password, random_nonc
 use pgwire::api::auth::{
     AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
 };
+use pgwire::api::cancel::CancelHandler;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::cancel::CancelRequest;
+use pgwire::messages::startup::SecretKey;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
@@ -31,8 +33,8 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::{
-    ColumnDefinition, ColumnId, ColumnType, DbError, RelationalDatabase,
-    RelationalDatabaseTransaction, TableDefinition, TableId, Value,
+    CancellationToken, ColumnDefinition, ColumnId, ColumnType, DbError, OperationControl,
+    RelationalDatabase, RelationalDatabaseTransaction, TableDefinition, TableId, Value,
 };
 
 /// Reserved identities for the wire-auth catalog table, far above the
@@ -460,10 +462,13 @@ fn build_factory(
     });
     let identities = Arc::new(Mutex::new(HashMap::new()));
     let failure_delays = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let connection_manager = Arc::new(ConnectionManager::new());
+    let cancellations = Arc::new(CancellationRegistry::new());
     Ok(Arc::new(HandlerFactory {
         handler: Arc::new(OmenDbHandler {
             database: Arc::clone(database),
             transactions: Mutex::new(HashMap::new()),
+            cancellations: Arc::clone(&cancellations),
             schema_probes: Mutex::new(HashMap::new()),
             identities: Arc::clone(&identities),
         }),
@@ -472,7 +477,13 @@ fn build_factory(
                 auth_source,
                 identities: Arc::clone(&identities),
                 failure_delays: Arc::clone(&failure_delays),
+                connection_manager: Arc::clone(&connection_manager),
+                cancellations: Arc::clone(&cancellations),
             })
+        }),
+        cancel_handler: Arc::new(WireCancelHandler {
+            manager: connection_manager,
+            cancellations,
         }),
     }))
 }
@@ -635,21 +646,28 @@ impl AuthSource for WireAuthSource {
 
 /// Trust mode: the credential table is absent or empty, so connections
 /// authenticate implicitly (loopback, single-user development).
-struct TrustStartup;
+struct TrustStartup {
+    connection_manager: Arc<ConnectionManager>,
+}
 
 #[async_trait]
-impl pgwire::api::auth::noop::NoopStartupHandler for TrustStartup {}
+impl pgwire::api::auth::noop::NoopStartupHandler for TrustStartup {
+    fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
+        Some(Arc::clone(&self.connection_manager))
+    }
+}
 
 /// Dispatches between trust mode and SCRAM based on what `serve` found at
 /// startup. Mode is fixed for the server's lifetime; provisioning users
 /// after start takes effect on restart.
 #[allow(clippy::large_enum_variant)]
 enum StartupMode {
-    Trust(TrustStartup),
+    Trust(TrustStartup, Arc<CancellationRegistry>),
     Scram(
         SASLAuthStartupHandler<DefaultServerParameterProvider>,
         Arc<IdentityMap>,
         Arc<FailureDelays>,
+        Arc<CancellationRegistry>,
     ),
 }
 
@@ -671,15 +689,22 @@ impl StartupMode {
 
     fn failure_delays(&self) -> &Arc<FailureDelays> {
         match self {
-            StartupMode::Trust(_) => unreachable!("trust mode never delays"),
-            StartupMode::Scram(_, _, delays) => delays,
+            StartupMode::Trust(_, _) => unreachable!("trust mode never delays"),
+            StartupMode::Scram(_, _, delays, _) => delays,
         }
     }
 
     fn identities(&self) -> Option<&Arc<IdentityMap>> {
         match self {
-            StartupMode::Trust(_) => None,
-            StartupMode::Scram(_, identities, _) => Some(identities),
+            StartupMode::Trust(_, _) => None,
+            StartupMode::Scram(_, identities, _, _) => Some(identities),
+        }
+    }
+
+    fn cancellations(&self) -> &Arc<CancellationRegistry> {
+        match self {
+            StartupMode::Trust(_, cancellations) => cancellations,
+            StartupMode::Scram(_, _, _, cancellations) => cancellations,
         }
     }
 }
@@ -698,11 +723,20 @@ impl StartupHandler for StartupMode {
         Self: Sync,
     {
         let result = match self {
-            StartupMode::Trust(trust) => trust.on_startup(client, message).await,
-            StartupMode::Scram(sasl, _, _) => sasl.on_startup(client, message).await,
+            StartupMode::Trust(trust, _) => trust.on_startup(client, message).await,
+            StartupMode::Scram(sasl, _, _, _) => sasl.on_startup(client, message).await,
         };
         match result {
-            Ok(()) => {
+            Ok(())
+                if matches!(
+                    client.state(),
+                    pgwire::api::PgWireConnectionState::ReadyForQuery
+                ) =>
+            {
+                // Register the protocol cancel identity only after startup
+                // authentication succeeds. pgwire owns the wire-level
+                // ConnectionHandle; the registry owns the database token.
+                self.cancellations().register(client);
                 // Record the authenticated role for grant enforcement.
                 // The startup packet's user parameter lands in client
                 // metadata (that is where the SCRAM machinery reads it).
@@ -719,6 +753,7 @@ impl StartupHandler for StartupMode {
                 }
                 Ok(())
             }
+            Ok(()) => Ok(()),
             Err(error) => {
                 let delay = self.register_failure_delay(client.socket_addr());
                 if delay > 0 {
@@ -737,11 +772,14 @@ struct ScramComponents {
     auth_source: Arc<WireAuthSource>,
     identities: Arc<IdentityMap>,
     failure_delays: Arc<FailureDelays>,
+    connection_manager: Arc<ConnectionManager>,
+    cancellations: Arc<CancellationRegistry>,
 }
 
 struct HandlerFactory {
     handler: Arc<OmenDbHandler>,
     auth: Option<Arc<ScramComponents>>,
+    cancel_handler: Arc<WireCancelHandler>,
 }
 
 impl PgWireServerHandlers for HandlerFactory {
@@ -753,6 +791,10 @@ impl PgWireServerHandlers for HandlerFactory {
         self.handler.clone()
     }
 
+    fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
+        self.cancel_handler.clone()
+    }
+
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         Arc::new(match self.auth.as_ref() {
             Some(components) => {
@@ -761,12 +803,19 @@ impl PgWireServerHandlers for HandlerFactory {
                     SASLAuthStartupHandler::new(
                         Arc::new(DefaultServerParameterProvider::default()),
                     )
-                    .with_scram(ScramAuth::new(components.auth_source)),
+                    .with_scram(ScramAuth::new(components.auth_source))
+                    .with_connection_manager(Arc::clone(&components.connection_manager)),
                     components.identities,
                     components.failure_delays,
+                    components.cancellations,
                 )
             }
-            None => StartupMode::Trust(TrustStartup),
+            None => StartupMode::Trust(
+                TrustStartup {
+                    connection_manager: Arc::clone(&self.cancel_handler.manager),
+                },
+                self.handler.cancellations.clone(),
+            ),
         })
     }
 }
@@ -874,10 +923,131 @@ type ProbeCache = HashMap<(String, String), Arc<Vec<(String, Type)>>>;
 
 type IdentityMap = Mutex<HashMap<std::net::SocketAddr, String>>;
 type FailureDelays = Mutex<std::collections::HashMap<std::net::IpAddr, u32>>;
+type CancelKey = (i32, Vec<u8>);
+
+/// Owns the bridge between PostgreSQL cancel requests and one cooperative
+/// operation token per authenticated connection. The pgwire connection
+/// manager owns protocol-level cancellation; this registry owns the database
+/// operation's cancellation state.
+struct CancellationRegistry {
+    entries: Mutex<HashMap<CancelKey, CancellationEntry>>,
+}
+
+struct CancellationEntry {
+    address: std::net::SocketAddr,
+    active: Option<Arc<WireQueryCancellation>>,
+}
+
+struct WireQueryCancellation {
+    token: CancellationToken,
+}
+
+struct QueryCancellationLease {
+    registry: Arc<CancellationRegistry>,
+    key: CancelKey,
+    operation: Arc<WireQueryCancellation>,
+}
+
+impl CancellationRegistry {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register<C: ClientInfo>(&self, client: &C) {
+        let (pid, secret_key) = client.pid_and_secret_key();
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                (pid, secret_key.to_bytes().to_vec()),
+                CancellationEntry {
+                    address: client.socket_addr(),
+                    active: None,
+                },
+            );
+        }
+    }
+
+    fn begin<C: ClientInfo>(
+        self: &Arc<Self>,
+        client: &C,
+    ) -> Option<(CancellationToken, QueryCancellationLease)> {
+        let (pid, secret_key) = client.pid_and_secret_key();
+        let key = (pid, secret_key.to_bytes().to_vec());
+        let operation = Arc::new(WireQueryCancellation {
+            token: CancellationToken::new(),
+        });
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.get_mut(&key)?;
+        entry.active = Some(Arc::clone(&operation));
+        Some((
+            operation.token.clone(),
+            QueryCancellationLease {
+                registry: Arc::clone(self),
+                key,
+                operation,
+            },
+        ))
+    }
+
+    fn cancel(&self, pid: i32, secret_key: &SecretKey) -> bool {
+        let key = (pid, secret_key.to_bytes().to_vec());
+        let Ok(entries) = self.entries.lock() else {
+            return false;
+        };
+        let Some(entry) = entries.get(&key) else {
+            return false;
+        };
+        if let Some(operation) = &entry.active {
+            operation.token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&self, key: &CancelKey, operation: &Arc<WireQueryCancellation>) {
+        if let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.get_mut(key)
+            && entry
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, operation))
+        {
+            entry.active = None;
+        }
+    }
+
+    fn cleanup_connection(&self, address: std::net::SocketAddr) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.retain(|_, entry| entry.address != address);
+        }
+    }
+}
+
+impl Drop for QueryCancellationLease {
+    fn drop(&mut self) {
+        self.registry.finish(&self.key, &self.operation);
+    }
+}
+
+struct WireCancelHandler {
+    manager: Arc<ConnectionManager>,
+    cancellations: Arc<CancellationRegistry>,
+}
+
+#[async_trait]
+impl CancelHandler for WireCancelHandler {
+    async fn on_cancel_request(&self, request: CancelRequest) {
+        self.cancellations.cancel(request.pid, &request.secret_key);
+        self.manager.cancel(request.pid, &request.secret_key).await;
+    }
+}
 
 struct OmenDbHandler {
     database: SharedDatabase,
     transactions: Mutex<HashMap<std::net::SocketAddr, TransactionBlock>>,
+    cancellations: Arc<CancellationRegistry>,
     /// Authenticated role per connection pid, recorded by the startup
     /// handler after a successful exchange and read per statement for
     /// grant enforcement.
@@ -901,6 +1071,11 @@ fn pg_error(code: &str, message: String) -> PgWireError {
 
 fn map_db_error(error: crate::DbError) -> PgWireError {
     let (code, message) = match &error {
+        crate::DbError::Cancelled => (
+            "57014",
+            "canceling statement due to user request".to_owned(),
+        ),
+        crate::DbError::DeadlineExceeded => ("57014", error.to_string()),
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
         crate::DbError::ForeignKeyViolation { .. }
         | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
@@ -1105,6 +1280,17 @@ impl OmenDbHandler {
         if let Ok(mut identities) = self.identities.lock() {
             identities.remove(&client_addr);
         }
+        self.cancellations.cleanup_connection(client_addr);
+    }
+
+    fn begin_query<C: ClientInfo>(
+        &self,
+        client: &C,
+    ) -> (CancellationToken, Option<QueryCancellationLease>) {
+        self.cancellations.begin(client).map_or_else(
+            || (CancellationToken::new(), None),
+            |(token, lease)| (token, Some(lease)),
+        )
     }
 
     fn lock_transactions(
@@ -1122,16 +1308,6 @@ impl OmenDbHandler {
         blocks.retain(|_, block| block.last_used.elapsed() < TX_IDLE_TIMEOUT);
     }
 
-    fn execute_locked(
-        database: &mut RelationalDatabase,
-        sql: &str,
-        params: &[Value],
-    ) -> PgWireResult<crate::SqlResult> {
-        database
-            .execute_sql_with_params(sql, params)
-            .map_err(map_db_error)
-    }
-
     /// Route one wire statement: transaction control, in-block execution,
     /// or autocommit. `format` is the negotiated result-column format; the
     /// statement executes exactly once.
@@ -1141,11 +1317,13 @@ impl OmenDbHandler {
         sql: &str,
         params: &[Value],
         format: &pgwire::api::portal::Format,
+        cancellation: &CancellationToken,
     ) -> PgWireResult<Response> {
-        if matches!(
-            sql.split_whitespace().next().unwrap_or_default(),
-            "CREATE" | "DROP" | "ALTER"
-        ) && let Ok(mut cache) = self.schema_probes.lock()
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
+        if Self::is_schema_statement(sql)
+            && let Ok(mut cache) = self.schema_probes.lock()
         {
             cache.clear();
         }
@@ -1159,6 +1337,9 @@ impl OmenDbHandler {
             self.reap_idle_blocks(&mut blocks);
         }
         self.enforce_grants(client_addr, sql)?;
+        if cancellation.is_cancelled() {
+            return Err(map_db_error(DbError::Cancelled));
+        }
         match transaction_command(sql) {
             Some(TransactionCommand::Begin) => {
                 let mut blocks = self.lock_transactions()?;
@@ -1175,7 +1356,10 @@ impl OmenDbHandler {
                 drop(blocks);
                 // begin() only needs &self: opening a block takes no write
                 // access and publishes nothing.
-                let transaction = read_lock(&self.database)?.begin().map_err(map_db_error)?;
+                let control = OperationControl::with_cancellation(cancellation.clone());
+                let transaction = read_lock(&self.database)?
+                    .begin_with_control(&control)
+                    .map_err(map_db_error)?;
                 let mut blocks = self.lock_transactions()?;
                 blocks.insert(
                     client_addr,
@@ -1192,7 +1376,7 @@ impl OmenDbHandler {
                     let mut blocks = self.lock_transactions()?;
                     blocks.remove(&client_addr)
                 };
-                let Some(block) = block else {
+                let Some(mut block) = block else {
                     return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
                 };
                 if block.errored {
@@ -1201,6 +1385,8 @@ impl OmenDbHandler {
                 }
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
+                let control = OperationControl::with_cancellation(cancellation.clone());
+                block.transaction.set_operation_control(&control);
                 let _database = write_lock(&self.database)?;
                 block.transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
@@ -1219,7 +1405,7 @@ impl OmenDbHandler {
                 // Membership check under the lock; execution outside it.
                 let in_block = { self.lock_transactions()?.contains_key(&client_addr) };
                 if !in_block {
-                    return self.run_autocommit(sql, params, format);
+                    return self.run_autocommit(sql, params, format, cancellation);
                 }
 
                 // Take this connection's block out so other connections
@@ -1237,6 +1423,8 @@ impl OmenDbHandler {
                     ));
                 }
                 block.last_used = Instant::now();
+                let control = OperationControl::with_cancellation(cancellation.clone());
+                block.transaction.set_operation_control(&control);
                 // Buffered into the transaction; publication happens at
                 // COMMIT under the write lock, so execution only needs
                 // shared access.
@@ -1357,12 +1545,31 @@ impl OmenDbHandler {
         sql: &str,
         params: &[Value],
         format: &pgwire::api::portal::Format,
+        cancellation: &CancellationToken,
     ) -> PgWireResult<Response> {
+        if Self::is_schema_statement(sql) {
+            // Schema changes are owned by the direct database method rather
+            // than a relational transaction. Cancellation is therefore a
+            // preflight check for this non-interruptible publication.
+            if cancellation.is_cancelled() {
+                return Err(map_db_error(DbError::Cancelled));
+            }
+            let mut database = write_lock(&self.database)?;
+            return Ok(encode_response_with_format(
+                database
+                    .execute_sql_with_params(sql, params)
+                    .map_err(map_db_error)?,
+                format,
+            ));
+        }
+        let control = OperationControl::with_cancellation(cancellation.clone());
         if Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             // Reads scale: snapshot query under shared access via an
             // autocommit transaction that aborts on completion.
             let database = read_lock(&self.database)?;
-            let mut transaction = database.begin().map_err(map_db_error)?;
+            let mut transaction = database
+                .begin_with_control(&control)
+                .map_err(map_db_error)?;
             let result = transaction.execute_sql_with_params(&database, sql, params);
             drop(transaction);
             return Ok(encode_response_with_format(
@@ -1371,10 +1578,25 @@ impl OmenDbHandler {
             ));
         }
         let mut database = write_lock(&self.database)?;
-        Ok(encode_response_with_format(
-            Self::execute_locked(&mut database, sql, params)?,
-            format,
-        ))
+        let (result, _) = database
+            .transaction_with_control(&control, |database, transaction| {
+                transaction.execute_sql_with_params(database, sql, params)
+            })
+            .map_err(map_db_error)?;
+        Ok(encode_response_with_format(result, format))
+    }
+
+    fn is_schema_statement(statement: &str) -> bool {
+        matches!(
+            statement
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches('(')
+                .to_ascii_uppercase()
+                .as_str(),
+            "CREATE" | "DROP" | "ALTER"
+        )
     }
 
     /// True when a statement produces rows and is safe to probe for its
@@ -1500,6 +1722,7 @@ impl SimpleQueryHandler for OmenDbHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let client_addr = _client.socket_addr();
+        let (cancellation, _lease) = self.begin_query(_client);
         let mut responses = Vec::new();
         // The embedded tier accepts one statement per call; simple-protocol
         // strings may carry several, so split conservatively on semicolons.
@@ -1513,6 +1736,7 @@ impl SimpleQueryHandler for OmenDbHandler {
                 statement,
                 &[],
                 &pgwire::api::portal::Format::UnifiedText,
+                &cancellation,
             )?);
         }
         if responses.is_empty() {
@@ -1540,6 +1764,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        let (cancellation, _lease) = self.begin_query(_client);
         let resolved = self.resolved_parameter_types(&portal.statement.statement);
         let params = decode_parameters(portal, &resolved)?;
         self.run_statement(
@@ -1547,6 +1772,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
             &portal.statement.statement.sql,
             &params,
             &portal.result_column_format,
+            &cancellation,
         )
     }
 
@@ -1588,5 +1814,30 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         )?)
         .unwrap_or_default();
         Ok(pgwire::api::results::DescribePortalResponse::new(fields))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pgwire::api::DefaultClient;
+
+    #[test]
+    fn cancellation_registry_routes_and_releases_query_tokens() {
+        let address = "127.0.0.1:6543".parse().expect("test address");
+        let mut client = DefaultClient::<ParsedStatement>::new(address, false);
+        client.set_pid_and_secret_key(17, SecretKey::I32(23));
+        let registry = Arc::new(CancellationRegistry::new());
+        registry.register(&client);
+
+        let (token, lease) = registry.begin(&client).expect("registered client");
+        assert!(!token.is_cancelled());
+        assert!(registry.cancel(17, &SecretKey::I32(23)));
+        assert!(token.is_cancelled());
+        drop(lease);
+        assert!(!registry.cancel(17, &SecretKey::I32(23)));
+
+        registry.cleanup_connection(address);
+        assert!(registry.begin(&client).is_none());
     }
 }

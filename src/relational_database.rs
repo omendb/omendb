@@ -889,6 +889,10 @@ impl RelationalDatabaseTransaction {
             .index_scan(table, index)
     }
 
+    pub(crate) fn set_operation_control(&mut self, control: &OperationControl) {
+        self.control = Some(control.clone());
+    }
+
     /// Execute one bounded embedded SQL statement inside this transaction.
     pub fn execute_sql(
         &mut self,

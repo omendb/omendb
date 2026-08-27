@@ -44,6 +44,9 @@ Empty `pgwire_auth` catalogs enable trust authentication only on loopback. A
 provisioned user switches startup to SCRAM-SHA-256; provision users while the
 database is closed, then restart the daemon. `--max-connections` bounds
 connection tasks; rejected sockets are counted in `RunningServer::status()`.
+PostgreSQL `CancelRequest` messages cancel the active database operation at
+its cooperative checkpoints; schema publication remains a non-interruptible
+operation and checks cancellation before it starts.
 
 ## Health checks
 

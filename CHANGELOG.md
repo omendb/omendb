@@ -13,6 +13,9 @@ All notable changes to OmenDB are documented here. Format follows
   and database close on shutdown.
 - `pgwire_server::RunningServer` and `ServerConfig` for embedding the same
   persistent server lifecycle in a Tokio application.
+- PostgreSQL `CancelRequest` routing into cooperative database operation
+  controls, including cancellation-aware autocommit and wire transaction
+  checkpoints.
 - Bounded embedded SQL batch execution:
   `RelationalDatabase::execute_sql_batch`,
   `execute_sql_batch_with_params`, and the session equivalents, each one

@@ -185,8 +185,10 @@ persistent `RunningServer` and the `omendbd` binary: one process owns one
 opened database, bounds admitted connection tasks, derives trust/SCRAM policy
 from the durable auth catalog, reports lifecycle counters, and closes the
 handle on explicit shutdown. This is a server foundation, not yet the complete
-alpha contract: protocol coverage, authorization policy, cancellation,
-resource quotas, and crash-level daemon tests remain open. The direct
+alpha contract: protocol coverage, authorization policy, resource quotas, and
+crash-level daemon tests remain open. Wire cancellation now routes
+`CancelRequest` to the transaction API's cooperative checkpoints; a dedicated
+process-level cancellation/failure test remains open. The direct
 SeerDB qualification path (`src/seer_direct.rs`) remains test-only evidence for
 catalog/table/index-to-tree mapping and is not a second relational backend.
 

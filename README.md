@@ -86,8 +86,9 @@ The daemon opens or creates the database, accepts multiple PostgreSQL wire
 sessions, and closes the durable handle on Ctrl-C. Empty authentication
 catalogs use trust mode on loopback only. Provision a SCRAM user through
 `pgwire_server::provision_wire_user` before starting the daemon; once a user
-exists, startup requires SCRAM authentication. Connection admission is
-bounded with `--max-connections`.
+exists, startup requires SCRAM authentication. PostgreSQL `CancelRequest`
+messages are routed to the database's cooperative cancellation checkpoints;
+connection admission is bounded with `--max-connections`.
 
 The supported SQL and wire surface is deliberate and bounded, not a claim of
 PostgreSQL compatibility. The throwaway seeded example remains available for
