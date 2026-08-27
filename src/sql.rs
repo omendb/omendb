@@ -663,10 +663,7 @@ pub(super) fn statement_access(
             SqlSetExpr::Select(select) => {
                 let select = select.as_ref();
                 for from_item in &select.from {
-                    collect_factor_tables(&from_item.relation, read);
-                    for join in &from_item.joins {
-                        collect_factor_tables(&join.relation, read);
-                    }
+                    collect_table_with_joins(from_item, read);
                 }
                 if let Some(selection_where) = &select.selection {
                     collect_expr_tables(selection_where, read);
@@ -694,6 +691,16 @@ pub(super) fn statement_access(
                 collect_query_tables(subquery, read);
             }
             _ => {}
+        }
+    }
+
+    fn collect_table_with_joins(
+        table: &sqlparser::ast::TableWithJoins,
+        read: &mut std::collections::BTreeSet<String>,
+    ) {
+        collect_factor_tables(&table.relation, read);
+        for join in &table.joins {
+            collect_factor_tables(&join.relation, read);
         }
     }
 
@@ -730,7 +737,7 @@ pub(super) fn statement_access(
                     | sqlparser::ast::UpdateTableFromKind::AfterSet(tables) => tables,
                 };
                 for item in tables {
-                    collect_factor_tables(&item.relation, &mut read);
+                    collect_table_with_joins(item, &mut read);
                 }
             }
             if let Some(selection) = &update.selection {
@@ -748,7 +755,7 @@ pub(super) fn statement_access(
             }
             if let Some(using) = &delete.using {
                 for item in using {
-                    collect_factor_tables(&item.relation, &mut read);
+                    collect_table_with_joins(item, &mut read);
                 }
             }
             if let Some(selection) = &delete.selection {
