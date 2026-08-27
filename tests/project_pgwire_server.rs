@@ -345,6 +345,51 @@ async fn persistent_server_rejects_unbounded_connection_configuration() {
 }
 
 #[tokio::test]
+async fn persistent_server_rejects_connections_over_bound() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database.close().expect("close seed database");
+
+    let server = pgwire_server::RunningServer::start(
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_create_if_missing(false)
+            .with_max_connections(1),
+    )
+    .await
+    .expect("start bounded server");
+    let dsn = format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    );
+    let (first, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .expect("first connection");
+    let connection_task = tokio::spawn(connection);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while server.status().active_connections < 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("first connection admitted");
+
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio_postgres::connect(&dsn, tokio_postgres::NoTls),
+    )
+    .await
+    .expect("bounded rejection completed");
+    assert!(second.is_err(), "second connection must be rejected");
+    assert_eq!(server.status().rejected_connections, 1);
+
+    drop(first);
+    server.shutdown().await.expect("shutdown bounded server");
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
 async fn wire_client_selects_seeds_and_reads_typed_rows() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());

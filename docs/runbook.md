@@ -61,8 +61,10 @@ workers whose cancellation token was observed. The failed and cancelled
 counters may overlap. A `RelationalDatabaseSession` exposes
 `admission_status()` with active operations, writer counts, admission waits,
 and rejections. `commit_id()` returns the visible commit frontier (the SeerDB
-commit sequence number). A failed durable write fences writes until reopen,
-and reopen failure surfaces as an open error.
+commit sequence number). The current hard wire-server quota is admitted
+connection count; query result memory, statement time, and bytes-per-query
+quotas are not yet implemented. A failed durable write fences writes until
+reopen, and reopen failure surfaces as an open error.
 
 ## Routine maintenance
 
