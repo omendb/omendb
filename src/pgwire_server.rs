@@ -1035,9 +1035,9 @@ type FailureDelays = Mutex<std::collections::HashMap<std::net::IpAddr, u32>>;
 type CancelKey = (i32, Vec<u8>);
 
 /// Owns the bridge between PostgreSQL cancel requests and one cooperative
-/// operation token per authenticated connection. The pgwire connection
-/// manager owns protocol-level cancellation; this registry owns the database
-/// operation's cancellation state.
+/// operation token per authenticated connection. The server's cancel handler
+/// routes protocol identities here; this registry owns both the identity and
+/// the database operation's cancellation state.
 struct CancellationRegistry {
     entries: Mutex<HashMap<CancelKey, CancellationEntry>>,
 }
