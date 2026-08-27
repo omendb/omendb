@@ -548,6 +548,15 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
     );
 
+    let not_null = client
+        .execute("INSERT INTO users (id, email) VALUES (4, NULL)", &[])
+        .await
+        .expect_err("not-null violations must be reported");
+    assert_eq!(
+        not_null.code(),
+        Some(&tokio_postgres::error::SqlState::NOT_NULL_VIOLATION)
+    );
+
     let unsupported = client
         .query("VACUUM", &[])
         .await

@@ -516,7 +516,7 @@ fn exercise_sql_oracle(directory: &Path) {
     ));
     assert!(matches!(
         database.execute_sql("INSERT INTO accounts VALUES (3, NULL, 'open')"),
-        Err(DbError::InvalidState(reason)) if reason.contains("does not satisfy SQL column balance")
+        Err(DbError::SqlNotNullViolation { column }) if column == "balance"
     ));
     assert_eq!(
         database
@@ -599,7 +599,10 @@ fn embedded_sql_refuses_unsupported_and_atomicity_is_preserved() {
         transaction.execute_sql(database, "INSERT INTO accounts VALUES (2, NULL)")?;
         Ok::<_, DbError>(())
     });
-    assert!(matches!(aborted, Err(DbError::InvalidState(_))));
+    assert!(matches!(
+        aborted,
+        Err(DbError::SqlNotNullViolation { column }) if column == "balance"
+    ));
     assert_eq!(
         database
             .execute_sql("SELECT * FROM accounts")
@@ -627,8 +630,7 @@ fn exercise_sql_composite_primary_key(directory: &Path) -> Vec<Vec<Value>> {
         .expect("insert composite rows");
     assert!(matches!(
         database.execute_sql("INSERT INTO ledger VALUES (NULL, 4, 'invalid')"),
-        Err(DbError::InvalidState(reason))
-            if reason == "value does not satisfy SQL column tenant_id"
+        Err(DbError::SqlNotNullViolation { column }) if column == "tenant_id"
     ));
     database
         .execute_sql(

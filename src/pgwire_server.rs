@@ -1279,6 +1279,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
         crate::DbError::SqlDivisionByZero => ("22012", error.to_string()),
         crate::DbError::SqlNumericValueOutOfRange(_) => ("22003", error.to_string()),
+        crate::DbError::SqlNotNullViolation { .. } => ("23502", error.to_string()),
         crate::DbError::SqlUnsupported { .. } => {
             ("0A000", format!("feature not supported: {error}"))
         }

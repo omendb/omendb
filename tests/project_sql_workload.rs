@@ -271,7 +271,10 @@ fn exercise_workload(directory: &Path) {
         )?;
         Ok::<_, DbError>(())
     });
-    assert!(matches!(aborted, Err(DbError::InvalidState(_))));
+    assert!(matches!(
+        aborted,
+        Err(DbError::SqlNotNullViolation { column }) if column == "state"
+    ));
     assert_eq!(model, before_abort);
     assert_state(&mut database, &model);
 

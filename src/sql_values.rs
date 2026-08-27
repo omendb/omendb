@@ -134,7 +134,12 @@ pub(super) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
             | (Value::U64(_), ColumnType::U64)
             | (Value::Text(_), ColumnType::Text)
     );
-    if !valid || (matches!(value, Value::Null) && !column.nullable) {
+    if matches!(value, Value::Null) && !column.nullable {
+        return Err(DbError::SqlNotNullViolation {
+            column: column.name.clone(),
+        });
+    }
+    if !valid {
         return Err(DbError::InvalidState(format!(
             "value does not satisfy SQL column {}",
             column.name

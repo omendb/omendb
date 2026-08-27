@@ -143,6 +143,8 @@ pub enum DbError {
     SqlDivisionByZero,
     #[error("numeric value out of range: {0}")]
     SqlNumericValueOutOfRange(String),
+    #[error("null value in column {column} violates not-null constraint")]
+    SqlNotNullViolation { column: String },
     #[error("unsupported SQL {statement}: {reason}")]
     SqlUnsupported {
         statement: &'static str,
@@ -253,6 +255,7 @@ impl DbError {
             | Self::SqlUndefinedColumn { .. }
             | Self::SqlDivisionByZero
             | Self::SqlNumericValueOutOfRange(_)
+            | Self::SqlNotNullViolation { .. }
             | Self::SqlUnsupported { .. }
             | Self::SessionClosing
             | Self::SessionClosed => TransactionErrorClass::InvalidRequest,
