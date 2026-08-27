@@ -139,6 +139,10 @@ pub enum DbError {
     SqlUndefinedTable { name: String },
     #[error("column {name} does not exist")]
     SqlUndefinedColumn { name: String },
+    #[error("division by zero")]
+    SqlDivisionByZero,
+    #[error("numeric value out of range: {0}")]
+    SqlNumericValueOutOfRange(String),
     #[error("unsupported SQL {statement}: {reason}")]
     SqlUnsupported {
         statement: &'static str,
@@ -247,6 +251,8 @@ impl DbError {
             | Self::SqlParameter(_)
             | Self::SqlUndefinedTable { .. }
             | Self::SqlUndefinedColumn { .. }
+            | Self::SqlDivisionByZero
+            | Self::SqlNumericValueOutOfRange(_)
             | Self::SqlUnsupported { .. }
             | Self::SessionClosing
             | Self::SessionClosed => TransactionErrorClass::InvalidRequest,

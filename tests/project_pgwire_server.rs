@@ -523,6 +523,31 @@ async fn wire_client_gets_clean_errors_and_rejects_unsupported_sql() {
         Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN)
     );
 
+    let division = client
+        .query("SELECT id / 0 FROM users", &[])
+        .await
+        .expect_err("division by zero must be reported");
+    assert_eq!(
+        division.code(),
+        Some(&tokio_postgres::error::SqlState::DIVISION_BY_ZERO)
+    );
+
+    client
+        .execute(
+            "INSERT INTO users (id, email) VALUES (3, 'carol@example.com')",
+            &[],
+        )
+        .await
+        .expect("seed overflow row");
+    let overflow = client
+        .query("SELECT id * 9223372036854775807 FROM users", &[])
+        .await
+        .expect_err("numeric overflow must be reported");
+    assert_eq!(
+        overflow.code(),
+        Some(&tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
+    );
+
     let unsupported = client
         .query("VACUUM", &[])
         .await

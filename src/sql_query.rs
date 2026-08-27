@@ -689,13 +689,13 @@ fn arithmetic(op: &BinaryOperator, lhs: &Value, rhs: &Value) -> Result<Value> {
         Multiply => l.checked_mul(r),
         Divide => {
             if r == 0 {
-                return Err(DbError::InvalidState("division by zero".to_owned()));
+                return Err(DbError::SqlDivisionByZero);
             }
             Some(l.div_euclid(r))
         }
         Modulo => {
             if r == 0 {
-                return Err(DbError::InvalidState("modulo by zero".to_owned()));
+                return Err(DbError::SqlDivisionByZero);
             }
             Some(l.rem_euclid(r))
         }
@@ -706,9 +706,9 @@ fn arithmetic(op: &BinaryOperator, lhs: &Value, rhs: &Value) -> Result<Value> {
             ));
         }
     }
-    .ok_or_else(|| DbError::InvalidState("arithmetic overflow".to_owned()))?;
+    .ok_or_else(|| DbError::SqlNumericValueOutOfRange("arithmetic overflow".to_owned()))?;
     if value < 0 || value > u64::MAX as i128 {
-        return Err(DbError::InvalidState(format!(
+        return Err(DbError::SqlNumericValueOutOfRange(format!(
             "arithmetic result {value} does not fit the engine's integer types"
         )));
     }
