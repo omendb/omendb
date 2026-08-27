@@ -214,7 +214,18 @@ async fn persistent_server_shutdown_cancels_query_before_database_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn omendbd_process_kill_reopens_durable_database() {
     use std::os::unix::process::ExitStatusExt;
-    use std::process::{Command, Stdio};
+    use std::process::{Child, Command, Stdio};
+
+    struct ChildGuard(Option<Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     let directory = tempdir().expect("tempdir");
     let database_path = directory.path().join("db");
@@ -237,17 +248,25 @@ async fn omendbd_process_kill_reopens_durable_database() {
         .expect("seed row");
     database.close().expect("close seed database");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_omendbd"))
-        .args([
-            "--path",
-            database_path.to_str().expect("database path"),
-            "--bind",
-            "127.0.0.1:0",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn omendbd");
-    let stdout = child.stdout.take().expect("daemon stdout");
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_omendbd"))
+            .args([
+                "--path",
+                database_path.to_str().expect("database path"),
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn omendbd"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("daemon child")
+        .stdout
+        .take()
+        .expect("daemon stdout");
     let banner = tokio::task::spawn_blocking(move || {
         let mut line = String::new();
         std::io::BufReader::new(stdout).read_line(&mut line)?;
@@ -261,9 +280,10 @@ async fn omendbd_process_kill_reopens_durable_database() {
         "banner: {banner:?}"
     );
 
-    let pid = i32::try_from(child.id()).expect("daemon pid");
+    let pid = i32::try_from(child.0.as_ref().expect("daemon child").id()).expect("daemon pid");
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    let status = tokio::task::spawn_blocking(move || child.wait())
+    let mut daemon = child.0.take().expect("daemon child");
+    let status = tokio::task::spawn_blocking(move || daemon.wait())
         .await
         .expect("daemon wait task")
         .expect("daemon wait");
