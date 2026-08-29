@@ -31,6 +31,10 @@ harness = false
 name = "ycsb"
 harness = false
 
+[[bench]]
+name = "cost_stack"
+harness = false
+
 [features]
 default = []
 # ZNS SSD support (Linux only)
