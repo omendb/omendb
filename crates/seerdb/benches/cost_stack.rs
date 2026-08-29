@@ -1,8 +1,6 @@
 #![allow(clippy::disallowed_methods)]
 
-use criterion::{
-    BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use seerdb::btree::{BTree, LookupResult};
 use seerdb::buffer::{BufferManager, GuardAccess};
 use seerdb::{DB, Options, PAGE_SIZE, TransactionDatabase, TreeId};
@@ -49,7 +47,8 @@ fn populated_db(count: usize) -> (TempDir, DB) {
     let directory = tempdir().unwrap();
     let mut db = DB::create(directory.path().join("db"), Options::default()).unwrap();
     for index in 0..count {
-        db.put(key(index).as_bytes(), value(index).as_bytes()).unwrap();
+        db.put(key(index).as_bytes(), value(index).as_bytes())
+            .unwrap();
     }
     db.flush().unwrap();
     (directory, db)
