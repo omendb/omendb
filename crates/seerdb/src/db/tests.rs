@@ -833,7 +833,7 @@ fn test_db_recovers_committed_blob_upsert() {
     let wal_end = wal_bytes
         .len()
         .saturating_add(record.to_bytes().len())
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize)
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4)
         as u64;
     let commit = CommitRecord {
         commit_id: CommitId::new(commit_id + 1),
@@ -889,7 +889,7 @@ fn test_db_recovers_committed_large_blob_value() {
     let wal_end = record
         .to_bytes()
         .len()
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
         commit_seq: CommitSeq::new(1),
@@ -921,7 +921,7 @@ fn test_db_replays_legacy_wal_put_record() {
     let wal_end = record
         .to_bytes()
         .len()
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
         commit_seq: CommitSeq::new(1),

@@ -119,7 +119,7 @@ fn test_db_recovers_committed_wal_prefix_with_torn_suffix() {
         .iter()
         .map(|record| record.to_bytes().len())
         .sum::<usize>()
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
         commit_seq: CommitSeq::new(1),
@@ -159,7 +159,7 @@ fn test_db_reopen_accepts_every_wal_truncation_prefix() {
         .iter()
         .map(|record| record.to_bytes().len())
         .sum::<usize>()
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
         commit_seq: CommitSeq::new(1),
@@ -213,7 +213,7 @@ fn test_db_rejects_wal_commit_digest_mismatch() {
     let wal_end = record
         .to_bytes()
         .len()
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(1),
         commit_seq: CommitSeq::new(1),
