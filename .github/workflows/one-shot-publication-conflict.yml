@@ -1,0 +1,309 @@
+name: One-shot publication conflict handoff fix
+
+on:
+  push:
+    branches:
+      - fix/publication-conflict-handoff
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Close drained-publication conflict gap
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/seerdb/src/transactional.rs')
+          text = path.read_text()
+
+          def replace_exact(old: str, new: str, expected: int = 1) -> None:
+              global text
+              found = text.count(old)
+              if found != expected:
+                  raise SystemExit(f'expected {expected} occurrence(s), found {found}: {old[:80]!r}')
+              text = text.replace(old, new)
+
+          replace_exact(
+          '''#[derive(Default)]
+          struct PrepareState {
+              queue: VecDeque<StagedCommit>,
+              /// Keys written by queued commits, for first-committer-wins against
+              /// work that is not yet visible in storage.
+              keys: BTreeSet<(TreeId, Vec<u8>)>,
+              /// Trees with queued lifecycle or data changes.
+              trees: BTreeSet<TreeId>,
+          }
+          ''',
+          '''#[derive(Default)]
+          struct PrepareState {
+              queue: VecDeque<StagedCommit>,
+              /// Keys written by queued commits, for first-committer-wins against
+              /// work that is not yet visible in storage.
+              keys: BTreeSet<(TreeId, Vec<u8>)>,
+              /// Trees with queued lifecycle or data changes.
+              trees: BTreeSet<TreeId>,
+          }
+
+          /// Conflict indexes for a queue that has left `PrepareState` but has
+          /// not completed physical publication yet. Stagers must consult both
+          /// queued and publishing indexes so draining cannot create a window
+          /// where an unpublished write disappears from conflict detection.
+          #[derive(Default)]
+          struct PublishingState {
+              keys: BTreeSet<(TreeId, Vec<u8>)>,
+              trees: BTreeSet<TreeId>,
+          }
+
+          struct PublishingGuard<'a> {
+              runtime: &'a Runtime,
+          }
+
+          impl Drop for PublishingGuard<'_> {
+              fn drop(&mut self) {
+                  let mut publishing = lock_publishing(self.runtime);
+                  publishing.keys.clear();
+                  publishing.trees.clear();
+              }
+          }
+
+          struct DrainedCommits<'a> {
+              queue: VecDeque<StagedCommit>,
+              _publishing: PublishingGuard<'a>,
+          }
+          ''')
+
+          replace_exact(
+          '''    active_snapshots: Mutex<ActiveSnapshots>,
+              prepare: Mutex<PrepareState>,
+              /// Publish lane: the holder drains staged commits before its own
+          ''',
+          '''    active_snapshots: Mutex<ActiveSnapshots>,
+              prepare: Mutex<PrepareState>,
+              publishing: Mutex<PublishingState>,
+              /// Publish lane: the holder drains staged commits before its own
+          ''')
+
+          replace_exact(
+          '''                active_snapshots: Mutex::new(ActiveSnapshots::new()),
+                          prepare: Mutex::new(PrepareState::default()),
+                          publish: Mutex::new(()),
+          ''',
+          '''                active_snapshots: Mutex::new(ActiveSnapshots::new()),
+                          prepare: Mutex::new(PrepareState::default()),
+                          publishing: Mutex::new(PublishingState::default()),
+                          publish: Mutex::new(()),
+          ''')
+
+          replace_exact(
+          '''    validate_conflicts(transaction, &db, &statuses, current)?;
+              reject_queued_conflicts(transaction, &prepare)?;
+          ''',
+          '''    validate_conflicts(transaction, &db, &statuses, current)?;
+              reject_unpublished_conflicts(transaction, &prepare.keys, &prepare.trees)?;
+              {
+                  let publishing = lock_publishing(&transaction.runtime);
+                  reject_unpublished_conflicts(transaction, &publishing.keys, &publishing.trees)?;
+              }
+          ''')
+
+          replace_exact(
+          '''/// Reject conflicts against commits that are validated and CSN-assigned but
+          /// not yet installed. Without this pass two transactions could both win the
+          /// same key against published state; first-committer-wins is decided in
+          /// assignment order instead.
+          fn reject_queued_conflicts(transaction: &Transaction, prepare: &PrepareState) -> Result<()> {
+              for (tree, key) in transaction.writes.keys() {
+                  if prepare.keys.contains(&(*tree, key.clone())) {
+                      return Err(Error::WriteConflict {
+                          tree: *tree,
+                          key: key.clone(),
+                      });
+                  }
+              }
+              for tree in &transaction.dropped {
+                  if prepare.trees.contains(tree) {
+                      return Err(Error::TreeConflict(*tree));
+                  }
+              }
+              for staged in &prepare.queue {
+                  for (tree, start, end) in &transaction.read_ranges {
+                      for (changed_tree, changed_key) in &staged.writes {
+                          if *changed_tree == *tree
+                              && changed_key.as_slice() >= start.as_slice()
+                              && end
+                                  .as_ref()
+                                  .is_none_or(|end| changed_key.as_slice() < end.as_slice())
+                          {
+                              // The queued writer has no assigned sequence yet; the
+                              // transaction's own snapshot names the visibility point
+                              // the phantom appeared after.
+                              return Err(Error::SerializationConflict {
+                                  expected: CommitId::new(transaction.snapshot.get()),
+                                  current: CommitId::new(transaction.snapshot.get()),
+                              });
+                          }
+                      }
+                  }
+              }
+              Ok(())
+          }
+          ''',
+          '''/// Reject conflicts against validated work that is not yet visible in the
+          /// published database image. The indexes cover both the staging queue and a
+          /// queue already drained into the physical publication lane.
+          fn reject_unpublished_conflicts(
+              transaction: &Transaction,
+              keys: &BTreeSet<(TreeId, Vec<u8>)>,
+              trees: &BTreeSet<TreeId>,
+          ) -> Result<()> {
+              for (tree, key) in transaction.writes.keys() {
+                  if keys.contains(&(*tree, key.clone())) {
+                      return Err(Error::WriteConflict {
+                          tree: *tree,
+                          key: key.clone(),
+                      });
+                  }
+              }
+              for tree in &transaction.dropped {
+                  if trees.contains(tree) {
+                      return Err(Error::TreeConflict(*tree));
+                  }
+              }
+              for (tree, start, end) in &transaction.read_ranges {
+                  for (changed_tree, changed_key) in keys {
+                      if *changed_tree == *tree
+                          && changed_key.as_slice() >= start.as_slice()
+                          && end
+                              .as_ref()
+                              .is_none_or(|end| changed_key.as_slice() < end.as_slice())
+                      {
+                          // The unpublished writer has no visible sequence yet; the
+                          // transaction's own snapshot names the visibility point the
+                          // phantom appeared after.
+                          return Err(Error::SerializationConflict {
+                              expected: CommitId::new(transaction.snapshot.get()),
+                              current: CommitId::new(transaction.snapshot.get()),
+                          });
+                      }
+                  }
+              }
+              Ok(())
+          }
+          ''')
+
+          replace_exact(
+          '''fn take_staged(runtime: &Runtime) -> PrepareState {
+              let mut prepare = lock_prepare(runtime);
+              std::mem::take(&mut *prepare)
+          }
+          ''',
+          '''fn take_staged(runtime: &Runtime) -> DrainedCommits<'_> {
+              let mut prepare = lock_prepare(runtime);
+              let queue = std::mem::take(&mut prepare.queue);
+              let keys = std::mem::take(&mut prepare.keys);
+              let trees = std::mem::take(&mut prepare.trees);
+              let mut publishing = lock_publishing(runtime);
+              debug_assert!(publishing.keys.is_empty());
+              debug_assert!(publishing.trees.is_empty());
+              publishing.keys = keys;
+              publishing.trees = trees;
+              drop(publishing);
+              DrainedCommits {
+                  queue,
+                  _publishing: PublishingGuard { runtime },
+              }
+          }
+          ''')
+
+          replace_exact(
+          '''fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: PrepareState) -> Result<()> {
+          ''',
+          '''fn publish_drained(
+              db: &mut DB,
+              runtime: &Runtime,
+              mut queue: DrainedCommits<'_>,
+          ) -> Result<()> {
+          ''')
+
+          replace_exact(
+          '''fn lock_prepare(runtime: &Runtime) -> std::sync::MutexGuard<'_, PrepareState> {
+              match runtime.prepare.lock() {
+                  Ok(prepare) => prepare,
+                  Err(poisoned) => poisoned.into_inner(),
+              }
+          }
+
+          fn lock_publish(runtime: &Runtime) -> std::sync::MutexGuard<'_, ()> {
+          ''',
+          '''fn lock_prepare(runtime: &Runtime) -> std::sync::MutexGuard<'_, PrepareState> {
+              match runtime.prepare.lock() {
+                  Ok(prepare) => prepare,
+                  Err(poisoned) => poisoned.into_inner(),
+              }
+          }
+
+          fn lock_publishing(runtime: &Runtime) -> std::sync::MutexGuard<'_, PublishingState> {
+              match runtime.publishing.lock() {
+                  Ok(publishing) => publishing,
+                  Err(poisoned) => poisoned.into_inner(),
+              }
+          }
+
+          fn lock_publish(runtime: &Runtime) -> std::sync::MutexGuard<'_, ()> {
+          ''')
+
+          replace_exact(
+          '''    #[test]
+              fn multi_tree_commit_and_snapshot_visibility_are_atomic() {
+          ''',
+          '''    #[test]
+              fn drained_publication_keeps_conflicts_visible_until_install() {
+                  let (_directory, database) = database();
+                  let shared = tree(&database);
+                  let mut seed = database.begin().expect("seed");
+                  seed.put(shared, b"contested", b"base").expect("seed put");
+                  seed.commit().expect("seed commit");
+
+                  let mut first = database.begin().expect("first");
+                  let mut second = database.begin().expect("second");
+                  first.put(shared, b"contested", b"first").expect("first put");
+                  second
+                      .put(shared, b"contested", b"second")
+                      .expect("second put");
+
+                  let _first_outcome = stage_commit(&first).expect("stage first");
+                  let _lane = lock_publish(&first.runtime);
+                  let drained = take_staged(&first.runtime);
+                  let conflict = match stage_commit(&second) {
+                      Ok(_) => panic!("drained writer disappeared from conflict indexes"),
+                      Err(error) => error,
+                  };
+                  assert!(matches!(
+                      conflict,
+                      Error::WriteConflict { tree, ref key }
+                          if tree == shared && key.as_slice() == b"contested"
+                  ));
+                  drop(drained);
+              }
+
+              #[test]
+              fn multi_tree_commit_and_snapshot_visibility_are_atomic() {
+          ''')
+
+          path.write_text(text)
+          PY
+          cargo fmt --all
+      - name: Commit fix and remove one-shot workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/one-shot-publication-conflict.yml
+          git add crates/seerdb/src/transactional.rs
+          git commit -m 'fix(seerdb): preserve conflicts across publication handoff'
+          git push origin HEAD:${GITHUB_REF_NAME}
