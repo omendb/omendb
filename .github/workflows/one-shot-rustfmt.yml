@@ -1,0 +1,36 @@
+name: One-shot rustfmt cleanup
+
+on:
+  push:
+    branches:
+      - fix/rust-1.98-clippy
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Apply exact formatter delta
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('crates/seerdb/src/db/tests.rs')
+          text = path.read_text()
+          old = '''        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4)\n        as u64;'''
+          new = '''        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one formatter replacement, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+      - name: Commit formatter delta and remove one-shot workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/one-shot-rustfmt.yml
+          git add crates/seerdb/src/db/tests.rs
+          git commit -m 'style(seerdb): format WAL size expression'
+          git push origin HEAD:${GITHUB_REF_NAME}
