@@ -2777,7 +2777,7 @@ mod tests {
             assert_eq!(change.commit.get(), (position + 1) as u64);
         }
         // Every write is visible exactly once at the final state.
-        let mut reader = database.begin().expect("reader");
+        let reader = database.begin().expect("reader");
         for worker in 0..THREADS {
             for step in 0..WRITES_PER_THREAD {
                 let key = format!("w{worker}-k{step}");

@@ -890,10 +890,6 @@ impl RelationalDatabaseTransaction {
             .index_scan(table, index)
     }
 
-    pub(crate) fn set_operation_control(&mut self, control: &OperationControl) {
-        self.control = Some(control.clone());
-    }
-
     pub(crate) fn check_operation_control(&self) -> Result<()> {
         self.control
             .as_ref()

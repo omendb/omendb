@@ -483,7 +483,7 @@ pub(super) fn predicate_candidate_rows(
     };
     let values = bound_values(&index.columns, table, &terms)?;
     let mut rows = transaction.index_get(database, table.id, index.id, &values)?;
-    rows.sort_by(|left, right| left.primary.cmp(&right.primary));
+    rows.sort_by_key(|left| left.primary);
     Ok(Some(rows))
 }
 
