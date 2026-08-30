@@ -102,7 +102,7 @@ fn dbnext_r0_repair_replays_committed_wal_into_new_location() {
     let wal_end = wal
         .len()
         .saturating_add(mutation.to_bytes().len())
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(current.commit_id.get() + 1),
         commit_seq: CommitSeq::new(current.commit_seq.get() + 1),
