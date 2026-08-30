@@ -147,7 +147,9 @@ fn execute_in_transaction_statement(
     params: &[Value],
 ) -> Result<SqlResult> {
     match statement {
-        Statement::Query(query) => query::execute_query(database, transaction, query, params),
+        Statement::Query(query) => {
+            query::execute_query(database, transaction, query, params).map_err(classify_query_error)
+        }
         Statement::Insert(insert) => write::execute_insert(database, transaction, insert, params),
         Statement::Update(update) => write::execute_update(database, transaction, update, params),
         Statement::Delete(delete) => write::execute_delete(database, transaction, delete, params),
@@ -173,6 +175,23 @@ fn execute_in_transaction_statement(
             statement_kind(other),
             "not in the embedded SQL tier",
         )),
+    }
+}
+
+fn classify_query_error(error: DbError) -> DbError {
+    const GROUPING_SUFFIX: &str =
+        "' must appear in the GROUP BY clause or be used in an aggregate function";
+    match error {
+        DbError::InvalidState(reason) => {
+            let column = reason
+                .strip_prefix("column '")
+                .and_then(|rest| rest.strip_suffix(GROUPING_SUFFIX))
+                .map(str::to_owned);
+            column.map_or(DbError::InvalidState(reason), |column| {
+                DbError::SqlGroupingError { column }
+            })
+        }
+        other => other,
     }
 }
 

@@ -141,6 +141,10 @@ pub enum DbError {
     SqlUndefinedColumn { name: String },
     #[error("value does not satisfy SQL column {column}")]
     SqlDatatypeMismatch { column: String },
+    #[error(
+        "column {column} must appear in the GROUP BY clause or be used in an aggregate function"
+    )]
+    SqlGroupingError { column: String },
     #[error("division by zero")]
     SqlDivisionByZero,
     #[error("numeric value out of range: {0}")]
@@ -256,6 +260,7 @@ impl DbError {
             | Self::SqlUndefinedTable { .. }
             | Self::SqlUndefinedColumn { .. }
             | Self::SqlDatatypeMismatch { .. }
+            | Self::SqlGroupingError { .. }
             | Self::SqlDivisionByZero
             | Self::SqlNumericValueOutOfRange(_)
             | Self::SqlNotNullViolation { .. }

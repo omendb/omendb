@@ -1294,6 +1294,7 @@ fn map_db_error(error: crate::DbError) -> PgWireError {
         crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
         crate::DbError::SqlDatatypeMismatch { .. } => ("42804", error.to_string()),
+        crate::DbError::SqlGroupingError { .. } => ("42803", error.to_string()),
         crate::DbError::SqlDivisionByZero => ("22012", error.to_string()),
         crate::DbError::SqlNumericValueOutOfRange(_) => ("22003", error.to_string()),
         crate::DbError::SqlNotNullViolation { .. } => ("23502", error.to_string()),
@@ -2160,6 +2161,17 @@ mod tests {
         ));
         match error {
             PgWireError::UserError(info) => assert_eq!(info.code, "08P01"),
+            other => panic!("expected user error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sql_grouping_errors_use_grouping_error_state() {
+        let error = map_db_error(DbError::SqlGroupingError {
+            column: "state".to_owned(),
+        });
+        match error {
+            PgWireError::UserError(info) => assert_eq!(info.code, "42803"),
             other => panic!("expected user error, got {other:?}"),
         }
     }
