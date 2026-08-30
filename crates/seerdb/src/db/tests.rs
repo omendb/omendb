@@ -833,8 +833,7 @@ fn test_db_recovers_committed_blob_upsert() {
     let wal_end = wal_bytes
         .len()
         .saturating_add(record.to_bytes().len())
-        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4)
-        as u64;
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as u64;
     let commit = CommitRecord {
         commit_id: CommitId::new(commit_id + 1),
         commit_seq: CommitSeq::new(commit_id + 1),
