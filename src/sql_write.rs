@@ -188,6 +188,54 @@ fn returning_plan(
     Ok((columns, positions))
 }
 
+#[cfg(feature = "pgwire")]
+/// Return target-table names and logical types for supported DML RETURNING.
+/// The executor already restricts RETURNING to column names or `*`, making
+/// this metadata independent of row values and safe to use during Describe.
+pub(super) fn describe_returning_columns(
+    database: &RelationalDatabase,
+    statement: &sqlparser::ast::Statement,
+) -> Result<Option<Vec<(String, crate::ColumnType)>>> {
+    let (table, returning) = match statement {
+        sqlparser::ast::Statement::Insert(insert) => {
+            let table_name = match &insert.table {
+                TableObject::TableName(name) => simple_object_name(name, "table")?,
+                _ => {
+                    return Err(unsupported("INSERT", "the target must be a plain table"));
+                }
+            };
+            let table = find_table(database.catalog(), table_name)?;
+            (table, insert.returning.as_ref())
+        }
+        sqlparser::ast::Statement::Update(update) => {
+            let table = super::table_from_join(database.catalog(), &update.table)?;
+            (table, update.returning.as_ref())
+        }
+        sqlparser::ast::Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            if tables.len() != 1 {
+                return Ok(None);
+            }
+            let table = super::table_from_join(database.catalog(), &tables[0])?;
+            (table, delete.returning.as_ref())
+        }
+        _ => return Ok(None),
+    };
+    let Some(items) = returning else {
+        return Ok(None);
+    };
+    let (columns, positions) = returning_plan(table, items)?;
+    Ok(Some(
+        columns
+            .into_iter()
+            .zip(positions)
+            .map(|(column, position)| (column.name, table.columns[position].data_type))
+            .collect(),
+    ))
+}
+
 pub(super) fn execute_update(
     database: &RelationalDatabase,
     transaction: &mut RelationalDatabaseTransaction,

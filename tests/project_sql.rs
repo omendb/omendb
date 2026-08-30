@@ -10,6 +10,28 @@ fn config(directory: &Path) -> RelationalBackendConfig {
     RelationalBackendConfig::new(directory.to_owned())
 }
 
+#[test]
+fn sql_parameter_types_infer_between_bounds_from_column() {
+    let directory = tempdir().expect("temporary directory");
+    let database_path = directory.path().join("database");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create");
+    database
+        .execute_sql(
+            "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, state TEXT)",
+        )
+        .expect("create accounts");
+
+    assert_eq!(
+        database
+            .sql_parameter_types(
+                "SELECT id FROM accounts WHERE balance BETWEEN $1 AND $2 ORDER BY id",
+            )
+            .expect("describe BETWEEN parameters"),
+        vec![Some(omendb::ColumnType::I64), Some(omendb::ColumnType::I64),]
+    );
+    database.close().expect("close");
+}
+
 fn exercise_sql(directory: &Path) -> Vec<Vec<Value>> {
     let database_config = config(directory);
     let mut database = RelationalDatabase::create(database_config.clone()).expect("create");

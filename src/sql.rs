@@ -176,6 +176,19 @@ fn execute_in_transaction_statement(
     }
 }
 
+#[cfg(feature = "pgwire")]
+/// Describe the statically known columns of a supported DML RETURNING clause.
+/// SELECT result typing still uses the execution probe; INSERT/UPDATE/DELETE
+/// RETURNING is restricted to target-table columns, so its wire schema does
+/// not depend on whether benign describe-time parameters happen to match a row.
+pub(crate) fn describe_returning_columns(
+    database: &RelationalDatabase,
+    source: &str,
+) -> Result<Option<Vec<(String, ColumnType)>>> {
+    let statement = parse_one(source)?;
+    write::describe_returning_columns(database, &statement)
+}
+
 /// Infer the expected engine type of each positional parameter in a
 /// statement so wire servers can report concrete parameter types to clients
 /// that refuse unspecified types. Positions the statement context does not
@@ -311,6 +324,14 @@ impl ParameterInference {
                         if let Some(resolved) = identifier_type(right.as_ref(), table) {
                             self.observe_placeholder(left, resolved);
                         }
+                    }
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    if let Some(resolved) = identifier_type(expr, table) {
+                        self.observe_placeholder(low, resolved);
+                        self.observe_placeholder(high, resolved);
                     }
                 }
                 Expr::Like { expr, pattern, .. } => {

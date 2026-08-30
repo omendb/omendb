@@ -1323,7 +1323,7 @@ fn value_type(value: Option<&Value>) -> Type {
     match value {
         Some(Value::Bool(_)) => Type::BOOL,
         Some(Value::U64(_) | Value::I64(_)) => Type::INT8,
-        Some(Value::Text(_)) => Type::VARCHAR,
+        Some(Value::Text(_)) => Type::TEXT,
         Some(Value::Bytes(_)) => Type::BYTEA,
         _ => Type::TEXT,
     }
@@ -1414,7 +1414,7 @@ fn column_type_to_pg(column_type: crate::ColumnType) -> Type {
     match column_type {
         crate::ColumnType::Bool => Type::BOOL,
         crate::ColumnType::U64 | crate::ColumnType::I64 => Type::INT8,
-        crate::ColumnType::Text => Type::VARCHAR,
+        crate::ColumnType::Text => Type::TEXT,
         crate::ColumnType::Bytes => Type::BYTEA,
     }
 }
@@ -1910,6 +1910,27 @@ impl OmenDbHandler {
         control.check().map_err(map_db_error)?;
         if !Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
             return Ok(Arc::new(Vec::new()));
+        }
+        let returning_columns = {
+            let database = read_lock_with_control(&self.database, control)?;
+            crate::sql::describe_returning_columns(&database, sql).map_err(map_db_error)?
+        };
+        if let Some(columns) = returning_columns {
+            return Ok(Arc::new(
+                columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, (name, column_type))| {
+                        FieldInfo::new(
+                            name,
+                            None,
+                            None,
+                            column_type_to_pg(column_type),
+                            format.format_for(position),
+                        )
+                    })
+                    .collect(),
+            ));
         }
         let probe_params: Vec<Value> = resolved
             .iter()
