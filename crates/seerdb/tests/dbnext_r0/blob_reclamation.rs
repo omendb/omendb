@@ -211,7 +211,7 @@ fn dbnext_r0_recovery_retires_blob_on_inline_wal_replacement() {
     let wal_end = wal_bytes
         .len()
         .saturating_add(record.to_bytes().len())
-        .saturating_add((4 + 1 + CommitRecord::SERIALIZED_SIZE + 4) as usize);
+        .saturating_add(4 + 1 + CommitRecord::SERIALIZED_SIZE + 4);
     let commit = CommitRecord {
         commit_id: CommitId::new(current.commit_id.get() + 1),
         commit_seq: CommitSeq::new(current.commit_seq.get() + 1),

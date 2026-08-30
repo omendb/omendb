@@ -890,6 +890,7 @@ impl RelationalDatabaseTransaction {
             .index_scan(table, index)
     }
 
+    #[cfg(feature = "pgwire")]
     pub(crate) fn set_operation_control(&mut self, control: &OperationControl) {
         self.control = Some(control.clone());
     }
