@@ -279,6 +279,33 @@ struct PrepareState {
     trees: BTreeSet<TreeId>,
 }
 
+/// Conflict indexes for a queue that has left `PrepareState` but has
+/// not completed physical publication yet. Stagers must consult both
+/// queued and publishing indexes so draining cannot create a window
+/// where an unpublished write disappears from conflict detection.
+#[derive(Default)]
+struct PublishingState {
+    keys: BTreeSet<(TreeId, Vec<u8>)>,
+    trees: BTreeSet<TreeId>,
+}
+
+struct PublishingGuard<'a> {
+    runtime: &'a Runtime,
+}
+
+impl Drop for PublishingGuard<'_> {
+    fn drop(&mut self) {
+        let mut publishing = lock_publishing(self.runtime);
+        publishing.keys.clear();
+        publishing.trees.clear();
+    }
+}
+
+struct DrainedCommits<'a> {
+    queue: VecDeque<StagedCommit>,
+    _publishing: PublishingGuard<'a>,
+}
+
 struct Runtime {
     db: Mutex<DB>,
     versions: Mutex<VersionStore>,
@@ -287,6 +314,7 @@ struct Runtime {
     leases: Mutex<BTreeMap<Vec<u8>, CommitSeq>>,
     active_snapshots: Mutex<ActiveSnapshots>,
     prepare: Mutex<PrepareState>,
+    publishing: Mutex<PublishingState>,
     /// Publish lane: the holder drains staged commits before its own
     /// physical publication, keeping assign order equal to publish order.
     publish: Mutex<()>,
@@ -380,6 +408,7 @@ impl TransactionDatabase {
                 leases: Mutex::new(leases),
                 active_snapshots: Mutex::new(ActiveSnapshots::new()),
                 prepare: Mutex::new(PrepareState::default()),
+                publishing: Mutex::new(PublishingState::default()),
                 publish: Mutex::new(()),
                 next_transaction: AtomicU64::new(next_transaction),
                 next_tree: AtomicU64::new(next_tree),
@@ -1449,7 +1478,11 @@ fn stage_commit(
         .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
     let current = db.durability_status().commit_position.csn;
     validate_conflicts(transaction, &db, &statuses, current)?;
-    reject_queued_conflicts(transaction, &prepare)?;
+    reject_unpublished_conflicts(transaction, &prepare.keys, &prepare.trees)?;
+    {
+        let publishing = lock_publishing(&transaction.runtime);
+        reject_unpublished_conflicts(transaction, &publishing.keys, &publishing.trees)?;
+    }
 
     let mut mutations = Vec::new();
     let mut writes = BTreeSet::new();
@@ -1513,13 +1546,16 @@ fn stage_commit(
     Ok(receiver)
 }
 
-/// Reject conflicts against commits that are validated and CSN-assigned but
-/// not yet installed. Without this pass two transactions could both win the
-/// same key against published state; first-committer-wins is decided in
-/// assignment order instead.
-fn reject_queued_conflicts(transaction: &Transaction, prepare: &PrepareState) -> Result<()> {
+/// Reject conflicts against validated work that is not yet visible in the
+/// published database image. The indexes cover both the staging queue and a
+/// queue already drained into the physical publication lane.
+fn reject_unpublished_conflicts(
+    transaction: &Transaction,
+    keys: &BTreeSet<(TreeId, Vec<u8>)>,
+    trees: &BTreeSet<TreeId>,
+) -> Result<()> {
     for (tree, key) in transaction.writes.keys() {
-        if prepare.keys.contains(&(*tree, key.clone())) {
+        if keys.contains(&(*tree, key.clone())) {
             return Err(Error::WriteConflict {
                 tree: *tree,
                 key: key.clone(),
@@ -1527,27 +1563,25 @@ fn reject_queued_conflicts(transaction: &Transaction, prepare: &PrepareState) ->
         }
     }
     for tree in &transaction.dropped {
-        if prepare.trees.contains(tree) {
+        if trees.contains(tree) {
             return Err(Error::TreeConflict(*tree));
         }
     }
-    for staged in &prepare.queue {
-        for (tree, start, end) in &transaction.read_ranges {
-            for (changed_tree, changed_key) in &staged.writes {
-                if *changed_tree == *tree
-                    && changed_key.as_slice() >= start.as_slice()
-                    && end
-                        .as_ref()
-                        .is_none_or(|end| changed_key.as_slice() < end.as_slice())
-                {
-                    // The queued writer has no assigned sequence yet; the
-                    // transaction's own snapshot names the visibility point
-                    // the phantom appeared after.
-                    return Err(Error::SerializationConflict {
-                        expected: CommitId::new(transaction.snapshot.get()),
-                        current: CommitId::new(transaction.snapshot.get()),
-                    });
-                }
+    for (tree, start, end) in &transaction.read_ranges {
+        for (changed_tree, changed_key) in keys {
+            if *changed_tree == *tree
+                && changed_key.as_slice() >= start.as_slice()
+                && end
+                    .as_ref()
+                    .is_none_or(|end| changed_key.as_slice() < end.as_slice())
+            {
+                // The unpublished writer has no visible sequence yet; the
+                // transaction's own snapshot names the visibility point the
+                // phantom appeared after.
+                return Err(Error::SerializationConflict {
+                    expected: CommitId::new(transaction.snapshot.get()),
+                    current: CommitId::new(transaction.snapshot.get()),
+                });
             }
         }
     }
@@ -1573,16 +1607,28 @@ fn publish_staged(runtime: &Runtime) -> Result<()> {
 /// Take the staged-commit queue and its conflict indexes, resetting them for
 /// the next assignment wave. Must run before any caller acquires the database
 /// lock; staging holds the prepare mutex across its own database-lock wait.
-fn take_staged(runtime: &Runtime) -> PrepareState {
+fn take_staged(runtime: &Runtime) -> DrainedCommits<'_> {
     let mut prepare = lock_prepare(runtime);
-    std::mem::take(&mut *prepare)
+    let queue = std::mem::take(&mut prepare.queue);
+    let keys = std::mem::take(&mut prepare.keys);
+    let trees = std::mem::take(&mut prepare.trees);
+    let mut publishing = lock_publishing(runtime);
+    debug_assert!(publishing.keys.is_empty());
+    debug_assert!(publishing.trees.is_empty());
+    publishing.keys = keys;
+    publishing.trees = trees;
+    drop(publishing);
+    DrainedCommits {
+        queue,
+        _publishing: PublishingGuard { runtime },
+    }
 }
 
 /// Publish previously staged commits while both the publish lane and the
 /// database handle are held by the caller. Control-plane writers run this
 /// before their own inline publication so every consumer of a commit sequence
 /// number passes through one ordered lane.
-fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: PrepareState) -> Result<()> {
+fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: DrainedCommits<'_>) -> Result<()> {
     if queue.queue.is_empty() {
         return Ok(());
     }
@@ -1711,6 +1757,13 @@ fn resolve_group_uncertain(queue: &[StagedCommit], failure: Arc<Error>) {
 fn lock_prepare(runtime: &Runtime) -> std::sync::MutexGuard<'_, PrepareState> {
     match runtime.prepare.lock() {
         Ok(prepare) => prepare,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_publishing(runtime: &Runtime) -> std::sync::MutexGuard<'_, PublishingState> {
+    match runtime.publishing.lock() {
+        Ok(publishing) => publishing,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
@@ -2821,6 +2874,38 @@ mod tests {
         assert_eq!(winners, 1, "first-committer-wins allows exactly one winner");
         let reader = database.begin().expect("reader");
         assert!(reader.get(shared, b"contested").expect("read").is_some());
+    }
+
+    #[test]
+    fn drained_publication_keeps_conflicts_visible_until_install() {
+        let (_directory, database) = database();
+        let shared = tree(&database);
+        let mut seed = database.begin().expect("seed");
+        seed.put(shared, b"contested", b"base").expect("seed put");
+        seed.commit().expect("seed commit");
+
+        let mut first = database.begin().expect("first");
+        let mut second = database.begin().expect("second");
+        first
+            .put(shared, b"contested", b"first")
+            .expect("first put");
+        second
+            .put(shared, b"contested", b"second")
+            .expect("second put");
+
+        let _first_outcome = stage_commit(&first).expect("stage first");
+        let _lane = lock_publish(&first.runtime);
+        let drained = take_staged(&first.runtime);
+        let conflict = match stage_commit(&second) {
+            Ok(_) => panic!("drained writer disappeared from conflict indexes"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            conflict,
+            Error::WriteConflict { tree, ref key }
+                if tree == shared && key.as_slice() == b"contested"
+        ));
+        drop(drained);
     }
 
     #[test]
