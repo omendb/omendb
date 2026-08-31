@@ -3014,7 +3014,9 @@ async fn wire_auth_failure_delays_repeat_attempts() {
         addr.port()
     );
 
-    // First failure is immediate; the second carries the base delay.
+    // The exact backoff schedule is unit-tested beside the server helper.
+    // Here, assert that the first three failed wire exchanges each include
+    // their configured delay without subtracting noisy connection setup time.
     let first_started = std::time::Instant::now();
     assert!(
         tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls)
@@ -3031,9 +3033,25 @@ async fn wire_auth_failure_delays_repeat_attempts() {
     );
     let second_elapsed = second_started.elapsed();
 
+    let third_started = std::time::Instant::now();
     assert!(
-        second_elapsed >= first_elapsed + std::time::Duration::from_millis(80),
-        "second attempt ({second_elapsed:?}) should be delayed past the first ({first_elapsed:?})"
+        tokio_postgres::connect(&bad_dsn, tokio_postgres::NoTls)
+            .await
+            .is_err()
+    );
+    let third_elapsed = third_started.elapsed();
+
+    assert!(
+        first_elapsed >= std::time::Duration::from_millis(100),
+        "first failed exchange ({first_elapsed:?}) should include the 100ms delay"
+    );
+    assert!(
+        second_elapsed >= std::time::Duration::from_millis(200),
+        "second failed exchange ({second_elapsed:?}) should include the 200ms delay"
+    );
+    assert!(
+        third_elapsed >= std::time::Duration::from_millis(400),
+        "third failed exchange ({third_elapsed:?}) should include the 400ms delay"
     );
 
     // The correct password still works after failures (delay applies to

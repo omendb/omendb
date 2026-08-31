@@ -45,11 +45,21 @@ const AUTH_SECRET_COLUMN_ID: u16 = u16::MAX;
 const GRANTS_TABLE_ID: u64 = u64::MAX - 2;
 
 /// Bounded authentication-failure delay per source address: the first
-/// failure is immediate, then exponential backoff capped at 5 seconds.
-/// Keyed by source IP (pgwire exposes it via ClientInfo::socket_addr);
-/// counters live for the server's lifetime.
+/// failure waits 100ms, then the delay doubles per consecutive failure and
+/// caps at 5 seconds. Keyed by source IP (pgwire exposes it via
+/// ClientInfo::socket_addr); counters live for the server's lifetime.
 const AUTH_FAILURE_DELAY_BASE_MS: u64 = 100;
 const AUTH_FAILURE_DELAY_CAP_MS: u64 = 5_000;
+
+fn auth_failure_delay_ms(failures: u32) -> u64 {
+    if failures == 0 {
+        return 0;
+    }
+    let exponent = failures.saturating_sub(1).min(6);
+    AUTH_FAILURE_DELAY_BASE_MS
+        .saturating_mul(1 << exponent)
+        .min(AUTH_FAILURE_DELAY_CAP_MS)
+}
 
 /// A shared database behind the wire server.
 ///
@@ -869,10 +879,7 @@ impl StartupMode {
             return AUTH_FAILURE_DELAY_CAP_MS;
         };
         let failures = delays.entry(addr.ip()).and_modify(|c| *c += 1).or_insert(1);
-        let exponent = (*failures - 1).min(6);
-        AUTH_FAILURE_DELAY_BASE_MS
-            .saturating_mul(1 << exponent)
-            .min(AUTH_FAILURE_DELAY_CAP_MS)
+        auth_failure_delay_ms(*failures)
     }
 
     fn failure_delays(&self) -> &Arc<FailureDelays> {
@@ -2154,6 +2161,15 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
 mod tests {
     use super::*;
     use pgwire::api::DefaultClient;
+
+    #[test]
+    fn auth_failure_delay_is_bounded_exponential() {
+        assert_eq!(auth_failure_delay_ms(0), 0);
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 7, 8].map(auth_failure_delay_ms),
+            [100, 200, 400, 800, 1_600, 3_200, 5_000, 5_000]
+        );
+    }
 
     #[test]
     fn cancellation_registry_routes_and_releases_query_tokens() {
