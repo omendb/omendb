@@ -41,7 +41,7 @@ enum Backend {
 impl Backend {
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "omendb" | "temporary" | "seer" => Ok(Self::Omendb),
+            "omendb" => Ok(Self::Omendb),
             "sqlite" => Ok(Self::Sqlite),
             other => bail!("unsupported backend {other}; use omendb or sqlite"),
         }
@@ -80,6 +80,7 @@ fn main() -> Result<()> {
     let (backend, workload) = parse_arguments()?;
     validate(workload)?;
     let temp = tempfile::tempdir().context("create benchmark directory")?;
+    let filesystem = filesystem_type(temp.path());
 
     let backends = match backend {
         None => vec![Backend::Omendb, Backend::Sqlite],
@@ -95,7 +96,10 @@ fn main() -> Result<()> {
             )?,
             Backend::Sqlite => run_sqlite(temp.path().join("sqlite.db"), workload)?,
         };
-        println!("{}", serde_json::to_string_pretty(&result_json(&result))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result_json(&result, &filesystem))?
+        );
         if index + 1 != backends.len() {
             println!();
         }
@@ -382,7 +386,7 @@ fn verify_sqlite(connection: &Connection, expected: &[i64]) -> Result<i128> {
     Ok(checksum)
 }
 
-fn result_json(result: &RunResult) -> serde_json::Value {
+fn result_json(result: &RunResult, filesystem: &str) -> serde_json::Value {
     let mut latencies = result.latencies_nanos.clone();
     latencies.sort_unstable();
     let elapsed_seconds = result.elapsed_nanos as f64 / 1_000_000_000.0;
@@ -390,10 +394,13 @@ fn result_json(result: &RunResult) -> serde_json::Value {
         "experiment": "omendb-relational-alpha-oltp-v0",
         "evidence_class": "reproducible_single_client_sql_baseline",
         "competitive_claim": false,
+        "schema": CREATE_TABLE,
+        "concurrency": 1,
         "platform": {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "filesystem": filesystem,
         },
         "backend": result.backend.label(),
         "rows": result.workload.rows,
@@ -503,6 +510,53 @@ fn percentile(samples: &[u64], numerator: usize, denominator: usize) -> u64 {
 
 fn nanos_to_seconds(nanos: u64) -> f64 {
     nanos as f64 / 1_000_000_000.0
+}
+
+fn filesystem_type(path: &Path) -> String {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return "unavailable".to_owned();
+        };
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return "unavailable".to_owned();
+        }
+        // SAFETY: a successful `statfs` call initialized the structure.
+        let stats = unsafe { stats.assume_init() };
+        format!("statfs:0x{:x}", stats.f_type as u64)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{CStr, CString};
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return "unavailable".to_owned();
+        };
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return "unavailable".to_owned();
+        }
+        // SAFETY: a successful `statfs` call initialized the structure, and
+        // Darwin guarantees `f_fstypename` is a NUL-terminated filesystem name.
+        let stats = unsafe { stats.assume_init() };
+        unsafe { CStr::from_ptr(stats.f_fstypename.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = path;
+        "unknown".to_owned()
+    }
 }
 
 /// Peak resident set size of this process so far, in KiB. Reported as

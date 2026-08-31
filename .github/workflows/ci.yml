@@ -105,7 +105,7 @@ jobs:
       - name: Run bounded workload
         run: |
           target/release/examples/alpha_oltp \
-            --backend temporary --rows 64 --operations 256 > smoke.json
+            --backend omendb --rows 64 --operations 256 > smoke.json
           THROUGHPUT=$(python3 -c "import json; print(json.load(open('smoke.json'))['throughput_operations_per_second'])")
           echo "throughput: ${THROUGHPUT} ops/s"
           python3 -c "exit(0 if ${THROUGHPUT} > 50 else 1)" || {
