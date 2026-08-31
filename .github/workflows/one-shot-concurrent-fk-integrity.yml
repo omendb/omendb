@@ -5,19 +5,13 @@ on:
     branches:
       - test/concurrent-fk-integrity
 
-permissions:
-  contents: write
-
 jobs:
-  qualify:
-    if: github.actor != 'github-actions[bot]'
+  diagnose:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
-        with:
-          components: rustfmt, clippy
-      - name: Add overlapping FK race qualification
+      - name: Add overlapping FK race diagnostic
         run: |
           cat >> tests/project_referential_actions.rs <<'RS'
 
@@ -39,11 +33,10 @@ jobs:
                   (directory, database)
               }
 
-              // Child publishes first. The overlapping parent delete validated
-              // against the older child-table snapshot, so publication must
-              // reject it rather than leave a dangling reference.
+              // Child publishes first. The overlapping parent delete must fail,
+              // and the durable state must retain both the parent and child.
               {
-                  let (_directory, mut database) = database_with_parent_and_restrict_fk();
+                  let (_directory, database) = database_with_parent_and_restrict_fk();
                   let mut child = database.begin().expect("child transaction");
                   let mut parent = database.begin().expect("parent transaction");
                   child
@@ -54,29 +47,27 @@ jobs:
                       .expect("stage parent delete");
 
                   child.commit().expect("child commits");
-                  assert!(matches!(
-                      parent.commit(),
-                      Err(omendb::DbError::SerializationConflict { .. })
-                  ));
-                  assert!(
-                      database
-                          .get(PARENTS, key_of(PARENTS, 1))
-                          .expect("parent read")
-                          .is_some()
+                  let parent_result = parent.commit();
+                  let parent_present = database
+                      .get(PARENTS, key_of(PARENTS, 1))
+                      .expect("parent read")
+                      .is_some();
+                  let child_present = database
+                      .get(CHILDREN, key_of(CHILDREN, 12))
+                      .expect("child read")
+                      .is_some();
+                  eprintln!(
+                      "child-first: parent_result={parent_result:?}, parent_present={parent_present}, child_present={child_present}"
                   );
-                  assert!(
-                      database
-                          .get(CHILDREN, key_of(CHILDREN, 12))
-                          .expect("child read")
-                          .is_some()
-                  );
+                  assert!(parent_result.is_err(), "overlapping parent delete unexpectedly committed");
+                  assert!(parent_present, "failed parent delete became durable");
+                  assert!(child_present, "committed child disappeared");
               }
 
-              // Parent publishes first. The overlapping child insert validated
-              // its reference against the older parent-index snapshot, so its
-              // publication must reject rather than resurrect a dangling FK.
+              // Parent publishes first. The overlapping child insert must fail,
+              // and the durable state must contain neither parent nor child.
               {
-                  let (_directory, mut database) = database_with_parent_and_restrict_fk();
+                  let (_directory, database) = database_with_parent_and_restrict_fk();
                   let mut child = database.begin().expect("child transaction");
                   let mut parent = database.begin().expect("parent transaction");
                   child
@@ -87,41 +78,24 @@ jobs:
                       .expect("stage parent delete");
 
                   parent.commit().expect("parent commits");
-                  assert!(matches!(
-                      child.commit(),
-                      Err(omendb::DbError::SerializationConflict { .. })
-                  ));
-                  assert!(
-                      database
-                          .get(PARENTS, key_of(PARENTS, 1))
-                          .expect("parent read")
-                          .is_none()
+                  let child_result = child.commit();
+                  let parent_present = database
+                      .get(PARENTS, key_of(PARENTS, 1))
+                      .expect("parent read")
+                      .is_some();
+                  let child_present = database
+                      .get(CHILDREN, key_of(CHILDREN, 12))
+                      .expect("child read")
+                      .is_some();
+                  eprintln!(
+                      "parent-first: child_result={child_result:?}, parent_present={parent_present}, child_present={child_present}"
                   );
-                  assert!(
-                      database
-                          .get(CHILDREN, key_of(CHILDREN, 12))
-                          .expect("child read")
-                          .is_none()
-                  );
+                  assert!(child_result.is_err(), "overlapping child insert unexpectedly committed");
+                  assert!(!parent_present, "committed parent delete disappeared");
+                  assert!(!child_present, "failed child insert became durable");
               }
           }
           RS
           cargo fmt --all
-      - name: Verify focused FK race
+      - name: Run focused FK race diagnostic
         run: cargo test --locked --test project_referential_actions overlapping_parent_delete_and_child_insert_cannot_both_commit -- --nocapture
-      - name: Repeat focused FK race
-        run: |
-          for attempt in 1 2 3 4 5; do
-            echo "FK race qualification run ${attempt}"
-            cargo test --locked --test project_referential_actions overlapping_parent_delete_and_child_insert_cannot_both_commit -- --nocapture
-          done
-      - name: Verify strict Clippy
-        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
-      - name: Commit test and remove one-shot workflow
-        run: |
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git rm .github/workflows/one-shot-concurrent-fk-integrity.yml
-          git add tests/project_referential_actions.rs
-          git commit -m 'test: cover concurrent foreign-key integrity'
-          git push origin HEAD:${GITHUB_REF_NAME}
