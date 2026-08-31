@@ -2,11 +2,21 @@
 
 This is the current development evidence for OmenDB's deliberately bounded
 PostgreSQL wire surface. It is a compatibility record, not a claim that OmenDB
-implements PostgreSQL. The executable evidence is in
-`tests/project_pgwire_server.rs`; run it with:
+implements PostgreSQL. The ordinary behavior and negative-path evidence lives
+in `tests/project_pgwire_server.rs`:
 
 ```bash
 cargo test --features pgwire --test project_pgwire_server
+```
+
+A separate live differential in `tests/project_postgres_oracle.rs` compares a
+representative documented subset against PostgreSQL. It is ignored in ordinary
+local test runs because it requires a PostgreSQL server; CI runs it against
+PostgreSQL 18.6 in the dedicated `postgres-oracle` job. To run it manually:
+
+```bash
+POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres' \
+  cargo test --features pgwire --test project_postgres_oracle -- --ignored --nocapture
 ```
 
 ## Server, startup, and lifecycle
@@ -29,8 +39,8 @@ cargo test --features pgwire --test project_pgwire_server
 | --- | --- | --- |
 | Startup and authentication | PostgreSQL startup packets use trust or SCRAM according to the durable auth catalog. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `pgwire_sasl_initial_response_decode_probe` |
 | Simple queries | Semicolon-separated statements, transaction control, and ordinary SQL execute through the wire handler. | `wire_transaction_block_rollback_discards_writes`, `wire_transaction_block_commit_persists_and_crosses_connections` |
-| Extended queries | Parse, parameter type resolution, bind, describe, and execute are exercised through `tokio-postgres`; repeated parameterized execution is covered. | `wire_hot_statement_repeats_across_params`, all `Client::query`/`Client::execute` tests |
-| Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension` |
+| Extended queries | Parse, parameter type resolution, bind, describe, and execute are exercised through `tokio-postgres`; repeated parameterized execution is covered. Parameter inference includes the supported `BETWEEN` form so bound values inherit the compared column's logical type. | `wire_hot_statement_repeats_across_params`, `sql_parameter_types_infer_between_bounds_from_column`, all `Client::query`/`Client::execute` tests |
+| Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; supported DML `RETURNING` uses static target-table metadata rather than depending on a probe row. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |
 | Transactions | `BEGIN`/`START`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local transaction blocks. Failed blocks reject later statements with `25P02` until rollback. | `wire_transaction_block_commit_persists_and_crosses_connections`, `wire_aborted_block_rejects_until_rollback` |
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
@@ -50,18 +60,21 @@ The wire suite exercises the supported bounded SQL overlap, including:
 - schema publication and schema-qualified public names exercised against the
   seeded durable catalog.
 
-The embedded SQL suite, rather than the wire suite, owns the differential
-SQLite oracle. Wire tests currently prove OmenDB behavior and negative paths;
-they do not constitute a differential run against a live PostgreSQL server.
+The embedded SQL suite owns the differential SQLite oracle for the bounded
+engine-level overlap. The live PostgreSQL oracle independently exercises a
+representative wire-level overlap and compares prepared-statement field names,
+PostgreSQL type OIDs, decoded row values, and transaction-visible results. The
+oracle is intentionally narrower than the ordinary pgwire suite: its purpose is
+to catch semantic or metadata drift in behavior OmenDB already documents, not
+to imply PostgreSQL-complete protocol or SQL coverage.
 
 ## Explicit gaps
 
 The following are outside the current compatibility claim and remain release
-gates:
+or later compatibility work:
 
 - SSL negotiation, COPY, replication, notifications, cursors, portals with
   incremental `max_rows`, and the wider PostgreSQL session-parameter surface;
-- a live-PostgreSQL differential matrix for the documented subset;
 - exhaustive SQLSTATE mapping; remaining execution-time `InvalidState` errors
   still report a generic internal wire error rather than their
   PostgreSQL-specific SQLSTATE;

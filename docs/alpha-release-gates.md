@@ -47,10 +47,11 @@ A releasable alpha has two surfaces sharing one transaction implementation:
   operational diagnostics;
 - a secondary typed Rust API for integration, testing, and embedded use.
 
-The SQL subset is intentionally not PostgreSQL-compatible. Unsupported syntax
-must return `DbError::SqlUnsupported` rather than silently doing something
-else. PostgreSQL compatibility claims require a tested compatibility matrix;
-the exploratory wire example is not evidence of that claim.
+The supported wire and SQL surface is deliberately bounded rather than
+PostgreSQL-complete. Unsupported syntax must return `DbError::SqlUnsupported`
+rather than silently doing something else. PostgreSQL compatibility claims are
+limited to the overlap catalogued in `docs/pgwire-compatibility.md` and backed
+by negative tests plus a live PostgreSQL differential oracle.
 
 The alpha does not promise production safety, stable storage-format upgrades,
 or competitive OLTP performance until the corresponding storage, server,
@@ -74,24 +75,27 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 ### Server and protocol
 
-The current development tree has a persistent `omendbd` daemon foundation and
-an integration test for durable shutdown/reopen. Wire `CancelRequest` now
-routes to cooperative transaction checkpoints, with focused registry,
-lock-wait, and shutdown-time wire coverage. A process-level `omendbd`
-SIGKILL/reopen test also covers clean recovery after daemon loss; the full gate
-remains open until authentication/authorization, protocol compatibility,
-resource limits, diagnostics, and every durable-publication fault seam have
-independent evidence.
+The current development tree has a persistent `omendbd` daemon with bounded
+multi-session admission, clean shutdown/reopen, cooperative statement
+cancellation and deadlines, a bounded result-payload admission check, SCRAM
+authentication, table-level grants, and operator-visible server status. Trust
+mode is restricted to loopback. A process-level `omendbd` SIGKILL/reopen test
+covers clean recovery after daemon loss. The documented wire subset is tested
+through `tokio-postgres`, negative SQLSTATE/unsupported paths, and a dedicated
+live PostgreSQL 18.6 differential oracle. Broader protocol features and true
+execution-memory quotas remain outside the current compatibility claim and are
+listed in `docs/pgwire-compatibility.md`; process-level publication-seam
+coverage remains a separate correctness gate below.
 
 - [x] a persistent daemon opens a durable database and supports multiple
       sessions with clean startup, shutdown, cancellation, and reopen;
-- [ ] authentication, authorization, resource limits, and operational
+- [x] authentication, authorization, resource limits, and operational
       diagnostics have an explicit documented baseline;
-- [ ] the supported PostgreSQL protocol/SQL subset has differential and
+- [x] the supported PostgreSQL protocol/SQL subset has differential and
       negative compatibility tests; unsupported behavior fails explicitly.
-      Current development evidence is catalogued in
-      [`docs/pgwire-compatibility.md`](pgwire-compatibility.md), but its live
-      PostgreSQL differential and wider-session gaps remain open.
+      Current evidence is catalogued in
+      [`docs/pgwire-compatibility.md`](pgwire-compatibility.md), including the
+      dedicated live PostgreSQL differential CI job.
 
 ### Correctness and isolation
 
