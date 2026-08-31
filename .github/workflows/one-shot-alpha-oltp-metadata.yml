@@ -63,8 +63,8 @@ jobs:
 
           workflow = Path('.github/workflows/ci.yml')
           ci = workflow.read_text()
-          old = '          --backend temporary \\\n'
-          new = '          --backend omendb \\\n'
+          old = '            --backend temporary --rows 64 --operations 256 > smoke.json\n'
+          new = '            --backend omendb --rows 64 --operations 256 > smoke.json\n'
           if ci.count(old) != 1:
               raise SystemExit(f'expected one perf-smoke backend anchor, found {ci.count(old)}')
           workflow.write_text(ci.replace(old, new))
