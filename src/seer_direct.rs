@@ -1963,4 +1963,47 @@ mod tests {
         ));
         assert_eq!(store.scan(TableId(1)).expect("scan").len(), 1);
     }
+
+    #[test]
+    fn overlapping_unique_value_inserts_cannot_both_commit() {
+        let (_directory, mut store) = store();
+        store
+            .create_table(table(), Some(vec![ColumnId(1)]))
+            .expect("create table");
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(1),
+                table: TableId(1),
+                columns: vec![ColumnId(2)],
+                unique: true,
+            })
+            .expect("create unique index");
+
+        let mut first = store.begin_transaction().expect("first begin");
+        let mut second = store.begin_transaction().expect("second begin");
+        first
+            .insert(TableId(1), row(1, "same@example.com"))
+            .expect("first stage");
+        second
+            .insert(TableId(1), row(2, "same@example.com"))
+            .expect("second stage");
+
+        first.commit().expect("first commits");
+        assert!(matches!(
+            second.commit(),
+            Err(DbError::SerializationConflict { .. })
+        ));
+
+        let rows = store.scan(TableId(1)).expect("rows after conflict");
+        assert_eq!(rows.len(), 1);
+        let indexed = store
+            .index_get(
+                TableId(1),
+                IndexId(1),
+                &[Value::Text("same@example.com".to_owned())],
+            )
+            .expect("unique index after conflict");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].values, row(1, "same@example.com").values);
+    }
 }
