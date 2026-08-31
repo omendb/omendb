@@ -24,17 +24,14 @@ jobs:
 
           path = Path('src/seer_direct.rs')
           text = path.read_text()
-          old = '''    pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {
-              let transaction = store.database.begin().map_err(map_seer_error)?;
-              Ok(Self {
-                  catalog: store.catalog.clone(),
-                  table_trees: store.table_trees.clone(),
-                  index_trees: store.index_trees.clone(),
-                  transaction,
-              })
-          }
-          '''
-          new = '''    pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {
+          impl_start = text.index('impl DirectTransaction {')
+          begin_start = text.index(
+              '    pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {',
+              impl_start,
+          )
+          next_marker = '\n    /// Validate that current snapshot-plus-staged rows already satisfy one'
+          begin_end = text.index(next_marker, begin_start)
+          replacement = '''    pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {
               let mut transaction = store.database.begin().map_err(map_seer_error)?;
 
               // The relational mappings below are a snapshot of OmenDB's catalog.
@@ -61,9 +58,8 @@ jobs:
               })
           }
           '''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected one DirectTransaction::begin, found {text.count(old)}')
-          path.write_text(text.replace(old, new))
+          text = text[:begin_start] + replacement + text[begin_end:]
+          path.write_text(text)
           PY
 
           cat >> tests/project_referential_actions.rs <<'RS'
@@ -73,15 +69,11 @@ jobs:
               let (_directory, mut database) = setup();
               seed(&mut database);
 
-              // Capture the pre-FK catalog and stage a parent deletion while the
-              // relation is still unconstrained.
               let mut stale = database.begin().expect("stale transaction");
               stale
                   .delete(&database, PARENTS, key_of(PARENTS, 1))
                   .expect("stage parent delete");
 
-              // The currently committed rows satisfy this constraint, so activation
-              // succeeds and publishes a new catalog marker.
               database
                   .create_foreign_key(fk(
                       1,
