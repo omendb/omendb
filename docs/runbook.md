@@ -17,8 +17,7 @@ and local runs.
   sync requests void the crash contract; do not place a database directory
   there.
 - Multiple processes must not share one database directory; SeerDB enforces
-  a writer lock per directory and the Temporary backend expects exclusive
-  ownership.
+  a writer lock per directory.
 - Case-insensitive filesystems work, but artifact names are lowercase and
   fixed; renaming or hand-editing files inside the directory is unsupported
   and will be refused as corruption on open.
