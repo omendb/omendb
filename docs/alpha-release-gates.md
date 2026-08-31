@@ -107,8 +107,15 @@ coverage remains a separate correctness gate below.
 - [x] property tests exercise row and row-identity encoding roundtrips,
       truncation refusal, and corruption detection; a randomized SQL trace
       covers transaction sequences against the SQLite oracle;
-- [ ] concurrent transaction tests cover read/write, write/write, unique,
-      foreign-key, snapshot, cancellation, and admission outcomes;
+- [x] concurrent transaction tests cover read/write, write/write, unique,
+      foreign-key, snapshot, cancellation, and admission outcomes. Evidence
+      includes the wire-level hot-key RMW invariant in
+      `tests/project_concurrency_stress.rs`, overlapping unique-value conflicts
+      in `src/seer_direct.rs`, concurrent FK and stale-catalog/DDL races in
+      `tests/project_referential_actions.rs`, stable read views while writers
+      advance in `crates/seerdb/tests/read_view.rs`, cancellation in
+      `tests/project_cancellation.rs`, and bounded connection admission in
+      `tests/project_pgwire_server.rs`;
 - [ ] every durable publication seam has a process-level kill/reopen test;
       the daemon-level SIGKILL/reopen path is covered, but storage publication
       seams still need their own process-level matrix.
