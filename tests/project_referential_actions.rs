@@ -292,3 +292,86 @@ fn cascade_depth_bound_rejects_deeper_than_max_chains() {
         70
     );
 }
+
+#[test]
+fn overlapping_parent_delete_and_child_insert_cannot_both_commit() {
+    fn database_with_parent_and_restrict_fk() -> (tempfile::TempDir, RelationalDatabase) {
+        let (directory, mut database) = setup();
+        database
+            .insert(PARENTS, row(PARENTS, 1, Some(0)))
+            .expect("parent");
+        database
+            .create_foreign_key(fk(
+                1,
+                CHILDREN,
+                PARENTS,
+                omendb::ReferentialAction::Restrict,
+            ))
+            .expect("restrict fk");
+        (directory, database)
+    }
+
+    // Child publishes first. Parent deletion validated an older child
+    // snapshot, so the child-table range dependency must reject it.
+    {
+        let (_directory, database) = database_with_parent_and_restrict_fk();
+        let mut child = database.begin().expect("child transaction");
+        let mut parent = database.begin().expect("parent transaction");
+        child
+            .insert(&database, CHILDREN, row(CHILDREN, 12, Some(1)))
+            .expect("stage child");
+        parent
+            .delete(&database, PARENTS, key_of(PARENTS, 1))
+            .expect("stage parent delete");
+
+        child.commit().expect("child commits");
+        assert!(matches!(
+            parent.commit(),
+            Err(omendb::DbError::SerializationConflict { .. })
+        ));
+        assert!(
+            database
+                .get(PARENTS, key_of(PARENTS, 1))
+                .expect("parent read")
+                .is_some()
+        );
+        assert!(
+            database
+                .get(CHILDREN, key_of(CHILDREN, 12))
+                .expect("child read")
+                .is_some()
+        );
+    }
+
+    // Parent publishes first. Child insertion validated an older
+    // referenced-index snapshot, so that range dependency must reject it.
+    {
+        let (_directory, database) = database_with_parent_and_restrict_fk();
+        let mut child = database.begin().expect("child transaction");
+        let mut parent = database.begin().expect("parent transaction");
+        child
+            .insert(&database, CHILDREN, row(CHILDREN, 12, Some(1)))
+            .expect("stage child");
+        parent
+            .delete(&database, PARENTS, key_of(PARENTS, 1))
+            .expect("stage parent delete");
+
+        parent.commit().expect("parent commits");
+        assert!(matches!(
+            child.commit(),
+            Err(omendb::DbError::SerializationConflict { .. })
+        ));
+        assert!(
+            database
+                .get(PARENTS, key_of(PARENTS, 1))
+                .expect("parent read")
+                .is_none()
+        );
+        assert!(
+            database
+                .get(CHILDREN, key_of(CHILDREN, 12))
+                .expect("child read")
+                .is_none()
+        );
+    }
+}
