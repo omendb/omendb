@@ -1,0 +1,52 @@
+name: One-shot materialize alpha OLTP metadata
+
+on:
+  push:
+    branches:
+      - perf/alpha-oltp-metadata
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          components: rustfmt
+      - name: Apply validated source patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('examples/alpha_oltp.rs')
+          text = path.read_text()
+          replacements = [
+              ('            "omendb" | "temporary" | "seer" => Ok(Self::Omendb),\n', '            "omendb" => Ok(Self::Omendb),\n'),
+              ('    let temp = tempfile::tempdir().context("create benchmark directory")?;\n\n    let backends = match backend {\n', '    let temp = tempfile::tempdir().context("create benchmark directory")?;\n    let filesystem = filesystem_type(temp.path());\n\n    let backends = match backend {\n'),
+              ('        println!("{}", serde_json::to_string_pretty(&result_json(&result))?);\n', '        println!(\n            "{}",\n            serde_json::to_string_pretty(&result_json(&result, &filesystem))?\n        );\n'),
+              ('fn result_json(result: &RunResult) -> serde_json::Value {\n', 'fn result_json(result: &RunResult, filesystem: &str) -> serde_json::Value {\n'),
+              ('        "competitive_claim": false,\n        "platform": {\n', '        "competitive_claim": false,\n        "schema": CREATE_TABLE,\n        "concurrency": 1,\n        "platform": {\n'),
+              ('            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },\n        },\n', '            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },\n            "filesystem": filesystem,\n        },\n'),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected one source anchor, found {text.count(old)}: {old!r}')
+              text = text.replace(old, new)
+
+          marker = '''/// Peak resident set size of this process so far, in KiB. Reported as\n/// process-wide max RSS; it bounds the workload's footprint from above and\n/// includes setup/teardown allocations.\nfn peak_rss_kib() -> u64 {\n'''
+          helper = '''fn filesystem_type(path: &Path) -> String {\n    #[cfg(any(target_os = "linux", target_os = "android"))]\n    {\n        use std::ffi::CString;\n        use std::os::unix::ffi::OsStrExt;\n\n        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {\n            return "unavailable".to_owned();\n        };\n        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();\n        // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.\n        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {\n            return "unavailable".to_owned();\n        }\n        // SAFETY: a successful `statfs` call initialized the structure.\n        let stats = unsafe { stats.assume_init() };\n        format!("statfs:0x{:x}", stats.f_type as u64)\n    }\n\n    #[cfg(target_os = "macos")]\n    {\n        use std::ffi::{CStr, CString};\n        use std::os::unix::ffi::OsStrExt;\n\n        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {\n            return "unavailable".to_owned();\n        };\n        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();\n        // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.\n        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {\n            return "unavailable".to_owned();\n        }\n        // SAFETY: a successful `statfs` call initialized the structure, and\n        // Darwin guarantees `f_fstypename` is a NUL-terminated filesystem name.\n        let stats = unsafe { stats.assume_init() };\n        unsafe { CStr::from_ptr(stats.f_fstypename.as_ptr()) }\n            .to_string_lossy()\n            .into_owned()\n    }\n\n    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]\n    {\n        let _ = path;\n        "unknown".to_owned()\n    }\n}\n\n/// Peak resident set size of this process so far, in KiB. Reported as\n/// process-wide max RSS; it bounds the workload's footprint from above and\n/// includes setup/teardown allocations.\nfn peak_rss_kib() -> u64 {\n'''
+          if text.count(marker) != 1:
+              raise SystemExit(f'expected one peak-rss marker, found {text.count(marker)}')
+          path.write_text(text.replace(marker, helper))
+          PY
+          cargo fmt --all
+      - name: Commit source blob
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add examples/alpha_oltp.rs
+          git commit -m 'perf: materialize alpha OLTP metadata source'
+          git push
