@@ -1,0 +1,127 @@
+name: One-shot concurrent FK integrity
+
+on:
+  push:
+    branches:
+      - test/concurrent-fk-integrity
+
+permissions:
+  contents: write
+
+jobs:
+  qualify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          components: rustfmt, clippy
+      - name: Add overlapping FK race qualification
+        run: |
+          cat >> tests/project_referential_actions.rs <<'RS'
+
+          #[test]
+          fn overlapping_parent_delete_and_child_insert_cannot_both_commit() {
+              fn database_with_parent_and_restrict_fk() -> (tempfile::TempDir, RelationalDatabase) {
+                  let (directory, mut database) = setup();
+                  database
+                      .insert(PARENTS, row(PARENTS, 1, Some(0)))
+                      .expect("parent");
+                  database
+                      .create_foreign_key(fk(
+                          1,
+                          CHILDREN,
+                          PARENTS,
+                          omendb::ReferentialAction::Restrict,
+                      ))
+                      .expect("restrict fk");
+                  (directory, database)
+              }
+
+              // Child publishes first. The overlapping parent delete validated
+              // against the older child-table snapshot, so publication must
+              // reject it rather than leave a dangling reference.
+              {
+                  let (_directory, mut database) = database_with_parent_and_restrict_fk();
+                  let mut child = database.begin().expect("child transaction");
+                  let mut parent = database.begin().expect("parent transaction");
+                  child
+                      .insert(&database, CHILDREN, row(CHILDREN, 12, Some(1)))
+                      .expect("stage child");
+                  parent
+                      .delete(&database, PARENTS, key_of(PARENTS, 1))
+                      .expect("stage parent delete");
+
+                  child.commit().expect("child commits");
+                  assert!(matches!(
+                      parent.commit(),
+                      Err(omendb::DbError::SerializationConflict { .. })
+                  ));
+                  assert!(
+                      database
+                          .get(PARENTS, key_of(PARENTS, 1))
+                          .expect("parent read")
+                          .is_some()
+                  );
+                  assert!(
+                      database
+                          .get(CHILDREN, key_of(CHILDREN, 12))
+                          .expect("child read")
+                          .is_some()
+                  );
+              }
+
+              // Parent publishes first. The overlapping child insert validated
+              // its reference against the older parent-index snapshot, so its
+              // publication must reject rather than resurrect a dangling FK.
+              {
+                  let (_directory, mut database) = database_with_parent_and_restrict_fk();
+                  let mut child = database.begin().expect("child transaction");
+                  let mut parent = database.begin().expect("parent transaction");
+                  child
+                      .insert(&database, CHILDREN, row(CHILDREN, 12, Some(1)))
+                      .expect("stage child");
+                  parent
+                      .delete(&database, PARENTS, key_of(PARENTS, 1))
+                      .expect("stage parent delete");
+
+                  parent.commit().expect("parent commits");
+                  assert!(matches!(
+                      child.commit(),
+                      Err(omendb::DbError::SerializationConflict { .. })
+                  ));
+                  assert!(
+                      database
+                          .get(PARENTS, key_of(PARENTS, 1))
+                          .expect("parent read")
+                          .is_none()
+                  );
+                  assert!(
+                      database
+                          .get(CHILDREN, key_of(CHILDREN, 12))
+                          .expect("child read")
+                          .is_none()
+                  );
+              }
+          }
+          RS
+          cargo fmt --all
+      - name: Verify focused FK race
+        run: cargo test --locked --test project_referential_actions overlapping_parent_delete_and_child_insert_cannot_both_commit -- --nocapture
+      - name: Repeat focused FK race
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "FK race qualification run ${attempt}"
+            cargo test --locked --test project_referential_actions overlapping_parent_delete_and_child_insert_cannot_both_commit -- --nocapture
+          done
+      - name: Verify strict Clippy
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+      - name: Commit test and remove one-shot workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/one-shot-concurrent-fk-integrity.yml
+          git add tests/project_referential_actions.rs
+          git commit -m 'test: cover concurrent foreign-key integrity'
+          git push origin HEAD:${GITHUB_REF_NAME}
