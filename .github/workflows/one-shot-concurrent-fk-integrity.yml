@@ -24,21 +24,15 @@ jobs:
 
           path = Path('src/seer_direct.rs')
           text = path.read_text()
-          old = '''    fn index_tree(&self, index: IndexId) -> Result<TreeId> {
-              self.index_trees
-                  .get(&index)
-                  .copied()
-                  .ok_or_else(|| DbError::InvalidState(format!("index {} has no SeerDB tree", index.0)))
-          }
 
-          /// Read one row at this transaction's snapshot.
-          '''
-          new = '''    fn index_tree(&self, index: IndexId) -> Result<TreeId> {
-              self.index_trees
-                  .get(&index)
-                  .copied()
-                  .ok_or_else(|| DbError::InvalidState(format!("index {} has no SeerDB tree", index.0)))
-          }
+          impl_start = text.index('impl DirectTransaction {')
+          index_start = text.index(
+              '    fn index_tree(&self, index: IndexId) -> Result<TreeId> {',
+              impl_start,
+          )
+          read_marker = "\n    /// Read one row at this transaction's snapshot."
+          index_end = text.index(read_marker, index_start)
+          helper = '''
 
           /// Scan an entire tree while registering the range as a read dependency.
           ///
@@ -59,12 +53,8 @@ jobs:
               }
               Ok(entries)
           }
-
-          /// Read one row at this transaction's snapshot.
           '''
-          if text.count(old) != 1:
-              raise SystemExit(f'expected one DirectTransaction::index_tree anchor, found {text.count(old)}')
-          text = text.replace(old, new)
+          text = text[:index_end] + helper + text[index_end:]
 
           start_marker = '    fn validate_referential_integrity(&self) -> Result<()> {'
           tail_marker = '\n}\nfn validate_mapping'
@@ -96,10 +86,10 @@ jobs:
                           ))
                       })?;
 
-                  // Both sides of the FK predicate must participate in conflict
-                  // detection. The current alpha validator already examines the
-                  // complete child table and referenced unique index, so register
-                  // those same full ranges until validation becomes key-directed.
+                  // The current alpha validator already examines the complete child
+                  // table and referenced unique index. Register those same ranges so
+                  // a concurrent write cannot invalidate the successful check before
+                  // this transaction publishes.
                   let referenced_tree = self.index_tree(referenced_index.id)?;
                   let referenced_values: std::collections::HashSet<Vec<u8>> = self
                       .scan_with_range_dependency(referenced_tree)?
