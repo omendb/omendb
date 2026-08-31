@@ -375,3 +375,40 @@ fn overlapping_parent_delete_and_child_insert_cannot_both_commit() {
         );
     }
 }
+
+#[test]
+fn transaction_started_before_fk_activation_cannot_publish_dangling_reference() {
+    let (_directory, mut database) = setup();
+    seed(&mut database);
+
+    let mut stale = database.begin().expect("stale transaction");
+    stale
+        .delete(&database, PARENTS, key_of(PARENTS, 1))
+        .expect("stage parent delete");
+
+    database
+        .create_foreign_key(fk(
+            1,
+            CHILDREN,
+            PARENTS,
+            omendb::ReferentialAction::Restrict,
+        ))
+        .expect("activate restrict fk");
+
+    assert!(matches!(
+        stale.commit(),
+        Err(omendb::DbError::SerializationConflict { .. })
+    ));
+    assert!(
+        database
+            .get(PARENTS, key_of(PARENTS, 1))
+            .expect("parent read")
+            .is_some()
+    );
+    assert!(
+        database
+            .get(CHILDREN, key_of(CHILDREN, 11))
+            .expect("child read")
+            .is_some()
+    );
+}

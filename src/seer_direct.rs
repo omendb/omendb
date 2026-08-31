@@ -509,7 +509,24 @@ pub(crate) struct DirectTransaction {
 
 impl DirectTransaction {
     pub(crate) fn begin(store: &DirectSeerStore) -> Result<Self> {
-        let transaction = store.database.begin().map_err(map_seer_error)?;
+        let mut transaction = store.database.begin().map_err(map_seer_error)?;
+
+        // The relational mappings below are a snapshot of OmenDB's catalog.
+        // Fence any writing transaction that outlives a schema publication:
+        // every schema change rewrites this marker, and SeerDB validates the
+        // registered exact-key range against commits after our snapshot.
+        let mut catalog_end = DIRECT_CATALOG_MARKER.to_vec();
+        catalog_end.push(0);
+        drop(
+            transaction
+                .cursor(
+                    store.catalog_tree,
+                    DIRECT_CATALOG_MARKER,
+                    Some(&catalog_end),
+                )
+                .map_err(map_seer_error)?,
+        );
+
         Ok(Self {
             catalog: store.catalog.clone(),
             table_trees: store.table_trees.clone(),
