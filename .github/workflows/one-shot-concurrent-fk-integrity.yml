@@ -43,12 +43,12 @@ jobs:
               &mut self,
               tree: TreeId,
           ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-              let mut cursor = self
+              let cursor = self
                   .transaction
                   .cursor(tree, &[], None)
                   .map_err(map_seer_error)?;
               let mut entries = Vec::new();
-              while let Some(entry) = cursor.next() {
+              for entry in cursor {
                   entries.push(entry.map_err(map_seer_error)?);
               }
               Ok(entries)
