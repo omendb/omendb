@@ -84,8 +84,8 @@ covers clean recovery after daemon loss. The documented wire subset is tested
 through `tokio-postgres`, negative SQLSTATE/unsupported paths, and a dedicated
 live PostgreSQL 18.6 differential oracle. Broader protocol features and true
 execution-memory quotas remain outside the current compatibility claim and are
-listed in `docs/pgwire-compatibility.md`; process-level publication-seam
-coverage remains a separate correctness gate below.
+listed in `docs/pgwire-compatibility.md`; SeerDB's process-level publication
+matrix provides the storage-side crash coverage below.
 
 - [x] a persistent daemon opens a durable database and supports multiple
       sessions with clean startup, shutdown, cancellation, and reopen;
@@ -107,11 +107,21 @@ coverage remains a separate correctness gate below.
 - [x] property tests exercise row and row-identity encoding roundtrips,
       truncation refusal, and corruption detection; a randomized SQL trace
       covers transaction sequences against the SQLite oracle;
-- [ ] concurrent transaction tests cover read/write, write/write, unique,
-      foreign-key, snapshot, cancellation, and admission outcomes;
-- [ ] every durable publication seam has a process-level kill/reopen test;
-      the daemon-level SIGKILL/reopen path is covered, but storage publication
-      seams still need their own process-level matrix.
+- [x] concurrent transaction tests cover read/write, write/write, unique,
+      foreign-key, snapshot, cancellation, and admission outcomes. Evidence
+      includes the wire-level hot-key RMW invariant in
+      `tests/project_concurrency_stress.rs`, overlapping unique-value conflicts
+      in `src/seer_direct.rs`, concurrent FK and stale-catalog/DDL races in
+      `tests/project_referential_actions.rs`, stable read views while writers
+      advance in `crates/seerdb/tests/read_view.rs`, cancellation in
+      `tests/project_cancellation.rs`, and bounded connection admission in
+      `tests/project_pgwire_server.rs`;
+- [x] every durable publication seam in SeerDB's current publication protocol
+      has process-level kill/reopen coverage. The
+      `dbnext_r0_process_crash_publication_matrix` test exits its child with
+      code 137 after WAL sync, page write/sync, manifest mirror/sync,
+      post-manifest, and final-space faults, and accepts only the documented
+      old/new durable outcomes;
 - [x] a versioned on-disk fixture (`tests/fixtures/format-current/`,
       regenerated deliberately per format change) proves the documented
       open/upgrade policy.
@@ -124,8 +134,10 @@ coverage remains a separate correctness gate below.
       replay (SeerDB transactional fault tests + seer_direct qualification);
 - [x] recovery-required behavior has an operator-facing runbook
       (`docs/runbook.md`);
-- [ ] recovery tests assert both the durable outcome and the allowed next
-      operation, not only that reopening succeeds.
+- [x] recovery tests assert both the durable outcome and the allowed next
+      operation. `crates/seerdb/tests/recovery_next_operation.rs` brackets
+      pre-publication old-state recovery and post-authority new-state recovery,
+      commits a subsequent mutation, and reopens again to verify that commit.
 
 ### Performance
 
