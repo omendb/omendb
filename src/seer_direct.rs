@@ -588,6 +588,23 @@ impl DirectTransaction {
             .ok_or_else(|| DbError::InvalidState(format!("index {} has no SeerDB tree", index.0)))
     }
 
+    /// Scan an entire tree while registering the range as a read dependency.
+    ///
+    /// Referential-integrity validation uses this instead of snapshot-only
+    /// `scan` so a concurrent write cannot invalidate the checked state before
+    /// publication.
+    fn scan_with_range_dependency(&mut self, tree: TreeId) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cursor = self
+            .transaction
+            .cursor(tree, &[], None)
+            .map_err(map_seer_error)?;
+        let mut entries = Vec::new();
+        for entry in cursor {
+            entries.push(entry.map_err(map_seer_error)?);
+        }
+        Ok(entries)
+    }
+
     /// Read one row at this transaction's snapshot.
     pub(crate) fn get(&mut self, table: TableId, identity: &[u8]) -> Result<Option<Row>> {
         let definition = self.catalog.table(table)?.clone();
@@ -950,27 +967,34 @@ impl DirectTransaction {
     /// Validate every foreign key in the catalog against the transaction's
     /// snapshot-plus-staged state. Every non-null child reference must have
     /// a matching entry in the referenced table's unique covering index.
-    fn validate_referential_integrity(&self) -> Result<()> {
+    fn validate_referential_integrity(&mut self) -> Result<()> {
         if self.catalog.foreign_keys().next().is_none() {
             return Ok(());
         }
-        for foreign_key in self.catalog.foreign_keys() {
-            let child_definition = self.catalog.table(foreign_key.table)?;
-            let referenced_definition = self.catalog.table(foreign_key.referenced_table)?;
+        let foreign_keys: Vec<ForeignKeyDefinition> =
+            self.catalog.foreign_keys().cloned().collect();
+        for foreign_key in foreign_keys {
+            let child_definition = self.catalog.table(foreign_key.table)?.clone();
+            let referenced_definition = self.catalog.table(foreign_key.referenced_table)?.clone();
             let referenced_index = self
                 .catalog
                 .indexes_for(foreign_key.referenced_table)
                 .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
+                .cloned()
                 .ok_or_else(|| {
                     DbError::InvalidState(format!(
                         "foreign key {} has no unique referenced index",
                         foreign_key.id.0
                     ))
                 })?;
+
+            // The current alpha validator already examines the complete child
+            // table and referenced unique index. Register those same ranges so
+            // a concurrent write cannot invalidate the successful check before
+            // this transaction publishes.
+            let referenced_tree = self.index_tree(referenced_index.id)?;
             let referenced_values: std::collections::HashSet<Vec<u8>> = self
-                .transaction
-                .scan(self.index_tree(referenced_index.id)?, &[], None, usize::MAX)
-                .map_err(map_seer_error)?
+                .scan_with_range_dependency(referenced_tree)?
                 .into_iter()
                 .filter_map(|(entry, existing_identity)| {
                     decode_index_entry(&entry, &existing_identity)
@@ -978,22 +1002,20 @@ impl DirectTransaction {
                         .map(|(values, _)| values)
                 })
                 .collect();
-            let child_rows = self
-                .transaction
-                .scan(self.table_tree(foreign_key.table)?, &[], None, usize::MAX)
-                .map_err(map_seer_error)?;
+            let child_tree = self.table_tree(foreign_key.table)?;
+            let child_rows = self.scan_with_range_dependency(child_tree)?;
             for (identity_bytes, bytes) in child_rows {
                 let row = row_from_storage_identity(
                     &self.catalog,
-                    child_definition,
+                    &child_definition,
                     &identity_bytes,
                     &bytes,
                 )?;
-                let values = foreign_key_values(&row, child_definition, &foreign_key.columns)?;
+                let values = foreign_key_values(&row, &child_definition, &foreign_key.columns)?;
                 if values.iter().any(|value| matches!(value, Value::Null)) {
                     continue;
                 }
-                let encoded = index_values_key(referenced_definition, referenced_index, &values)?;
+                let encoded = index_values_key(&referenced_definition, &referenced_index, &values)?;
                 if !referenced_values.contains(&encoded) {
                     return Err(DbError::ForeignKeyViolation {
                         constraint: foreign_key.id.0,
