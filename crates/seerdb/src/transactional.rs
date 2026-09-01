@@ -262,6 +262,11 @@ struct StagedCommit {
     mutations: Vec<BatchMutation>,
     changed_trees: BTreeSet<TreeId>,
     writes: BTreeSet<(TreeId, Vec<u8>)>,
+    /// Encoded change record, preflighted at stage time so the publish
+    /// lane only assigns its key. The assigned sequence number lives in
+    /// the record key, not the payload, so the encoding cannot depend on
+    /// publication order.
+    change_record: Vec<u8>,
     /// Filled by the publisher immediately before installation.
     assigned: CommitSeq,
     outcome: std::sync::mpsc::Sender<std::result::Result<CommitPosition, Arc<Error>>>,
@@ -1484,8 +1489,28 @@ fn stage_commit(
         reject_unpublished_conflicts(transaction, &publishing.keys, &publishing.trees)?;
     }
 
-    let mut mutations = Vec::new();
+    let mut changed_trees = transaction.created.clone();
+    changed_trees.extend(transaction.dropped.iter().copied());
     let mut writes = BTreeSet::new();
+    for (tree, key) in transaction.writes.keys() {
+        if transaction.dropped.contains(tree) {
+            continue;
+        }
+        writes.insert((*tree, key.clone()));
+    }
+
+    // The change record is encoded and bounds-checked here, before any
+    // version-store or candidate work, so the serialized publish lane never
+    // panics on an oversized transaction and rejected staging leaves no
+    // partial state behind.
+    let change_record = encode_change_body(
+        transaction.id,
+        transaction.snapshot,
+        &changed_trees,
+        &writes,
+    )?;
+
+    let mut mutations = Vec::new();
     for ((tree, key), value) in &transaction.writes {
         if transaction.dropped.contains(tree) {
             continue;
@@ -1502,11 +1527,8 @@ fn stage_commit(
                 value: value.clone(),
             })?,
         });
-        writes.insert((*tree, key.clone()));
     }
 
-    let mut changed_trees = transaction.created.clone();
-    changed_trees.extend(transaction.dropped.iter().copied());
     for tree in &changed_trees {
         let lifecycle = if transaction.dropped.contains(tree) {
             TREE_DROPPED
@@ -1527,8 +1549,8 @@ fn stage_commit(
         });
     }
 
-    // Status and change records are built by the publisher once the wave's
-    // sequence numbers are assigned; staged mutations stay data-only.
+    // The status record is built by the publisher once the wave's sequence
+    // numbers are assigned; staged mutations stay data-only.
 
     let (sender, receiver) = std::sync::mpsc::channel();
     prepare.keys.extend(writes.iter().cloned());
@@ -1540,6 +1562,7 @@ fn stage_commit(
         mutations,
         changed_trees,
         writes,
+        change_record,
         assigned: CommitSeq::new(0),
         outcome: sender,
     });
@@ -1656,16 +1679,12 @@ fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: DrainedCommits<'_>
                 key: status_record_key(staged.transaction),
                 value: encode_status(staged.assigned),
             });
-            let change = CommittedChange {
-                commit: staged.assigned,
-                transaction: staged.transaction,
-                snapshot: staged.snapshot,
-                changed_trees: staged.changed_trees.clone(),
-                writes: staged.writes.clone(),
-            };
+            // The payload was encoded and bounds-checked at stage time; the
+            // publisher only assigns its key, which carries the sequence
+            // number.
             batch.push(BatchMutation::Put {
                 key: change_record_key(staged.assigned),
-                value: encode_change(&change).expect("change record fits"),
+                value: staged.change_record.clone(),
             });
             batch
         })
@@ -2189,21 +2208,29 @@ fn decode_status(bytes: &[u8]) -> Result<CommitSeq> {
     Ok(commit)
 }
 
-fn encode_change(change: &CommittedChange) -> Result<Vec<u8>> {
-    let tree_count = u32::try_from(change.changed_trees.len())
+/// Encode the change-record payload. The stream position lives in the
+/// record key, not the body, so the body can be built and bounds-checked
+/// before the publish lane assigns the sequence number.
+fn encode_change_body(
+    transaction: TxnId,
+    snapshot: CommitSeq,
+    changed_trees: &BTreeSet<TreeId>,
+    writes: &BTreeSet<(TreeId, Vec<u8>)>,
+) -> Result<Vec<u8>> {
+    let tree_count = u32::try_from(changed_trees.len())
         .map_err(|_| Error::InvalidArgument("too many changed trees".into()))?;
-    let write_count = u32::try_from(change.writes.len())
+    let write_count = u32::try_from(writes.len())
         .map_err(|_| Error::InvalidArgument("too many transaction writes".into()))?;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(CHANGE_MAGIC);
-    bytes.extend_from_slice(&change.transaction.get().to_be_bytes());
-    bytes.extend_from_slice(&change.snapshot.get().to_be_bytes());
+    bytes.extend_from_slice(&transaction.get().to_be_bytes());
+    bytes.extend_from_slice(&snapshot.get().to_be_bytes());
     bytes.extend_from_slice(&tree_count.to_be_bytes());
-    for tree in &change.changed_trees {
+    for tree in changed_trees {
         bytes.extend_from_slice(&tree.get().to_be_bytes());
     }
     bytes.extend_from_slice(&write_count.to_be_bytes());
-    for (tree, key) in &change.writes {
+    for (tree, key) in writes {
         let length = u32::try_from(key.len())
             .map_err(|_| Error::InvalidArgument("transaction key is too large".into()))?;
         bytes.extend_from_slice(&tree.get().to_be_bytes());
@@ -2212,10 +2239,19 @@ fn encode_change(change: &CommittedChange) -> Result<Vec<u8>> {
     }
     if bytes.len() > MAX_CHANGE_RECORD_BYTES {
         return Err(Error::InvalidArgument(
-            "transaction conflict record is too large".into(),
+            "transaction change record exceeds the size limit".into(),
         ));
     }
     Ok(bytes)
+}
+
+fn encode_change(change: &CommittedChange) -> Result<Vec<u8>> {
+    encode_change_body(
+        change.transaction,
+        change.snapshot,
+        &change.changed_trees,
+        &change.writes,
+    )
 }
 
 fn decode_change(key: &[u8], bytes: &[u8]) -> Result<CommittedChange> {
@@ -2585,6 +2621,122 @@ mod tests {
         slow.advance(head).expect("slow advance");
         let pruned = database.gc_changes().expect("gc after both advance");
         assert!(pruned.changes_after < pruned.changes_before);
+    }
+
+    /// Key length for oversized/boundary change-record staging. Chosen so
+    /// one write costs `12 + key` change-record bytes while both leaf and
+    /// internal pages still split reliably at this separator size; larger
+    /// keys approach the internal-page entry budget and fail to split.
+    const OVERSIZED_KEY_LENGTH: usize = 900;
+
+    fn oversized_staging_shape() -> (usize, usize) {
+        let per_write = 12 + OVERSIZED_KEY_LENGTH;
+        let writes_for_limit = (MAX_CHANGE_RECORD_BYTES - 28) / per_write;
+        (OVERSIZED_KEY_LENGTH, writes_for_limit)
+    }
+
+    #[test]
+    fn oversized_change_record_rejects_staging_without_state_mutation() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        commit_key(&database, owned, b"seed");
+        let head_before = database.snapshot_export().expect("export").csn;
+
+        // A transaction whose change record exceeds the record bound but
+        // whose WAL footprint stays inside the admission budget used to
+        // reach the serialized publisher and panic. Staging must return a
+        // normal error instead.
+        let (_, writes_for_limit) = oversized_staging_shape();
+        let error = {
+            let mut oversized = database.begin().expect("begin");
+            for position in 0..(writes_for_limit + 1) {
+                let mut key = vec![0u8; OVERSIZED_KEY_LENGTH];
+                key[..8].copy_from_slice(&position.to_be_bytes());
+                oversized.put(owned, &key, b"v").expect("put");
+            }
+            oversized.commit()
+        }
+        .expect_err("oversized change record");
+        assert!(
+            matches!(&error, Error::InvalidArgument(message) if message.contains("size limit")),
+            "unexpected error: {error:?}"
+        );
+
+        // Rejection mutated nothing: the head is unchanged, committed data
+        // is intact, and new transactions still work.
+        let head_after = database.snapshot_export().expect("export").csn;
+        assert_eq!(head_after, head_before);
+        assert_eq!(
+            database
+                .read_changes(CommitSeq::new(1), usize::MAX)
+                .expect("read changes")
+                .len() as u64,
+            head_before.get()
+        );
+        commit_key(&database, owned, b"after-reject");
+        let head_next = database.snapshot_export().expect("export").csn;
+        assert_eq!(head_next.get(), head_before.get() + 1);
+        let mut read = database.begin().expect("read");
+        assert_eq!(
+            read.get(owned, b"after-reject").expect("read"),
+            Some(b"after-reject".to_vec())
+        );
+        read.abort().expect("abort");
+    }
+
+    #[test]
+    fn boundary_sized_change_record_commits() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+
+        // Largest write count whose change record still fits the bound.
+        let (_, writes_for_limit) = oversized_staging_shape();
+        let mut boundary = database.begin().expect("begin");
+        for position in 0..writes_for_limit {
+            let mut key = vec![0u8; OVERSIZED_KEY_LENGTH];
+            key[..8].copy_from_slice(&position.to_be_bytes());
+            boundary.put(owned, &key, b"v").expect("put");
+        }
+        let position = boundary.commit().expect("boundary commit");
+        assert!(position.csn.get() >= 1);
+
+        // The committed change record decodes back with the full write set.
+        let changes = database
+            .read_changes(CommitSeq::new(position.csn.get()), 1)
+            .expect("read boundary change");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].writes.len(), writes_for_limit);
+    }
+
+    #[test]
+    fn rejected_oversized_staging_keeps_conflict_indexes_exact() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+
+        // Stage an oversized transaction but never let it commit: the error
+        // surfaces at staging, so queued conflict indexes must not retain
+        // its keys.
+        let (key_length, writes_for_limit) = oversized_staging_shape();
+        let oversized_result = {
+            let mut oversized = database.begin().expect("begin");
+            for position in 0..(writes_for_limit + 1) {
+                let mut key = vec![0u8; key_length];
+                key[..8].copy_from_slice(&position.to_be_bytes());
+                oversized.put(owned, &key, b"v").expect("put");
+            }
+            oversized.commit()
+        };
+        assert!(oversized_result.is_err());
+
+        // A later writer must win the same keys: the rejected staging left
+        // no conflict-index residue.
+        let mut probe = vec![0u8; key_length];
+        probe[..8].copy_from_slice(&0u64.to_be_bytes());
+        let mut winner = database.begin().expect("begin");
+        winner.put(owned, &probe, b"w").expect("put");
+        winner
+            .commit()
+            .expect("winner commits against rejected keys");
     }
 
     #[test]

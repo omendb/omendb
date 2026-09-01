@@ -27,9 +27,12 @@ Publication is a two-phase pipeline with one ordered publish lane.
    leader swaps out the staged queue **before** acquiring the database handle
    (staging waits on the database lock while holding prepare, so taking the
    database lock first would deadlock), assigns each member its sequence as
-   `head + position + 1`, builds per-member status/change records, chains the
-   candidate states, syncs the version store once and the WAL once, and
-   publishes **one authority frame** covering all members.
+   `head + position + 1`, installs the per-member status record plus the
+   member's **stage-time-encoded** change record under its assigned key
+   (encoding and the 16 MiB record bound are validated during staging, so the
+   serialized lane never re-encodes or panics), chains the candidate states,
+   syncs the version store once and the WAL once, and publishes **one
+   authority frame** covering all members.
 3. **Control-plane writers join the lane.** Tree reservations, retention-lease
    writes, change GC, and version GC drain staged work before their own inline
    single-commit publications, so every consumer of a sequence number passes
