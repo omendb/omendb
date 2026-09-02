@@ -12,25 +12,46 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use omendb::pgwire_server;
 use tempfile::tempdir;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row};
 
 const POSTGRES_ORACLE_URL: &str = "POSTGRES_ORACLE_URL";
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct QuerySnapshot {
     columns: Vec<(String, u32)>,
     rows: Vec<Vec<Cell>>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Cell {
     Null,
     Bool(bool),
     I64(i64),
     Text(String),
     Bytes(Vec<u8>),
+    F64(NanEqF64),
+    /// Days since the Unix epoch (OmenDB's date representation; the
+    /// oracle compares through the text form, so this carries PG's
+    /// normalized text).
+    Date(String),
+    Timestamp(String),
+    Numeric(String),
+    Uuid(String),
 }
+
+/// f64 wrapper where NaN equals NaN (the SQL float total order), used
+/// inside the oracle's snapshot cells.
+#[derive(Debug)]
+struct NanEqF64(f64);
+
+impl PartialEq for NanEqF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.is_nan() && other.0.is_nan() || self.0 == other.0
+    }
+}
+
+impl Eq for NanEqF64 {}
 
 async fn connect(
     config: &str,
@@ -90,7 +111,11 @@ async fn snapshot(
         .query(&statement, params)
         .await
         .with_context(|| format!("execute oracle query: {sql}"))?;
-    let rows = rows.iter().map(decode_row).collect::<Result<Vec<_>>>()?;
+    let rows = rows
+        .iter()
+        .map(decode_row)
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("decode oracle query: {sql}"))?;
     Ok(QuerySnapshot { columns, rows })
 }
 
@@ -132,6 +157,36 @@ fn decode_cell(row: &Row, index: usize, data_type: &Type) -> Result<Cell> {
         return Ok(row
             .try_get::<_, Option<Vec<u8>>>(index)?
             .map_or(Cell::Null, Cell::Bytes));
+    }
+    // Typed scalars compare through their canonical client-rendered text
+    // form. tokio-postgres has no text FromSql for these types in binary
+    // mode, so the oracle carries its own wire decoders - independently
+    // written from the PostgreSQL formats, which doubles as a check on
+    // OmenDB's encoders.
+    if data_type == &Type::FLOAT8 {
+        return Ok(row
+            .try_get::<_, Option<f64>>(index)?
+            .map_or(Cell::Null, |value| Cell::F64(NanEqF64(value))));
+    }
+    if data_type == &Type::DATE {
+        return Ok(row
+            .try_get::<_, Option<DateText>>(index)?
+            .map_or(Cell::Null, |value| Cell::Date(value.0)));
+    }
+    if data_type == &Type::TIMESTAMP {
+        return Ok(row
+            .try_get::<_, Option<TimestampText>>(index)?
+            .map_or(Cell::Null, |value| Cell::Timestamp(value.0)));
+    }
+    if data_type == &Type::NUMERIC {
+        return Ok(row
+            .try_get::<_, Option<NumericText>>(index)?
+            .map_or(Cell::Null, |value| Cell::Numeric(value.0)));
+    }
+    if data_type == &Type::UUID {
+        return Ok(row
+            .try_get::<_, Option<UuidText>>(index)?
+            .map_or(Cell::Null, |value| Cell::Uuid(value.0)));
     }
     bail!(
         "live PostgreSQL oracle returned unsupported comparison type {} (OID {})",
@@ -314,6 +369,11 @@ async fn documented_wire_subset_matches_live_postgresql() -> Result<()> {
     )
     .await?;
 
+    // Typed scalar values: DDL with typed columns, literal inserts,
+    // binary parameters, text/binary result decoding, ordering, and
+    // arithmetic must all agree with live PostgreSQL.
+    typed_scalar_subset_matches_live_postgres(&omendb, &postgres).await?;
+
     drop(omendb);
     drop(postgres);
     server.shutdown().await.context("shutdown OmenDB oracle")?;
@@ -324,4 +384,282 @@ async fn documented_wire_subset_matches_live_postgresql() -> Result<()> {
         .await
         .context("join PostgreSQL oracle connection")??;
     Ok(())
+}
+
+/// Create the typed-table pair (OmenDB + PostgreSQL) and run the typed
+/// comparisons. Both clients' tables use identical DDL.
+async fn typed_scalar_subset_matches_live_postgres(
+    omendb: &Client,
+    postgres: &Client,
+) -> Result<()> {
+    postgres
+        .execute("DROP TABLE IF EXISTS oracle_typed", &[])
+        .await?;
+    // Unconstrained NUMERIC: OmenDB accepts NUMERIC(p,s) DDL but stores
+    // unconstrained scale-tracked decimals today (documented divergence);
+    // the oracle compares the unconstrained behavior.
+    let typed_ddl = "CREATE TABLE oracle_typed (
+            id BIGINT PRIMARY KEY,
+            price NUMERIC,
+            ratio DOUBLE PRECISION,
+            occurred DATE NOT NULL,
+            seen_at TIMESTAMP,
+            token UUID
+        )";
+    omendb.execute(typed_ddl, &[]).await?;
+    postgres.execute(typed_ddl, &[]).await?;
+
+    let typed_inserts = [
+        "INSERT INTO oracle_typed VALUES (1, '19.99', '0.5', '2026-08-31', '2026-08-31 13:45:21.123456', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+        "INSERT INTO oracle_typed VALUES (2, '0.001', 'NaN', '2026-01-01', '2026-08-31 13:45:21', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12')",
+        "INSERT INTO oracle_typed VALUES (3, '-2.75', '-1.5', '2025-12-31', NULL, 'b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a13')",
+    ];
+    for insert in typed_inserts {
+        omendb.execute(insert, &[]).await?;
+        postgres.execute(insert, &[]).await?;
+    }
+
+    // Full projection round-trip: text-form cells must match exactly.
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT id, price, ratio, occurred, seen_at, token FROM oracle_typed ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    // Numeric ordering and cross-type comparison.
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT id FROM oracle_typed WHERE price > 1 ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    // Date range comparison through a literal.
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT id FROM oracle_typed WHERE occurred < '2026-08-31' ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    // Decimal arithmetic and aggregate.
+    compare_query(omendb, postgres, "SELECT SUM(price) FROM oracle_typed", &[]).await?;
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT MIN(occurred), MAX(occurred) FROM oracle_typed",
+        &[],
+    )
+    .await?;
+
+    // Float text rendering (NaN, negatives) matches.
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT ratio FROM oracle_typed ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    // Binary parameter round-trip: tokio-postgres sends float8/date/
+    // timestamp/uuid parameters as binary and decodes typed results as
+    // binary; any wire-encoder mismatch fails here. (numeric parameters
+    // would need the rust_decimal feature and stay covered by the
+    // text-form comparisons above.)
+    compare_query(
+        omendb,
+        postgres,
+        "SELECT id, ratio, occurred FROM oracle_typed WHERE ratio > $1 ORDER BY id",
+        &[&(-10.0_f64)],
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Oracle-side wire decoders. Independent from OmenDB's encoders so the
+// comparison is honest; formats from PostgreSQL's COPY BINARY spec.
+// ---------------------------------------------------------------------------
+
+/// DATE: i32 big-endian days since 2000-01-01 -> `YYYY-MM-DD`.
+struct DateText(String);
+
+impl<'a> FromSql<'a> for DateText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let raw: [u8; 4] = raw.try_into().map_err(|_| "date width")?;
+        let days = i32::from_be_bytes(raw);
+        // days since 2000-01-01 -> since 1970-01-01
+        Ok(DateText(civil_from_days(days + 10_957)))
+    }
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::DATE
+    }
+}
+
+/// TIMESTAMP: i64 big-endian micros since 2000-01-01 -> ISO text with
+/// fraction trimmed like PostgreSQL.
+struct TimestampText(String);
+
+impl<'a> FromSql<'a> for TimestampText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let raw: [u8; 8] = raw.try_into().map_err(|_| "timestamp width")?;
+        let micros = i64::from_be_bytes(raw) + 946_684_800_000_000; // to Unix epoch
+        let days = micros.div_euclid(86_400_000_000);
+        let time = micros.rem_euclid(86_400_000_000);
+        let date = civil_from_days(i32::try_from(days).map_err(|_| "timestamp range")?);
+        let hour = time / 3_600_000_000;
+        let minute = (time / 60_000_000) % 60;
+        let second = (time / 1_000_000) % 60;
+        let fraction = time % 1_000_000;
+        let text = if fraction == 0 {
+            format!("{date} {hour:02}:{minute:02}:{second:02}")
+        } else {
+            let trimmed = format!("{fraction:06}");
+            format!(
+                "{date} {hour:02}:{minute:02}:{second:02}.{}",
+                trimmed.trim_end_matches('0')
+            )
+        };
+        Ok(TimestampText(text))
+    }
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::TIMESTAMP
+    }
+}
+
+/// NUMERIC: ndigits | weight | sign | dscale | base-10000 groups ->
+/// PostgreSQL-normalized text.
+struct NumericText(String);
+
+impl<'a> FromSql<'a> for NumericText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 8 || !raw.len().is_multiple_of(2) {
+            return Err("numeric width".into());
+        }
+        let be16 = |offset: usize| u16::from_be_bytes([raw[offset], raw[offset + 1]]);
+        let ndigits = be16(0) as usize;
+        if raw.len() != 8 + ndigits * 2 {
+            return Err("numeric group count".into());
+        }
+        let weight = i16::from_be_bytes([raw[2], raw[3]]) as i64;
+        let sign = be16(4);
+        let dscale = be16(6) as usize;
+        let groups: Vec<u16> = (0..ndigits).map(|i| be16(8 + i * 2)).collect();
+
+        let mut text = String::new();
+        if sign == 0x4000 {
+            text.push('-');
+        }
+        if groups.is_empty() {
+            text.push('0');
+            if dscale > 0 {
+                text.push('.');
+                for _ in 0..dscale {
+                    text.push('0');
+                }
+            }
+            return Ok(NumericText(text));
+        }
+        // Integer part: groups [0..weight+1) when weight >= 0.
+        let int_group_count = usize::try_from(weight + 1).unwrap_or(0);
+        let (int_groups, frac_groups) = if groups.len() >= int_group_count && weight >= 0 {
+            (&groups[..int_group_count], &groups[int_group_count..])
+        } else {
+            (&[] as &[u16], &groups[..])
+        };
+        let mut int_part = String::new();
+        for (index, group) in int_groups.iter().enumerate() {
+            if index == 0 {
+                int_part.push_str(&group.to_string());
+            } else {
+                int_part.push_str(&format!("{group:04}"));
+            }
+        }
+        if int_part.is_empty() {
+            text.push('0');
+        } else {
+            text.push_str(&int_part);
+        }
+        if dscale > 0 {
+            // Fraction digits from the groups below 10^0, padded to 4,
+            // then fixed to exactly dscale digits.
+            let mut frac_digits = String::new();
+            let mut remaining_groups = frac_groups.to_vec();
+            if weight < 0 {
+                // All groups are fractional; leading zero digits sit
+                // between the decimal point and the first group.
+                let leading_zeros = (-weight - 1) * 4;
+                for _ in 0..leading_zeros {
+                    frac_digits.push('0');
+                }
+                remaining_groups = groups.clone();
+            }
+            for group in &remaining_groups {
+                frac_digits.push_str(&format!("{group:04}"));
+            }
+            while frac_digits.len() < dscale {
+                frac_digits.push('0');
+            }
+            frac_digits.truncate(dscale);
+            text.push('.');
+            text.push_str(&frac_digits);
+        }
+        Ok(NumericText(text))
+    }
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::NUMERIC
+    }
+}
+
+/// UUID: 16 raw bytes -> canonical hyphenated lowercase hex.
+struct UuidText(String);
+
+impl<'a> FromSql<'a> for UuidText {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let raw: [u8; 16] = raw.try_into().map_err(|_| "uuid width")?;
+        let mut text = String::with_capacity(36);
+        for (index, byte) in raw.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                text.push('-');
+            }
+            text.push_str(&format!("{byte:02x}"));
+        }
+        Ok(UuidText(text))
+    }
+    fn accepts(ty: &Type) -> bool {
+        ty == &Type::UUID
+    }
+}
+
+/// Proleptic Gregorian date text from days since 1970-01-01.
+fn civil_from_days(days: i32) -> String {
+    let z = i64::from(days) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }

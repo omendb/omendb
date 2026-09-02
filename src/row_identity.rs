@@ -96,7 +96,7 @@ impl RowIdentity {
         );
         for (column, value) in self.columns.iter().zip(&self.values) {
             bytes.extend_from_slice(&column.0.to_le_bytes());
-            value.encode(&mut bytes)?;
+            value.encode_for_key(&mut bytes)?;
         }
         Ok(bytes)
     }
@@ -214,6 +214,7 @@ impl Cursor<'_> {
     }
 
     fn value(&mut self) -> Result<Value> {
+        use crate::sql_types::{DateValue, DecimalValue, F64, TimestampValue, UuidValue};
         match self.byte()? {
             0 => Err(self.corrupt("NULL is not valid in a row identity")),
             1 => Ok(Value::Bytes(self.bytes()?)),
@@ -229,6 +230,25 @@ impl Cursor<'_> {
             5 => String::from_utf8(self.bytes()?)
                 .map(Value::Text)
                 .map_err(|_| self.corrupt("text is not UTF-8 in row identity")),
+            6 => Ok(Value::Float64(F64(f64::from_le_bytes(
+                self.take(8)?.try_into().expect("f64 width"),
+            )))),
+            7 => Ok(Value::Date(DateValue(i32::from_le_bytes(
+                self.take(4)?.try_into().expect("i32 width"),
+            )))),
+            8 => Ok(Value::Timestamp(TimestampValue(i64::from_le_bytes(
+                self.take(8)?.try_into().expect("i64 width"),
+            )))),
+            9 => {
+                let mantissa = i128::from_le_bytes(self.take(16)?.try_into().expect("i128 width"));
+                let scale = u32::from_le_bytes(self.take(4)?.try_into().expect("u32 width"));
+                DecimalValue::new(mantissa, scale)
+                    .map(Value::Decimal)
+                    .map_err(|_| self.corrupt("invalid decimal in row identity"))
+            }
+            10 => Ok(Value::Uuid(UuidValue(
+                self.take(16)?.try_into().expect("uuid width"),
+            ))),
             _ => Err(self.corrupt("unknown value tag in row identity")),
         }
     }

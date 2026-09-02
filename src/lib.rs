@@ -21,6 +21,7 @@ mod seer_direct;
 mod serializable;
 mod session;
 mod sql;
+mod sql_types;
 
 pub use fault::{FailOnce, FaultInjector, FaultPoint, NoFaults};
 pub use model::{CommitId, IndexId, Key, Mutation, StorageIdentity};
@@ -57,6 +58,11 @@ pub use session::{
     RelationalSessionStatus,
 };
 pub use sql::{SqlColumn, SqlResult};
+pub use sql_types::{
+    DECIMAL_MAX_PRECISION, DateValue, DecimalValue, F64, MAX_DATE_DAYS, MAX_TIMESTAMP_MICROS,
+    MIN_DATE_DAYS, MIN_TIMESTAMP_MICROS, POSTGRES_EPOCH_OFFSET_DAYS, POSTGRES_EPOCH_OFFSET_MICROS,
+    TimestampValue, UuidValue,
+};
 #[cfg(feature = "pgwire")]
 pub mod pgwire_server;
 pub type Result<T> = std::result::Result<T, DbError>;

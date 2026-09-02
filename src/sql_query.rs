@@ -668,8 +668,72 @@ impl ComputedTerm {
     }
 }
 
+/// SQL arithmetic promotion: both operands must be numeric. Integers
+/// stay in the i128 integer domain; a float operand promotes both sides
+/// to float8 (IEEE semantics, division by zero yields ±infinity like
+/// PostgreSQL); two decimals stay exact at the wider scale; an integer
+/// mixed with a decimal runs exactly in the decimal domain.
 fn arithmetic(op: &BinaryOperator, lhs: &Value, rhs: &Value) -> Result<Value> {
+    use crate::sql_types::DecimalValue;
     use BinaryOperator::*;
+
+    let float_pair = matches!(
+        (lhs, rhs),
+        (Value::Float64(_), _)
+            | (_, Value::Float64(_))
+            if matches!(rhs, Value::I64(_) | Value::U64(_) | Value::Float64(_) | Value::Decimal(_))
+                && matches!(lhs, Value::I64(_) | Value::U64(_) | Value::Float64(_) | Value::Decimal(_))
+    );
+    if float_pair {
+        let l = sql_float(lhs);
+        let r = sql_float(rhs);
+        let quotient = match op {
+            Plus => Some(l + r),
+            Minus => Some(l - r),
+            Multiply => Some(l * r),
+            Divide if r == 0.0 => Some(l / r), // PostgreSQL float8: x/0 = ±infinity
+            Divide => Some(l / r),
+            _ => {
+                return Err(unsupported(
+                    "projection",
+                    "modulo is not defined for float operands",
+                ));
+            }
+        };
+        return Ok(Value::Float64(crate::sql_types::F64::new(
+            quotient.expect("float arithmetic"),
+        )));
+    }
+
+    let decimal_pair = matches!(
+        (lhs, rhs),
+        (Value::Decimal(_) | Value::I64(_) | Value::U64(_), Value::Decimal(_) | Value::I64(_) | Value::U64(_))
+            if matches!(lhs, Value::Decimal(_)) || matches!(rhs, Value::Decimal(_))
+    );
+    if decimal_pair {
+        let l = sql_decimal(lhs)?;
+        let r = sql_decimal(rhs)?;
+        let scale = l.scale.max(r.scale);
+        let l = l.rescale(scale)?;
+        let r = r.rescale(scale)?;
+        let (mantissa, result_scale) = match op {
+            Plus => (l.mantissa.checked_add(r.mantissa), scale),
+            Minus => (l.mantissa.checked_sub(r.mantissa), scale),
+            Multiply => (l.mantissa.checked_mul(r.mantissa), l.scale + r.scale),
+            Divide => return decimal_divide(&l, &r),
+            _ => {
+                return Err(unsupported(
+                    "projection",
+                    "modulo is not defined for numeric operands",
+                ));
+            }
+        };
+        let mantissa = mantissa.ok_or_else(|| out_of_range("arithmetic"))?;
+        return Ok(Value::Decimal(
+            DecimalValue::new(mantissa, result_scale).map_err(|_| out_of_range("arithmetic"))?,
+        ));
+    }
+
     let (l, r) = match (lhs, rhs) {
         (Value::U64(l), Value::U64(r)) => (*l as i128, *r as i128),
         (Value::I64(l), Value::I64(r)) => (*l as i128, *r as i128),
@@ -711,6 +775,72 @@ fn arithmetic(op: &BinaryOperator, lhs: &Value, rhs: &Value) -> Result<Value> {
         )));
     }
     Ok(Value::U64(value as u64))
+}
+
+fn out_of_range(what: &str) -> DbError {
+    DbError::SqlNumericValueOutOfRange(format!("{what} overflow"))
+}
+
+fn sql_float(value: &Value) -> f64 {
+    match value {
+        Value::Float64(inner) => inner.0,
+        Value::I64(inner) => *inner as f64,
+        Value::U64(inner) => *inner as f64,
+        Value::Decimal(inner) => inner.mantissa as f64 / 10_f64.powi(inner.scale as i32),
+        other => unreachable!("float promotion requires numeric operand, got {other:?}"),
+    }
+}
+
+fn sql_decimal(value: &Value) -> Result<crate::sql_types::DecimalValue> {
+    match value {
+        Value::Decimal(inner) => Ok(*inner),
+        Value::I64(inner) => crate::sql_types::DecimalValue::new(i128::from(*inner), 0)
+            .map_err(|_| out_of_range("integer to numeric")),
+        Value::U64(inner) => crate::sql_types::DecimalValue::new(i128::from(*inner), 0)
+            .map_err(|_| out_of_range("integer to numeric")),
+        other => Err(DbError::InvalidState(format!(
+            "numeric arithmetic requires numeric operands, got {other:?}"
+        ))),
+    }
+}
+
+/// PostgreSQL numeric division: the result scale is (dividend scale +
+/// divisor precision + 4) digits after the decimal point, rounded half
+/// away from zero.
+fn decimal_divide(
+    l: &crate::sql_types::DecimalValue,
+    r: &crate::sql_types::DecimalValue,
+) -> Result<Value> {
+    use crate::sql_types::DecimalValue;
+    if r.mantissa == 0 {
+        return Err(DbError::SqlDivisionByZero);
+    }
+    let divisor_digits = DecimalValue::digit_count(r.mantissa) as i64;
+    let target_scale = i64::from(l.scale) + divisor_digits + 4;
+    // Shift the dividend so the quotient carries `target_scale` decimals.
+    let shift = target_scale + i64::from(r.scale) - i64::from(l.scale);
+    if shift > 38 {
+        return Err(out_of_range("numeric division"));
+    }
+    let factor = 10_i128
+        .checked_pow(u32::try_from(shift).map_err(|_| out_of_range("numeric division"))?)
+        .ok_or_else(|| out_of_range("numeric division"))?;
+    let numerator = l
+        .mantissa
+        .checked_mul(factor)
+        .ok_or_else(|| out_of_range("numeric division"))?;
+    let quotient = numerator / r.mantissa;
+    let remainder = numerator % r.mantissa;
+    let half = (r.mantissa / 2).abs();
+    let rounded = if remainder.abs() >= half {
+        quotient + numerator.signum()
+    } else {
+        quotient
+    };
+    let scale = u32::try_from(target_scale).map_err(|_| out_of_range("numeric division"))?;
+    Ok(Value::Decimal(
+        DecimalValue::new(rounded, scale).map_err(|_| out_of_range("numeric division"))?,
+    ))
 }
 
 fn plan_computed(
@@ -1761,6 +1891,50 @@ fn joined_aggregates(
                                 return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
                             }
                         },
+                        // Float and decimal sums accumulate in their own
+                        // domain: floats add in f64, decimals align scales
+                        // exactly (the same rule as the morsel executor).
+                        (JoinedAggregate::Sum, Some(Value::Float64(current))) => match value {
+                            Value::Float64(addend) => {
+                                Value::Float64(crate::sql_types::F64::new(current.0 + addend.0))
+                            }
+                            other => {
+                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
+                            }
+                        },
+                        (JoinedAggregate::Sum, Some(Value::Decimal(current))) => match value {
+                            Value::Decimal(addend) => {
+                                let target = current.scale.max(addend.scale);
+                                let left = current.rescale(target).map_err(|_| {
+                                    DbError::SqlNumericValueOutOfRange(
+                                        "decimal sum overflow".to_owned(),
+                                    )
+                                })?;
+                                let right = addend.rescale(target).map_err(|_| {
+                                    DbError::SqlNumericValueOutOfRange(
+                                        "decimal sum overflow".to_owned(),
+                                    )
+                                })?;
+                                let mantissa =
+                                    left.mantissa.checked_add(right.mantissa).ok_or_else(|| {
+                                        DbError::SqlNumericValueOutOfRange(
+                                            "decimal sum overflow".to_owned(),
+                                        )
+                                    })?;
+                                Value::Decimal(
+                                    crate::sql_types::DecimalValue::new(mantissa, target).map_err(
+                                        |_| {
+                                            DbError::SqlNumericValueOutOfRange(
+                                                "decimal sum overflow".to_owned(),
+                                            )
+                                        },
+                                    )?,
+                                )
+                            }
+                            other => {
+                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
+                            }
+                        },
                         (_, None) => value.clone(),
                         _ => unreachable!("min/max handled above"),
                     });
@@ -1985,6 +2159,9 @@ fn sort_joined_rows(
     Ok(())
 }
 
+/// Total ordering for JOIN aggregate accumulation, falling back to the
+/// shared SQL comparison; incomparable pairs (mixed non-numeric types)
+/// order Equal as before.
 fn joined_value_ordering(left: &Value, right: &Value) -> Ordering {
     match (left, right) {
         (Value::U64(l), Value::U64(r)) => l.cmp(r),
@@ -1992,7 +2169,12 @@ fn joined_value_ordering(left: &Value, right: &Value) -> Ordering {
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
         (Value::U64(l), Value::I64(r)) if *r >= 0 => l.cmp(&(*r as u64)),
         (Value::I64(l), Value::U64(r)) if *l >= 0 => (*l as u64).cmp(r),
-        _ => Ordering::Equal,
+        (Value::Float64(l), Value::Float64(r)) => l.cmp(r),
+        (Value::Date(l), Value::Date(r)) => l.cmp(r),
+        (Value::Timestamp(l), Value::Timestamp(r)) => l.cmp(r),
+        (Value::Decimal(l), Value::Decimal(r)) => l.cmp(r),
+        (Value::Uuid(l), Value::Uuid(r)) => l.cmp(r),
+        _ => value_cmp(left, right).unwrap_or(Ordering::Equal),
     }
 }
 
@@ -2446,9 +2628,39 @@ fn compare_predicate(
     table: &TableDefinition,
     params: &[Value],
 ) -> Result<Truth> {
-    let left = eval_expression(left, row, table, params)?;
-    let right = eval_expression(right, row, table, params)?;
+    // Resolve the opposite side's column type first so a compared
+    // literal converts through it (PostgreSQL: `when_c < '2026-02-01'`
+    // parses the literal as a date).
+    let left_type = column_position(table, left)
+        .ok()
+        .flatten()
+        .map(|position| table.columns[position].data_type);
+    let right_type = column_position(table, right)
+        .ok()
+        .flatten()
+        .map(|position| table.columns[position].data_type);
+    let left = coerce_operand(&eval_expression(left, row, table, params)?, right_type);
+    let right = coerce_operand(&eval_expression(right, row, table, params)?, left_type);
     Ok(compare_values(&left, &right, operator))
+}
+
+/// Coerce one comparison operand toward the opposite side's column type
+/// (PostgreSQL input conversion). Only literal-shaped values move; a
+/// failed conversion (malformed literal) leaves the original value so
+/// the comparison evaluates Unknown instead of failing the statement.
+/// Strict input errors live in the INSERT/UPDATE coercion path.
+fn coerce_operand(value: &Value, target: Option<crate::ColumnType>) -> Value {
+    let Some(target) = target else {
+        return value.clone();
+    };
+    let definition = crate::ColumnDefinition {
+        id: crate::ColumnId(0),
+        name: "comparison operand".to_owned(),
+        data_type: target,
+        nullable: true,
+    };
+    crate::sql::typed_input::coerce_for_comparison(value.clone(), &definition)
+        .unwrap_or_else(|_| value.clone())
 }
 
 fn compare_values(left: &Value, right: &Value, operator: &BinaryOperator) -> Truth {
@@ -2525,8 +2737,65 @@ fn value_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
         (Value::Bytes(left), Value::Bytes(right)) => Some(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
+        (Value::Float64(left), Value::Float64(right)) => Some(left.cmp(right)),
+        (Value::Date(left), Value::Date(right)) => Some(left.cmp(right)),
+        (Value::Timestamp(left), Value::Timestamp(right)) => Some(left.cmp(right)),
+        (Value::Decimal(left), Value::Decimal(right)) => Some(left.cmp(right)),
+        (Value::Uuid(left), Value::Uuid(right)) => Some(left.cmp(right)),
+        // Cross numeric-type comparisons follow PostgreSQL's promotion:
+        // int/decimal pairs scale the integer side up to the decimal's
+        // scale so the comparison is exact; anything against float
+        // converts the exact side to f64 and compares with the SQL
+        // float order (NaN greatest).
+        (Value::I64(left), Value::Decimal(right)) => {
+            Some(scaled_int(i128::from(*left), right.scale).cmp(&right.mantissa))
+        }
+        (Value::Decimal(left), Value::I64(right)) => Some(
+            left.mantissa
+                .cmp(&scaled_int(i128::from(*right), left.scale)),
+        ),
+        (Value::U64(left), Value::Decimal(right)) => {
+            Some(scaled_int(i128::from(*left), right.scale).cmp(&right.mantissa))
+        }
+        (Value::Decimal(left), Value::U64(right)) => Some(
+            left.mantissa
+                .cmp(&scaled_int(i128::from(*right), left.scale)),
+        ),
+        (Value::Decimal(left), Value::Float64(right)) => Some(
+            crate::sql_types::F64::new(decimal_to_f64(left))
+                .cmp(&crate::sql_types::F64::new(right.0)),
+        ),
+        (Value::Float64(left), Value::Decimal(right)) => Some(
+            crate::sql_types::F64::new(left.0)
+                .cmp(&crate::sql_types::F64::new(decimal_to_f64(right))),
+        ),
+        (Value::I64(left), Value::Float64(right)) => {
+            Some(crate::sql_types::F64::new(*left as f64).cmp(&crate::sql_types::F64::new(right.0)))
+        }
+        (Value::Float64(left), Value::I64(right)) => {
+            Some(crate::sql_types::F64::new(left.0).cmp(&crate::sql_types::F64::new(*right as f64)))
+        }
+        (Value::U64(left), Value::Float64(right)) => {
+            Some(crate::sql_types::F64::new(*left as f64).cmp(&crate::sql_types::F64::new(right.0)))
+        }
+        (Value::Float64(left), Value::U64(right)) => {
+            Some(crate::sql_types::F64::new(left.0).cmp(&crate::sql_types::F64::new(*right as f64)))
+        }
         _ => None,
     }
+}
+
+/// Mantissa of a decimal rescaled to `scale` (i128 units), saturating on
+/// overflow like the ordering path.
+/// A decimal's approximate f64 value for float cross-comparisons.
+fn decimal_to_f64(value: &crate::sql_types::DecimalValue) -> f64 {
+    value.mantissa as f64 / 10_f64.powi(value.scale as i32)
+}
+
+/// An integer expressed in 10^scale units (exact; saturates beyond i128,
+/// which cannot happen inside the 38-digit decimal bound).
+fn scaled_int(value: i128, scale: u32) -> i128 {
+    value.saturating_mul(10_i128.saturating_pow(scale))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

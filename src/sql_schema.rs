@@ -1,6 +1,6 @@
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, ColumnOption, CreateIndex, CreateTable, DataType,
-    NullsDistinctOption, TableConstraint,
+    NullsDistinctOption, TableConstraint, TimezoneInfo,
 };
 
 use crate::{
@@ -553,8 +553,29 @@ fn sql_data_type(data_type: &DataType) -> Result<ColumnType> {
     ) {
         return Ok(ColumnType::I64);
     }
+    if matches!(
+        display.as_str(),
+        "DOUBLE PRECISION" | "DOUBLE" | "FLOAT8" | "REAL8" | "FLOAT64"
+    ) {
+        return Ok(ColumnType::Float64);
+    }
+    if matches!(data_type, DataType::Timestamp(_, TimezoneInfo::None)) {
+        return Ok(ColumnType::Timestamp);
+    }
+    if display == "DATE" {
+        return Ok(ColumnType::Date);
+    }
+    if matches!(
+        data_type,
+        DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_)
+    ) {
+        return Ok(ColumnType::Decimal);
+    }
+    if matches!(data_type, DataType::Uuid) || display == "UUID" {
+        return Ok(ColumnType::Uuid);
+    }
     Err(unsupported(
         "CREATE TABLE",
-        "supported types are BIGINT, INTEGER, BOOLEAN, TEXT, and byte strings",
+        "supported types are BIGINT, INTEGER, BOOLEAN, TEXT, DOUBLE PRECISION, TIMESTAMP, DATE, NUMERIC, UUID, and byte strings",
     ))
 }

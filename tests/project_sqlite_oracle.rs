@@ -27,6 +27,16 @@ fn sqlite_value(value: &Value) -> rusqlite::types::Value {
         ),
         Value::Text(value) => rusqlite::types::Value::Text(value.clone()),
         Value::Bytes(value) => rusqlite::types::Value::Blob(value.clone()),
+        // The SQLite oracle runs integer/text/bytes workloads only; the
+        // typed scalars have no faithful SQLite mapping and never appear
+        // in its randomized traces.
+        Value::Float64(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Decimal(_)
+        | Value::Uuid(_) => {
+            unreachable!("oracle workload never produces typed scalar values")
+        }
     }
 }
 

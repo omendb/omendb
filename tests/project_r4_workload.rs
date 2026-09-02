@@ -298,13 +298,16 @@ fn public_facade_replays_r4_analytical_workload() {
                             oracle.accounts.values().map(|a| a.balance).min().unwrap();
                         let expected_max =
                             oracle.accounts.values().map(|a| a.balance).max().unwrap();
-                        let expected_avg =
-                            (expected_sum as f64 / expected_count as f64).round() as i64;
+                        // AVG now returns float8 for every input type.
+                        let expected_avg = expected_sum as f64 / expected_count as f64;
 
                         assert_eq!(sql_res.rows.len(), 1);
                         assert_eq!(sql_res.rows[0][0], Value::U64(expected_count));
                         assert_eq!(sql_res.rows[0][1], Value::U64(expected_sum));
-                        assert_eq!(sql_res.rows[0][2], Value::I64(expected_avg));
+                        assert_eq!(
+                            sql_res.rows[0][2],
+                            Value::Float64(omendb::F64::new(expected_avg))
+                        );
                         assert_eq!(sql_res.rows[0][3], Value::U64(expected_min));
                         assert_eq!(sql_res.rows[0][4], Value::U64(expected_max));
                     }

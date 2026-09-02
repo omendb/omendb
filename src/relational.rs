@@ -28,13 +28,18 @@ pub struct ColumnId(pub u16);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConstraintId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ColumnType {
     Bytes,
     Bool,
     I64,
     U64,
     Text,
+    Float64,
+    Date,
+    Timestamp,
+    Decimal,
+    Uuid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -514,9 +519,28 @@ pub enum Value {
     I64(i64),
     U64(u64),
     Text(String),
+    Float64(crate::sql_types::F64),
+    Date(crate::sql_types::DateValue),
+    Timestamp(crate::sql_types::TimestampValue),
+    Decimal(crate::sql_types::DecimalValue),
+    Uuid(crate::sql_types::UuidValue),
 }
 
 impl Value {
+    /// Canonical encoding for equality keys (row identities, index
+    /// entries), where byte equality must mean value equality: decimals
+    /// normalize so 1.50 and 1.5 collide, as they do in SQL.
+    pub(crate) fn encode_for_key(&self, bytes: &mut Vec<u8>) -> Result<()> {
+        if let Self::Decimal(value) = self {
+            let crate::sql_types::DecimalValue { mantissa, scale } = value.normalized();
+            bytes.push(9);
+            bytes.extend_from_slice(&mantissa.to_le_bytes());
+            bytes.extend_from_slice(&scale.to_le_bytes());
+            return Ok(());
+        }
+        self.encode(bytes)
+    }
+
     pub(crate) fn matches(&self, data_type: ColumnType) -> bool {
         matches!(
             (self, data_type),
@@ -526,10 +550,16 @@ impl Value {
                 | (Self::I64(_), ColumnType::I64)
                 | (Self::U64(_), ColumnType::U64)
                 | (Self::Text(_), ColumnType::Text)
+                | (Self::Float64(_), ColumnType::Float64)
+                | (Self::Date(_), ColumnType::Date)
+                | (Self::Timestamp(_), ColumnType::Timestamp)
+                | (Self::Decimal(_), ColumnType::Decimal)
+                | (Self::Uuid(_), ColumnType::Uuid)
         )
     }
 
     pub(crate) fn encode(&self, bytes: &mut Vec<u8>) -> Result<()> {
+        use crate::sql_types::{DateValue, TimestampValue, UuidValue};
         match self {
             Self::Null => bytes.push(0),
             Self::Bytes(value) => {
@@ -548,6 +578,27 @@ impl Value {
             Self::Text(value) => {
                 bytes.push(5);
                 put_bytes(bytes, value.as_bytes())?;
+            }
+            Self::Float64(value) => {
+                bytes.push(6);
+                bytes.extend_from_slice(&value.0.to_le_bytes());
+            }
+            Self::Date(DateValue(days)) => {
+                bytes.push(7);
+                bytes.extend_from_slice(&days.to_le_bytes());
+            }
+            Self::Timestamp(TimestampValue(micros)) => {
+                bytes.push(8);
+                bytes.extend_from_slice(&micros.to_le_bytes());
+            }
+            Self::Decimal(value) => {
+                bytes.push(9);
+                bytes.extend_from_slice(&value.mantissa.to_le_bytes());
+                bytes.extend_from_slice(&value.scale.to_le_bytes());
+            }
+            Self::Uuid(UuidValue(bits)) => {
+                bytes.push(10);
+                bytes.extend_from_slice(bits);
             }
         }
         Ok(())
@@ -753,6 +804,36 @@ pub fn decode_row(primary: Key, bytes: &[u8]) -> Result<Row> {
                         reason: "text is not UTF-8".to_owned(),
                     },
                 )?),
+                6 => {
+                    let raw = read_fixed::<8>(bytes, &mut cursor)?;
+                    Value::Float64(crate::sql_types::F64(f64::from_le_bytes(raw)))
+                }
+                7 => {
+                    let raw = read_fixed::<4>(bytes, &mut cursor)?;
+                    Value::Date(crate::sql_types::DateValue(i32::from_le_bytes(raw)))
+                }
+                8 => {
+                    let raw = read_fixed::<8>(bytes, &mut cursor)?;
+                    Value::Timestamp(crate::sql_types::TimestampValue(i64::from_le_bytes(raw)))
+                }
+                9 => {
+                    let raw = read_fixed::<16>(bytes, &mut cursor)?;
+                    let mantissa = i128::from_le_bytes(raw);
+                    let raw = read_fixed::<4>(bytes, &mut cursor)?;
+                    let scale = u32::from_le_bytes(raw);
+                    let value =
+                        crate::sql_types::DecimalValue::new(mantissa, scale).map_err(|error| {
+                            DbError::Corruption {
+                                artifact: "row",
+                                reason: error.to_string(),
+                            }
+                        })?;
+                    Value::Decimal(value)
+                }
+                10 => {
+                    let raw = read_fixed::<16>(bytes, &mut cursor)?;
+                    Value::Uuid(crate::sql_types::UuidValue(raw))
+                }
                 _ => {
                     return Err(DbError::Corruption {
                         artifact: "row",
@@ -895,7 +976,7 @@ pub(crate) fn row_index_key(
     }
     let mut bytes = Vec::new();
     for value in values {
-        value.encode(&mut bytes)?;
+        value.encode_for_key(&mut bytes)?;
     }
     Ok(Some(bytes))
 }
@@ -933,7 +1014,7 @@ pub(crate) fn index_values_key(
                 index.id.0, column.name
             )));
         }
-        value.encode(&mut bytes)?;
+        value.encode_for_key(&mut bytes)?;
     }
     Ok(bytes)
 }
@@ -1014,6 +1095,26 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
     );
     *cursor = end;
     Ok(value)
+}
+
+/// Read `WIDTH` raw little-endian bytes for fixed-width value tags.
+fn read_fixed<const WIDTH: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; WIDTH]> {
+    let end = cursor
+        .checked_add(WIDTH)
+        .ok_or_else(|| DbError::Corruption {
+            artifact: "row",
+            reason: "fixed-width value overflows".to_owned(),
+        })?;
+    let raw: [u8; WIDTH] = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| DbError::Corruption {
+            artifact: "row",
+            reason: "truncated fixed-width value".to_owned(),
+        })?
+        .try_into()
+        .expect("fixed width");
+    *cursor = end;
+    Ok(raw)
 }
 
 pub(crate) fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>> {
@@ -1332,6 +1433,11 @@ fn column_type_tag(data_type: ColumnType) -> u8 {
         ColumnType::I64 => 3,
         ColumnType::U64 => 4,
         ColumnType::Text => 5,
+        ColumnType::Float64 => 6,
+        ColumnType::Date => 7,
+        ColumnType::Timestamp => 8,
+        ColumnType::Decimal => 9,
+        ColumnType::Uuid => 10,
     }
 }
 
@@ -1342,6 +1448,11 @@ fn column_type_from_tag(tag: u8) -> Result<ColumnType> {
         3 => Ok(ColumnType::I64),
         4 => Ok(ColumnType::U64),
         5 => Ok(ColumnType::Text),
+        6 => Ok(ColumnType::Float64),
+        7 => Ok(ColumnType::Date),
+        8 => Ok(ColumnType::Timestamp),
+        9 => Ok(ColumnType::Decimal),
+        10 => Ok(ColumnType::Uuid),
         _ => Err(DbError::Corruption {
             artifact: "catalog",
             reason: "unknown column type".to_owned(),

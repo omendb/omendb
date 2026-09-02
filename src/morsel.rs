@@ -124,6 +124,8 @@ pub enum AggregateAccumulator {
     SumUnset,
     SumI64(i64),
     SumU64(u64),
+    SumF64(f64),
+    SumDecimal(crate::sql_types::DecimalValue),
     Avg { sum_f64: f64, count: u64 },
     Min(Option<Value>),
     Max(Option<Value>),
@@ -159,6 +161,59 @@ impl AggregateAccumulator {
                     match val {
                         Value::U64(u) => *self = Self::SumU64(*u),
                         Value::I64(i) => *self = Self::SumI64(*i),
+                        Value::Float64(f) => *self = Self::SumF64(f.0),
+                        Value::Decimal(d) => *self = Self::SumDecimal(*d),
+                        Value::Null => {}
+                        _ => {
+                            return Err(DbError::InvalidState(
+                                "SUM requires numeric column".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Self::SumF64(sum) => {
+                if let Some(val) = value {
+                    match val {
+                        Value::Float64(f) => *sum += f.0,
+                        Value::Null => {}
+                        _ => {
+                            return Err(DbError::InvalidState(
+                                "SUM requires float column".to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Self::SumDecimal(sum) => {
+                if let Some(val) = value {
+                    match val {
+                        Value::Decimal(d) => {
+                            let target = sum.scale.max(d.scale);
+                            let left = sum.rescale(target).map_err(|_| {
+                                DbError::SqlNumericValueOutOfRange(
+                                    "decimal sum overflow".to_owned(),
+                                )
+                            })?;
+                            let right = d.rescale(target).map_err(|_| {
+                                DbError::SqlNumericValueOutOfRange(
+                                    "decimal sum overflow".to_owned(),
+                                )
+                            })?;
+                            let mantissa =
+                                left.mantissa.checked_add(right.mantissa).ok_or_else(|| {
+                                    DbError::SqlNumericValueOutOfRange(
+                                        "decimal sum overflow".to_owned(),
+                                    )
+                                })?;
+                            *sum = crate::sql_types::DecimalValue::new(mantissa, target).map_err(
+                                |_| {
+                                    DbError::SqlNumericValueOutOfRange(
+                                        "decimal sum overflow".to_owned(),
+                                    )
+                                },
+                            )?;
+                        }
                         Value::Null => {}
                         _ => {
                             return Err(DbError::InvalidState(
@@ -211,6 +266,14 @@ impl AggregateAccumulator {
                             *sum_f64 += *u as f64;
                             *count += 1;
                         }
+                        Value::Float64(f) => {
+                            *sum_f64 += f.0;
+                            *count += 1;
+                        }
+                        Value::Decimal(d) => {
+                            *sum_f64 += d.mantissa as f64 / 10_f64.powi(d.scale as i32);
+                            *count += 1;
+                        }
                         Value::Null => {}
                         _ => {
                             return Err(DbError::InvalidState(
@@ -258,11 +321,13 @@ impl AggregateAccumulator {
             Self::SumUnset => Value::U64(0),
             Self::SumI64(sum) => Value::I64(sum),
             Self::SumU64(sum) => Value::U64(sum),
+            Self::SumF64(sum) => Value::Float64(crate::sql_types::F64::new(sum)),
+            Self::SumDecimal(sum) => Value::Decimal(sum),
             Self::Avg { sum_f64, count } => {
                 if count == 0 {
                     Value::Null
                 } else {
-                    Value::I64((sum_f64 / count as f64).round() as i64)
+                    Value::Float64(crate::sql_types::F64::new(sum_f64 / count as f64))
                 }
             }
             Self::Min(min) => min.unwrap_or(Value::Null),
@@ -454,6 +519,9 @@ impl AnalyticalExecutor {
     }
 }
 
+/// Total ordering for MIN/MAX accumulation across the typed value set;
+/// incomparable mixed-type pairs order Equal (aggregate input of one
+/// column never mixes types in practice).
 fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
     match (left, right) {
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
@@ -466,6 +534,11 @@ fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
         (Value::U64(a), Value::I64(b)) => (*a as i128).cmp(&(*b as i128)),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::Float64(a), Value::Float64(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
+        (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -493,8 +566,44 @@ mod tests {
 
         assert_eq!(count.finalize(), Value::U64(3));
         assert_eq!(sum.finalize(), Value::U64(60));
-        assert_eq!(avg.finalize(), Value::I64(20));
+        // AVG returns float8 for every input type, like PostgreSQL's
+        // documented numeric result rendered through the wire as float.
+        assert_eq!(
+            avg.finalize(),
+            Value::Float64(crate::sql_types::F64::new(20.0))
+        );
         assert_eq!(min.finalize(), Value::U64(10));
         assert_eq!(max.finalize(), Value::U64(30));
+    }
+
+    #[test]
+    fn accumulator_sums_floats_and_decimals_exactly() {
+        let mut float_sum = AggregateAccumulator::new(AggregateKind::Sum);
+        for val in [1.5f64, 2.25, -0.75] {
+            float_sum
+                .update(Some(&Value::Float64(crate::sql_types::F64::new(val))))
+                .unwrap();
+        }
+        assert_eq!(
+            float_sum.finalize(),
+            Value::Float64(crate::sql_types::F64::new(3.0))
+        );
+
+        // Mixed-scale decimals sum exactly at the wider scale.
+        let mut decimal_sum = AggregateAccumulator::new(AggregateKind::Sum);
+        decimal_sum
+            .update(Some(&Value::Decimal(
+                crate::sql_types::DecimalValue::new(125, 2).unwrap(),
+            )))
+            .unwrap();
+        decimal_sum
+            .update(Some(&Value::Decimal(
+                crate::sql_types::DecimalValue::new(-1, 1).unwrap(),
+            )))
+            .unwrap();
+        let Value::Decimal(total) = decimal_sum.finalize() else {
+            panic!("decimal sum");
+        };
+        assert_eq!((total.mantissa, total.scale), (115, 2)); // 1.25 + -0.1 = 1.15
     }
 }

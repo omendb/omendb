@@ -26,6 +26,16 @@ mod query;
 mod schema;
 #[path = "sql_values.rs"]
 mod values;
+
+pub(crate) mod typed_input {
+    //! Shared input grammars and coercion rules for SQL literals and wire
+    //! parameters.
+
+    pub(crate) use super::values::{
+        coerce_for_comparison, parse_date_parameter as date, parse_decimal_parameter as decimal,
+        parse_float_parameter as float, parse_timestamp_parameter as timestamp,
+    };
+}
 #[path = "sql_write.rs"]
 mod write;
 

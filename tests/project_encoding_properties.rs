@@ -17,6 +17,21 @@ fn arb_value() -> impl Strategy<Value = Value> {
         any::<u64>().prop_map(Value::U64),
         ".*".prop_map(Value::Text),
         proptest::collection::vec(any::<u8>(), 0..64).prop_map(Value::Bytes),
+        // Typed scalars: floats include the specials (NaN, infinities,
+        // zeros) through any::<f64>; decimals pair a mantissa with a
+        // scale that keeps total digits within the 38-digit bound.
+        any::<f64>().prop_map(|f| Value::Float64(omendb::F64::new(f))),
+        (-3_000_000..3_000_000i64)
+            .prop_map(|micros| { Value::Timestamp(omendb::TimestampValue(micros)) }),
+        (-1_000_000..1_000_000i32).prop_map(|days| Value::Date(omendb::DateValue(days))),
+        (-(10i128.pow(20))..10i128.pow(20), 0u32..=18u32).prop_map(|(mantissa, scale)| {
+            Value::Decimal(omendb::DecimalValue::new(mantissa, scale).expect("bounded"))
+        }),
+        proptest::collection::vec(any::<u8>(), 16).prop_map(|bytes| {
+            let mut bits = [0u8; 16];
+            bits.copy_from_slice(&bytes);
+            Value::Uuid(omendb::UuidValue(bits))
+        }),
     ]
 }
 
