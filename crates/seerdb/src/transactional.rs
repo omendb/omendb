@@ -716,7 +716,10 @@ impl TransactionDatabase {
     /// lease covers the range this cannot fail for retention reasons; reads
     /// reaching below the oldest retained record report
     /// [`Error::ChangesPruned`]. A `from` above the current head returns an
-    /// empty result.
+    /// empty result. A short read that ends below the head reports
+    /// [`Error::Corruption`]: every commit sequence number carries exactly
+    /// one change record, so a missing tail record means the durable stream
+    /// is inconsistent rather than exhausted.
     pub fn read_changes(&self, from: CommitSeq, limit: usize) -> Result<Vec<CommittedChange>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -752,12 +755,29 @@ impl TransactionDatabase {
             }
             out.push(change.clone());
             if out.len() == limit {
-                break;
+                return Ok(out);
             }
             let Some(next) = expected.get().checked_add(1) else {
-                break;
+                return Ok(out);
             };
             expected = CommitSeq::new(next);
+        }
+        // The map ended before the limit was reached. Every commit sequence
+        // number below the head has exactly one change record — logical
+        // commits, tree reservations, everything — so a tail ending below
+        // the head means the durable stream is inconsistent: a CSN was
+        // published without its record. Report it instead of returning a
+        // short read that silently advances a consumer's checkpoint.
+        let last = out.last().map(|change| change.commit);
+        let incomplete_tail = match last {
+            Some(last) => last < head,
+            None => from <= head,
+        };
+        if incomplete_tail {
+            return Err(Error::Corruption(format!(
+                "committed-change stream ends at {:?} below the head {head:?}",
+                last.unwrap_or(from)
+            )));
         }
         Ok(out)
     }
@@ -2538,6 +2558,57 @@ mod tests {
         let mut transaction = database.begin().expect("begin");
         transaction.put(tree, key, key).expect("put");
         transaction.commit().expect("commit");
+    }
+
+    #[test]
+    fn read_changes_reports_short_tail_below_head_as_corruption() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("db");
+        let database = TransactionDatabase::create(&path, Options::for_test()).expect("create");
+        let owned = tree(&database);
+        commit_key(&database, owned, b"a");
+        let head = database.snapshot_export().expect("export").csn;
+        assert_eq!(head.get(), 3);
+
+        // Simulate a publisher that advanced the head without its change
+        // record becoming durable: delete the head's record through the
+        // maintenance lane (no CSN, no map update) and reopen.
+        {
+            let mut db = database.runtime.db.lock().expect("database mutex");
+            db.commit_maintenance_batch(&[BatchMutation::Delete {
+                key: change_record_key(head),
+            }])
+            .expect("delete head record");
+        }
+        drop(database);
+
+        let reopened = TransactionDatabase::open(&path, Options::for_test()).expect("reopen");
+        assert_eq!(reopened.snapshot_export().expect("export").csn, head);
+
+        // A full read ends below the head: the missing tail is corruption,
+        // not a silent short read a consumer could checkpoint on.
+        let error = reopened
+            .read_changes(CommitSeq::new(1), usize::MAX)
+            .expect_err("short tail below head");
+        assert!(
+            matches!(&error, Error::Corruption(message) if message.contains("below the head")),
+            "unexpected error: {error:?}"
+        );
+
+        // Bounded reads that legitimately stop at the limit still succeed.
+        let bounded = reopened
+            .read_changes(CommitSeq::new(1), 1)
+            .expect("bounded read stops at limit");
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].commit, CommitSeq::new(1));
+
+        // Reading from the missing position itself is also corruption: the
+        // head published a record that does not exist.
+        assert!(matches!(
+            reopened.read_changes(head, usize::MAX),
+            Err(Error::Corruption(_))
+        ));
+        reopened.close().expect("close");
     }
 
     #[test]
