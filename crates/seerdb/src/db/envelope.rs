@@ -131,7 +131,7 @@ impl DB {
 
     /// Blob artifacts once for the group: all staged blob changes are
     /// already installed in the live manager.
-    fn write_group_blob_artifacts(&mut self, generation: GenerationId) -> Result<()> {
+    pub(super) fn write_group_blob_artifacts(&mut self, generation: GenerationId) -> Result<()> {
         if self.blobs.is_segmented() || self.pending_blob_frame {
             let blob_started = Instant::now();
             self.blobs.set_generation(generation.get());

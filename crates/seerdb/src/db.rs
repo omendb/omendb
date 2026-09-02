@@ -45,6 +45,11 @@ mod invariants;
 mod io;
 #[path = "db/lifecycle.rs"]
 mod lifecycle;
+#[path = "db/maintenance.rs"]
+mod maintenance;
+#[path = "db/maintenance_tests.rs"]
+#[cfg(test)]
+mod maintenance_tests;
 #[path = "db/metadata.rs"]
 mod metadata;
 #[path = "db/metadata_codec.rs"]
