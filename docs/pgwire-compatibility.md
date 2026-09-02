@@ -45,12 +45,32 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
 
+## Scalar value types
+
+The typed scalars below ride the standard binary result and parameter
+encodings. Each encoder was pinned byte-for-byte against PostgreSQL `COPY
+BINARY` probes (see `/tmp/pgprobe` methodology: probe first, then implement),
+and the live oracle compares decoded values and type OIDs for a representative
+typed workload in every CI run.
+
+| Type | Storage | Wire encoding | Semantics | Evidence |
+| --- | --- | --- | --- | --- |
+| `FLOAT8` / `DOUBLE PRECISION` | IEEE-754 bits | PostgreSQL float8 binary; NaN/Infinity text forms | SQL float total order: NaN sorts greatest and equals itself, `-0 == 0` | `typed_scalar_subset_matches_live_postgres`, `project_typed_values.rs` |
+| `DATE` | days since Unix epoch | i32 days since 2000-01-01 | Proleptic Gregorian, no timezone | `typed_scalar_subset_matches_live_postgres`, date parse/format unit tests |
+| `TIMESTAMP` (without time zone) | microseconds since Unix epoch | i64 microseconds since 2000-01-01 | Microsecond precision, no timezone | `typed_scalar_subset_matches_live_postgres` |
+| `NUMERIC` / `DECIMAL` | i128 mantissa + scale | PostgreSQL base-10000 groups, decimal-point-aligned weight, u16 dscale | Exact decimal arithmetic (PG divide rule: result scale = dscale + divisor digits + 4); stored rows keep dscale (`1.50` round-trips), equality keys normalize trailing zeros (`1.50 == 1.5`) | `typed_scalar_subset_matches_live_postgres`, `tests/project_typed_values.rs` |
+| `UUID` | 128 raw bits | PostgreSQL uuid binary | Canonical hex text parse/format | `typed_scalar_subset_matches_live_postgres` |
+
+Known divergence: `NUMERIC(p,s)` typmods are accepted in DDL but not stored
+or enforced (values track their own scale, like unconstrained `NUMERIC`).
+
 ## SQL workload coverage
 
 The wire suite exercises the supported bounded SQL overlap, including:
 
 - single-table projection, aliases, arithmetic, parameters, `IN`, `BETWEEN`,
-  `NULL`, `DISTINCT`, ordering, and pagination;
+  `NULL`, `DISTINCT`, ordering, and pagination, including typed scalar
+  comparisons, ranges, and aggregates over the typed columns;
 - inner, non-equi, cross, left, right, and full joins, including `USING` and
   `NATURAL JOIN`;
 - scalar, `IN`, and `EXISTS` subqueries; grouping and aggregates; set
