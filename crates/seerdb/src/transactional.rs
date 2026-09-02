@@ -28,6 +28,8 @@ const TREE_RECORD_PREFIX: &[u8] = b"\x00seerdb/tree/";
 const STATUS_RECORD_PREFIX: &[u8] = b"\x00seerdb/status/";
 const CHANGE_RECORD_PREFIX: &[u8] = b"\x00seerdb/change/";
 const LEASE_RECORD_PREFIX: &[u8] = b"\x00seerdb/lease/";
+const ALLOCATOR_RECORD_KEY: &[u8] = b"\x00seerdb/allocator";
+const ALLOCATOR_MAGIC: &[u8; 4] = b"SAL1";
 /// Longest accepted retention-lease name in bytes.
 const MAX_LEASE_NAME_LEN: usize = 255;
 const TREE_DATA_PREFIX: u8 = 0x01;
@@ -175,7 +177,7 @@ impl RetentionLease {
         if csn <= current {
             return Ok(current);
         }
-        publish_lease_write(&mut db, &self.runtime, &mut leases, &self.name, Some(csn))?;
+        publish_lease_write(&mut db, &mut leases, &self.name, Some(csn))?;
         Ok(csn)
     }
 
@@ -201,7 +203,7 @@ impl RetentionLease {
                 "retention lease record vanished from runtime state".into(),
             ));
         }
-        publish_lease_write(&mut db, &self.runtime, &mut leases, &self.name, None)?;
+        publish_lease_write(&mut db, &mut leases, &self.name, None)?;
         self.released.store(true, Ordering::Release);
         Ok(())
     }
@@ -503,8 +505,11 @@ impl TransactionDatabase {
 
     /// Compact logical MVCC history while preserving every active snapshot.
     pub fn gc_versions(&self) -> Result<VersionGcReport> {
-        // GC rewrites current records, consuming a commit sequence number;
-        // join the publish lane and settle staged commits first.
+        // GC rewrites current records as maintenance: join the publish lane
+        // and settle staged commits first so the rewrite set is computed
+        // against the settled head, then publish rewrites, status pruning,
+        // and the allocator high-water as ONE maintenance generation that
+        // consumes no commit sequence number.
         let _lane = lock_publish(&self.runtime);
         let staged = take_staged(&self.runtime);
         let mut db = lock_db(&self.runtime);
@@ -546,16 +551,6 @@ impl TransactionDatabase {
         }
 
         let versions_before = version_store.len();
-        if !rewrites.is_empty() {
-            db.commit_batch(&rewrites)?;
-        }
-        let (_, versions_after) = match version_store.compact(&retained) {
-            Ok(counts) => counts,
-            Err(error) => {
-                db.fence_writes();
-                return Err(error);
-            }
-        };
 
         // Retained undo versions still pin their creators' status entries.
         for id in &retained {
@@ -567,25 +562,55 @@ impl TransactionDatabase {
 
         // Durable status freezing: a committed status entry whose creator no
         // longer holds any placeholder reference can be pruned from storage
-        // and memory. Freezing rewrites landed in the batch above; pruning
-        // them in the same locked section keeps one consistent view.
+        // and memory. The prune set is computed BEFORE any records vanish so
+        // the pruned identities are covered by the high-water.
         let prunable: Vec<TxnId> = statuses
             .keys()
             .filter(|transaction| !unfrozen.contains(transaction))
             .copied()
             .collect();
         let statuses_pruned = prunable.len();
-        if !prunable.is_empty() {
-            let deletions: Vec<BatchMutation> = prunable
-                .iter()
-                .map(|transaction| BatchMutation::Delete {
-                    key: status_record_key(*transaction),
-                })
-                .collect();
-            db.commit_batch(&deletions)?;
+
+        // One maintenance batch: record rewrites, status deletions, and the
+        // allocator high-water covering every identity whose implying records
+        // are being removed. The high-water is written BEFORE pruning makes
+        // those identities un-reconstructible, so reopen can never reuse an
+        // issued transaction or tree ID.
+        if !rewrites.is_empty() || !prunable.is_empty() {
+            let mut mutations = rewrites.clone();
             for transaction in &prunable {
-                statuses.remove(transaction);
+                mutations.push(BatchMutation::Delete {
+                    key: status_record_key(*transaction),
+                });
             }
+            mutations.push(BatchMutation::Put {
+                key: ALLOCATOR_RECORD_KEY.to_vec(),
+                value: encode_allocator_high_water(&AllocatorHighWater {
+                    next_transaction: self.runtime.next_transaction.load(Ordering::Acquire).max(
+                        statuses
+                            .keys()
+                            .next_back()
+                            .map_or(0, |transaction| transaction.get()),
+                    ),
+                    next_tree: self.runtime.next_tree.load(Ordering::Acquire),
+                }),
+            });
+            db.commit_maintenance_batch(&mutations)?;
+        }
+
+        // Compact the version store only after the rewritten current records
+        // are durable: a live current record must never name an undo version
+        // that no longer exists in the store.
+        let (_, versions_after) = match version_store.compact(&retained) {
+            Ok(counts) => counts,
+            Err(error) => {
+                db.fence_writes();
+                return Err(error);
+            }
+        };
+
+        for transaction in &prunable {
+            statuses.remove(transaction);
         }
 
         Ok(VersionGcReport {
@@ -666,7 +691,7 @@ impl TransactionDatabase {
             .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
         match leases.get(name) {
             Some(&floor) if start <= floor => (),
-            _ => publish_lease_write(&mut db, &self.runtime, &mut leases, name, Some(start))?,
+            _ => publish_lease_write(&mut db, &mut leases, name, Some(start))?,
         }
         Ok(RetentionLease {
             runtime: Arc::clone(&self.runtime),
@@ -736,8 +761,10 @@ impl TransactionDatabase {
     /// retention-lease floor. With no leases nothing is pruned, keeping the
     /// full history available until a consumer takes responsibility for it.
     pub fn gc_changes(&self) -> Result<ChangeGcReport> {
-        // Pruning consumes a commit sequence number for its system record;
-        // join the publish lane and settle staged commits first.
+        // Pruning is maintenance, not a visibility event: it joins the
+        // publish lane only to settle staged commits against the same head
+        // the change map already reflects, then publishes the deletions
+        // without consuming a commit sequence number.
         let _lane = lock_publish(&self.runtime);
         let staged = take_staged(&self.runtime);
         let mut db = lock_db(&self.runtime);
@@ -768,44 +795,16 @@ impl TransactionDatabase {
                 changes_after: before,
             });
         }
-        let current = db.durability_status().commit_position.csn;
-        let next = CommitSeq::new(
-            current
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
-        );
-        // System change record keeps the CSN stream gap-free.
-        let change = CommittedChange {
-            commit: next,
-            transaction: TxnId::new(0),
-            snapshot: current,
-            changed_trees: BTreeSet::new(),
-            writes: BTreeSet::new(),
-        };
-        let mut mutations: Vec<BatchMutation> = stale_commits
+        let mutations: Vec<BatchMutation> = stale_commits
             .iter()
             .map(|commit| BatchMutation::Delete {
                 key: change_record_key(*commit),
             })
             .collect();
-        mutations.push(BatchMutation::Put {
-            key: change_record_key(next),
-            value: encode_change(&change)?,
-        });
-        let expected = db.durability_status().commit_id;
-        let status = db.commit_batch_at(expected, &mutations)?;
-        let committed = status.commit_position.csn;
-        if committed != next {
-            return Err(Error::Corruption(format!(
-                "change GC expected commit {:?}, storage published {:?}",
-                next, committed
-            )));
-        }
+        db.commit_maintenance_batch(&mutations)?;
         for commit in &stale_commits {
             changes.remove(commit);
         }
-        changes.insert(committed, change);
         Ok(ChangeGcReport {
             floor: Some(floor),
             changes_before: before,
@@ -2169,6 +2168,15 @@ fn load_control_state(db: &mut DB, version_store: &mut VersionStore) -> Result<C
             return Err(Error::Corruption("duplicate retention lease record".into()));
         }
     }
+    // The durable allocator high-water covers identities whose implying
+    // records (status, change, lifecycle) maintenance already pruned: it is
+    // a floor, never an upper bound, and merges with whatever records still
+    // survive.
+    if let Some(value) = db.get(ALLOCATOR_RECORD_KEY)? {
+        let water = decode_allocator_high_water(&value)?;
+        max_transaction = max_transaction.max(water.next_transaction.saturating_sub(1));
+        max_tree = max_tree.max(water.next_tree.saturating_sub(1));
+    }
     Ok(ControlState {
         statuses,
         changes,
@@ -2333,31 +2341,46 @@ fn decode_lease_floor(bytes: &[u8]) -> Result<CommitSeq> {
     Ok(floor)
 }
 
+/// Durable allocator high-water: the transaction and tree identities whose
+/// records (status, change, or lifecycle) may already have been pruned by
+/// maintenance. Persisted before the records that currently imply them are
+/// removed, so reopen never reuses a previously issued identity.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct AllocatorHighWater {
+    next_transaction: u64,
+    next_tree: u64,
+}
+
+fn encode_allocator_high_water(water: &AllocatorHighWater) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20);
+    bytes.extend_from_slice(ALLOCATOR_MAGIC);
+    bytes.extend_from_slice(&water.next_transaction.to_be_bytes());
+    bytes.extend_from_slice(&water.next_tree.to_be_bytes());
+    bytes
+}
+
+fn decode_allocator_high_water(bytes: &[u8]) -> Result<AllocatorHighWater> {
+    if bytes.len() != 20 || &bytes[..4] != ALLOCATOR_MAGIC {
+        return Err(Error::Corruption(
+            "malformed allocator high-water record".into(),
+        ));
+    }
+    Ok(AllocatorHighWater {
+        next_transaction: u64::from_be_bytes(bytes[4..12].try_into().expect("checked length")),
+        next_tree: u64::from_be_bytes(bytes[12..20].try_into().expect("checked length")),
+    })
+}
+
 /// Publish a retention-lease mutation (set or clear one floor) as one atomic
-/// durable batch. Every batch consumes exactly one commit sequence number,
-/// so an empty system change record is written alongside to keep the
-/// committed-change stream gap-free.
+/// maintenance batch. Lease state is consumer bookkeeping, not a logical
+/// visibility event: no commit sequence number is consumed and no
+/// committed-change record is written.
 fn publish_lease_write(
     db: &mut DB,
-    runtime: &Runtime,
     leases: &mut BTreeMap<Vec<u8>, CommitSeq>,
     name: &[u8],
     floor: Option<CommitSeq>,
 ) -> Result<()> {
-    let current = db.durability_status().commit_position.csn;
-    let next = CommitSeq::new(
-        current
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?,
-    );
-    let change = CommittedChange {
-        commit: next,
-        transaction: TxnId::new(0),
-        snapshot: current,
-        changed_trees: BTreeSet::new(),
-        writes: BTreeSet::new(),
-    };
     let lease_mutation = match floor {
         Some(csn) => BatchMutation::Put {
             key: lease_record_key(name),
@@ -2367,21 +2390,7 @@ fn publish_lease_write(
             key: lease_record_key(name),
         },
     };
-    let mutations = [
-        lease_mutation,
-        BatchMutation::Put {
-            key: change_record_key(next),
-            value: encode_change(&change)?,
-        },
-    ];
-    let status = db.commit_batch_at(db.durability_status().commit_id, &mutations)?;
-    let committed = status.commit_position.csn;
-    if committed != next {
-        return Err(Error::Corruption(format!(
-            "retention write expected commit {:?}, storage published {:?}",
-            next, committed
-        )));
-    }
+    db.commit_maintenance_batch(&[lease_mutation])?;
     match floor {
         Some(csn) => {
             leases.insert(name.to_vec(), csn);
@@ -2390,7 +2399,6 @@ fn publish_lease_write(
             leases.remove(name);
         }
     }
-    lock_changes(runtime).insert(committed, change);
     Ok(())
 }
 
@@ -2556,12 +2564,14 @@ mod tests {
         assert_eq!(reattached.floor().expect("floor"), CommitSeq::new(2));
         assert_eq!(reattached.name(), b"cdc");
 
-        // Advancing releases older records from the stream.
+        // Advancing releases older records from the stream. The advance and
+        // the prune are maintenance: neither adds a change record or consumes
+        // a CSN, so the head stays at the last real commit.
         let head = reopened.snapshot_export().expect("export").csn;
         reattached.advance(head).expect("advance");
         let report = reopened.gc_changes().expect("gc");
-        // Records pinned at the floor plus the advance/GC system records.
-        assert_eq!(report.changes_after, 3);
+        assert_eq!(report.changes_after, 1);
+        assert_eq!(reopened.snapshot_export().expect("export").csn, head);
         assert_eq!(
             reopened.oldest_retained_change().expect("oldest"),
             Some(head)
@@ -2571,7 +2581,7 @@ mod tests {
             Err(Error::ChangesPruned { requested, oldest })
                 if requested == CommitSeq::new(1) && oldest == head
         ));
-        assert_eq!(reopened.read_changes(head, 4).expect("from floor").len(), 3);
+        assert_eq!(reopened.read_changes(head, 4).expect("from floor").len(), 1);
 
         // Backwards advance is a no-op; release unpins everything.
         reattached.advance(CommitSeq::new(1)).expect("backwards");
@@ -2586,6 +2596,140 @@ mod tests {
             reopened.read_changes(CommitSeq::new(1), 4),
             Err(Error::ChangesPruned { .. })
         ));
+    }
+
+    #[test]
+    fn maintenance_consumes_no_logical_changes() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        commit_key(&database, owned, b"a");
+        let mut overwriter = database.begin().expect("begin");
+        overwriter.put(owned, b"a", b"a2").expect("put");
+        overwriter.commit().expect("commit");
+        // Tree reservation consumed CSN 1; each logical commit adds one.
+        let head = database.snapshot_export().expect("export").csn;
+        assert_eq!(head.get(), 4);
+
+        // Every maintenance operation leaves the logical stream untouched:
+        // same head, same records, no fabricated system entries. The lease is
+        // taken at CSN 1 so gc_changes prunes nothing and the full stream
+        // stays readable.
+        database.gc_versions().expect("gc versions");
+        let lease = database
+            .acquire_change_lease(b"cdc", CommitSeq::new(1))
+            .expect("lease");
+        database.gc_changes().expect("gc changes");
+        database.gc_versions().expect("gc versions again");
+        assert_eq!(database.snapshot_export().expect("export").csn, head);
+
+        // The stream still reads contiguously from CSN 1 through the head.
+        let changes = database
+            .read_changes(CommitSeq::new(1), usize::MAX)
+            .expect("stream stays contiguous across maintenance");
+        assert_eq!(changes.len() as u64, head.get());
+        for (position, change) in changes.iter().enumerate() {
+            assert_eq!(change.commit.get(), (position + 1) as u64);
+            assert_ne!(
+                change.transaction.get(),
+                0,
+                "no fabricated system change records remain"
+            );
+        }
+
+        // A logical commit after maintenance continues the stream exactly.
+        commit_key(&database, owned, b"b");
+        let next_head = database.snapshot_export().expect("export").csn;
+        assert_eq!(next_head.get(), head.get() + 1);
+        let tail = database
+            .read_changes(next_head, 1)
+            .expect("tail reads without gaps");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].commit, next_head);
+
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn gc_and_maintenance_survive_reopen_with_intact_stream() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("db");
+        let database = TransactionDatabase::create(&path, Options::for_test()).expect("create");
+        let owned = tree(&database);
+        commit_key(&database, owned, b"a");
+        let mut overwriter = database.begin().expect("begin");
+        overwriter.put(owned, b"a", b"a2").expect("put");
+        overwriter.commit().expect("commit");
+        let head = database.snapshot_export().expect("export").csn;
+
+        // The original corruption scenario: maintenance prunes history below
+        // the lease floor, reopens, then one more commit. The surviving
+        // stream must stay contiguous and readable from the floor.
+        database.gc_versions().expect("gc versions");
+        let _lease = database.acquire_change_lease(b"cdc", head).expect("lease");
+        database.gc_changes().expect("gc changes");
+        database.close().expect("close");
+
+        let reopened = TransactionDatabase::open(&path, Options::for_test()).expect("reopen");
+        assert_eq!(reopened.snapshot_export().expect("export").csn, head);
+        let mut transaction = reopened.begin().expect("begin");
+        transaction.put(owned, b"c", b"c").expect("put");
+        let position = transaction.commit().expect("commit");
+        assert_eq!(position.csn.get(), head.get() + 1);
+
+        let changes = reopened
+            .read_changes(head, usize::MAX)
+            .expect("contiguous stream after reopen and maintenance");
+        assert_eq!(changes.len() as u64, position.csn.get() - head.get() + 1);
+        for (offset, change) in changes.iter().enumerate() {
+            assert_eq!(change.commit.get(), head.get() + offset as u64);
+        }
+        assert!(matches!(
+            reopened.read_changes(CommitSeq::new(1), usize::MAX),
+            Err(Error::ChangesPruned { .. })
+        ));
+        // Old values stay readable: the maintenance rewrites preserved MVCC
+        // history for the surviving watermark.
+        let mut reader = reopened.begin().expect("begin reader");
+        assert_eq!(
+            reader.get(owned, b"a").expect("read after reopen"),
+            Some(b"a2".to_vec())
+        );
+        reader.abort().expect("abort");
+        reopened.close().expect("close");
+    }
+
+    #[test]
+    fn allocator_high_water_prevents_txn_id_reuse_after_pruning() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("db");
+        let database = TransactionDatabase::create(&path, Options::for_test()).expect("create");
+        let owned = tree(&database);
+        // Several committed transactions create prunable status records.
+        for key in [b"a", b"b", b"c"] {
+            commit_key(&database, owned, key);
+        }
+        let head = database.snapshot_export().expect("export").csn;
+        let last_txn = database
+            .read_changes(head, 1)
+            .expect("last change")
+            .pop()
+            .expect("non-empty")
+            .transaction;
+
+        // GC prunes every status record (no active snapshots pin them) and
+        // persists the allocator high-water in the same maintenance batch.
+        let report = database.gc_versions().expect("gc");
+        assert!(report.statuses_pruned >= 3);
+        database.close().expect("close");
+
+        let reopened = TransactionDatabase::open(&path, Options::for_test()).expect("reopen");
+        // The reopened allocator must start beyond every pruned identity:
+        // a new transaction never reuses an issued TxnId.
+        let mut transaction = reopened.begin().expect("begin");
+        assert!(transaction.id().get() > last_txn.get());
+        transaction.put(owned, b"d", b"d").expect("put");
+        transaction.commit().expect("commit");
+        reopened.close().expect("close");
     }
 
     #[test]
