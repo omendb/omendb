@@ -103,7 +103,8 @@ pub struct SnapshotExport {
 /// Outcome of a committed-change retention pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeGcReport {
-    /// Minimum floor across active retention leases, if any.
+    /// Effective floor used for pruning, bounded by the minimum active lease
+    /// floor and the oldest active transaction snapshot.
     pub floor: Option<CommitSeq>,
     /// Change records before the pass.
     pub changes_before: usize,
@@ -445,13 +446,19 @@ impl TransactionDatabase {
                 ));
             }
             let position = durability.commit_position;
+            // Register under the database guard. GC computes retention floors
+            // while holding that same guard, so it either sees this snapshot
+            // or begin observes the post-GC commit position; it can never
+            // prune a range needed by this transaction between those steps.
+            self.runtime
+                .active_snapshots
+                .lock()
+                .map_err(|_| {
+                    Error::Corruption("active snapshot registry mutex is poisoned".into())
+                })?
+                .insert(TxnId::new(id), position.csn);
             (position.csn, position)
         };
-        self.runtime
-            .active_snapshots
-            .lock()
-            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
-            .insert(TxnId::new(id), snapshot);
         Ok(Transaction {
             runtime: Arc::clone(&self.runtime),
             id: TxnId::new(id),
@@ -503,7 +510,8 @@ impl TransactionDatabase {
         db.metrics()
     }
 
-    /// Compact logical MVCC history while preserving every active snapshot.
+    /// Compact logical MVCC history while preserving every active snapshot
+    /// and durable retention-lease floor.
     pub fn gc_versions(&self) -> Result<VersionGcReport> {
         // GC rewrites current records as maintenance: join the publish lane
         // and settle staged commits first so the rewrite set is computed
@@ -527,12 +535,14 @@ impl TransactionDatabase {
             .statuses
             .lock()
             .map_err(|_| Error::Corruption("transaction status mutex is poisoned".into()))?;
-        let watermark = self
-            .runtime
-            .active_snapshots
-            .lock()
-            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
-            .oldest();
+        // Retention history is pinned by both active snapshots and retention
+        // leases: a CDC consumer holding a lease resolves its pinned change
+        // records against the row state visible at the lease floor, so undo
+        // history at or below the oldest lease floor must survive too.
+        // Lock order note: every lease and snapshot lock site takes the
+        // active-snapshot registry last, so holding it and then taking the
+        // lease registry cannot deadlock.
+        let watermark = self.runtime.retention_watermark()?;
         let mut retained = BTreeSet::new();
         let mut rewrites = Vec::new();
         let mut unfrozen = BTreeSet::new();
@@ -757,9 +767,12 @@ impl TransactionDatabase {
         Ok(lock_changes(&self.runtime).keys().next().copied())
     }
 
-    /// Prune committed-change records strictly below the minimum active
-    /// retention-lease floor. With no leases nothing is pruned, keeping the
-    /// full history available until a consumer takes responsibility for it.
+    /// Prune committed-change records below the older of the minimum active
+    /// retention-lease floor and the oldest active transaction snapshot: a
+    /// lease alone must not unpin records that active transactions still
+    /// need for commit-time range re-validation. With no leases nothing is
+    /// pruned, keeping the full history available until a consumer takes
+    /// responsibility for it.
     pub fn gc_changes(&self) -> Result<ChangeGcReport> {
         // Pruning is maintenance, not a visibility event: it joins the
         // publish lane only to settle staged commits against the same head
@@ -772,14 +785,29 @@ impl TransactionDatabase {
             return Err(Error::InvalidArgument("database is closed".into()));
         }
         publish_drained(&mut db, &self.runtime, staged)?;
+        // Read the oldest active snapshot before taking the lease guard so
+        // the two registries are never nested in opposite orders elsewhere.
+        // Lease mutations all hold the publish lane this function already
+        // holds, so the read order does not affect which floors are visible.
+        let oldest_active = self.runtime.oldest_active_snapshot()?;
         let leases = self
             .runtime
             .leases
             .lock()
             .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?;
         let mut changes = lock_changes(&self.runtime);
+        // Pruning is bounded by both retention floors. Active transactions
+        // re-validate read ranges at commit time by walking durable change
+        // records in (snapshot, current]; records above the oldest active
+        // snapshot are still needed for phantom conflict detection, so a
+        // lease floor alone must not unpin them.
         let before = changes.len();
-        let Some(floor) = leases.values().copied().min() else {
+        let Some(floor) = leases
+            .values()
+            .copied()
+            .min()
+            .map(|lease| oldest_active.map_or(lease, |snapshot| lease.min(snapshot)))
+        else {
             return Ok(ChangeGcReport {
                 floor: None,
                 changes_before: before,
@@ -843,6 +871,24 @@ impl Runtime {
             .lock()
             .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
             .oldest())
+    }
+
+    /// Minimum CSN whose retention history must survive GC: the older of the
+    /// oldest active transaction snapshot and the oldest durable lease
+    /// floor. Returns `None` when neither pins anything.
+    fn retention_watermark(&self) -> Result<Option<CommitSeq>> {
+        let snapshot = self.oldest_active_snapshot()?;
+        let lease = self
+            .leases
+            .lock()
+            .map_err(|_| Error::Corruption("retention lease mutex is poisoned".into()))?
+            .values()
+            .copied()
+            .min();
+        Ok(match (snapshot, lease) {
+            (Some(snapshot), Some(lease)) => Some(snapshot.min(lease)),
+            (snapshot, lease) => snapshot.or(lease),
+        })
     }
 
     fn reserve_tree(&self, owner: TxnId, tree: TreeId) -> Result<CommitSeq> {
@@ -2881,6 +2927,111 @@ mod tests {
         winner
             .commit()
             .expect("winner commits against rejected keys");
+    }
+
+    #[test]
+    fn gc_changes_respects_active_snapshot_watermark() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        commit_key(&database, owned, b"k");
+
+        // A writing transaction registers a read range (scan), pinning an
+        // old snapshot before a later commit lands inside that range. Its
+        // commit-time re-validation walks durable change records in
+        // (snapshot, current]: record `a` is inside the range, above the
+        // snapshot, and below the lease floor taken afterwards.
+        let mut range_reader = database.begin().expect("begin reader");
+        range_reader.put(owned, b"z", b"z").expect("write");
+        {
+            let mut cursor = range_reader
+                .cursor(owned, b"a", Some(b"m"))
+                .expect("cursor registers range");
+            while let Some(entry) = cursor.advance().expect("cursor advance") {
+                let _ = entry;
+            }
+        }
+        let snapshot = range_reader.snapshot();
+        let mut writer = database.begin().expect("writer");
+        writer.put(owned, b"a", b"a").expect("put inside range");
+        let writer_commit = writer.commit().expect("commit inside range");
+        assert!(writer_commit.csn.get() > snapshot.get());
+        // One more commit outside the range so the lease floor taken at the
+        // head sits strictly above the writer's record: under the old
+        // single-floor pruning the writer's record would be deleted.
+        commit_key(&database, owned, b"n");
+        let head = database.snapshot_export().expect("export").csn;
+        assert_eq!(head.get(), writer_commit.csn.get() + 1);
+
+        // The lease floor alone would prune everything below the head;
+        // the reader's older snapshot must hold the writer's record back.
+        let lease = database.acquire_change_lease(b"cdc", head).expect("lease");
+        let report = database.gc_changes().expect("gc");
+        assert_eq!(report.floor, Some(snapshot));
+        // Records above the snapshot survive; strictly older ones prune.
+        assert_eq!(
+            report.changes_after as u64,
+            report.changes_before as u64 - snapshot.get() + 1
+        );
+        assert!(
+            database
+                .read_changes(writer_commit.csn, 1)
+                .expect("record survives")
+                .iter()
+                .any(|change| change.commit == writer_commit.csn)
+        );
+
+        // The phantom is still detected at commit time: the surviving
+        // record proves the range saw a concurrent write.
+        assert!(matches!(
+            range_reader.commit(),
+            Err(Error::SerializationConflict { .. })
+        ));
+        lease.release().expect("release");
+    }
+
+    #[test]
+    fn gc_versions_respects_lease_watermark() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        let mut seed = database.begin().expect("seed");
+        seed.put(owned, b"k", b"v1").expect("put v1");
+        let seed_commit = seed.commit().expect("seed").csn;
+        let mut overwriter = database.begin().expect("overwriter");
+        overwriter.put(owned, b"k", b"v2").expect("put v2");
+        overwriter.commit().expect("overwrite");
+
+        // No active snapshots: the old watermark (None) cleared v1's undo
+        // history. A CDC lease whose floor sits at the seed's commit must
+        // retain it — the consumer resolves that record against the row
+        // state visible at its floor, which is v1, i.e. the undo version.
+        let lease = database
+            .acquire_change_lease(b"cdc", seed_commit)
+            .expect("lease");
+        let report = database.gc_versions().expect("gc");
+        assert_eq!(report.watermark, Some(seed_commit));
+        assert_eq!(
+            report.versions_after, 1,
+            "lease floor must pin the seed's undo version"
+        );
+
+        // The pin holds across maintenance rounds and a reopen: the
+        // surviving version resolves without corruption and a reader at
+        // the head still sees the current value.
+        let report = database.gc_versions().expect("gc again");
+        assert_eq!(report.versions_after, 1);
+        let mut verifier = database.begin().expect("verifier");
+        assert_eq!(
+            verifier.get(owned, b"k").expect("verifier reads head"),
+            Some(b"v2".to_vec())
+        );
+        verifier.abort().expect("abort");
+        lease.release().expect("release");
+
+        // With the lease gone and no active snapshots, the next pass
+        // reclaims the pinned history.
+        let report = database.gc_versions().expect("final gc");
+        assert_eq!(report.watermark, None);
+        assert_eq!(report.versions_after, 0);
     }
 
     #[test]
