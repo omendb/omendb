@@ -17,14 +17,21 @@ files, or measured baselines in this repository. Last audited 2026-08-31.
   honest benchmark schemas (pgbench uses numeric), and SQL-standard
   semantics (three-valued logic on new types).
 
-## Schema evolution — high severity
+## Schema evolution — LANDED 2026-08-31
 
-- `ALTER TABLE` accepts exactly one nullable `ADD COLUMN`
-  (`src/sql_schema.rs`: everything else is rejected as unsupported).
-- No `DROP COLUMN`, `RENAME`, `ALTER COLUMN TYPE`, no `CREATE/DROP INDEX`
-  DDL through SQL (typed API publishes indexes; SQL path is unverified).
-- Consequence: no long-lived deployment can evolve its schema; no
-  migrations story. DX blocker of the same class as the type gap.
+Landed in `feat/schema-evolution`: multi-operation ALTER TABLE (rename
+column/table, alter column type with value rewrite through the shared
+input grammar, drop column, add nullable column, DROP NOT NULL),
+DROP TABLE (refused while referenced by foreign keys), DROP INDEX, and
+CREATE INDEX — all one atomic publication where every operation applies
+or none do (candidate catalog built before any physical work; row
+rewrites and tree drops inside the same SeerDB transaction as the
+catalog marker; range-registered scans so concurrent writers conflict
+instead of slipping past the publication). Constrained columns
+(primary key, secondary index, foreign key) refuse changes; drop the
+constraint first. Remaining follow-up work: SET NOT NULL (needs a
+validated backfill), ALTER TYPE on constrained columns, and ADD COLUMN
+with non-null defaults.
 
 ## Backup and restore — high severity
 
