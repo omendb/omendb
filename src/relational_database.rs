@@ -14,6 +14,7 @@ use crate::relational::{
     Row, row_identity_bytes,
 };
 use crate::row_identity::encode_legacy_key;
+pub use crate::seer_direct::SchemaMutation;
 use crate::seer_direct::{DirectSeerStore, DirectTransaction};
 use crate::{CommitId, DbError, Key, Result, RowIdentity, TableId, Value};
 
@@ -369,6 +370,15 @@ impl RelationalDatabase {
         column: crate::ColumnDefinition,
     ) -> Result<CommitId> {
         let commit = self.store.add_nullable_column(table, column)?;
+        Ok(CommitId(commit.get()))
+    }
+
+    /// Apply a batch of schema mutations as one atomic publication.
+    /// Multi-operation `ALTER TABLE` and `DROP TABLE` use this; see
+    /// [`SchemaMutation`] for the mutation vocabulary and the atomicity
+    /// contract.
+    pub fn apply_schema_mutations(&mut self, mutations: &[SchemaMutation]) -> Result<CommitId> {
+        let commit = self.store.apply_schema_mutations(mutations)?;
         Ok(CommitId(commit.get()))
     }
 

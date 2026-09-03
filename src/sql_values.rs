@@ -138,7 +138,7 @@ pub(crate) fn coerce_for_comparison(value: Value, column: &ColumnDefinition) -> 
     }
 }
 
-pub(super) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Value> {
+pub(crate) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Value> {
     // Integer literals always parse as I64; coerce into the column's integer
     // type when the value fits, mirroring sql_primary_key's rule. String
     // literals convert into the column's type like PostgreSQL input parsing.
@@ -243,6 +243,7 @@ pub(super) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
 
 /// Parse a float literal: decimal or scientific notation, plus infinity
 /// and NaN spellings (PostgreSQL input syntax).
+#[cfg(feature = "pgwire")]
 pub(crate) fn parse_float_parameter(text: &str) -> Result<f64> {
     match parse_float_text(text)? {
         Value::Float64(inner) => Ok(inner.0),
@@ -252,16 +253,19 @@ pub(crate) fn parse_float_parameter(text: &str) -> Result<f64> {
 
 /// Parse a date literal into its Value form (shared by SQL coercion and
 /// wire text parameters).
+#[cfg(feature = "pgwire")]
 pub(crate) fn parse_date_parameter(text: &str) -> Result<Value> {
     parse_date_text(text)
 }
 
 /// Parse a timestamp literal into its Value form.
+#[cfg(feature = "pgwire")]
 pub(crate) fn parse_timestamp_parameter(text: &str) -> Result<Value> {
     parse_timestamp_text(text)
 }
 
 /// Parse a decimal literal into its Value form.
+#[cfg(feature = "pgwire")]
 pub(crate) fn parse_decimal_parameter(text: &str) -> Result<Value> {
     parse_decimal_text(text)
 }

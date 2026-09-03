@@ -834,6 +834,18 @@ impl RelationalDatabaseSession {
         })
     }
 
+    /// Apply a batch of schema mutations as one atomic publication under
+    /// exclusive admission.
+    pub fn apply_schema_mutations(
+        &self,
+        control: &OperationControl,
+        mutations: &[crate::SchemaMutation],
+    ) -> Result<CommitId> {
+        self.exclusive(control, |database| {
+            database.apply_schema_mutations(mutations)
+        })
+    }
+
     /// Publish an index definition under exclusive admission.
     pub fn create_index(
         &self,

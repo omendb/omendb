@@ -31,8 +31,10 @@ pub(crate) mod typed_input {
     //! Shared input grammars and coercion rules for SQL literals and wire
     //! parameters.
 
+    pub(crate) use super::values::{coerce_for_comparison, coerce_value};
+    #[cfg(feature = "pgwire")]
     pub(crate) use super::values::{
-        coerce_for_comparison, parse_date_parameter as date, parse_decimal_parameter as decimal,
+        parse_date_parameter as date, parse_decimal_parameter as decimal,
         parse_float_parameter as float, parse_timestamp_parameter as timestamp,
     };
 }
@@ -123,6 +125,15 @@ pub(crate) fn execute_with_params(
             commit: Some(commit),
         });
     }
+    if let Statement::Drop { .. } = &statement {
+        let commit = schema::execute_drop(database, &statement)?;
+        return Ok(SqlResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            affected_rows: 0,
+            commit: Some(commit),
+        });
+    }
 
     let (mut result, commit) = database.transaction(|store, transaction| {
         execute_in_transaction_statement(store, transaction, &statement, params)
@@ -177,6 +188,10 @@ fn execute_in_transaction_statement(
         )),
         Statement::CreateIndex(_) => Err(unsupported(
             "CREATE INDEX",
+            "schema changes must use the direct database method",
+        )),
+        Statement::Drop { .. } => Err(unsupported(
+            "DROP",
             "schema changes must use the direct database method",
         )),
         other => Err(unsupported(
@@ -808,6 +823,7 @@ fn statement_kind(statement: &Statement) -> &'static str {
         Statement::CreateTable(_) => "CREATE TABLE",
         Statement::AlterTable(_) => "ALTER TABLE",
         Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::Drop { .. } => "DROP",
         Statement::StartTransaction { .. } => "BEGIN",
         Statement::Commit { .. } => "COMMIT",
         Statement::Rollback { .. } => "ROLLBACK",

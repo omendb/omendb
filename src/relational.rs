@@ -509,6 +509,235 @@ impl Catalog {
     pub fn foreign_keys(&self) -> impl Iterator<Item = &ForeignKeyDefinition> {
         self.foreign_keys.values()
     }
+
+    /// Rename one column in place. Refused while the column participates
+    /// in the primary key, any secondary index, or any foreign key: those
+    /// definitions reference the column by ID and stay correct, but a
+    /// rename that also changes their meaning is better made explicit by
+    /// dropping and recreating the constraint. The owning store publishes
+    /// the candidate catalog.
+    pub fn rename_column(
+        &mut self,
+        table: TableId,
+        column: ColumnId,
+        new_name: &str,
+    ) -> Result<()> {
+        let definition = self.table(table)?;
+        if definition
+            .columns
+            .iter()
+            .any(|existing| existing.name == new_name)
+        {
+            return Err(DbError::InvalidState(format!(
+                "column name {new_name} already exists in table {}",
+                table.0
+            )));
+        }
+        self.assert_column_unconstrained(table, column, "rename")?;
+        let column_position = definition
+            .columns
+            .iter()
+            .position(|existing| existing.id == column)
+            .ok_or_else(|| DbError::InvalidState(format!("column {} does not exist", column.0)))?;
+        let table_definition = self
+            .tables
+            .get_mut(&table)
+            .expect("table was checked above");
+        table_definition.columns[column_position].name = new_name.to_owned();
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Change one column's declared type. Existing rows are rewritten by
+    /// the owning store before the candidate catalog is published, so this
+    /// catalog mutation only records the new declaration. Refused while
+    /// the column participates in any constraint (identities and index
+    /// entries must stay stable).
+    pub fn alter_column_type(
+        &mut self,
+        table: TableId,
+        column: ColumnId,
+        data_type: ColumnType,
+        nullable: bool,
+    ) -> Result<()> {
+        self.assert_column_unconstrained(table, column, "alter")?;
+        let primary_key = self
+            .primary_keys
+            .get(&table)
+            .is_some_and(|columns| columns.contains(&column));
+        if primary_key {
+            return Err(DbError::InvalidState(
+                "primary-key columns cannot change type; rebuild the table".to_owned(),
+            ));
+        }
+        if !nullable && !self.table(table)?.column(column)?.nullable {
+            // Nullable stays nullable; tightening requires a validated
+            // backfill, not a declaration flip.
+            return Err(DbError::InvalidState(
+                "columns cannot gain NOT NULL through ALTER TYPE; rebuild the table".to_owned(),
+            ));
+        }
+        let definition = self.table(table)?;
+        let position = definition
+            .columns
+            .iter()
+            .position(|existing| existing.id == column)
+            .ok_or_else(|| DbError::InvalidState(format!("column {} does not exist", column.0)))?;
+        let table_definition = self
+            .tables
+            .get_mut(&table)
+            .expect("table was checked above");
+        table_definition.columns[position].data_type = data_type;
+        if nullable {
+            table_definition.columns[position].nullable = true;
+        }
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Remove one column from the table declaration. Existing rows are
+    /// rewritten by the owning store before the candidate catalog is
+    /// published. Refused while the column participates in any constraint.
+    pub fn drop_column(&mut self, table: TableId, column: ColumnId) -> Result<()> {
+        self.assert_column_unconstrained(table, column, "drop")?;
+        let definition = self.table(table)?;
+        if definition.columns.len() == 1 {
+            return Err(DbError::InvalidState(
+                "cannot drop the last column of a table".to_owned(),
+            ));
+        }
+        let position = definition
+            .columns
+            .iter()
+            .position(|existing| existing.id == column)
+            .ok_or_else(|| DbError::InvalidState(format!("column {} does not exist", column.0)))?;
+        let table_definition = self
+            .tables
+            .get_mut(&table)
+            .expect("table was checked above");
+        table_definition.columns.remove(position);
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Rename one table. Referencing foreign keys keep working (they use
+    /// table IDs), as do grants and other name-independent metadata.
+    pub fn rename_table(&mut self, table: TableId, new_name: &str) -> Result<()> {
+        if self
+            .tables
+            .values()
+            .any(|existing| existing.name == new_name)
+        {
+            return Err(DbError::InvalidState(format!(
+                "table name {new_name} already exists"
+            )));
+        }
+        self.tables
+            .get_mut(&table)
+            .ok_or_else(|| DbError::InvalidState(format!("table {} does not exist", table.0)))?
+            .name = new_name.to_owned();
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Remove one table, its primary-key order, its secondary indexes,
+    /// and the foreign keys it owns from the catalog. The owning store
+    /// drops the physical trees in the same publication. Foreign keys
+    /// from OTHER tables that reference this one refuse the drop (the
+    /// caller checks first) because they strand child rows.
+    pub fn drop_table(&mut self, table: TableId) -> Result<()> {
+        self.tables
+            .remove(&table)
+            .ok_or_else(|| DbError::InvalidState(format!("table {} does not exist", table.0)))?;
+        self.primary_keys.remove(&table);
+        let owned_indexes: Vec<IndexId> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table)
+            .map(|index| index.id)
+            .collect();
+        for index in owned_indexes {
+            self.indexes.remove(&index);
+            self.index_names.remove(&index);
+        }
+        let owned_keys: Vec<ConstraintId> = self
+            .foreign_keys
+            .values()
+            .filter(|foreign_key| foreign_key.table == table)
+            .map(|foreign_key| foreign_key.id)
+            .collect();
+        for constraint in owned_keys {
+            self.foreign_keys.remove(&constraint);
+            self.foreign_key_names.remove(&constraint);
+        }
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Remove one secondary index and its durable name from the catalog.
+    /// The owning store drops the physical index tree in the same
+    /// publication.
+    pub fn drop_index(&mut self, index: IndexId) -> Result<()> {
+        self.indexes
+            .remove(&index)
+            .ok_or_else(|| DbError::InvalidState(format!("index {} does not exist", index.0)))?;
+        self.index_names.remove(&index);
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Remove one foreign key and its durable name from the catalog.
+    pub fn drop_foreign_key(&mut self, constraint: ConstraintId) -> Result<()> {
+        self.foreign_keys.remove(&constraint).ok_or_else(|| {
+            DbError::InvalidState(format!("constraint {} does not exist", constraint.0))
+        })?;
+        self.foreign_key_names.remove(&constraint);
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Refuse an operation on a column that participates in the primary
+    /// key, a secondary index, or a foreign key. Those stores reference the
+    /// column by ID; a change that invalidates their entries must go
+    /// through dropping the constraint first.
+    fn assert_column_unconstrained(
+        &self,
+        table: TableId,
+        column: ColumnId,
+        operation: &str,
+    ) -> Result<()> {
+        if self
+            .primary_keys
+            .get(&table)
+            .is_some_and(|columns| columns.contains(&column))
+        {
+            return Err(DbError::InvalidState(format!(
+                "cannot {operation} primary-key column {}",
+                column.0
+            )));
+        }
+        if self
+            .indexes
+            .values()
+            .any(|index| index.table == table && index.columns.contains(&column))
+        {
+            return Err(DbError::InvalidState(format!(
+                "cannot {operation} column {}; it participates in a secondary index",
+                column.0
+            )));
+        }
+        if self.foreign_keys.values().any(|foreign_key| {
+            (foreign_key.table == table && foreign_key.columns.contains(&column))
+                || (foreign_key.referenced_table == table
+                    && foreign_key.referenced_columns.contains(&column))
+        }) {
+            return Err(DbError::InvalidState(format!(
+                "cannot {operation} column {}; it participates in a foreign key",
+                column.0
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

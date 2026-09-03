@@ -237,10 +237,19 @@ impl DirectSeerStore {
         let mut transaction = self.database.begin().map_err(map_seer_error)?;
         let index_tree = transaction.create_tree().map_err(map_seer_error)?;
         let mut seen_unique = BTreeSet::new();
-        for (identity, bytes) in transaction
-            .scan(table_tree, &[], None, usize::MAX)
-            .map_err(map_seer_error)?
-        {
+        // Register the whole table range as a read dependency so a
+        // concurrent row write that lands between this scan and the
+        // publication fails THIS commit instead of silently missing
+        // from the new index (same rule as foreign-key validation).
+        let mut cursor = transaction
+            .cursor(table_tree, &[], None)
+            .map_err(map_seer_error)?;
+        let mut entries = Vec::new();
+        while let Some((identity, bytes)) = cursor.next().transpose().map_err(map_seer_error)? {
+            entries.push((identity, bytes));
+        }
+        drop(cursor);
+        for (identity, bytes) in entries {
             let row = row_from_storage_identity(&candidate, &table, &identity, &bytes)?;
             if let Some(values) = row_index_key(&table, &index, &row)? {
                 if index.unique && !seen_unique.insert(values.clone()) {
@@ -281,6 +290,172 @@ impl DirectSeerStore {
             candidate
         };
         self.publish_catalog(candidate)
+    }
+
+    /// Apply a batch of schema mutations as one atomic publication.
+    ///
+    /// Every mutation validates against a candidate catalog built from
+    /// the mutations in order, so one `ALTER TABLE` with several
+    /// operations behaves like PostgreSQL: all operations apply or none
+    /// do. Row rewrites (alter type, drop column) and physical tree drops
+    /// (drop table, drop index) execute inside the same SeerDB
+    /// transaction that publishes the candidate catalog marker, so the
+    /// durable state is never a catalog that disagrees with its rows or
+    /// trees.
+    ///
+    /// Rewrite scans register the full table range as a read dependency:
+    /// a concurrent row write that lands between the scan and the
+    /// publication fails THIS publication with a serialization conflict
+    /// rather than silently missing from the rewritten rows or a newly
+    /// built index (the same rule the foreign-key validator enforces).
+    pub(crate) fn apply_schema_mutations(
+        &mut self,
+        mutations: &[SchemaMutation],
+    ) -> Result<CommitSeq> {
+        // Build the candidate catalog first: validation failures must be
+        // certain no-ops before any physical work begins.
+        let mut candidate = self.catalog.clone();
+        for mutation in mutations {
+            match mutation {
+                SchemaMutation::AddNullableColumn { table, column } => {
+                    candidate.add_nullable_column(*table, column.clone())?
+                }
+                SchemaMutation::RenameColumn {
+                    table,
+                    column,
+                    new_name,
+                } => candidate.rename_column(*table, *column, new_name)?,
+                SchemaMutation::AlterColumnType {
+                    table,
+                    column,
+                    data_type,
+                    nullable,
+                } => candidate.alter_column_type(*table, *column, *data_type, *nullable)?,
+                SchemaMutation::DropColumn { table, column } => {
+                    candidate.drop_column(*table, *column)?
+                }
+                SchemaMutation::RenameTable { table, new_name } => {
+                    candidate.rename_table(*table, new_name)?
+                }
+                SchemaMutation::DropTable { table } => candidate.drop_table(*table)?,
+                SchemaMutation::DropIndex { index } => candidate.drop_index(*index)?,
+                SchemaMutation::DropForeignKey { constraint } => {
+                    candidate.drop_foreign_key(*constraint)?
+                }
+            }
+        }
+        let mut transaction = self.database.begin().map_err(map_seer_error)?;
+
+        // Phase 1: physical work under the transaction's snapshot, all
+        // range-registered so concurrent writers conflict instead of
+        // slipping past the publication.
+        let mut table_trees = self.table_trees.clone();
+        let mut index_trees = self.index_trees.clone();
+        let mut dropped_trees: BTreeSet<TreeId> = BTreeSet::new();
+        for mutation in mutations {
+            match mutation {
+                SchemaMutation::AddNullableColumn { .. }
+                | SchemaMutation::RenameColumn { .. }
+                | SchemaMutation::RenameTable { .. }
+                | SchemaMutation::DropForeignKey { .. } => {}
+                SchemaMutation::AlterColumnType { table, column, .. }
+                | SchemaMutation::DropColumn { table, column } => {
+                    Self::rewrite_rows_for_column_change(
+                        &mut transaction,
+                        &self.catalog,
+                        &candidate,
+                        &table_trees,
+                        *table,
+                        *column,
+                    )?;
+                }
+                SchemaMutation::DropTable { table } => {
+                    if let Some(tree) = table_trees.remove(table) {
+                        transaction.drop_tree(tree).map_err(map_seer_error)?;
+                        dropped_trees.insert(tree);
+                    }
+                    // The candidate catalog already removed the table's
+                    // secondary indexes; drop their physical trees too.
+                    for index in self
+                        .catalog
+                        .indexes_for(*table)
+                        .map(|index| index.id)
+                        .collect::<Vec<_>>()
+                    {
+                        if let Some(tree) = index_trees.remove(&index) {
+                            transaction.drop_tree(tree).map_err(map_seer_error)?;
+                            dropped_trees.insert(tree);
+                        }
+                    }
+                }
+                SchemaMutation::DropIndex { index } => {
+                    if let Some(tree) = index_trees.remove(index) {
+                        transaction.drop_tree(tree).map_err(map_seer_error)?;
+                        dropped_trees.insert(tree);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: publish the candidate catalog in the same transaction.
+        let state = encode_catalog_state(&candidate, &table_trees, &index_trees)?;
+        transaction
+            .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
+            .map_err(map_seer_error)?;
+        let commit = transaction.commit().map_err(map_seer_error)?.csn;
+        drop(transaction);
+        self.catalog = candidate;
+        self.table_trees = table_trees;
+        self.index_trees = index_trees;
+        Ok(commit)
+    }
+
+    /// Rewrite every row of one table after a column change, inside the
+    /// caller's transaction. Identity bytes never change (identities are
+    /// built from the primary key, and constrained columns are refused
+    /// earlier), so the rewrite is a per-row value replacement at the
+    /// same identity key.
+    fn rewrite_rows_for_column_change(
+        transaction: &mut Transaction,
+        old_catalog: &Catalog,
+        candidate: &Catalog,
+        table_trees: &BTreeMap<TableId, TreeId>,
+        table: TableId,
+        changed_column: ColumnId,
+    ) -> Result<()> {
+        let tree = table_trees.get(&table).copied().ok_or_else(|| {
+            DbError::InvalidState(format!("table {} has no SeerDB tree", table.0))
+        })?;
+        // Decode against the old declaration, re-encode against the new
+        // one: a row written before the change must satisfy the change.
+        let old_definition = old_catalog.table(table)?.clone();
+        let new_definition = candidate.table(table)?.clone();
+        let old_position = old_definition
+            .columns
+            .iter()
+            .position(|column| column.id == changed_column)
+            .ok_or_else(|| {
+                DbError::InvalidState(format!("column {} does not exist", changed_column.0))
+            })?;
+        // Register the whole table range as a read dependency so a
+        // concurrent insert cannot slip between the scan and the commit.
+        let mut cursor = transaction
+            .cursor(tree, &[], None)
+            .map_err(map_seer_error)?;
+        let mut entries = Vec::new();
+        while let Some((identity, bytes)) = cursor.next().transpose().map_err(map_seer_error)? {
+            entries.push((identity, bytes));
+        }
+        drop(cursor);
+        for (identity, bytes) in entries {
+            let row = row_from_storage_identity(old_catalog, &old_definition, &identity, &bytes)?;
+            let rewritten =
+                rewrite_row_for_column(&old_definition, &new_definition, row, old_position)?;
+            transaction
+                .put(tree, &identity, &encode_row(&rewritten)?)
+                .map_err(map_seer_error)?;
+        }
+        Ok(())
     }
 
     /// Validate and publish one foreign-key definition.
@@ -1246,6 +1421,98 @@ fn encode_index_entry(values: &[u8], identity: &[u8]) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&identity_len.to_be_bytes());
     bytes.extend_from_slice(identity);
     Ok(bytes)
+}
+
+/// One schema mutation applied atomically by the relational facade's
+/// `apply_schema_mutations`.
+#[derive(Clone, Debug)]
+pub enum SchemaMutation {
+    /// Append one nullable column. Rows materialize the new field as
+    /// logical NULL at read time; no physical rewrite is needed.
+    AddNullableColumn {
+        table: TableId,
+        column: crate::ColumnDefinition,
+    },
+    RenameColumn {
+        table: TableId,
+        column: ColumnId,
+        new_name: String,
+    },
+    /// Change a column's declared type. `nullable` may relax NULLability
+    /// but never tighten it (a NOT NULL backfill is a separate validated
+    /// operation, not a declaration flip).
+    AlterColumnType {
+        table: TableId,
+        column: ColumnId,
+        data_type: crate::ColumnType,
+        nullable: bool,
+    },
+    DropColumn {
+        table: TableId,
+        column: ColumnId,
+    },
+    RenameTable {
+        table: TableId,
+        new_name: String,
+    },
+    DropTable {
+        table: TableId,
+    },
+    DropIndex {
+        index: IndexId,
+    },
+    DropForeignKey {
+        constraint: crate::ConstraintId,
+    },
+}
+
+/// Rewrite one decoded row for a column change: coerce the changed
+/// column's value into its new declaration, or remove the dropped
+/// column's value. Values are positional, so every column after the
+/// changed position shifts once on a drop.
+fn rewrite_row_for_column(
+    old_definition: &TableDefinition,
+    new_definition: &TableDefinition,
+    row: Row,
+    old_position: usize,
+) -> Result<Row> {
+    if new_definition.columns.len() == old_definition.columns.len() {
+        // ALTER TYPE: coerce the changed value through the same input
+        // grammar SQL literals and wire parameters use.
+        let mut values = row.values;
+        let target = new_definition
+            .columns
+            .get(old_position)
+            .ok_or_else(|| {
+                DbError::InvalidState("altered column is missing from the new table".to_owned())
+            })?
+            .clone();
+        let value = values
+            .get_mut(old_position)
+            .ok_or_else(|| DbError::InvalidState("row is missing the altered column".to_owned()))?;
+        let previous = std::mem::replace(value, Value::Null);
+        *value = crate::sql::typed_input::coerce_value(previous, &target)?;
+        Ok(Row {
+            primary: row.primary,
+            values,
+        })
+    } else {
+        // DROP COLUMN: remove the positional value.
+        let mut values = row.values;
+        if old_position >= values.len() {
+            // The row predates a later ADD COLUMN; the dropped column was
+            // logically NULL and there is nothing to remove.
+            return Ok(Row {
+                primary: row.primary,
+                values,
+            });
+        }
+        values.remove(old_position);
+        Ok(Row {
+            primary: row.primary,
+            values,
+        })
+    }
 }
 
 fn decode_index_entry(entry: &[u8], value: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {

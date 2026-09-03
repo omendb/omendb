@@ -40,7 +40,7 @@ pub use relational_database::{
     CancellationToken, OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT,
     RELATIONAL_SQL_BATCH_LIMIT, RelationalBackendConfig, RelationalCapability,
     RelationalCapabilityInfo, RelationalCapabilityReport, RelationalCapabilityState,
-    RelationalDatabase, RelationalDatabaseTransaction,
+    RelationalDatabase, RelationalDatabaseTransaction, SchemaMutation,
 };
 pub use row_identity::RowIdentity;
 pub use runtime::{

@@ -1,12 +1,12 @@
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, ColumnOption, CreateIndex, CreateTable, DataType,
-    NullsDistinctOption, TableConstraint, TimezoneInfo,
+    NullsDistinctOption, ObjectType, Statement, TableConstraint, TimezoneInfo,
 };
 
 use crate::{
     ColumnDefinition, ColumnId, ColumnType, CommitId, ConstraintId, DbError, IndexId,
     NamedForeignKeyDefinition, NamedIndexDefinition, RelationalDatabase,
-    RelationalSchemaDefinition, Result, TableDefinition, TableId,
+    RelationalSchemaDefinition, Result, SchemaMutation, TableDefinition, TableId,
 };
 
 use super::{column_position, find_table, simple_object_name, unsupported};
@@ -91,80 +91,292 @@ pub(super) fn execute_alter_table(
         || alter.location.is_some()
         || alter.on_cluster.is_some()
         || alter.table_type.is_some()
-        || alter.operations.len() != 1
     {
         return Err(unsupported(
             "ALTER TABLE",
-            "only one plain nullable ADD COLUMN operation is supported",
+            "plain unqualified ALTER TABLE is required",
         ));
     }
-    let table_name = simple_object_name(&alter.name, "table")?;
-    let operation = &alter.operations[0];
-    let AlterTableOperation::AddColumn {
-        if_not_exists,
-        column_def,
-        column_position,
-        ..
-    } = operation
-    else {
+    let table_name = simple_object_name(&alter.name, "table")?.to_owned();
+    let mut mutations = Vec::new();
+    for operation in &alter.operations {
+        mutations.extend(alter_table_mutation(database, &table_name, operation)?);
+    }
+    if mutations.is_empty() {
         return Err(unsupported(
             "ALTER TABLE",
-            "only nullable ADD COLUMN is supported",
-        ));
-    };
-    if *if_not_exists || column_position.is_some() {
-        return Err(unsupported(
-            "ALTER TABLE",
-            "ADD COLUMN IF NOT EXISTS and column placement are not supported",
+            "at least one operation is required",
         ));
     }
-    let mut nullable = true;
-    for option in &column_def.options {
-        if option.name.is_some() {
-            return Err(unsupported(
-                "ALTER TABLE",
-                "named column constraints are not supported",
-            ));
-        }
-        match &option.option {
-            ColumnOption::Null => nullable = true,
-            ColumnOption::NotNull => nullable = false,
-            _ => {
+    database.apply_schema_mutations(&mutations)
+}
+
+/// Translate one ALTER TABLE operation into schema mutations, validating
+/// against the current catalog so failures are certain no-ops.
+fn alter_table_mutation(
+    database: &mut RelationalDatabase,
+    table_name_ref: &str,
+    operation: &AlterTableOperation,
+) -> Result<Vec<SchemaMutation>> {
+    match operation {
+        AlterTableOperation::AddColumn {
+            if_not_exists,
+            column_def,
+            column_position,
+            ..
+        } => {
+            if *if_not_exists || column_position.is_some() {
                 return Err(unsupported(
                     "ALTER TABLE",
-                    "only a nullable column without a default or constraint is supported",
+                    "ADD COLUMN IF NOT EXISTS and column placement are not supported",
                 ));
             }
+            let mut nullable = true;
+            for option in &column_def.options {
+                if option.name.is_some() {
+                    return Err(unsupported(
+                        "ALTER TABLE",
+                        "named column constraints are not supported",
+                    ));
+                }
+                match &option.option {
+                    ColumnOption::Null => nullable = true,
+                    ColumnOption::NotNull => nullable = false,
+                    _ => {
+                        return Err(unsupported(
+                            "ALTER TABLE",
+                            "only a column without a default or constraint is supported",
+                        ));
+                    }
+                }
+            }
+            if !nullable {
+                return Err(unsupported(
+                    "ALTER TABLE",
+                    "new columns must be nullable until backfill and validation exist",
+                ));
+            }
+            let (table_id, column_id) = {
+                let table = find_table(database.catalog(), table_name_ref)?;
+                let next_column = table
+                    .columns
+                    .iter()
+                    .map(|column| column.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        DbError::InvalidState("no SQL column ID is available".to_owned())
+                    })?;
+                (table.id, ColumnId(next_column))
+            };
+            // ADD COLUMN joins the same batch publication so a multi-
+            // operation ALTER TABLE stays all-or-nothing; the batch path
+            // appends it to the candidate catalog without a rewrite.
+            Ok(vec![SchemaMutation::AddNullableColumn {
+                table: table_id,
+                column: ColumnDefinition {
+                    id: column_id,
+                    name: column_def.name.value.clone(),
+                    data_type: sql_data_type(&column_def.data_type)?,
+                    nullable: true,
+                },
+            }])
         }
-    }
-    if !nullable {
-        return Err(unsupported(
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+            ..
+        } => {
+            let table = find_table(database.catalog(), table_name_ref)?;
+            let column = column_id_by_name(table, &old_column_name.value, "renamed")?;
+            Ok(vec![SchemaMutation::RenameColumn {
+                table: table.id,
+                column,
+                new_name: new_column_name.value.clone(),
+            }])
+        }
+        AlterTableOperation::AlterColumn {
+            column_name,
+            op: sqlparser::ast::AlterColumnOperation::SetDataType { data_type, .. },
+        } => {
+            let table = find_table(database.catalog(), table_name_ref)?;
+            let column = column_id_by_name(table, &column_name.value, "altered")?;
+            let target = sql_data_type(data_type)?;
+            // Only widening/coercible changes pass; the rewrite coerces
+            // every stored value through the shared input grammar and a
+            // value that cannot convert fails the ALTER.
+            Ok(vec![SchemaMutation::AlterColumnType {
+                table: table.id,
+                column,
+                data_type: target,
+                nullable: table
+                    .column(column)
+                    .map(|column| column.nullable)
+                    .unwrap_or(true),
+            }])
+        }
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            drop_behavior,
+            ..
+        } => {
+            if *if_exists {
+                return Err(unsupported(
+                    "ALTER TABLE",
+                    "DROP COLUMN IF EXISTS is not supported",
+                ));
+            }
+            if drop_behavior.is_some() {
+                return Err(unsupported(
+                    "ALTER TABLE",
+                    "DROP COLUMN CASCADE/RESTRICT is not supported",
+                ));
+            }
+            let table = find_table(database.catalog(), table_name_ref)?;
+            column_names
+                .iter()
+                .map(|name| {
+                    Ok(SchemaMutation::DropColumn {
+                        table: table.id,
+                        column: column_id_by_name(table, &name.value, "dropped")?,
+                    })
+                })
+                .collect()
+        }
+        AlterTableOperation::RenameTable { table_name } => match table_name {
+            sqlparser::ast::RenameTableNameKind::To(name)
+            | sqlparser::ast::RenameTableNameKind::As(name) => {
+                let new_name = simple_object_name(name, "table")?.to_owned();
+                let table = find_table(database.catalog(), table_name_ref)?;
+                Ok(vec![SchemaMutation::RenameTable {
+                    table: table.id,
+                    new_name,
+                }])
+            }
+        },
+        AlterTableOperation::AlterColumn {
+            op: sqlparser::ast::AlterColumnOperation::DropNotNull,
+            column_name,
+        } => {
+            let table = find_table(database.catalog(), table_name_ref)?;
+            let column = column_id_by_name(table, &column_name.value, "altered")?;
+            let definition = table.column(column)?;
+            Ok(vec![SchemaMutation::AlterColumnType {
+                table: table.id,
+                column,
+                data_type: definition.data_type,
+                nullable: true,
+            }])
+        }
+        AlterTableOperation::AlterColumn {
+            op: sqlparser::ast::AlterColumnOperation::SetNotNull,
+            ..
+        } => Err(unsupported(
             "ALTER TABLE",
-            "new columns must be nullable until backfill and validation exist",
+            "SET NOT NULL requires a validated backfill",
+        )),
+        other => Err(unsupported(
+            "ALTER TABLE",
+            &format!("operation {other} is not supported"),
+        )),
+    }
+}
+
+/// Execute one DROP statement: TABLE or INDEX, with the referenced
+/// objects' physical trees dropped in the same atomic publication.
+pub(super) fn execute_drop(
+    database: &mut RelationalDatabase,
+    drop: &Statement,
+) -> Result<CommitId> {
+    let Statement::Drop {
+        object_type,
+        if_exists,
+        names,
+        cascade,
+        restrict,
+        purge,
+        temporary,
+        table: mysql_table,
+    } = drop
+    else {
+        return Err(unsupported("DROP", "malformed DROP statement"));
+    };
+    if mysql_table.is_some() {
+        return Err(unsupported(
+            "DROP",
+            "MySQL table-qualified index drops are not supported",
         ));
     }
-
-    let (table_id, column_id) = {
-        let table = find_table(database.catalog(), table_name)?;
-        let next_column = table
-            .columns
-            .iter()
-            .map(|column| column.id.0)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| DbError::InvalidState("no SQL column ID is available".to_owned()))?;
-        (table.id, ColumnId(next_column))
-    };
-    database.add_nullable_column(
-        table_id,
-        ColumnDefinition {
-            id: column_id,
-            name: column_def.name.value.clone(),
-            data_type: sql_data_type(&column_def.data_type)?,
-            nullable: true,
-        },
-    )
+    if *cascade || *restrict || *purge || *temporary {
+        return Err(unsupported(
+            "DROP",
+            "CASCADE/RESTRICT/PURGE are not required; drops refuse dependent objects",
+        ));
+    }
+    if names.len() != 1 {
+        return Err(unsupported("DROP", "exactly one object is required"));
+    }
+    match object_type {
+        ObjectType::Table => {
+            let name = simple_object_name(&names[0], "table")?.to_owned();
+            let Some(table) = database
+                .catalog()
+                .tables()
+                .find(|table| table.name == name)
+                .map(|table| table.id)
+            else {
+                if *if_exists {
+                    // A no-op drop still publishes nothing; report the
+                    // current position like an empty transaction.
+                    return Ok(database.commit_id());
+                }
+                return Err(DbError::InvalidState(format!(
+                    "table {name} does not exist"
+                )));
+            };
+            // Refuse while foreign keys depend on this table: dropping it
+            // would strand child rows with no referenced index. CASCADE is
+            // the explicit path, and it is not supported yet.
+            if let Some(foreign_key) = database
+                .catalog()
+                .foreign_keys()
+                .find(|foreign_key| foreign_key.referenced_table == table)
+            {
+                return Err(DbError::InvalidState(format!(
+                    "table {name} is referenced by foreign key {}",
+                    foreign_key.id.0
+                )));
+            }
+            // One mutation: Catalog::drop_table removes the table, its
+            // indexes, and its owned foreign keys in the same candidate,
+            // and the orchestrator drops the physical trees for every
+            // object the candidate no longer maps.
+            database.apply_schema_mutations(&[SchemaMutation::DropTable { table }])
+        }
+        ObjectType::Index => {
+            let name = simple_object_name(&names[0], "index")?.to_owned();
+            let Some(index) = database
+                .catalog()
+                .indexes()
+                .find(|index| database.catalog().index_name(index.id) == Some(name.as_str()))
+                .map(|index| index.id)
+            else {
+                if *if_exists {
+                    return Ok(database.commit_id());
+                }
+                return Err(DbError::InvalidState(format!(
+                    "index {name} does not exist"
+                )));
+            };
+            database.apply_schema_mutations(&[SchemaMutation::DropIndex { index }])
+        }
+        other => Err(unsupported(
+            "DROP",
+            &format!("object type {other:?} is not supported"),
+        )),
+    }
 }
 
 pub(super) fn execute_create_table(
