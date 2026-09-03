@@ -54,11 +54,11 @@ required-features = ["pgwire"]
 [[bin]]
 name = "omendbd"
 path = "src/bin/omendbd.rs"
+required-features = ["pgwire"]
 
 [[bin]]
 name = "omendb-tool"
 path = "src/bin/omendb-tool.rs"
-required-features = ["pgwire"]
 
 [dev-dependencies]
 bytes = "1"
