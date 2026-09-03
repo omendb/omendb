@@ -277,11 +277,125 @@ fn alter_table_mutation(
             "ALTER TABLE",
             "SET NOT NULL requires a validated backfill",
         )),
+        AlterTableOperation::AddConstraint {
+            constraint,
+            not_valid,
+        } => {
+            if *not_valid {
+                return Err(unsupported(
+                    "ALTER TABLE",
+                    "ADD CONSTRAINT NOT VALID is not supported",
+                ));
+            }
+            let table = find_table(database.catalog(), table_name_ref)?;
+            match constraint {
+                sqlparser::ast::TableConstraint::Unique(unique) => {
+                    if unique.index_type.is_some()
+                        || !unique.index_options.is_empty()
+                        || unique.characteristics.is_some()
+                        || unique.nulls_distinct != NullsDistinctOption::None
+                    {
+                        return Err(unsupported(
+                            "ALTER TABLE",
+                            "only plain immediate UNIQUE constraints are supported",
+                        ));
+                    }
+                    let index_id = next_index_id(database)?;
+                    Ok(vec![SchemaMutation::AddIndex {
+                        index: crate::IndexDefinition {
+                            id: IndexId(index_id),
+                            table: table.id,
+                            columns: simple_index_columns(table, &unique.columns, "UNIQUE")?,
+                            unique: true,
+                        },
+                        name: primary_object_name(
+                            unique.name.as_ref(),
+                            unique.index_name.as_ref(),
+                        )?,
+                    }])
+                }
+                sqlparser::ast::TableConstraint::ForeignKey(foreign_key) => {
+                    if foreign_key.index_name.is_some()
+                        || foreign_key.on_delete.is_some()
+                        || foreign_key.on_update.is_some()
+                        || foreign_key.match_kind.is_some()
+                        || foreign_key.characteristics.is_some()
+                        || foreign_key.columns.len() != foreign_key.referred_columns.len()
+                    {
+                        return Err(unsupported(
+                            "ALTER TABLE",
+                            "only immediate foreign keys with explicit columns are supported",
+                        ));
+                    }
+                    let foreign_table_name =
+                        simple_object_name(&foreign_key.foreign_table, "table")?;
+                    let referenced_table = if table.name == foreign_table_name {
+                        table
+                    } else {
+                        find_table(database.catalog(), foreign_table_name)?
+                    };
+                    let constraint_id = next_constraint_id(database)?;
+                    Ok(vec![SchemaMutation::AddForeignKey {
+                        foreign_key: crate::ForeignKeyDefinition {
+                            id: ConstraintId(constraint_id),
+                            table: table.id,
+                            columns: foreign_key
+                                .columns
+                                .iter()
+                                .map(|column| {
+                                    column_id_by_name(table, &column.value, "foreign-key")
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                            referenced_table: referenced_table.id,
+                            referenced_columns: foreign_key
+                                .referred_columns
+                                .iter()
+                                .map(|column| {
+                                    column_id_by_name(referenced_table, &column.value, "referenced")
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                            on_delete: crate::ReferentialAction::default(),
+                            timing: crate::ConstraintTiming::default(),
+                        },
+                        name: foreign_key.name.as_ref().map(|name| name.value.clone()),
+                    }])
+                }
+                _ => Err(unsupported(
+                    "ALTER TABLE",
+                    "only UNIQUE and FOREIGN KEY constraints can be added",
+                )),
+            }
+        }
         other => Err(unsupported(
             "ALTER TABLE",
             &format!("operation {other} is not supported"),
         )),
     }
+}
+
+/// The next free index ID: SQL-tier creation grows above every existing
+/// index in the catalog.
+fn next_index_id(database: &RelationalDatabase) -> Result<u64> {
+    database
+        .catalog()
+        .indexes()
+        .map(|index| index.id.0)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidState("no SQL index ID is available".to_owned()))
+}
+
+/// The next free constraint ID for foreign keys.
+fn next_constraint_id(database: &RelationalDatabase) -> Result<u64> {
+    database
+        .catalog()
+        .foreign_keys()
+        .map(|foreign_key| foreign_key.id.0)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| DbError::InvalidState("no SQL constraint ID is available".to_owned()))
 }
 
 /// Execute one DROP statement: TABLE or INDEX, with the referenced

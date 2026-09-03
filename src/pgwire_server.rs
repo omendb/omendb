@@ -1386,7 +1386,7 @@ impl pgwire::types::ToSqlText for PgDate {
         out: &mut bytes::BytesMut,
         _format_options: &pgwire::types::format::FormatOptions,
     ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(civil_from_days(self.0).as_bytes());
+        out.extend_from_slice(crate::sql_types::date_text(self.0).as_bytes());
         Ok(IsNull::No)
     }
 }
@@ -1421,7 +1421,7 @@ impl pgwire::types::ToSqlText for PgTimestamp {
         out: &mut bytes::BytesMut,
         _format_options: &pgwire::types::format::FormatOptions,
     ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(timestamp_text(self.0).as_bytes());
+        out.extend_from_slice(crate::sql_types::timestamp_text(self.0).as_bytes());
         Ok(IsNull::No)
     }
 }
@@ -1456,7 +1456,7 @@ impl pgwire::types::ToSqlText for PgNumeric {
         out: &mut bytes::BytesMut,
         _format_options: &pgwire::types::format::FormatOptions,
     ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(decimal_text(&self.0).as_bytes());
+        out.extend_from_slice(crate::sql_types::decimal_text(&self.0).as_bytes());
         Ok(IsNull::No)
     }
 }
@@ -1583,96 +1583,6 @@ fn numeric_groups_weighted(
     let weight = bottom_slots + (groups.len() as i32 - 1) + (untrimmed - groups.len()) as i32;
     let weight = i16::try_from(weight).map_err(|_| "numeric weight overflow".to_owned())?;
     Ok((weight, groups))
-}
-
-/// PostgreSQL numeric text rendering: no exponent, trailing zeros kept
-/// per dscale, at least one digit on each side of the point.
-fn decimal_text(value: &crate::sql_types::DecimalValue) -> String {
-    use std::fmt::Write;
-    let negative = value.mantissa < 0;
-    // Render from the integer mantissa with a decimal insertion.
-    let mut mantissa = value.mantissa.unsigned_abs();
-    let mut out = String::new();
-    if negative {
-        out.push('-');
-    }
-    if value.scale == 0 {
-        // integer form
-        write!(out, "{mantissa}").expect("write to string");
-        return out;
-    }
-    if mantissa == 0 {
-        out.push('0');
-        if value.scale > 0 {
-            out.push('.');
-            for _ in 0..value.scale {
-                out.push('0');
-            }
-        }
-        return out;
-    }
-    let mut digit_stack = Vec::new();
-    while mantissa > 0 {
-        digit_stack.push(b'0' + u8::try_from(mantissa % 10).expect("digit"));
-        mantissa /= 10;
-    }
-    let total = digit_stack.len();
-    if total <= value.scale as usize {
-        // 0.000ddd
-        out.push_str("0.");
-        for _ in 0..(value.scale as usize - total) {
-            out.push('0');
-        }
-        for digit in digit_stack.iter().rev() {
-            out.push(*digit as char);
-        }
-    } else {
-        let split = total - value.scale as usize;
-        for (index, digit) in digit_stack.iter().rev().enumerate() {
-            if index == split {
-                out.push('.');
-            }
-            out.push(*digit as char);
-        }
-    }
-    out
-}
-
-/// ISO text for a timestamp in micros since the Unix epoch.
-fn timestamp_text(micros: i64) -> String {
-    let days = micros.div_euclid(86_400_000_000);
-    let time = micros.rem_euclid(86_400_000_000);
-    let date = civil_from_days(i32::try_from(days).unwrap_or(0));
-    let hour = time / 3_600_000_000;
-    let minute = (time / 60_000_000) % 60;
-    let second = (time / 1_000_000) % 60;
-    let fraction = time % 1_000_000;
-    if fraction == 0 {
-        format!("{date} {hour:02}:{minute:02}:{second:02}")
-    } else {
-        let text = format!("{fraction:06}");
-        format!(
-            "{date} {hour:02}:{minute:02}:{second:02}.{}",
-            text.trim_end_matches('0')
-        )
-    }
-}
-
-/// Proleptic Gregorian `YYYY-MM-DD` from days since 1970-01-01
-/// (Howard Hinnant's civil_from_days).
-fn civil_from_days(days: i32) -> String {
-    let z = i64::from(days) + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let mp = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn value_type(value: Option<&Value>) -> Type {

@@ -159,6 +159,14 @@ impl DecimalValue {
     /// Number of decimal digits in a mantissa's absolute value (zero
     /// has zero digits).
     #[must_use]
+    pub fn to_f64(&self) -> f64 {
+        if self.scale == 0 {
+            self.mantissa as f64
+        } else {
+            (self.mantissa as f64) / 10f64.powi(self.scale as i32)
+        }
+    }
+
     pub fn digit_count(mantissa: i128) -> u32 {
         let mut digits = 0_u32;
         let mut value = mantissa.unsigned_abs();
@@ -332,6 +340,109 @@ fn hex_digit(digit: char) -> Result<u8> {
             "invalid uuid text representation".to_owned(),
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared SQL text renderings. The wire tier's text format and the logical
+// dump format are the same surface: what a client sees, a dump file holds.
+// ---------------------------------------------------------------------------
+
+/// Render a float as PostgreSQL does: shortest round-trip decimal with the
+/// special values spelled NaN / Infinity / -Infinity.
+pub fn float_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "Infinity".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_owned()
+    } else {
+        format!("{value}")
+    }
+}
+
+/// Proleptic Gregorian `YYYY-MM-DD` from days since 1970-01-01
+/// (Howard Hinnant's civil_from_days).
+pub fn date_text(days: i32) -> String {
+    let z = i64::from(days) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// ISO text for a timestamp in micros since the Unix epoch.
+pub fn timestamp_text(micros: i64) -> String {
+    let days = micros.div_euclid(86_400_000_000);
+    let time = micros.rem_euclid(86_400_000_000);
+    let date = date_text(i32::try_from(days).unwrap_or(0));
+    let hour = time / 3_600_000_000;
+    let minute = (time / 60_000_000) % 60;
+    let second = (time / 1_000_000) % 60;
+    let fraction = time % 1_000_000;
+    if fraction == 0 {
+        format!("{date} {hour:02}:{minute:02}:{second:02}")
+    } else {
+        let text = format!("{fraction:06}");
+        format!(
+            "{date} {hour:02}:{minute:02}:{second:02}.{}",
+            text.trim_end_matches('0')
+        )
+    }
+}
+
+/// Exact decimal text with the stored scale (dscale is part of the value).
+pub fn decimal_text(value: &DecimalValue) -> String {
+    use std::fmt::Write;
+    let negative = value.mantissa < 0;
+    let mut mantissa = value.mantissa.unsigned_abs();
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if value.scale == 0 {
+        write!(out, "{mantissa}").expect("write to string");
+        return out;
+    }
+    if mantissa == 0 {
+        out.push('0');
+        out.push('.');
+        for _ in 0..value.scale {
+            out.push('0');
+        }
+        return out;
+    }
+    let mut digit_stack = Vec::new();
+    while mantissa > 0 {
+        digit_stack.push(b'0' + u8::try_from(mantissa % 10).expect("digit"));
+        mantissa /= 10;
+    }
+    let total = digit_stack.len();
+    if total <= value.scale as usize {
+        out.push_str("0.");
+        for _ in 0..(value.scale as usize - total) {
+            out.push('0');
+        }
+        for digit in digit_stack.iter().rev() {
+            out.push(*digit as char);
+        }
+    } else {
+        let split = total - value.scale as usize;
+        for (index, digit) in digit_stack.iter().rev().enumerate() {
+            if index == split {
+                out.push('.');
+            }
+            out.push(*digit as char);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

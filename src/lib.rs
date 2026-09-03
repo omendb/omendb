@@ -21,6 +21,7 @@ mod seer_direct;
 mod serializable;
 mod session;
 mod sql;
+mod sql_dump;
 mod sql_types;
 
 pub use fault::{FailOnce, FaultInjector, FaultPoint, NoFaults};
@@ -58,6 +59,7 @@ pub use session::{
     RelationalSessionStatus,
 };
 pub use sql::{SqlColumn, SqlResult};
+pub use sql_dump::{dump_sql, restore_sql};
 pub use sql_types::{
     DECIMAL_MAX_PRECISION, DateValue, DecimalValue, F64, MAX_DATE_DAYS, MAX_TIMESTAMP_MICROS,
     MIN_DATE_DAYS, MIN_TIMESTAMP_MICROS, POSTGRES_EPOCH_OFFSET_DAYS, POSTGRES_EPOCH_OFFSET_MICROS,

@@ -33,15 +33,21 @@ constraint first. Remaining follow-up work: SET NOT NULL (needs a
 validated backfill), ALTER TYPE on constrained columns, and ADD COLUMN
 with non-null defaults.
 
-## Backup and restore — high severity
+## Backup and restore — LANDED 2026-08-31
 
-- Engine-level archive/restore exists in SeerDB
-  (`crates/seerdb/src/db/archive.rs`) but is not user-facing.
-- No logical dump/restore at the OmenDB layer: no SQL export, no way to
-  move data between engines or versions.
-- Consequence: "how do I get my data out?" has no answer; upgrade and
-  rollback stories are undefined for users. A pg_dump-compatible logical
-  dump would double as a differential-test tool.
+Landed in `feat/logical-backup`: `dump_sql`/`restore_sql` (public API +
+`omendb-tool dump|restore` CLI). One read-consistent snapshot renders
+as plain SQL — tables with inline primary keys, data as multi-row
+INSERTs (100 rows per statement) in scan order, named secondary
+indexes, foreign keys last as ALTER TABLE ADD CONSTRAINT after data —
+restoring into both OmenDB and real PostgreSQL (the live-PG dump
+differential runs in the oracle CI job, verifying values, FK
+enforcement, and unique constraints after restore). Bytea uses
+PostgreSQL hex format; typed literals quote the shared text grammar.
+Documented divergence: U64 columns dump as NUMERIC(20,0) (PostgreSQL
+has no unsigned 64-bit integer). Engine-level archive/restore
+(`crates/seerdb/src/db/archive.rs`) remains the physical-path
+primitive.
 
 ## Isolation level — medium severity
 

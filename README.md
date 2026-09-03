@@ -73,6 +73,21 @@ cargo run --release --example alpha_oltp -- \
 The baseline reports workload metadata and latency but makes no competitive
 performance claim; `--batch-size` measures the explicit transaction trade-off.
 
+## Logical dump and restore
+
+Move data in and out with plain SQL:
+
+```bash
+cargo run --bin omendb-tool -- dump --path ./omendb-data > backup.sql
+cargo run --bin omendb-tool -- restore --path ./fresh-db --input backup.sql
+```
+
+Dumps render one read-consistent snapshot: tables with inline primary
+keys, data as multi-row INSERTs in scan order, secondary indexes, and
+foreign keys last. The format restores into OmenDB and into PostgreSQL
+(within the documented divergences in `docs/gap-register.md`), so it
+doubles as a migration and differential-testing tool.
+
 ## PostgreSQL wire server
 
 Run the persistent daemon with:

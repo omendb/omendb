@@ -320,6 +320,16 @@ impl DirectSeerStore {
                 SchemaMutation::AddNullableColumn { table, column } => {
                     candidate.add_nullable_column(*table, column.clone())?
                 }
+                SchemaMutation::AddIndex { index, name } => match name {
+                    Some(name) => candidate.create_named_index(index.clone(), name.clone())?,
+                    None => candidate.create_index(index.clone())?,
+                },
+                SchemaMutation::AddForeignKey { foreign_key, name } => match name {
+                    Some(name) => {
+                        candidate.create_named_foreign_key(foreign_key.clone(), name.clone())?
+                    }
+                    None => candidate.create_foreign_key(foreign_key.clone())?,
+                },
                 SchemaMutation::RenameColumn {
                     table,
                     column,
@@ -358,6 +368,135 @@ impl DirectSeerStore {
                 | SchemaMutation::RenameColumn { .. }
                 | SchemaMutation::RenameTable { .. }
                 | SchemaMutation::DropForeignKey { .. } => {}
+                SchemaMutation::AddIndex { index, .. } => {
+                    let index_tree = transaction.create_tree().map_err(map_seer_error)?;
+                    let table = candidate
+                        .table(index.table)
+                        .map_err(|_| {
+                            DbError::InvalidState(format!(
+                                "index {} targets an unknown table",
+                                index.id.0
+                            ))
+                        })?
+                        .clone();
+                    let table_tree = table_trees.get(&index.table).copied().ok_or_else(|| {
+                        DbError::InvalidState(format!("table {} has no SeerDB tree", index.table.0))
+                    })?;
+                    let mut cursor = transaction
+                        .cursor(table_tree, &[], None)
+                        .map_err(map_seer_error)?;
+                    let mut entries = Vec::new();
+                    while let Some((identity, bytes)) =
+                        cursor.next().transpose().map_err(map_seer_error)?
+                    {
+                        entries.push((identity, bytes));
+                    }
+                    drop(cursor);
+                    let mut seen_unique = BTreeSet::new();
+                    for (identity, bytes) in entries {
+                        let row = row_from_storage_identity(&candidate, &table, &identity, &bytes)?;
+                        if let Some(values) = row_index_key(&table, index, &row)? {
+                            if index.unique && !seen_unique.insert(values.clone()) {
+                                return Err(DbError::UniqueViolation {
+                                    index: index.id.0,
+                                    key: values,
+                                });
+                            }
+                            let key = encode_index_entry(&values, &identity)?;
+                            transaction
+                                .put(index_tree, &key, &identity)
+                                .map_err(map_seer_error)?;
+                        }
+                    }
+                    index_trees.insert(index.id, index_tree);
+                }
+                SchemaMutation::AddForeignKey { foreign_key, .. } => {
+                    // Validate existing rows against the new constraint
+                    // inside the same transaction that publishes it: the
+                    // same check validate_one_foreign_key runs, inlined
+                    // here because this orchestrator owns the raw
+                    // transaction rather than a DirectTransaction wrapper.
+                    let child_definition = candidate.table(foreign_key.table)?.clone();
+                    let referenced_definition =
+                        candidate.table(foreign_key.referenced_table)?.clone();
+                    let referenced_index = candidate
+                        .indexes_for(foreign_key.referenced_table)
+                        .find(|index| {
+                            index.unique && index.columns == foreign_key.referenced_columns
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            DbError::InvalidState(format!(
+                                "foreign key {} has no unique referenced index",
+                                foreign_key.id.0
+                            ))
+                        })?;
+                    let referenced_tree = index_trees
+                        .get(&referenced_index.id)
+                        .copied()
+                        .ok_or_else(|| {
+                            DbError::InvalidState(format!(
+                                "index {} has no SeerDB tree",
+                                referenced_index.id.0
+                            ))
+                        })?;
+                    let child_tree =
+                        table_trees
+                            .get(&foreign_key.table)
+                            .copied()
+                            .ok_or_else(|| {
+                                DbError::InvalidState(format!(
+                                    "table {} has no SeerDB tree",
+                                    foreign_key.table.0
+                                ))
+                            })?;
+                    let mut referenced_values: BTreeSet<Vec<u8>> = BTreeSet::new();
+                    {
+                        let mut cursor = transaction
+                            .cursor(referenced_tree, &[], None)
+                            .map_err(map_seer_error)?;
+                        while let Some((entry, identity)) =
+                            cursor.next().transpose().map_err(map_seer_error)?
+                        {
+                            if let Ok((values, _)) = decode_index_entry(&entry, &identity) {
+                                referenced_values.insert(values);
+                            }
+                        }
+                    }
+                    let mut entries = Vec::new();
+                    {
+                        let mut cursor = transaction
+                            .cursor(child_tree, &[], None)
+                            .map_err(map_seer_error)?;
+                        while let Some((identity, bytes)) =
+                            cursor.next().transpose().map_err(map_seer_error)?
+                        {
+                            entries.push((identity, bytes));
+                        }
+                    }
+                    for (identity, bytes) in entries {
+                        let row = row_from_storage_identity(
+                            &candidate,
+                            &child_definition,
+                            &identity,
+                            &bytes,
+                        )?;
+                        let values =
+                            foreign_key_values(&row, &child_definition, &foreign_key.columns)?;
+                        if values.iter().any(|value| matches!(value, Value::Null)) {
+                            continue;
+                        }
+                        let encoded =
+                            index_values_key(&referenced_definition, &referenced_index, &values)?;
+                        if !referenced_values.contains(&encoded) {
+                            return Err(DbError::ForeignKeyViolation {
+                                constraint: foreign_key.id.0,
+                                table: foreign_key.table.0,
+                                referenced_table: foreign_key.referenced_table.0,
+                            });
+                        }
+                    }
+                }
                 SchemaMutation::AlterColumnType { table, column, .. }
                 | SchemaMutation::DropColumn { table, column } => {
                     Self::rewrite_rows_for_column_change(
@@ -1432,6 +1571,20 @@ pub enum SchemaMutation {
     AddNullableColumn {
         table: TableId,
         column: crate::ColumnDefinition,
+    },
+    /// Register one named secondary index and build its entries from
+    /// existing rows inside the same atomic publication. The entries are
+    /// range-registered, so concurrent writers conflict instead of
+    /// slipping past the build scan.
+    AddIndex {
+        index: IndexDefinition,
+        name: Option<String>,
+    },
+    /// Register one named foreign key after validating existing rows
+    /// against it (same validation as the direct create path).
+    AddForeignKey {
+        foreign_key: ForeignKeyDefinition,
+        name: Option<String>,
     },
     RenameColumn {
         table: TableId,

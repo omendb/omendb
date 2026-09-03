@@ -663,3 +663,120 @@ fn civil_from_days(days: i32) -> String {
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}")
 }
+
+/// Dump/restore differential: an OmenDB dump must restore into real
+/// PostgreSQL and reproduce the same logical content. This is the
+/// data-in/data-out trust gate — if a dump cannot move data into
+/// PostgreSQL, the dump format has drifted from its contract.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn dump_restores_into_live_postgresql() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL).with_context(|| {
+        format!("{POSTGRES_ORACLE_URL} must point to the live PostgreSQL oracle")
+    })?;
+
+    // Build an OmenDB database directly (the dump API is engine-local;
+    // the wire tier is not involved in dumping).
+    let directory = tempdir().context("dump differential directory")?;
+    let db_path = directory.path().join("dump-db");
+    let config = omendb::RelationalBackendConfig::new(db_path);
+    let mut omendb_db =
+        omendb::RelationalDatabase::create(config).context("create OmenDB source")?;
+    for statement in [
+        "CREATE TABLE dump_groups (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE dump_accounts (
+             id BIGINT PRIMARY KEY,
+             label TEXT,
+             ratio DOUBLE PRECISION,
+             opened DATE,
+             price NUMERIC,
+             token UUID,
+             payload BYTEA,
+             group_id BIGINT,
+             FOREIGN KEY (group_id) REFERENCES dump_groups (id)
+         )",
+        "INSERT INTO dump_groups (id, name) VALUES (1, 'alpha'), (2, 'beta')",
+        "INSERT INTO dump_accounts (id, label, ratio, opened, price, token, payload, group_id) VALUES
+             (1, 'first', 0.5, '2026-01-15', '19.99', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\\xabcd', 1),
+             (2, 'second', 'NaN', '2025-12-31', '-0.001', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', '\\x', 2),
+             (3, 'third', -1.5, NULL, NULL, NULL, NULL, NULL)",
+    ] {
+        omendb_db
+            .execute_sql(statement)
+            .with_context(|| format!("seed dump source: {statement}"))?;
+    }
+
+    let dump = omendb::dump_sql(&mut omendb_db).context("dump")?;
+    drop(omendb_db);
+
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+    postgres
+        .batch_execute(
+            "DROP TABLE IF EXISTS dump_accounts;
+             DROP TABLE IF EXISTS dump_groups;",
+        )
+        .await
+        .context("clean differential tables")?;
+    // The dump's CREATE TABLE order respects FK references (children
+    // after parents in catalog ID order here), but restore must not
+    // depend on that: our own restore_sql replays statements in order
+    // and the FK arrives after the data, so plain batch_execute works.
+    postgres
+        .batch_execute(&dump)
+        .await
+        .context("restore OmenDB dump into PostgreSQL")?;
+
+    // Same logical content in both engines.
+    let pg_rows: Vec<i64> = postgres
+        .query("SELECT id FROM dump_accounts ORDER BY id", &[])
+        .await
+        .context("query restored rows")?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(pg_rows, vec![1, 2, 3]);
+
+    let pg_ratio: Vec<Option<String>> = postgres
+        .query("SELECT ratio::text FROM dump_accounts ORDER BY id", &[])
+        .await?
+        .iter()
+        .map(|row| row.get::<_, Option<String>>(0))
+        .collect();
+    // PostgreSQL renders float8 NaN as 'NaN'; 0.5 and -1.5 round-trip.
+    assert_eq!(pg_ratio[0].as_deref(), Some("0.5"));
+    assert_eq!(pg_ratio[1].as_deref(), Some("NaN"));
+    assert_eq!(pg_ratio[2].as_deref(), Some("-1.5"));
+
+    let pg_price: Vec<Option<String>> = postgres
+        .query("SELECT price::text FROM dump_accounts ORDER BY id", &[])
+        .await?
+        .iter()
+        .map(|row| row.get::<_, Option<String>>(0))
+        .collect();
+    assert_eq!(pg_price[0].as_deref(), Some("19.99"));
+    assert_eq!(pg_price[1].as_deref(), Some("-0.001"));
+    assert_eq!(pg_price[2], None);
+
+    // The foreign key is live in PostgreSQL too: an orphan insert fails.
+    let orphan = postgres
+        .execute(
+            "INSERT INTO dump_accounts (id, label, group_id) VALUES (99, 'orphan', 77)",
+            &[],
+        )
+        .await;
+    assert!(orphan.is_err(), "restored FK must reject orphans in PG");
+
+    // Unique constraint survives the round trip.
+    postgres
+        .batch_execute(
+            "DROP TABLE IF EXISTS dump_accounts;
+             DROP TABLE IF EXISTS dump_groups;",
+        )
+        .await
+        .context("clean up differential tables")?;
+    drop(postgres);
+    postgres_connection
+        .await
+        .context("join PostgreSQL oracle connection")??;
+    Ok(())
+}

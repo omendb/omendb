@@ -19,8 +19,15 @@ pub(super) fn literal_value(expression: &Expr, params: &[Value]) -> Result<Value
                 .checked_neg()
                 .map(Value::I64)
                 .ok_or_else(|| DbError::InvalidState("integer literal underflow".to_owned())),
+            // Negative decimal and float literals apply the unary minus
+            // to the parsed value, matching PostgreSQL input syntax.
+            Value::Decimal(value) => Ok(Value::Decimal(
+                crate::sql_types::DecimalValue::new(-value.mantissa, value.scale)
+                    .map_err(|_| DbError::InvalidState("decimal literal underflow".to_owned()))?,
+            )),
+            Value::Float64(value) => Ok(Value::Float64(crate::sql_types::F64::new(-value.0))),
             _ => Err(DbError::InvalidState(
-                "unary minus requires an integer literal".to_owned(),
+                "unary minus requires a numeric literal".to_owned(),
             )),
         },
         Expr::Value(value) => match &value.value {
@@ -164,6 +171,9 @@ pub(crate) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
         (Value::I64(inner), ColumnType::Float64) => {
             Value::Float64(crate::sql_types::F64::new(*inner as f64))
         }
+        (Value::Decimal(inner), ColumnType::Float64) => {
+            Value::Float64(crate::sql_types::F64::new(inner.to_f64()))
+        }
         (Value::U64(inner), ColumnType::Float64) => {
             Value::Float64(crate::sql_types::F64::new(*inner as f64))
         }
@@ -212,6 +222,15 @@ pub(crate) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
             .map_err(|_| DbError::SqlDatatypeMismatch {
                 column: column.name.clone(),
             })?,
+        // PostgreSQL bytea hex input: \x followed by hex digit pairs.
+        (Value::Text(inner), ColumnType::Bytes) => {
+            let text = inner
+                .strip_prefix("\\x")
+                .ok_or_else(|| DbError::SqlDatatypeMismatch {
+                    column: column.name.clone(),
+                })?;
+            decode_hex(text)?
+        }
         _ => value,
     };
     let valid = matches!(
