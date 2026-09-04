@@ -87,7 +87,7 @@ impl DB {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            if required > fs2::available_space(&self.path)? {
+            if required > fs4::available_space(&self.path)? {
                 return Err(Error::DiskFull);
             }
         }
@@ -172,7 +172,7 @@ impl DB {
             .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
             .ok_or(Error::DiskFull)?;
 
-        if fs2::available_space(&self.path)? < required {
+        if fs4::available_space(&self.path)? < required {
             return Err(Error::CapacityPreflight);
         }
         Ok(())
@@ -204,7 +204,7 @@ impl DB {
             .and_then(|size| size.checked_add(history_bytes))
             .and_then(|size| size.checked_add(PUBLICATION_CAPACITY_SAFETY_BYTES))
             .ok_or(Error::DiskFull)?;
-        if fs2::available_space(&self.path)? < required {
+        if fs4::available_space(&self.path)? < required {
             return Err(Error::CapacityPreflight);
         }
         Ok(())

@@ -6,7 +6,6 @@
 //! only admit or release access to that state.
 
 use super::*;
-use fs2::FileExt;
 use std::fs::OpenOptions;
 
 impl DB {
@@ -82,12 +81,10 @@ impl DB {
             .read(true)
             .write(true)
             .open(path)?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(Error::DatabaseBusy)
-            }
-            Err(error) => Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::DatabaseBusy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 
@@ -98,12 +95,10 @@ impl DB {
         }
 
         let file = OpenOptions::new().read(true).open(lock_path)?;
-        match fs2::FileExt::try_lock_shared(&file) {
+        match file.try_lock_shared() {
             Ok(()) => Ok(Some(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(Error::DatabaseBusy)
-            }
-            Err(error) => Err(error.into()),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::DatabaseBusy),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 }

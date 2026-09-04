@@ -33,8 +33,6 @@ async-trait = { version = "0.1.92", optional = true }
 bytes = "1"
 futures = { version = "0.3", optional = true }
 crc32c = "0.6.8"
-fs2 = "0.4.3"
-libc = "0.2.186"
 pgwire = { version = "0.40.7", optional = true }
 postgres-types = { version = "0.2", optional = true }
 seerdb = { path = "crates/seerdb", version = "0.1.0-alpha.1" }
@@ -42,6 +40,7 @@ sha2 = "0.11.0"
 sqlparser = { version = "0.62.0", default-features = false, features = ["recursive-protection", "std", "visitor"] }
 thiserror = "2.0.18"
 tokio = { version = "1.53.1", features = ["net", "rt-multi-thread", "time", "io-util", "sync", "signal"], optional = true }
+libc = "0.2.186"
 
 [[example]]
 name = "concurrency_stress"

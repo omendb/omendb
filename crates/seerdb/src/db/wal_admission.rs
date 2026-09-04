@@ -187,7 +187,7 @@ impl DB {
         if current < target {
             let physically_reserved = reserve_file(&file, target)?;
             if !physically_reserved
-                && fs2::available_space(&self.path)? < target.saturating_sub(current)
+                && fs4::available_space(&self.path)? < target.saturating_sub(current)
             {
                 return Err(Error::DiskFull);
             }
