@@ -284,6 +284,79 @@ fn exercise_sql(directory: &Path) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn update_assignment_arithmetic_matches_read_modify_write() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let database_path = directory.path().join("assignment-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+    database
+        .execute_sql(
+            "CREATE TABLE ledgers (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, price NUMERIC)",
+        )
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO ledgers VALUES (1, 100, '10.50'), (2, 40, NULL)")
+        .expect("seed");
+
+    // The OLTP read-modify-write shape: column +/- literal and parameter.
+    database
+        .execute_sql("UPDATE ledgers SET balance = balance + 15 WHERE id = 1")
+        .expect("column plus literal");
+    database
+        .execute_sql("UPDATE ledgers SET balance = balance - 10 WHERE id = 2")
+        .expect("column minus literal");
+    let balances = database
+        .execute_sql("SELECT balance FROM ledgers ORDER BY id")
+        .expect("select balances");
+    assert_eq!(balances.rows[0][0], Value::I64(115));
+    assert_eq!(balances.rows[1][0], Value::I64(30));
+
+    // Parameterized delta through the typed-parameter path.
+    let adjusted = database
+        .execute_sql_with_params(
+            "UPDATE ledgers SET balance = balance + $1 WHERE id = $2",
+            &[Value::I64(5), Value::I64(1)],
+        )
+        .expect("parameterized delta");
+    assert_eq!(adjusted.affected_rows, 1);
+    let balances = database
+        .execute_sql("SELECT balance FROM ledgers ORDER BY id")
+        .expect("select balances");
+    assert_eq!(balances.rows[0][0], Value::I64(120));
+
+    // Decimal arithmetic at the operand scales; NULL propagates.
+    database
+        .execute_sql("UPDATE ledgers SET price = price + 0.25 WHERE id = 1")
+        .expect("decimal add");
+    let prices = database
+        .execute_sql("SELECT price FROM ledgers ORDER BY id")
+        .expect("select prices");
+    assert_eq!(
+        prices.rows[0][0],
+        Value::Decimal(omendb::DecimalValue::new(10_75, 2).expect("decimal"))
+    );
+    assert_eq!(prices.rows[1][0], Value::Null);
+
+    // Overflows refuse instead of wrapping.
+    database
+        .execute_sql("CREATE TABLE wide (id BIGINT PRIMARY KEY, n BIGINT NOT NULL)")
+        .expect("wide table");
+    database
+        .execute_sql("INSERT INTO wide VALUES (1, 9223372036854775807)")
+        .expect("seed max");
+    assert!(
+        database
+            .execute_sql("UPDATE wide SET n = n + 1 WHERE id = 1")
+            .is_err()
+    );
+
+    // Closing the loop: the value read back is exactly the written value.
+    let value = database
+        .execute_sql("SELECT balance FROM ledgers WHERE id = 1")
+        .expect("final read");
+    assert_eq!(value.rows[0][0], Value::I64(120));
+}
+
+#[test]
 fn embedded_sql_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
     exercise_sql(&temporary.path().join("temporary"));

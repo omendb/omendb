@@ -1,6 +1,6 @@
 use sqlparser::ast::{
-    AssignmentTarget, Delete, Expr, FromTable, Insert, ObjectName, SelectItem, SetExpr,
-    TableObject, Update,
+    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName, SelectItem,
+    SetExpr, TableObject, Update,
 };
 
 use crate::{
@@ -346,31 +346,7 @@ pub(super) fn execute_update(
         )? {
             continue;
         }
-        let mut updated = row.clone();
-        for (position, expression) in &assignments {
-            let value = literal_value(expression, params)?;
-            updated.values[*position] = coerce_value(value, &table.columns[*position])?;
-        }
-        let primary_changed = if let Some(columns) = database.catalog().primary_key(table.id) {
-            columns.iter().try_fold(false, |changed, column| {
-                let position = table
-                    .columns
-                    .iter()
-                    .position(|candidate| candidate.id == *column)
-                    .ok_or_else(|| {
-                        DbError::InvalidState("primary-key column is missing".to_owned())
-                    })?;
-                Ok::<_, DbError>(changed || updated.values[position] != row.values[position])
-            })?
-        } else {
-            updated.values[0] != row.values[0]
-        };
-        if primary_changed {
-            return Err(DbError::InvalidState(
-                "updating the SQL primary key is not supported; delete and insert the row instead"
-                    .to_owned(),
-            ));
-        }
+        let updated = apply_assignments(database, transaction, table, &assignments, &row, params)?;
         if let Some((_, positions)) = &returning_plan {
             returned_rows.push(
                 positions
@@ -390,6 +366,138 @@ pub(super) fn execute_update(
 
 /// Apply assignments to one target row in place (shared by the plain and
 /// FROM-join update paths), enforcing primary-key invariance.
+/// Evaluate one UPDATE assignment against the row being updated.
+///
+/// Assignments may be a literal (the historical surface), a bare column
+/// reference, or `operand +|- operand` where each operand is a column
+/// reference or a numeric literal/parameter — the read-modify-write
+/// shape every OLTP driver uses (`SET balance = balance + $delta`).
+/// Operands coerce to the target column's type exactly as literal
+/// assignments do.
+fn assignment_value(
+    expression: &Expr,
+    table: &TableDefinition,
+    row: &Row,
+    params: &[Value],
+) -> Result<Value> {
+    match expression {
+        Expr::Nested(inner) => assignment_value(inner, table, row, params),
+        Expr::BinaryOp { left, op, right } => {
+            let subtract = match op {
+                BinaryOperator::Plus => false,
+                BinaryOperator::Minus => true,
+                _ => {
+                    return Err(DbError::InvalidState(
+                        "only + and - are supported in assignment expressions".to_owned(),
+                    ));
+                }
+            };
+            let left = assignment_operand(left, table, row, params)?;
+            let right = assignment_operand(right, table, row, params)?;
+            numeric_assignment_op(left, right, subtract)
+        }
+        Expr::Identifier(identifier) => {
+            let name = identifier
+                .value
+                .strip_suffix('"')
+                .unwrap_or(&identifier.value)
+                .trim_matches('"');
+            let position = column_position_by_name(table, name)?;
+            Ok(row.values[position].clone())
+        }
+        other => literal_value(other, params),
+    }
+}
+
+/// One side of an assignment arithmetic expression: a row column or a
+/// literal/parameter.
+fn assignment_operand(
+    expression: &Expr,
+    table: &TableDefinition,
+    row: &Row,
+    params: &[Value],
+) -> Result<Value> {
+    match expression {
+        Expr::Nested(inner) => assignment_operand(inner, table, row, params),
+        Expr::Identifier(identifier) => {
+            let name = identifier
+                .value
+                .strip_suffix('"')
+                .unwrap_or(&identifier.value)
+                .trim_matches('"');
+            let position = column_position_by_name(table, name)?;
+            Ok(row.values[position].clone())
+        }
+        other => literal_value(other, params),
+    }
+}
+
+/// Numeric + / - over assignment operands with SQL overflow semantics.
+/// Decimal operands add at the wider scale, exactly as SUM does.
+fn numeric_assignment_op(left: Value, right: Value, subtract: bool) -> Result<Value> {
+    match (&left, &right) {
+        (Value::I64(a), Value::I64(b)) => {
+            let b = if subtract {
+                b.checked_neg().ok_or_else(|| {
+                    DbError::InvalidState("integer assignment overflow".to_owned())
+                })?
+            } else {
+                *b
+            };
+            a.checked_add(b)
+                .map(Value::I64)
+                .ok_or_else(|| DbError::InvalidState("integer assignment overflow".to_owned()))
+        }
+        (Value::Decimal(a), Value::Decimal(b)) => {
+            let target = a.scale.max(b.scale);
+            let a = a
+                .rescale(target)
+                .map_err(|_| DbError::InvalidState("decimal assignment overflow".to_owned()))?;
+            let b = b
+                .rescale(target)
+                .map_err(|_| DbError::InvalidState("decimal assignment overflow".to_owned()))?;
+            let b = if subtract {
+                b.mantissa.checked_neg().ok_or_else(|| {
+                    DbError::InvalidState("decimal assignment overflow".to_owned())
+                })?
+            } else {
+                b.mantissa
+            };
+            let mantissa = a
+                .mantissa
+                .checked_add(b)
+                .ok_or_else(|| DbError::InvalidState("decimal assignment overflow".to_owned()))?;
+            Ok(Value::Decimal(
+                crate::sql_types::DecimalValue::new(mantissa, target)
+                    .map_err(|_| DbError::InvalidState("decimal assignment overflow".to_owned()))?,
+            ))
+        }
+        // Mixed integer and decimal operands follow PostgreSQL's numeric
+        // promotion; float operands (including promoted decimals via
+        // to_f64) stay in float8.
+        _ => {
+            let (a, b) = (
+                numeric_operand_to_f64(&left)?,
+                numeric_operand_to_f64(&right)?,
+            );
+            let b = if subtract { -b } else { b };
+            Ok(Value::Float64(crate::sql_types::F64::new(a + b)))
+        }
+    }
+}
+
+fn numeric_operand_to_f64(value: &Value) -> Result<f64> {
+    match value {
+        Value::I64(value) => Ok(*value as f64),
+        Value::U64(value) => Ok(*value as f64),
+        Value::Decimal(value) => Ok(value.to_f64()),
+        Value::Float64(value) => Ok(value.0),
+        other => Err(DbError::InvalidState(format!(
+            "assignment arithmetic requires numeric operands, found {other:?}"
+        ))),
+    }
+}
+
 fn apply_assignments(
     database: &RelationalDatabase,
     transaction: &mut RelationalDatabaseTransaction,
@@ -400,7 +508,7 @@ fn apply_assignments(
 ) -> Result<Row> {
     let mut updated = row.clone();
     for (position, expression) in assignments {
-        let value = literal_value(expression, params)?;
+        let value = assignment_value(expression, table, row, params)?;
         updated.values[*position] = coerce_value(value, &table.columns[*position])?;
     }
     let primary_changed = if let Some(columns) = database.catalog().primary_key(table.id) {
