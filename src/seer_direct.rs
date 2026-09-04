@@ -412,32 +412,18 @@ impl DirectSeerStore {
                 }
                 SchemaMutation::AddForeignKey { foreign_key, .. } => {
                     // Validate existing rows against the new constraint
-                    // inside the same transaction that publishes it: the
-                    // same check validate_one_foreign_key runs, inlined
-                    // here because this orchestrator owns the raw
-                    // transaction rather than a DirectTransaction wrapper.
-                    let child_definition = candidate.table(foreign_key.table)?.clone();
-                    let referenced_definition =
-                        candidate.table(foreign_key.referenced_table)?.clone();
-                    let referenced_index = candidate
-                        .indexes_for(foreign_key.referenced_table)
-                        .find(|index| {
-                            index.unique && index.columns == foreign_key.referenced_columns
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            DbError::InvalidState(format!(
-                                "foreign key {} has no unique referenced index",
-                                foreign_key.id.0
-                            ))
-                        })?;
+                    // inside the same transaction that publishes it. The
+                    // shared validator runs against the candidate catalog:
+                    // the referenced unique index may be created in this
+                    // same mutation batch.
+                    let parts = resolve_foreign_key_parts(&candidate, foreign_key)?;
                     let referenced_tree = index_trees
-                        .get(&referenced_index.id)
+                        .get(&parts.referenced_index.id)
                         .copied()
                         .ok_or_else(|| {
                             DbError::InvalidState(format!(
                                 "index {} has no SeerDB tree",
-                                referenced_index.id.0
+                                parts.referenced_index.id.0
                             ))
                         })?;
                     let child_tree =
@@ -450,52 +436,17 @@ impl DirectSeerStore {
                                     foreign_key.table.0
                                 ))
                             })?;
-                    let mut referenced_values: BTreeSet<Vec<u8>> = BTreeSet::new();
-                    {
-                        let mut cursor = transaction
-                            .cursor(referenced_tree, &[], None)
-                            .map_err(map_seer_error)?;
-                        while let Some((entry, identity)) =
-                            cursor.next().transpose().map_err(map_seer_error)?
-                        {
-                            if let Ok((values, _)) = decode_index_entry(&entry, &identity) {
-                                referenced_values.insert(values);
-                            }
-                        }
-                    }
-                    let mut entries = Vec::new();
-                    {
-                        let mut cursor = transaction
-                            .cursor(child_tree, &[], None)
-                            .map_err(map_seer_error)?;
-                        while let Some((identity, bytes)) =
-                            cursor.next().transpose().map_err(map_seer_error)?
-                        {
-                            entries.push((identity, bytes));
-                        }
-                    }
-                    for (identity, bytes) in entries {
-                        let row = row_from_storage_identity(
-                            &candidate,
-                            &child_definition,
-                            &identity,
-                            &bytes,
-                        )?;
-                        let values =
-                            foreign_key_values(&row, &child_definition, &foreign_key.columns)?;
-                        if values.iter().any(|value| matches!(value, Value::Null)) {
-                            continue;
-                        }
-                        let encoded =
-                            index_values_key(&referenced_definition, &referenced_index, &values)?;
-                        if !referenced_values.contains(&encoded) {
-                            return Err(DbError::ForeignKeyViolation {
-                                constraint: foreign_key.id.0,
-                                table: foreign_key.table.0,
-                                referenced_table: foreign_key.referenced_table.0,
-                            });
-                        }
-                    }
+                    let referenced_entries =
+                        collect_cursor_entries(&mut transaction, referenced_tree)?;
+                    let child_entries = collect_cursor_entries(&mut transaction, child_tree)?;
+                    let referenced_values = decode_referenced_values(&referenced_entries);
+                    validate_child_references(
+                        &candidate,
+                        foreign_key,
+                        &parts,
+                        &referenced_values,
+                        &child_entries,
+                    )?;
                 }
                 SchemaMutation::AlterColumnType { table, column, .. }
                 | SchemaMutation::DropColumn { table, column } => {
@@ -850,59 +801,36 @@ impl DirectTransaction {
     }
 
     /// Validate that current snapshot-plus-staged rows already satisfy one
-    /// newly created foreign-key definition.
+    /// newly created foreign-key definition. Reads at this transaction's
+    /// snapshot without registering ranges: the publication that follows
+    /// runs in a separate transaction, so registration here would fence
+    /// nothing.
     pub(crate) fn validate_one_foreign_key(
         &self,
         foreign_key: &ForeignKeyDefinition,
     ) -> Result<()> {
-        let child_definition = self.catalog.table(foreign_key.table)?;
-        let referenced_definition = self.catalog.table(foreign_key.referenced_table)?;
-        let referenced_index = self
-            .catalog
-            .indexes_for(foreign_key.referenced_table)
-            .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
-            .ok_or_else(|| {
-                DbError::InvalidState(format!(
-                    "foreign key {} has no unique referenced index",
-                    foreign_key.id.0
-                ))
-            })?;
-        let referenced_values: std::collections::HashSet<Vec<u8>> = self
+        let parts = resolve_foreign_key_parts(&self.catalog, foreign_key)?;
+        let referenced_entries = self
             .transaction
-            .scan(self.index_tree(referenced_index.id)?, &[], None, usize::MAX)
-            .map_err(map_seer_error)?
-            .into_iter()
-            .filter_map(|(entry, existing_identity)| {
-                decode_index_entry(&entry, &existing_identity)
-                    .ok()
-                    .map(|(values, _)| values)
-            })
-            .collect();
-        let child_rows = self
+            .scan(
+                self.index_tree(parts.referenced_index.id)?,
+                &[],
+                None,
+                usize::MAX,
+            )
+            .map_err(map_seer_error)?;
+        let child_entries = self
             .transaction
             .scan(self.table_tree(foreign_key.table)?, &[], None, usize::MAX)
             .map_err(map_seer_error)?;
-        for (identity_bytes, bytes) in child_rows {
-            let row = row_from_storage_identity(
-                &self.catalog,
-                child_definition,
-                &identity_bytes,
-                &bytes,
-            )?;
-            let values = foreign_key_values(&row, child_definition, &foreign_key.columns)?;
-            if values.iter().any(|value| matches!(value, Value::Null)) {
-                continue;
-            }
-            let encoded = index_values_key(referenced_definition, referenced_index, &values)?;
-            if !referenced_values.contains(&encoded) {
-                return Err(DbError::ForeignKeyViolation {
-                    constraint: foreign_key.id.0,
-                    table: foreign_key.table.0,
-                    referenced_table: foreign_key.referenced_table.0,
-                });
-            }
-        }
-        Ok(())
+        let referenced_values = decode_referenced_values(&referenced_entries);
+        validate_child_references(
+            &self.catalog,
+            foreign_key,
+            &parts,
+            &referenced_values,
+            &child_entries,
+        )
     }
 
     fn table_tree(&self, table: TableId) -> Result<TreeId> {
@@ -925,15 +853,7 @@ impl DirectTransaction {
     /// `scan` so a concurrent write cannot invalidate the checked state before
     /// publication.
     fn scan_with_range_dependency(&mut self, tree: TreeId) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let cursor = self
-            .transaction
-            .cursor(tree, &[], None)
-            .map_err(map_seer_error)?;
-        let mut entries = Vec::new();
-        for entry in cursor {
-            entries.push(entry.map_err(map_seer_error)?);
-        }
-        Ok(entries)
+        collect_cursor_entries(&mut self.transaction, tree)
     }
 
     /// Read one row at this transaction's snapshot.
@@ -1305,60 +1225,122 @@ impl DirectTransaction {
         let foreign_keys: Vec<ForeignKeyDefinition> =
             self.catalog.foreign_keys().cloned().collect();
         for foreign_key in foreign_keys {
-            let child_definition = self.catalog.table(foreign_key.table)?.clone();
-            let referenced_definition = self.catalog.table(foreign_key.referenced_table)?.clone();
-            let referenced_index = self
-                .catalog
-                .indexes_for(foreign_key.referenced_table)
-                .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
-                .cloned()
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!(
-                        "foreign key {} has no unique referenced index",
-                        foreign_key.id.0
-                    ))
-                })?;
+            let parts = resolve_foreign_key_parts(&self.catalog, &foreign_key)?;
 
-            // The current alpha validator already examines the complete child
-            // table and referenced unique index. Register those same ranges so
-            // a concurrent write cannot invalidate the successful check before
-            // this transaction publishes.
-            let referenced_tree = self.index_tree(referenced_index.id)?;
-            let referenced_values: std::collections::HashSet<Vec<u8>> = self
-                .scan_with_range_dependency(referenced_tree)?
-                .into_iter()
-                .filter_map(|(entry, existing_identity)| {
-                    decode_index_entry(&entry, &existing_identity)
-                        .ok()
-                        .map(|(values, _)| values)
-                })
-                .collect();
+            // The validator examines the complete child table and referenced
+            // unique index; registering those ranges keeps a concurrent
+            // write from invalidating the checked state before this
+            // transaction publishes.
+            let referenced_tree = self.index_tree(parts.referenced_index.id)?;
+            let referenced_entries = self.scan_with_range_dependency(referenced_tree)?;
             let child_tree = self.table_tree(foreign_key.table)?;
-            let child_rows = self.scan_with_range_dependency(child_tree)?;
-            for (identity_bytes, bytes) in child_rows {
-                let row = row_from_storage_identity(
-                    &self.catalog,
-                    &child_definition,
-                    &identity_bytes,
-                    &bytes,
-                )?;
-                let values = foreign_key_values(&row, &child_definition, &foreign_key.columns)?;
-                if values.iter().any(|value| matches!(value, Value::Null)) {
-                    continue;
-                }
-                let encoded = index_values_key(&referenced_definition, &referenced_index, &values)?;
-                if !referenced_values.contains(&encoded) {
-                    return Err(DbError::ForeignKeyViolation {
-                        constraint: foreign_key.id.0,
-                        table: foreign_key.table.0,
-                        referenced_table: foreign_key.referenced_table.0,
-                    });
-                }
-            }
+            let child_entries = self.scan_with_range_dependency(child_tree)?;
+            let referenced_values = decode_referenced_values(&referenced_entries);
+            validate_child_references(
+                &self.catalog,
+                &foreign_key,
+                &parts,
+                &referenced_values,
+                &child_entries,
+            )?;
         }
         Ok(())
     }
 }
+/// The catalog pieces a foreign-key validation needs: the child and
+/// referenced table definitions plus the referenced unique index.
+struct ForeignKeyParts {
+    child_definition: TableDefinition,
+    referenced_definition: TableDefinition,
+    referenced_index: IndexDefinition,
+}
+
+fn resolve_foreign_key_parts(
+    catalog: &Catalog,
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<ForeignKeyParts> {
+    let child_definition = catalog.table(foreign_key.table)?.clone();
+    let referenced_definition = catalog.table(foreign_key.referenced_table)?.clone();
+    let referenced_index = catalog
+        .indexes_for(foreign_key.referenced_table)
+        .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
+        .cloned()
+        .ok_or_else(|| {
+            DbError::InvalidState(format!(
+                "foreign key {} has no unique referenced index",
+                foreign_key.id.0
+            ))
+        })?;
+    Ok(ForeignKeyParts {
+        child_definition,
+        referenced_definition,
+        referenced_index,
+    })
+}
+
+/// Decode the decoded index-value sets from every entry of a referenced
+/// unique index. Undecodable entries are skipped, as before: corruption
+/// surfaces later through the row decode or the membership check.
+fn decode_referenced_values(entries: &[(Vec<u8>, Vec<u8>)]) -> BTreeSet<Vec<u8>> {
+    entries
+        .iter()
+        .filter_map(|(entry, existing_identity)| {
+            decode_index_entry(entry, existing_identity)
+                .ok()
+                .map(|(values, _)| values)
+        })
+        .collect()
+}
+
+/// Check every non-null child reference has a matching referenced unique-
+/// index entry. `catalog` resolves the child rows; `parts` carries the
+/// definitions resolved against the catalog the constraint belongs to.
+fn validate_child_references(
+    catalog: &Catalog,
+    foreign_key: &ForeignKeyDefinition,
+    parts: &ForeignKeyParts,
+    referenced_values: &BTreeSet<Vec<u8>>,
+    child_entries: &[(Vec<u8>, Vec<u8>)],
+) -> Result<()> {
+    for (identity_bytes, bytes) in child_entries {
+        let row =
+            row_from_storage_identity(catalog, &parts.child_definition, identity_bytes, bytes)?;
+        let values = foreign_key_values(&row, &parts.child_definition, &foreign_key.columns)?;
+        if values.iter().any(|value| matches!(value, Value::Null)) {
+            continue;
+        }
+        let encoded = index_values_key(
+            &parts.referenced_definition,
+            &parts.referenced_index,
+            &values,
+        )?;
+        if !referenced_values.contains(&encoded) {
+            return Err(DbError::ForeignKeyViolation {
+                constraint: foreign_key.id.0,
+                table: foreign_key.table.0,
+                referenced_table: foreign_key.referenced_table.0,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Read every live entry of one tree through a cursor, registering the
+/// full tree range as a transactional read dependency.
+fn collect_cursor_entries(
+    transaction: &mut Transaction,
+    tree: TreeId,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut cursor = transaction
+        .cursor(tree, &[], None)
+        .map_err(map_seer_error)?;
+    let mut entries = Vec::new();
+    while let Some(entry) = cursor.next().transpose().map_err(map_seer_error)? {
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 fn validate_mapping(
     transaction: &Transaction,
     catalog_tree: TreeId,
