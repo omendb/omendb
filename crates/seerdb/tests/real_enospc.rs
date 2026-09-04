@@ -25,7 +25,7 @@ mod linux {
             .open(filler_path)?;
         let chunk = vec![0u8; 64 * 1024];
         loop {
-            let available = fs2::available_space(root)?;
+            let available = fs4::available_space(root)?;
             if available <= 1024 {
                 break;
             }
