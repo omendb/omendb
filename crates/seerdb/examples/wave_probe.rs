@@ -2,7 +2,7 @@
 //! transactions; prints wave sizes and aggregate throughput. Run with:
 //!
 //! ```text
-//! cargo run --release --example wave_probe -- [threads] [commits-per-thread]
+//! cargo run --release --example wave_probe -- [threads] [commits-per-thread] [--wal-first]
 //! ```
 
 use seerdb::{Options, TransactionDatabase};
@@ -17,9 +17,16 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(500);
 
+    // WAL-first acks (PG-shaped: one WAL sync per wave, pages deferred to
+    // the materialization bound) with --wal-first, so the probe measures
+    // both durability postures from one binary.
+    let wal_first = std::env::args().any(|arg| arg == "--wal-first");
+    let options = Options {
+        wal_first_commits: wal_first,
+        ..Options::default()
+    };
     let directory = tempfile::tempdir().expect("tempdir");
-    let database =
-        TransactionDatabase::create(directory.path().join("db"), Options::default()).expect("db");
+    let database = TransactionDatabase::create(directory.path().join("db"), options).expect("db");
     let database = std::sync::Arc::new(database);
 
     // One tree up front so the probe measures pure commit waves.
