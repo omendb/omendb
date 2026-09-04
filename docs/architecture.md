@@ -191,8 +191,9 @@ routes `CancelRequest` to the transaction API's cooperative checkpoints;
 representative lock-wait and shutdown-time wire tests cover SQLSTATE `57014`
 and worker drain before reopen. A daemon-level SIGKILL/reopen test covers
 recovery after process loss. The direct
-SeerDB qualification path (`src/seer_direct.rs`) remains test-only evidence for
-catalog/table/index-to-tree mapping and is not a second relational backend.
+SeerDB path (`src/seer_direct.rs`) is the single production backend
+([ADR 0005](adr/0005-delete-storage-kernel-seam.md)): there is no second
+relational backend and no storage-kernel seam.
 
 The roadmap is intentionally dependency-ordered, but OmenDB follows each
 SeerDB milestone immediately so the storage contract is validated by a real

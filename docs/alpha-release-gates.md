@@ -95,11 +95,23 @@ matrix provides the storage-side crash coverage below.
       negative compatibility tests; unsupported behavior fails explicitly.
       Current evidence is catalogued in
       [`docs/pgwire-compatibility.md`](pgwire-compatibility.md), including the
-      dedicated live PostgreSQL differential CI job.
+      dedicated live PostgreSQL differential CI job. The SQL scalar type set
+      (float8, date, timestamp, numeric, uuid) landed with wire codecs verified
+      byte-identical to live PostgreSQL (`feat/types-core`, 1bb5b84;
+      `tests/project_typed_values.rs` + the typed-value oracle differential);
+      schema evolution (multi-operation ALTER TABLE, DROP TABLE/INDEX) is
+      covered by `tests/project_schema_evolution.rs` (54883b8);
+- [x] logical dump/restore round-trips: one read-consistent snapshot
+      renders as plain SQL that restores into OmenDB and into real
+      PostgreSQL, with the differential running in the live-PG oracle CI
+      job (`feat/logical-backup`, 7f94fdc;
+      `tests/project_dump_restore.rs`).
 
 ### Correctness and isolation
 
-- [x] typed and SQL tests pass on both temporary and SeerDB backends;
+- [x] typed and SQL tests pass on the direct SeerDB backend (the
+      storage-kernel seam and temporary backend were deleted per
+      [ADR 0005](adr/0005-delete-storage-kernel-seem.md));
 - [x] SQL three-valued logic tests cover `NULL`, `IN`, `NOT IN`, `BETWEEN`,
       joins, and `DISTINCT` with pagination;
 - [x] differential SQL tests compare the overlapping bounded subset with an
@@ -162,7 +174,6 @@ competitive claims:
 
 | backend | throughput | p50 | p95 | p99 | db bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| temporary | 964 ops/s | 13 us | 5.3 ms | 6.1 ms | 85 KB |
 | seer | 249 ops/s | 27 us | 17 ms | 20 ms | 338 KB |
 | sqlite | 68,591 ops/s | 2.3 us | 55 us | 65 us | 16 KB |
 

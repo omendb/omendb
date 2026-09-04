@@ -96,10 +96,28 @@ idempotency keys are the caller's reconciliation tool.
 
 ## Backups
 
-Copy the database directory only while no process holds it closed; SeerDB
-enforces a writer lock per directory. Snapshot export through SeerDB's
-`snapshot_export()` (`{CSN, restart LSN}`) identifies a consistent position
-for logical exports; physical archive/restore is future work.
+Logical dump and restore are the supported path (`omendb-tool`):
+
+```bash
+omendb-tool dump --path ./omendb-data > backup.sql
+omendb-tool restore --path ./restored-db --input backup.sql
+```
+
+The dump renders one read-consistent snapshot as plain SQL: tables with
+inline primary keys, data as multi-row INSERTs in scan order, secondary
+indexes after data, foreign keys last as `ALTER TABLE ADD CONSTRAINT`.
+It restores into OmenDB and into PostgreSQL (within the documented
+divergences in `docs/gap-register.md`), so the same tool verifies a
+backup by differential restore. Restore is not resumable: it stops at
+the first error and earlier committed chunks remain — drop and re-run
+into a fresh directory after correcting the script. U64 columns dump as
+`NUMERIC(20,0)` (PostgreSQL has no unsigned 64-bit integer).
+
+Physical copies of the database directory require no process holding it
+open; SeerDB enforces a writer lock per directory. Snapshot export
+through SeerDB's `snapshot_export()` (`{CSN, restart LSN}`) identifies a
+consistent position for logical exports; physical archive/restore is
+future work.
 
 ## Escalation
 

@@ -1,11 +1,11 @@
-//! Direct qualification path from OmenDB's relational model to SeerDB.
+//! Direct storage backend mapping OmenDB's relational model onto SeerDB.
 //!
-//! This module intentionally bypasses the transitional `StorageKernel` seam.
-//! It is not wired into `RelationalDatabase::Backend::Seer` yet: the existing
-//! facade still promises historical leases, archive/restore, and physical
-//! status projections that the first SeerDB transaction API does not provide.
-//! The direct path proves the planned ownership boundary with one catalog
-//! tree, one tree per table, and one tree per index.
+//! One catalog tree, one tree per table, one tree per index ([ADR
+//! 0005](../../docs/adr/0005-delete-storage-kernel-seam.md)): the storage-
+//! kernel seam, attempt machinery, and temporary backend were deleted; this
+//! is the only backend behind `RelationalDatabase`. Schema mutations and
+//! row writes publish atomically through the same SeerDB transaction as the
+//! catalog marker put.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

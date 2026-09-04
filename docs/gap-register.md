@@ -4,18 +4,20 @@ Evidence-backed register of open product gaps, ordered by quality dimension.
 This is the input to roadmap prioritization, not a commitment list: items move
 into `ai/brief.md` (active work) and `docs/alpha-release-gates.md` (release
 evidence) when they become active. Evidence citations refer to tests, source
-files, or measured baselines in this repository. Last audited 2026-08-31.
+files, or measured baselines in this repository. Last audited 2026-09-03 (post logical-backup landing).
 
-## Type system — high severity
+## Type system — LANDED 2026-08-30
 
-- `ColumnType` supports only `Bytes, Bool, I64, U64, Text`
-  (`src/relational.rs`). `Value` mirrors it. No Float, Decimal, Timestamp,
-  Date, or UUID.
-- Consequence: most real schemas cannot be expressed. A `created_at`
-  column, a price, or an `id UUID` each block adoption today.
-- Prerequisite for: SQL functions (date/text math), ORM compatibility,
-  honest benchmark schemas (pgbench uses numeric), and SQL-standard
-  semantics (three-valued logic on new types).
+Landed in `feat/types-core` (1bb5b84): Float64, Date, Timestamp,
+Decimal (i128 mantissa + u16 scale, 38 digits), and UUID on
+`ColumnType`/`Value` (`src/sql_types.rs`), with wire codecs verified
+byte-identical to live PostgreSQL (numeric base-10000 groups,
+2000-epoch date/timestamp), WHERE literal coercion, cross-numeric
+comparison, exact decimal SUM (AVG returns float8), and
+describe/probe binding of typed parameters. Per-type storage, wire, and
+divergence detail lives in `docs/pgwire-compatibility.md`. Residual
+divergences: NUMERIC(p,s) typmod is accepted but not enforced, and U64
+dumps as NUMERIC(20,0) (no unsigned 64-bit integer in PostgreSQL).
 
 ## Schema evolution — LANDED 2026-08-31
 

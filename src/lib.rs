@@ -14,8 +14,9 @@ mod relational;
 mod relational_database;
 mod row_identity;
 mod runtime;
-// This direct path is a qualification surface until historical retention and
-// durability-position results are ready to replace the transitional facade.
+// The direct SeerDB backend: the only backend behind RelationalDatabase
+// (ADR 0005). Historical retention and durability-position results that
+// motivated the transitional facade landed; the facade is the API surface.
 #[allow(dead_code, clippy::type_complexity)]
 mod seer_direct;
 mod serializable;
