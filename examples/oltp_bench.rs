@@ -107,6 +107,33 @@ fn identity(table: TableId, record: u64) -> Result<RowIdentity> {
     )
 }
 
+fn concurrent_inserts(
+    database: &std::sync::Arc<RelationalDatabase>,
+    threads: usize,
+    per_thread: usize,
+    id_base: u64,
+) -> (usize, f64) {
+    let started = Instant::now();
+    let handles: Vec<_> = (0..threads)
+        .map(|thread| {
+            let db = std::sync::Arc::clone(database);
+            std::thread::spawn(move || {
+                for record in 0..per_thread {
+                    let id = id_base + (thread * per_thread) as u64 + record as u64;
+                    db.insert(TableId(1), row(id, &format!("c{id}@x")))
+                        .expect("concurrent insert");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer thread");
+    }
+    let total = threads * per_thread;
+    let elapsed = started.elapsed().as_secs_f64();
+    (total, total as f64 / elapsed)
+}
+
 fn main() {
     let directory = tempfile::tempdir().expect("tempdir");
     let mut database =
@@ -286,30 +313,66 @@ fn main() {
     let shared = std::sync::Arc::new(database);
     const THREADS: usize = 8;
     const PER_THREAD: usize = 2_000;
-    let started = Instant::now();
-    let handles: Vec<_> = (0..THREADS)
-        .map(|thread| {
-            let db = std::sync::Arc::clone(&shared);
-            std::thread::spawn(move || {
-                for record in 0..PER_THREAD {
-                    let id = 100_000 + (thread * PER_THREAD) as u64 + record as u64;
-                    db.insert(TableId(1), row(id, &format!("c{id}@x")))
-                        .expect("concurrent insert");
-                }
+    let (total, elapsed) = {
+        let started = Instant::now();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let db = std::sync::Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    for record in 0..PER_THREAD {
+                        let id = 100_000 + (thread * PER_THREAD) as u64 + record as u64;
+                        db.insert(TableId(1), row(id, &format!("c{id}@x")))
+                            .expect("concurrent insert");
+                    }
+                })
             })
-        })
-        .collect();
-    for handle in handles {
-        handle.join().expect("writer thread");
-    }
-    let total = THREADS * PER_THREAD;
-    let elapsed = started.elapsed().as_secs_f64();
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+        (THREADS * PER_THREAD, started.elapsed().as_secs_f64())
+    };
     println!(
         "  {:<38} {:>12.0} ops/s  ({:>8.3}s total, {THREADS} threads)",
         "concurrent point insert",
         total as f64 / elapsed,
         elapsed
     );
+    std::sync::Arc::try_unwrap(shared).ok().map(|db| db.close());
+
+    // WAL-first acks: the same concurrent workload with commit
+    // acknowledgement after one group-synced WAL append (pages and the
+    // authority frame defer to the 2 MiB materialization bound) — the
+    // PostgreSQL-shaped durability path. Same binary, same hardware,
+    // fresh database: the ratio against the arm above is the point.
+    let wal_first_directory = tempfile::tempdir().expect("tempdir");
+    let mut wal_first_db = RelationalDatabase::create(
+        RelationalBackendConfig::new(wal_first_directory.path().join("db"))
+            .with_wal_first_commits(),
+    )
+    .expect("create WAL-first database");
+    wal_first_db
+        .create_table_with_schema_and_primary_key(
+            users_table(),
+            Some(vec![ColumnId(1), ColumnId(2)]),
+            Default::default(),
+        )
+        .expect("create table");
+    wal_first_db
+        .create_index(IndexDefinition {
+            id: omendb::IndexId(1),
+            table: TableId(1),
+            columns: vec![ColumnId(3)],
+            unique: true,
+        })
+        .expect("create index");
+    let shared = std::sync::Arc::new(wal_first_db);
+    let (total, throughput) = concurrent_inserts(&shared, THREADS, PER_THREAD, 200_000);
+    println!(
+        "  {:<38} {:>12.0} ops/s  (WAL-first acks, {THREADS} threads)",
+        "concurrent point insert", throughput
+    );
+    let _ = total;
 
     println!("\ndone.");
     std::sync::Arc::try_unwrap(shared).ok().map(|db| db.close());
