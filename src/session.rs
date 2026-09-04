@@ -4,66 +4,13 @@ use std::sync::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::relational_database::{
-    OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT, RelationalBackendConfig,
-    RelationalCapabilityReport, RelationalDatabase, RelationalDatabaseTransaction,
+    OperationControl, RelationalBackendConfig, RelationalCapabilityReport, RelationalDatabase,
+    RelationalDatabaseTransaction,
 };
 use crate::{
     ColumnId, CommitId, DbError, ForeignKeyDefinition, IndexDefinition, IndexId, Key,
     RelationalSchemaDefinition, Result, Row, RowIdentity, TableDefinition, TableId, Value,
 };
-
-/// The kind of operation observed by a project-facing session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RelationalSessionOperationKind {
-    Read,
-    Write,
-}
-
-/// Stable, redacted event kinds emitted by session admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RelationalSessionEventKind {
-    /// An operation acquired and released its session permit.
-    OperationCompleted,
-    /// An operation could not acquire admission within its configured bound.
-    AdmissionRejected,
-    /// Cancellation prevented admission.
-    CancellationObserved,
-    /// A deadline prevented admission.
-    DeadlineObserved,
-}
-
-/// A bounded, non-sensitive event emitted by one project-facing session.
-///
-/// The durations describe only session admission and permit ownership. They
-/// contain no query, row, key, path, or caller identity information.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RelationalSessionEvent {
-    /// Monotonic sequence within the owning session.
-    pub sequence: u64,
-    pub kind: RelationalSessionEventKind,
-    pub operation: RelationalSessionOperationKind,
-    pub admission_wait: Duration,
-    pub operation_time: Duration,
-}
-
-/// A bounded event-history projection for session admission.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RelationalSessionEventHistory {
-    /// Events retained in sequence order. The oldest events may be omitted
-    /// when `dropped` is non-zero.
-    pub events: Vec<RelationalSessionEvent>,
-    /// Number of older events evicted from the bounded history.
-    pub dropped: u64,
-}
-
-impl RelationalSessionEventHistory {
-    /// Return whether the history no longer contains its complete prefix.
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn is_truncated(&self) -> bool {
-        self.dropped != 0
-    }
-}
 
 /// Bounds for one project-facing database session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,46 +98,7 @@ enum OperationKind {
 }
 
 #[derive(Debug, Default)]
-struct RelationalSessionEventLog {
-    next_sequence: u64,
-    dropped: u64,
-    events: std::collections::VecDeque<RelationalSessionEvent>,
-}
-
-impl RelationalSessionEventLog {
-    #[allow(dead_code)]
-    fn snapshot(&self) -> RelationalSessionEventHistory {
-        RelationalSessionEventHistory {
-            events: self.events.iter().copied().collect(),
-            dropped: self.dropped,
-        }
-    }
-
-    fn record(
-        &mut self,
-        kind: RelationalSessionEventKind,
-        operation: OperationKind,
-        admission_wait: Duration,
-        operation_time: Duration,
-    ) {
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        self.events.push_back(RelationalSessionEvent {
-            sequence: self.next_sequence,
-            kind,
-            operation: operation.into(),
-            admission_wait,
-            operation_time,
-        });
-        if self.events.len() > RELATIONAL_EVENT_HISTORY_LIMIT {
-            let _ = self.events.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-        }
-    }
-}
-
-#[derive(Debug)]
 struct AdmissionState {
-    events: RelationalSessionEventLog,
     active_operations: usize,
     active_writers: usize,
     waiting_operations: usize,
@@ -242,7 +150,6 @@ impl OperationAdmission {
                 rejected_operations: 0,
                 cancelled_operations: 0,
                 deadline_expired_operations: 0,
-                events: RelationalSessionEventLog::default(),
             }),
             changed: Condvar::new(),
             max_in_flight: config.max_in_flight,
@@ -265,13 +172,13 @@ impl OperationAdmission {
         loop {
             if let Err(error) = control.check() {
                 self.remove_waiter(&mut state, kind, &mut waiting);
-                record_control_rejection(&mut state, kind, &error, started.elapsed());
+                record_control_rejection(&mut state, &error);
                 return Err(error);
             }
             if state.closing {
                 self.remove_waiter(&mut state, kind, &mut waiting);
                 state.rejected_operations = state.rejected_operations.saturating_add(1);
-                record_admission_rejection(&mut state, kind, started.elapsed());
+                record_admission_rejection(&mut state);
                 return Err(DbError::SessionClosing);
             }
             let blocked = state.active_operations >= self.max_in_flight
@@ -311,109 +218,18 @@ impl OperationAdmission {
             if remaining.is_zero() {
                 if let Err(error) = control.check() {
                     self.remove_waiter(&mut state, kind, &mut waiting);
-                    record_control_rejection(&mut state, kind, &error, started.elapsed());
+                    record_control_rejection(&mut state, &error);
                     return Err(error);
                 }
                 self.remove_waiter(&mut state, kind, &mut waiting);
                 state.rejected_operations = state.rejected_operations.saturating_add(1);
-                record_admission_rejection(&mut state, kind, started.elapsed());
+                record_admission_rejection(&mut state);
                 return Err(DbError::SessionBusy);
             }
             let wait_for = remaining.min(ADMISSION_POLL_INTERVAL);
             state = self
                 .changed
                 .wait_timeout(state, wait_for)
-                .map_err(|_| session_lock_poisoned("admission"))?
-                .0;
-        }
-    }
-
-    #[allow(dead_code)]
-    fn promote_to_write(
-        &self,
-        permit: &mut OperationPermit<'_>,
-        control: &OperationControl,
-    ) -> Result<()> {
-        if permit.kind != OperationKind::Read {
-            return Err(DbError::InvalidState(
-                "only a read permit can be promoted to a write permit".to_owned(),
-            ));
-        }
-        let started = Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| session_lock_poisoned("admission"))?;
-        state.active_operations = state
-            .active_operations
-            .checked_sub(1)
-            .expect("operation permit count cannot underflow");
-        let mut waiting = true;
-        state.waiting_operations = state.waiting_operations.saturating_add(1);
-        state.waiting_writers = state.waiting_writers.saturating_add(1);
-
-        loop {
-            if let Err(error) = control.check() {
-                self.remove_waiter(&mut state, OperationKind::Write, &mut waiting);
-                state.active_operations = state.active_operations.saturating_add(1);
-                record_control_rejection(
-                    &mut state,
-                    OperationKind::Read,
-                    &error,
-                    started.elapsed(),
-                );
-                self.changed.notify_all();
-                return Err(error);
-            }
-            if state.closing {
-                self.remove_waiter(&mut state, OperationKind::Write, &mut waiting);
-                state.active_operations = state.active_operations.saturating_add(1);
-                state.rejected_operations = state.rejected_operations.saturating_add(1);
-                record_admission_rejection(&mut state, OperationKind::Read, started.elapsed());
-                self.changed.notify_all();
-                return Err(DbError::SessionClosing);
-            }
-            if state.active_operations == 0 {
-                self.remove_waiter(&mut state, OperationKind::Write, &mut waiting);
-                state.active_operations = 1;
-                state.active_writers = state.active_writers.saturating_add(1);
-                permit.kind = OperationKind::Write;
-                permit.admission_wait = permit.admission_wait.saturating_add(started.elapsed());
-                return Ok(());
-            }
-
-            let remaining = self
-                .admission_timeout
-                .saturating_sub(started.elapsed())
-                .min(
-                    control
-                        .deadline()
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                        .unwrap_or(self.admission_timeout),
-                );
-            if remaining.is_zero() {
-                if let Err(error) = control.check() {
-                    self.remove_waiter(&mut state, OperationKind::Write, &mut waiting);
-                    state.active_operations = state.active_operations.saturating_add(1);
-                    record_control_rejection(
-                        &mut state,
-                        OperationKind::Read,
-                        &error,
-                        started.elapsed(),
-                    );
-                    self.changed.notify_all();
-                    return Err(error);
-                }
-                self.remove_waiter(&mut state, OperationKind::Write, &mut waiting);
-                state.active_operations = state.active_operations.saturating_add(1);
-                state.rejected_operations = state.rejected_operations.saturating_add(1);
-                record_admission_rejection(&mut state, OperationKind::Read, started.elapsed());
-                self.changed.notify_all();
-                return Err(DbError::SessionBusy);
-            }
-            state = self
-                .changed
-                .wait_timeout(state, remaining.min(ADMISSION_POLL_INTERVAL))
                 .map_err(|_| session_lock_poisoned("admission"))?
                 .0;
         }
@@ -454,12 +270,6 @@ impl OperationAdmission {
             state.max_admission_wait = state.max_admission_wait.max(admission_wait);
             state.total_operation_time = state.total_operation_time.saturating_add(operation_time);
             state.max_operation_time = state.max_operation_time.max(operation_time);
-            state.events.record(
-                RelationalSessionEventKind::OperationCompleted,
-                kind,
-                admission_wait,
-                operation_time,
-            );
             self.changed.notify_all();
         }
     }
@@ -502,15 +312,6 @@ impl OperationAdmission {
             deadline_expired_operations: state.deadline_expired_operations,
         })
     }
-
-    #[allow(dead_code)]
-    fn event_history(&self) -> Result<RelationalSessionEventHistory> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| session_lock_poisoned("admission"))?;
-        Ok(state.events.snapshot())
-    }
 }
 
 struct OperationPermit<'a> {
@@ -527,20 +328,7 @@ impl Drop for OperationPermit<'_> {
     }
 }
 
-fn record_control_rejection(
-    state: &mut AdmissionState,
-    kind: OperationKind,
-    error: &DbError,
-    admission_wait: Duration,
-) {
-    let event_kind = match error {
-        DbError::Cancelled => RelationalSessionEventKind::CancellationObserved,
-        DbError::DeadlineExceeded => RelationalSessionEventKind::DeadlineObserved,
-        _ => RelationalSessionEventKind::AdmissionRejected,
-    };
-    state
-        .events
-        .record(event_kind, kind, admission_wait, Duration::ZERO);
+fn record_control_rejection(state: &mut AdmissionState, error: &DbError) {
     match error {
         DbError::Cancelled => {
             state.cancelled_operations = state.cancelled_operations.saturating_add(1);
@@ -554,26 +342,8 @@ fn record_control_rejection(
     }
 }
 
-fn record_admission_rejection(
-    state: &mut AdmissionState,
-    kind: OperationKind,
-    admission_wait: Duration,
-) {
-    state.events.record(
-        RelationalSessionEventKind::AdmissionRejected,
-        kind,
-        admission_wait,
-        Duration::ZERO,
-    );
-}
-
-impl From<OperationKind> for RelationalSessionOperationKind {
-    fn from(kind: OperationKind) -> Self {
-        match kind {
-            OperationKind::Read => Self::Read,
-            OperationKind::Write => Self::Write,
-        }
-    }
+fn record_admission_rejection(state: &mut AdmissionState) {
+    state.rejected_operations = state.rejected_operations.saturating_add(1);
 }
 
 fn session_lock_poisoned(resource: &'static str) -> DbError {
@@ -987,37 +757,5 @@ impl RelationalDatabase {
         config: RelationalSessionConfig,
     ) -> Result<RelationalDatabaseSession> {
         RelationalDatabaseSession::new(self, config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_event_history_is_bounded() {
-        let admission = OperationAdmission::new(RelationalSessionConfig::default())
-            .expect("valid session configuration");
-        for _ in 0..(RELATIONAL_EVENT_HISTORY_LIMIT + 3) {
-            let control = OperationControl::default();
-            let permit = admission
-                .acquire(&control, OperationKind::Read)
-                .expect("read admission");
-            drop(permit);
-        }
-
-        let history = admission.event_history().expect("event history");
-        assert_eq!(history.events.len(), RELATIONAL_EVENT_HISTORY_LIMIT);
-        assert_eq!(history.dropped, 3);
-        assert!(history.is_truncated());
-        assert_eq!(history.events[0].sequence, 4);
-        assert_eq!(
-            history.events[0].kind,
-            RelationalSessionEventKind::OperationCompleted
-        );
-        assert_eq!(
-            history.events.last().expect("last session event").sequence,
-            (RELATIONAL_EVENT_HISTORY_LIMIT + 3) as u64
-        );
     }
 }

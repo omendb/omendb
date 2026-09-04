@@ -22,8 +22,6 @@ static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum statements accepted in one atomic SQL batch.
 pub const RELATIONAL_SQL_BATCH_LIMIT: usize = 1_024;
-/// Maximum events retained in one session event history ring buffer.
-pub const RELATIONAL_EVENT_HISTORY_LIMIT: usize = 128;
 
 /// Cooperative cancellation shared by a project-facing transaction and its
 /// caller.

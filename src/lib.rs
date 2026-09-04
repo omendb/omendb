@@ -39,10 +39,9 @@ pub use relational::{
     TableId, Value, decode_row, encode_row,
 };
 pub use relational_database::{
-    CancellationToken, OperationControl, RELATIONAL_EVENT_HISTORY_LIMIT,
-    RELATIONAL_SQL_BATCH_LIMIT, RelationalBackendConfig, RelationalCapability,
-    RelationalCapabilityInfo, RelationalCapabilityReport, RelationalCapabilityState,
-    RelationalDatabase, RelationalDatabaseTransaction, SchemaMutation,
+    CancellationToken, OperationControl, RELATIONAL_SQL_BATCH_LIMIT, RelationalBackendConfig,
+    RelationalCapability, RelationalCapabilityInfo, RelationalCapabilityReport,
+    RelationalCapabilityState, RelationalDatabase, RelationalDatabaseTransaction, SchemaMutation,
 };
 pub use row_identity::RowIdentity;
 pub use runtime::{

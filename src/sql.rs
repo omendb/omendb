@@ -86,11 +86,6 @@ mod result {
 
 pub use result::{SqlColumn, SqlResult};
 
-#[allow(dead_code)]
-pub(crate) fn execute(database: &mut RelationalDatabase, source: &str) -> Result<SqlResult> {
-    execute_with_params(database, source, &[])
-}
-
 pub(crate) fn execute_with_params(
     database: &mut RelationalDatabase,
     source: &str,
