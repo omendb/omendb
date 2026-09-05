@@ -372,6 +372,129 @@ async fn persistent_server_shutdown_cancels_query_before_database_close() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn omendbd_logs_slow_statements_when_threshold_set() {
+    use std::process::{Child, Command, Stdio};
+
+    struct ChildGuard(Option<Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let mut database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database
+        .execute_sql("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO items (id) VALUES (1)")
+        .expect("seed row");
+    database.close().expect("close seed database");
+
+    // Zero threshold: every statement is slow, so one query proves the
+    // log line reaches stderr with duration, user, and statement text.
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_omendbd"))
+            .args([
+                "--path",
+                database_path.to_str().expect("database path"),
+                "--bind",
+                "127.0.0.1:0",
+                "--slow-statement-ms",
+                "0",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn omendbd"),
+    ));
+    let stdout = child
+        .0
+        .as_mut()
+        .expect("daemon child")
+        .stdout
+        .take()
+        .expect("daemon stdout");
+    let banner = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut line)?;
+        Ok::<_, std::io::Error>(line)
+    })
+    .await
+    .expect("banner reader task")
+    .expect("daemon banner");
+    let port: &str = banner
+        .strip_prefix("omendbd listening on 127.0.0.1:")
+        .map(str::trim)
+        .expect("banner names the port");
+
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=omendb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+    let row = client
+        .query_one("SELECT count(*) FROM items", &[])
+        .await
+        .expect("run counted query");
+    assert_eq!(row.get::<_, i64>(0), 1);
+    drop(client);
+    let _ = connection_task.await;
+
+    let stderr = child
+        .0
+        .as_mut()
+        .expect("daemon child")
+        .stderr
+        .take()
+        .expect("daemon stderr");
+    let logged = tokio::task::spawn_blocking(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut found = String::new();
+        // The daemon writes the slow-statement line on the statement
+        // path; a few lines suffice to find it.
+        for _ in 0..16 {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line.contains("slow statement") {
+                found = line;
+                break;
+            }
+        }
+        found
+    })
+    .await
+    .expect("stderr reader task");
+    assert!(
+        logged.contains("statement\":\"SELECT count(*) FROM items\""),
+        "slow-statement log names the statement: {logged:?}"
+    );
+    assert!(
+        logged.contains("duration_ms\":"),
+        "slow-statement log includes a duration: {logged:?}"
+    );
+    assert!(
+        logged.contains("user\":\"trust\""),
+        "trust connections log as the trust user: {logged:?}"
+    );
+
+    let pid = i32::try_from(child.0.as_ref().expect("daemon child").id()).expect("daemon pid");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn omendbd_process_kill_reopens_durable_database() {
     use std::os::unix::process::ExitStatusExt;
     use std::process::{Child, Command, Stdio};

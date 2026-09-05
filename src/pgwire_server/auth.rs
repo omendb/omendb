@@ -63,6 +63,7 @@ pub(super) fn build_factory(
     query_workers: Arc<QueryWorkers>,
     statement_timeout: Option<Duration>,
     max_result_bytes: Option<usize>,
+    slow_statement_threshold: Option<Duration>,
 ) -> std::io::Result<Arc<HandlerFactory>> {
     {
         let mut database =
@@ -116,6 +117,7 @@ pub(super) fn build_factory(
             query_workers,
             statement_timeout,
             max_result_bytes,
+            slow_statement_threshold,
         }),
         auth: auth.map(|auth_source| {
             Arc::new(ScramComponents {

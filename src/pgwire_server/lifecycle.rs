@@ -101,6 +101,10 @@ pub struct ServerConfig {
     /// Ack commits after the group-synced WAL append instead of full
     /// publication; trades recovery replay for commit latency.
     pub wal_first_commits: bool,
+    /// Log statements that take longer than this to execute (including
+    /// commit publication) to the server log. `None` disables slow
+    /// statement logging.
+    pub slow_statement_threshold: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -115,6 +119,7 @@ impl ServerConfig {
             statement_timeout: None,
             max_result_bytes: None,
             wal_first_commits: false,
+            slow_statement_threshold: None,
         }
     }
 
@@ -150,6 +155,14 @@ impl ServerConfig {
     #[must_use]
     pub fn with_wal_first_commits(mut self, wal_first_commits: bool) -> Self {
         self.wal_first_commits = wal_first_commits;
+        self
+    }
+
+    /// Set the duration above which a statement (including its commit
+    /// publication) is logged to the server log.
+    #[must_use]
+    pub fn with_slow_statement_threshold(mut self, threshold: Option<Duration>) -> Self {
+        self.slow_statement_threshold = threshold;
         self
     }
 }
@@ -407,6 +420,7 @@ impl RunningServer {
             Arc::clone(&state.query_workers),
             config.statement_timeout,
             config.max_result_bytes,
+            config.slow_statement_threshold,
         ) {
             Ok(factory) => factory,
             Err(error) => {
@@ -500,6 +514,7 @@ pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::
         &database,
         listener.local_addr()?,
         Arc::clone(&state.query_workers),
+        None,
         None,
         None,
     )?;

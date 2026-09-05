@@ -42,6 +42,9 @@ pub(super) struct OmenDbHandler {
     pub(super) query_workers: Arc<QueryWorkers>,
     pub(super) statement_timeout: Option<Duration>,
     pub(super) max_result_bytes: Option<usize>,
+    /// Statements whose execution (including commit publication) exceeds
+    /// this duration are logged to stderr.
+    pub(super) slow_statement_threshold: Option<Duration>,
 }
 
 impl OmenDbHandler {
@@ -147,6 +150,46 @@ impl OmenDbHandler {
     /// or autocommit. `format` is the negotiated result-column format; the
     /// statement executes exactly once.
     fn run_statement(
+        &self,
+        client_addr: std::net::SocketAddr,
+        sql: &str,
+        params: &[Value],
+        format: &pgwire::api::portal::Format,
+        control: &OperationControl,
+    ) -> PgWireResult<Response> {
+        let started = self.slow_statement_threshold.map(|_| Instant::now());
+        let response = self.run_statement_inner(client_addr, sql, params, format, control);
+        if let (Some(started), Some(threshold)) = (started, self.slow_statement_threshold) {
+            let elapsed = started.elapsed();
+            if elapsed >= threshold {
+                let identity = self
+                    .identities
+                    .lock()
+                    .ok()
+                    .and_then(|identities| identities.get(&client_addr).cloned())
+                    .unwrap_or_else(|| "trust".to_owned());
+                eprintln!(
+                    "omendbd: slow statement: {{\"duration_ms\":{:.3},\"user\":\"{}\",\"statement\":\"{}\"}}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    identity,
+                    Self::statement_log_line(sql),
+                );
+            }
+        }
+        response
+    }
+
+    /// One physical line per statement: collapse embedded newlines and
+    /// bracket the text so multi-statement text stays machine-greppable.
+    fn statement_log_line(sql: &str) -> String {
+        sql.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn run_statement_inner(
         &self,
         client_addr: std::net::SocketAddr,
         sql: &str,
