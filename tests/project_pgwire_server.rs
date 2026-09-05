@@ -1098,11 +1098,21 @@ async fn wire_cancel_request_aborts_lock_wait_before_publication() {
     let cancel_token = client.cancel_token();
 
     let (release_lock, wait_for_release) = std::sync::mpsc::channel();
+    let (lock_acquired, wait_for_lock) = std::sync::mpsc::channel();
     let database_for_lock = database.clone();
     let lock_thread = std::thread::spawn(move || {
         let _database_guard = database_for_lock.write().expect("database lock");
+        lock_acquired
+            .send(())
+            .expect("signal publication lock is held");
         wait_for_release.recv().expect("release publication lock");
     });
+    // Wait until the publication lock is actually held: without this,
+    // the query can win the lock race on a slow runner and succeed,
+    // making the cancellation assertion a scheduling coin flip.
+    wait_for_lock
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("publication lock is held before the query starts");
 
     let query = tokio::spawn(async move {
         client
