@@ -267,6 +267,19 @@ fn exercise() -> Result<()> {
         "SELECT id, CASE WHEN COALESCE(state, 'closed') = 'closed' THEN 'closed-band' ELSE 'open-band' END FROM accounts ORDER BY id",
         &[],
     )?;
+    // Scalar function catalog: text and numeric functions, matching SQLite.
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, upper(state), lower(state), length(state) FROM accounts ORDER BY id",
+        &[],
+    )?;
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, abs(balance) FROM accounts ORDER BY id",
+        &[],
+    )?;
     compare_query(
         &mut database,
         &connection,

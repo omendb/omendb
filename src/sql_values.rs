@@ -80,12 +80,273 @@ pub(super) fn literal_value(expression: &Expr, params: &[Value]) -> Result<Value
             }
             Ok(Value::Null)
         }
+        Expr::Function(func) if scalar_function_arity(&func.name.to_string()).is_some() => {
+            evaluate_scalar_function(func, params)
+        }
+        Expr::Extract {
+            field,
+            syntax: _,
+            expr,
+        } => {
+            let value = literal_value(expr, params)?;
+            extract_datetime_part(&field.to_string(), &value)
+        }
+        Expr::Floor { expr, .. } => {
+            let value = literal_value(expr, params)?;
+            apply_scalar_function("floor", &[value])
+        }
+        Expr::Ceil { expr, .. } => {
+            let value = literal_value(expr, params)?;
+            apply_scalar_function("ceil", &[value])
+        }
         Expr::Function(func) if function_has_no_arguments(func) => {
             session_function_value(&func.name.to_string().to_lowercase())
         }
         _ => Err(unsupported(
             "expression",
             "only literals and simple column references are supported",
+        )),
+    }
+}
+
+/// Scalar functions over literal arguments. The literal tier evaluates
+/// them eagerly; the row tier (plan_computed) supports the same catalog
+/// for column arguments.
+pub(super) fn scalar_function_arity(name: &str) -> Option<usize> {
+    match name.to_ascii_lowercase().as_str() {
+        // text
+        "upper" | "lower" | "length" | "char_length" | "character_length" | "btrim" | "ltrim"
+        | "rtrim" | "abs" | "round" | "floor" | "ceil" | "ceiling" => Some(1),
+        "date_trunc" | "date_part" => Some(2),
+        _ => None,
+    }
+}
+
+/// Apply a scalar function to already-evaluated arguments.
+pub(super) fn apply_scalar_function(name: &str, arguments: &[Value]) -> Result<Value> {
+    match name {
+        "date_trunc" => return apply_date_function("date_trunc", arguments),
+        "date_part" => return apply_date_function("date_part", arguments),
+        _ => {}
+    }
+    let [first] = arguments else {
+        return Err(unsupported(
+            "scalar function",
+            "internal: wrong argument count",
+        ));
+    };
+    match (name, first) {
+        ("upper", Value::Text(text)) => Ok(Value::Text(text.to_uppercase())),
+        ("lower", Value::Text(text)) => Ok(Value::Text(text.to_lowercase())),
+        ("length" | "char_length" | "character_length", Value::Text(text)) => {
+            Ok(Value::I64(text.chars().count() as i64))
+        }
+        ("btrim" | "ltrim" | "rtrim", Value::Text(text)) => {
+            let trimmed = match name {
+                "btrim" => text.trim(),
+                "ltrim" => text.trim_start(),
+                _ => text.trim_end(),
+            };
+            Ok(Value::Text(trimmed.to_owned()))
+        }
+        ("abs", Value::I64(value)) => value
+            .checked_abs()
+            .map(Value::I64)
+            .ok_or_else(|| DbError::SqlNumericValueOutOfRange("abs(i64) overflow".to_owned())),
+        ("abs", Value::Float64(value)) => {
+            Ok(Value::Float64(crate::sql_types::F64::new(value.0.abs())))
+        }
+        ("abs", Value::Decimal(value)) => Ok(Value::Decimal(crate::sql_types::DecimalValue::new(
+            value.mantissa.abs(),
+            value.scale,
+        )?)),
+        ("round" | "floor" | "ceil" | "ceiling", Value::Float64(value)) => {
+            let rounded = match name {
+                "round" => value.0.round(),
+                "floor" => value.0.floor(),
+                _ => value.0.ceil(),
+            };
+            Ok(Value::Float64(crate::sql_types::F64::new(rounded)))
+        }
+        ("round" | "floor" | "ceil" | "ceiling", Value::I64(value)) => Ok(Value::I64(*value)),
+        (function, Value::Null) if scalar_function_arity(function).is_some() => Ok(Value::Null),
+        _ => Err(unsupported(
+            "scalar function",
+            &format!("{name} does not accept this argument type"),
+        )),
+    }
+}
+
+/// Evaluate a scalar function over literal-shaped arguments.
+fn evaluate_scalar_function(func: &sqlparser::ast::Function, params: &[Value]) -> Result<Value> {
+    let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
+        return Err(unsupported("scalar function", "arguments are required"));
+    };
+    let name = func.name.to_string().to_ascii_lowercase();
+    let arity = scalar_function_arity(&func.name.to_string()).expect("guarded by dispatch arm");
+    if list.args.len() != arity {
+        return Err(unsupported(
+            "scalar function",
+            &format!("{name} takes exactly {arity} argument(s)"),
+        ));
+    }
+    let mut arguments = Vec::with_capacity(arity);
+    for argument in &list.args {
+        let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expression)) =
+            argument
+        else {
+            return Err(unsupported(
+                "scalar function",
+                "arguments must be expressions",
+            ));
+        };
+        arguments.push(literal_value(expression, params)?);
+    }
+    apply_scalar_function(&name, &arguments)
+}
+
+/// date_trunc(field, value) and date_part(field, value): PostgreSQL
+/// semantics over DATE and TIMESTAMP. `extract(field from x)` routes
+/// here from its dedicated expression arm with the same field logic.
+pub(super) fn extract_datetime_part(field: &str, value: &Value) -> Result<Value> {
+    if field.eq_ignore_ascii_case("epoch") {
+        // PostgreSQL's epoch is numeric seconds with the fractional
+        // part; dates are whole-day (integer) seconds.
+        return match value {
+            Value::Timestamp(timestamp) => Ok(Value::Decimal(crate::sql_types::DecimalValue::new(
+                i128::from(timestamp.0),
+                6,
+            )?)),
+            Value::Date(date) => Ok(Value::I64(i64::from(date.0) * 86_400)),
+            Value::Null => Ok(Value::Null),
+            other => Err(unsupported(
+                "EXTRACT",
+                &format!("EXTRACT requires a date or timestamp, not {other:?}"),
+            )),
+        };
+    }
+    match value {
+        Value::Date(date) => {
+            let (year, month, day) = crate::sql_types::civil_from_days(i64::from(date.0));
+            datetime_part_from_civil(field, year, month, day, 0, 0, 0)
+        }
+        Value::Timestamp(timestamp) => {
+            let days = timestamp.0.div_euclid(86_400_000_000);
+            let time = timestamp.0.rem_euclid(86_400_000_000);
+            let (year, month, day) = crate::sql_types::civil_from_days(days);
+            datetime_part_from_civil(
+                field,
+                year,
+                month,
+                day,
+                time / 3_600_000_000,
+                (time / 60_000_000) % 60,
+                (time / 1_000_000) % 60,
+            )
+        }
+        Value::Null => Ok(Value::Null),
+        other => Err(unsupported(
+            "EXTRACT",
+            &format!("EXTRACT requires a date or timestamp, not {other:?}"),
+        )),
+    }
+}
+
+fn datetime_part_from_civil(
+    field: &str,
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Result<Value> {
+    match field.to_ascii_lowercase().as_str() {
+        "year" => Ok(Value::I64(year)),
+        "month" => Ok(Value::I64(i64::from(month))),
+        "day" => Ok(Value::I64(i64::from(day))),
+        "hour" => Ok(Value::I64(hour)),
+        "minute" => Ok(Value::I64(minute)),
+        "second" => Ok(Value::I64(second)),
+        other => Err(unsupported(
+            "EXTRACT",
+            &format!(
+                "datetime field {other} is not supported; supported fields are year, month, day, hour, minute, second, epoch"
+            ),
+        )),
+    }
+}
+
+fn apply_date_function(name: &'static str, arguments: &[Value]) -> Result<Value> {
+    let [field, value] = arguments else {
+        return Err(unsupported(
+            name,
+            &format!("{name} takes a field and a value"),
+        ));
+    };
+    let Value::Text(field) = field else {
+        return Err(unsupported(
+            name,
+            &format!("the {name} field must be a text literal"),
+        ));
+    };
+    if name == "date_part" {
+        return extract_datetime_part(field, value);
+    }
+    // date_trunc: floor the value to the field's boundary.
+    match value {
+        Value::Timestamp(timestamp) => {
+            let days = timestamp.0.div_euclid(86_400_000_000);
+            let (year, month, _day) = crate::sql_types::civil_from_days(days);
+            let truncated_days = match field.to_ascii_lowercase().as_str() {
+                "year" => crate::sql_types::days_from_civil(year, 1, 1),
+                "month" => crate::sql_types::days_from_civil(year, month, 1),
+                "day" => days,
+                "hour" | "minute" => days,
+                other => {
+                    return Err(unsupported(
+                        "date_trunc",
+                        &format!(
+                            "field {other} is not supported; supported fields are year, month, day, hour, minute"
+                        ),
+                    ));
+                }
+            };
+            let mut micros = truncated_days * 86_400_000_000;
+            if field.eq_ignore_ascii_case("hour") {
+                let time = timestamp.0.rem_euclid(86_400_000_000);
+                micros += (time / 3_600_000_000) * 3_600_000_000;
+            } else if field.eq_ignore_ascii_case("minute") {
+                let time = timestamp.0.rem_euclid(86_400_000_000);
+                micros += (time / 60_000_000) * 60_000_000;
+            }
+            Ok(Value::Timestamp(
+                crate::sql_types::TimestampValue::from_micros(micros)?,
+            ))
+        }
+        Value::Date(date) => {
+            let (year, month, _) = crate::sql_types::civil_from_days(i64::from(date.0));
+            let days = match field.to_ascii_lowercase().as_str() {
+                "year" => crate::sql_types::days_from_civil(year, 1, 1),
+                "month" => crate::sql_types::days_from_civil(year, month, 1),
+                "day" => i64::from(date.0),
+                _ => {
+                    return Err(unsupported(
+                        "date_trunc",
+                        "date_trunc on a DATE supports year, month, and day",
+                    ));
+                }
+            };
+            Ok(Value::Date(crate::sql_types::DateValue(
+                i32::try_from(days).map_err(|_| {
+                    DbError::SqlNumericValueOutOfRange("date out of range".to_owned())
+                })?,
+            )))
+        }
+        Value::Null => Ok(Value::Null),
+        other => Err(unsupported(
+            "date_trunc",
+            &format!("date_trunc requires a date or timestamp, not {other:?}"),
         )),
     }
 }

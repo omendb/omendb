@@ -357,6 +357,108 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn scalar_function_catalog_matches_postgresql_semantics() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("scalar-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+    database
+        .execute_sql(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT, price DOUBLE PRECISION, created TIMESTAMP)",
+        )
+        .expect("create table");
+    database
+        .execute_sql(
+            "INSERT INTO t VALUES (1, '  Alice ', 2.7, '2026-09-05 14:30:45.123'), (2, 'BOB', -2.7, '2026-01-15 08:00:00')",
+        )
+        .expect("seed");
+
+    // Text functions over rows, with NULL coming through the column.
+    let result = database
+        .execute_sql(
+            "SELECT upper(name), lower(name), length(name), btrim(name) FROM t WHERE id = 1",
+        )
+        .expect("text functions");
+    assert_eq!(
+        result.rows[0],
+        vec![
+            Value::Text("  ALICE ".to_owned()),
+            Value::Text("  alice ".to_owned()),
+            Value::I64(8),
+            Value::Text("Alice".to_owned()),
+        ]
+    );
+
+    // Numeric functions: abs preserves sign semantics, round/floor/ceil
+    // match PostgreSQL's half-away-from-zero round and IEEE floor/ceil.
+    let result = database
+        .execute_sql(
+            "SELECT abs(price), round(price), floor(price), ceil(price) FROM t WHERE id = 2",
+        )
+        .expect("numeric functions");
+    assert_eq!(
+        result.rows[0],
+        vec![
+            Value::Float64(omendb::F64::new(2.7)),
+            Value::Float64(omendb::F64::new(-3.0)),
+            Value::Float64(omendb::F64::new(-3.0)),
+            Value::Float64(omendb::F64::new(-2.0)),
+        ]
+    );
+
+    // EXTRACT: calendar fields and epoch as scale-6 decimal seconds.
+    let result = database
+        .execute_sql(
+            "SELECT extract(year from created), extract(month from created), extract(day from created), extract(hour from created), extract(epoch from created) FROM t WHERE id = 1",
+        )
+        .expect("extract");
+    assert_eq!(
+        result.rows[0],
+        vec![
+            Value::I64(2026),
+            Value::I64(9),
+            Value::I64(5),
+            Value::I64(14),
+            Value::Decimal(omendb::DecimalValue::new(1_788_618_645_123_000, 6).expect("epoch")),
+        ]
+    );
+
+    // date_trunc boundaries match PostgreSQL's rendering. Days since the
+    // epoch are computed inline (fixed civil-calendar math):
+    //   2026-01-01 = 20454, 2026-09-01 = 20697, 2026-09-05 = 20701.
+    let result = database
+        .execute_sql(
+            "SELECT date_trunc('year', created), date_trunc('month', created), date_trunc('minute', created) FROM t WHERE id = 1",
+        )
+        .expect("date_trunc");
+    assert_eq!(
+        result.rows[0],
+        vec![
+            Value::Timestamp(
+                omendb::TimestampValue::from_micros(20_454 * 86_400_000_000).expect("year start")
+            ),
+            Value::Timestamp(
+                omendb::TimestampValue::from_micros(20_697 * 86_400_000_000).expect("month start")
+            ),
+            Value::Timestamp(
+                omendb::TimestampValue::from_micros(
+                    20_701 * 86_400_000_000 + 14 * 3_600_000_000 + 30 * 60_000_000
+                )
+                .expect("minute start")
+            ),
+        ]
+    );
+
+    // Scalar functions over literals (no FROM).
+    let result = database
+        .execute_sql("SELECT upper('hi'), length('hello'), abs(-5)")
+        .expect("literal scalar functions");
+    assert_eq!(
+        result.rows[0],
+        vec![Value::Text("HI".to_owned()), Value::I64(5), Value::I64(5)]
+    );
+}
+
+#[test]
 fn clock_functions_evaluate_and_round_trip() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("clock-db");

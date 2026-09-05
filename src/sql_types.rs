@@ -361,10 +361,12 @@ pub fn float_text(value: f64) -> String {
     }
 }
 
-/// Proleptic Gregorian `YYYY-MM-DD` from days since 1970-01-01
-/// (Howard Hinnant's civil_from_days).
-pub fn date_text(days: i32) -> String {
-    let z = i64::from(days) + 719_468;
+/// Civil date parts (year, month 1-12, day 1-31) from days since
+/// 1970-01-01 (Howard Hinnant's civil_from_days). Shared by date
+/// rendering, EXTRACT, and date_trunc.
+#[must_use]
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let day_of_era = z - era * 146_097;
     let year_of_era =
@@ -375,6 +377,27 @@ pub fn date_text(days: i32) -> String {
     let day = day_of_year - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
+    (year, month as u32, day as u32)
+}
+
+/// Inverse of `civil_from_days`: days since 1970-01-01 for a civil
+/// date (Howard Hinnant's days_from_civil). The month/day inputs are
+/// validated by construction in callers (1-12 / 1-31 from civil parts).
+#[must_use]
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Proleptic Gregorian `YYYY-MM-DD` from days since 1970-01-01.
+pub fn date_text(days: i32) -> String {
+    let (year, month, day) = civil_from_days(i64::from(days));
     format!("{year:04}-{month:02}-{day:02}")
 }
 

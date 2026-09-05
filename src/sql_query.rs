@@ -11,7 +11,10 @@ use crate::{
     Value,
 };
 
-use super::values::{coerce_value, literal_value};
+use super::values::{
+    apply_scalar_function, coerce_value, extract_datetime_part, literal_value,
+    scalar_function_arity,
+};
 use super::{column_position, find_table, simple_object_name, table_from_join, unsupported};
 
 pub(super) fn execute_query(
@@ -722,6 +725,11 @@ enum ComputedTerm {
     },
     /// COALESCE: first non-NULL argument in source order.
     Coalesce(Vec<ComputedTerm>),
+    /// A catalog scalar function over computed arguments.
+    Scalar {
+        name: String,
+        arguments: Vec<ComputedTerm>,
+    },
 }
 
 /// One CASE WHEN condition: a comparison over computed values.
@@ -791,6 +799,22 @@ impl ComputedTerm {
                 }
                 Ok(Value::Null)
             }
+            Self::Scalar { name, arguments } => {
+                let mut evaluated = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    evaluated.push(argument.evaluate(values)?);
+                }
+                if let Some(field) = name.strip_prefix("__extract_") {
+                    let [value] = evaluated.as_slice() else {
+                        return Err(unsupported(
+                            "EXTRACT",
+                            "EXTRACT takes exactly one datetime value",
+                        ));
+                    };
+                    return extract_datetime_part(field, value);
+                }
+                apply_scalar_function(name, &evaluated)
+            }
         }
     }
 
@@ -830,6 +854,16 @@ impl ComputedTerm {
                 .first()
                 .map(|argument| argument.static_type(table))
                 .unwrap_or(crate::ColumnType::I64),
+            // Scalar text functions produce TEXT; length produces INT8;
+            // abs/round/floor/ceil preserve the argument's numeric type.
+            Self::Scalar { name, arguments } => match name.as_str() {
+                "upper" | "lower" | "btrim" | "ltrim" | "rtrim" => crate::ColumnType::Text,
+                "length" | "char_length" | "character_length" => crate::ColumnType::I64,
+                _ => arguments
+                    .first()
+                    .map(|argument| argument.static_type(table))
+                    .unwrap_or(crate::ColumnType::I64),
+            },
         }
     }
 }
@@ -1133,6 +1167,54 @@ fn plan_computed(
                 operand: planned_operand,
                 conditions: planned_conditions,
                 else_result: planned_else,
+            })
+        }
+        Expr::Extract {
+            field,
+            syntax: _,
+            expr,
+        } => {
+            let argument = plan_computed(expr, table, params)?;
+            Some(ComputedTerm::Scalar {
+                name: format!("__extract_{}", field),
+                arguments: vec![argument],
+            })
+        }
+        Expr::Floor { expr, .. } => {
+            let argument = plan_computed(expr, table, params)?;
+            Some(ComputedTerm::Scalar {
+                name: "floor".to_owned(),
+                arguments: vec![argument],
+            })
+        }
+        Expr::Ceil { expr, .. } => {
+            let argument = plan_computed(expr, table, params)?;
+            Some(ComputedTerm::Scalar {
+                name: "ceil".to_owned(),
+                arguments: vec![argument],
+            })
+        }
+        Expr::Function(func) if scalar_function_arity(&func.name.to_string()).is_some() => {
+            let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
+                return None;
+            };
+            let arity = scalar_function_arity(&func.name.to_string()).expect("guarded");
+            if list.args.len() != arity {
+                return None;
+            }
+            let mut arguments = Vec::with_capacity(arity);
+            for argument in &list.args {
+                let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expression,
+                )) = argument
+                else {
+                    return None;
+                };
+                arguments.push(plan_computed(expression, table, params)?);
+            }
+            Some(ComputedTerm::Scalar {
+                name: func.name.to_string().to_ascii_lowercase(),
+                arguments,
             })
         }
         Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
@@ -3141,8 +3223,11 @@ fn is_aggregate_query(select: &Select) -> bool {
         _ => {}
     }
     fn is_row_function(expression: &Expr) -> bool {
+        // Row functions evaluate per row (COALESCE, the scalar catalog);
+        // everything else that parses as a function is an aggregate.
         matches!(expression, Expr::Function(func)
-            if !func.name.to_string().eq_ignore_ascii_case("coalesce"))
+            if !func.name.to_string().eq_ignore_ascii_case("coalesce")
+                && scalar_function_arity(&func.name.to_string()).is_none())
     }
     select.projection.iter().any(|item| match item {
         SelectItem::UnnamedExpr(expression)
