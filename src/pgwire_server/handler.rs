@@ -459,7 +459,7 @@ impl OmenDbHandler {
                 .trim_start_matches('(')
                 .to_ascii_uppercase()
                 .as_str(),
-            "SELECT" | "WITH" | "TABLE" | "VALUES" | "SHOW"
+            "SELECT" | "WITH" | "TABLE" | "VALUES" | "SHOW" | "EXPLAIN"
         )
     }
 

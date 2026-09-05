@@ -130,6 +130,83 @@ async fn persistent_server_reopens_durable_database_after_shutdown() {
 }
 
 #[tokio::test]
+async fn explain_reports_access_path_through_wire() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"));
+    let server = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+
+    client
+        .batch_execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT, state TEXT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("CREATE INDEX accounts_state_idx ON accounts (state)")
+        .await
+        .expect("create index");
+    client
+        .batch_execute("INSERT INTO accounts VALUES (1, 100, 'open'), (2, 40, 'closed')")
+        .await
+        .expect("seed");
+
+    // Primary-key lookup through the real wire protocol.
+    let row = client
+        .query_one("EXPLAIN SELECT balance FROM accounts WHERE id = 1", &[])
+        .await
+        .expect("explain pk");
+    assert_eq!(row.get::<_, String>(0), "Primary Key Lookup on accounts");
+
+    // Secondary-index scan with every indexed column bound.
+    let row = client
+        .query_one(
+            "EXPLAIN SELECT balance FROM accounts WHERE state = 'open'",
+            &[],
+        )
+        .await
+        .expect("explain index");
+    assert_eq!(
+        row.get::<_, String>(0),
+        "Index Scan using accounts_state_idx on accounts (state)"
+    );
+
+    // Unmodeled predicate: the honest full scan.
+    let row = client
+        .query_one(
+            "EXPLAIN SELECT balance FROM accounts WHERE balance > 50",
+            &[],
+        )
+        .await
+        .expect("explain scan");
+    assert_eq!(row.get::<_, String>(0), "Seq Scan on accounts");
+
+    // EXPLAIN runs inside transaction blocks like any statement.
+    client.batch_execute("BEGIN").await.expect("begin");
+    let row = client
+        .query_one("EXPLAIN UPDATE accounts SET balance = 1 WHERE id = 2", &[])
+        .await
+        .expect("explain update in block");
+    assert_eq!(row.get::<_, String>(0), "Primary Key Lookup on accounts");
+    client.batch_execute("ROLLBACK").await.expect("rollback");
+
+    drop(client);
+    server.shutdown().await.expect("shutdown server");
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
 async fn persistent_server_statement_timeout_cancels_before_execution() {
     let directory = tempdir().expect("tempdir");
     let config = pgwire_server::ServerConfig::new(

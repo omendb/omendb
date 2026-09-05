@@ -6,8 +6,9 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    ColumnId, DbError, IndexDefinition, RelationalDatabase, RelationalDatabaseTransaction, Result,
-    Row, RowIdentity, SqlColumn, SqlResult, TableDefinition, Value,
+    Catalog, ColumnId, DbError, IndexDefinition, IndexId, RelationalDatabase,
+    RelationalDatabaseTransaction, Result, Row, RowIdentity, SqlColumn, SqlResult, TableDefinition,
+    Value,
 };
 
 use super::values::{coerce_value, literal_value};
@@ -395,60 +396,73 @@ fn resolve_scalar_subqueries(
 
 /// DISTINCT deduplicates projected rows preserving first-seen order
 /// (PostgreSQL applies DISTINCT after projection, before LIMIT).
-pub(super) fn primary_key_rows(
-    database: &RelationalDatabase,
-    transaction: &mut RelationalDatabaseTransaction,
-    table: &TableDefinition,
-    selection: Option<&Expr>,
-    params: &[Value],
-) -> Result<Option<Vec<Row>>> {
-    let Some(primary_key) = database.catalog().primary_key(table.id) else {
-        return Ok(None);
-    };
-    let Some(selection) = selection else {
-        return Ok(None);
-    };
-
-    // Flatten the predicate into AND-joined column = literal terms. Any
-    // other shape (OR, BETWEEN, IN, subqueries, column-to-column compare,
-    // arithmetic) conservatively falls back to the scan path.
-    let mut terms: Vec<(usize, Value)> = Vec::new();
-    if !collect_equality_terms(selection, table, params, &mut terms)? {
-        return Ok(None);
-    }
-    if let Some(rows) = null_conjunction_result(&terms) {
-        return Ok(Some(rows));
-    }
-
-    // Every primary-key column must be covered exactly once; repeated
-    // coverage falls back rather than reasoning about contradiction.
-    if !columns_covered_exactly_once(primary_key, table, &terms) {
-        return Ok(None);
-    }
-
-    let values = bound_values(primary_key, table, &terms)?;
-    let identity = RowIdentity::new(table.id, primary_key.to_vec(), values)?;
-    Ok(transaction
-        .get_by_identity(database, table.id, &identity)?
-        .map(|row| vec![row])
-        .or_else(|| Some(Vec::new())))
+/// The row-access decision the executor makes for one table and
+/// predicate. Pure over (catalog, table, predicate, params): both
+/// execution and `EXPLAIN` resolve it so a named plan never disagrees
+/// with the access path taken.
+#[derive(Debug, PartialEq)]
+pub(super) enum PredicatePlan {
+    /// One row through its exact primary-key identity.
+    PrimaryKeyLookup { primary_key: Vec<ColumnId> },
+    /// A secondary index whose full column list the predicate binds;
+    /// the scan runs against that index.
+    IndexScan {
+        index_id: IndexId,
+        columns: Vec<ColumnId>,
+    },
+    /// The predicate pins a primary-key column to NULL: nothing can
+    /// match and execution short-circuits to no rows.
+    NullShortCircuit,
 }
 
-/// Candidate rows for SELECT/UPDATE/DELETE: the primary-key identity
-/// lookup when the predicate pins it exactly, otherwise a secondary-index
-/// exact match when an index's full column list is bound, otherwise `None`
-/// (caller falls back to a full scan). Returned rows are ordered by primary
-/// key to preserve the scan-order contract for unordered queries.
-pub(super) fn predicate_candidate_rows(
-    database: &RelationalDatabase,
-    transaction: &mut RelationalDatabaseTransaction,
+/// Resolve the access plan for `selection` over `table` exactly as the
+/// executor does: same term collection, same coverage checks, same
+/// most-bound-columns index choice with the lowest id breaking ties.
+/// `Ok(None)` means the caller falls back to a scan because the
+/// predicate shape is not modeled, or no fast path applies, so the
+/// caller scans every row (the executor's `None` contract).
+/// Resolve the single-table SELECT's target and WHERE for EXPLAIN.
+/// Mirrors execute_query's table resolution without executing: rejects
+/// the same shapes the executor rejects.
+pub(crate) fn query_table_and_selection(
+    catalog: &crate::Catalog,
+    query: &Query,
+) -> Result<(crate::TableDefinition, Option<sqlparser::ast::Expr>)> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(unsupported(
+            "SELECT",
+            "only SELECT bodies are supported here",
+        ));
+    };
+    let select = select.as_ref();
+    if select.from.len() != 1 {
+        return Err(unsupported("SELECT", "only one table in FROM is supported"));
+    }
+    if !select.from[0].joins.is_empty() {
+        return Err(unsupported("SELECT", "JOIN is not explainable yet"));
+    }
+    let table = table_from_join(catalog, &select.from[0])?;
+    Ok((table.clone(), select.selection.clone()))
+}
+
+/// The INSERT's target table name for EXPLAIN.
+pub(crate) fn table_name_from_insert(
+    catalog: &crate::Catalog,
+    insert: &sqlparser::ast::Insert,
+) -> Result<String> {
+    let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
+        return Err(unsupported("INSERT", "the target must be a plain table"));
+    };
+    let resolved = super::find_table(catalog, &name.to_string())?;
+    Ok(resolved.name.clone())
+}
+
+pub(super) fn resolve_predicate_plan(
+    catalog: &Catalog,
     table: &TableDefinition,
     selection: Option<&Expr>,
     params: &[Value],
-) -> Result<Option<Vec<Row>>> {
-    if let Some(rows) = primary_key_rows(database, transaction, table, selection, params)? {
-        return Ok(Some(rows));
-    }
+) -> Result<Option<PredicatePlan>> {
     let Some(selection) = selection else {
         return Ok(None);
     };
@@ -456,13 +470,18 @@ pub(super) fn predicate_candidate_rows(
     if !collect_equality_terms(selection, table, params, &mut terms)? {
         return Ok(None);
     }
-    if let Some(rows) = null_conjunction_result(&terms) {
-        return Ok(Some(rows));
+    if terms.iter().any(|(_, value)| matches!(value, Value::Null)) {
+        return Ok(Some(PredicatePlan::NullShortCircuit));
     }
-
-    let primary_key = database.catalog().primary_key(table.id);
-    let mut candidates: Vec<&IndexDefinition> = database
-        .catalog()
+    if let Some(primary_key) = catalog.primary_key(table.id)
+        && columns_covered_exactly_once(primary_key, table, &terms)
+    {
+        return Ok(Some(PredicatePlan::PrimaryKeyLookup {
+            primary_key: primary_key.to_vec(),
+        }));
+    }
+    let primary_key = catalog.primary_key(table.id);
+    let mut candidates: Vec<&IndexDefinition> = catalog
         .indexes()
         .filter(|index| index.table == table.id)
         .filter(|index| {
@@ -478,21 +497,59 @@ pub(super) fn predicate_candidate_rows(
             .cmp(&left.columns.len())
             .then(left.id.cmp(&right.id))
     });
-    let Some(index) = candidates.first() else {
-        return Ok(None);
-    };
-    let values = bound_values(&index.columns, table, &terms)?;
-    let mut rows = transaction.index_get(database, table.id, index.id, &values)?;
-    rows.sort_by_key(|left| left.primary);
-    Ok(Some(rows))
+    Ok(candidates.first().map(|index| PredicatePlan::IndexScan {
+        index_id: index.id,
+        columns: index.columns.clone(),
+    }))
 }
 
-/// A pure equality conjunction containing NULL is UNKNOWN for every row.
-fn null_conjunction_result(terms: &[(usize, Value)]) -> Option<Vec<Row>> {
-    terms
-        .iter()
-        .any(|(_, value)| matches!(value, Value::Null))
-        .then(Vec::new)
+/// Candidate rows for SELECT/UPDATE/DELETE: the primary-key identity
+/// lookup when the predicate pins it exactly, otherwise a secondary-index
+/// exact match when an index's full column list is bound, otherwise `None`
+/// (caller falls back to a full scan). Returned rows are ordered by primary
+/// key to preserve the scan-order contract for unordered queries.
+pub(super) fn predicate_candidate_rows(
+    database: &RelationalDatabase,
+    transaction: &mut RelationalDatabaseTransaction,
+    table: &TableDefinition,
+    selection: Option<&Expr>,
+    params: &[Value],
+) -> Result<Option<Vec<Row>>> {
+    match resolve_predicate_plan(database.catalog(), table, selection, params)? {
+        Some(PredicatePlan::PrimaryKeyLookup { primary_key }) => {
+            // Run the identity lookup directly: the plan already proved
+            // every primary-key column is bound exactly once.
+            let Some(selection) = selection else {
+                return Ok(None);
+            };
+            let mut terms: Vec<(usize, Value)> = Vec::new();
+            if !collect_equality_terms(selection, table, params, &mut terms)? {
+                return Ok(None);
+            }
+            let values = bound_values(&primary_key, table, &terms)?;
+            let identity = RowIdentity::new(table.id, primary_key, values)?;
+            Ok(transaction
+                .get_by_identity(database, table.id, &identity)?
+                .map(|row| vec![row])
+                .or_else(|| Some(Vec::new())))
+        }
+        Some(PredicatePlan::NullShortCircuit) => Ok(Some(Vec::new())),
+        Some(PredicatePlan::IndexScan { index_id, columns }) => {
+            let Some(selection) = selection else {
+                return Ok(None);
+            };
+            let mut terms: Vec<(usize, Value)> = Vec::new();
+            if !collect_equality_terms(selection, table, params, &mut terms)? {
+                return Ok(None);
+            }
+            let values = bound_values(&columns, table, &terms)?;
+            let mut rows = transaction.index_get(database, table.id, index_id, &values)?;
+            rows.sort_by_key(|left| left.primary);
+            Ok(Some(rows))
+        }
+        // Unmodeled predicate shape or no predicate: the caller scans.
+        None => Ok(None),
+    }
 }
 
 fn columns_covered_exactly_once(

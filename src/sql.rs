@@ -41,6 +41,9 @@ pub(crate) mod typed_input {
 #[path = "sql_write.rs"]
 mod write;
 
+#[path = "sql/explain.rs"]
+mod explain;
+
 mod result {
     use crate::{CommitId, Value};
 
@@ -163,6 +166,25 @@ fn execute_in_transaction_statement(
     params: &[Value],
 ) -> Result<SqlResult> {
     match statement {
+        Statement::Explain {
+            statement: explained,
+            analyze,
+            ..
+        } => {
+            if *analyze {
+                return Err(unsupported(
+                    "EXPLAIN",
+                    "EXPLAIN ANALYZE is not supported; run the statement and time it",
+                ));
+            }
+            let plan = explain::explain_statement(database, explained, params)?;
+            Ok(SqlResult {
+                columns: plan.columns,
+                rows: plan.rows,
+                affected_rows: 0,
+                commit: None,
+            })
+        }
         Statement::Query(query) => query::execute_query(database, transaction, query, params),
         Statement::Insert(insert) => write::execute_insert(database, transaction, insert, params),
         Statement::Update(update) => write::execute_update(database, transaction, update, params),
@@ -803,6 +825,17 @@ pub(super) fn statement_access(
                 collect_expr_tables(selection, &mut read);
             }
             false
+        }
+        // EXPLAIN reads what its statement reads (and writes what it
+        // writes, since the plan names the target): grant analysis
+        // recurses so a role cannot probe table structure it cannot
+        // read through the plan.
+        SqlStatement::Explain { statement, .. } => {
+            let inner = statement.to_string();
+            let (inner_read, inner_write, inner_admin) = statement_access(&inner)?;
+            read.extend(inner_read);
+            write.extend(inner_write);
+            inner_admin
         }
         _ => true,
     };

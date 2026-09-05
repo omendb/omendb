@@ -357,6 +357,88 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn explain_names_the_access_path_execution_takes() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("explain-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+    database
+        .execute_sql(
+            "CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL, state TEXT, nickname TEXT)",
+        )
+        .expect("create table");
+    database
+        .execute_sql("CREATE INDEX accounts_state_idx ON accounts (state)")
+        .expect("create index");
+    database
+        .execute_sql(
+            "INSERT INTO accounts VALUES (1, 100, 'open', 'one'), (2, 40, 'open', 'two'), (3, 10, 'closed', NULL)",
+        )
+        .expect("seed");
+
+    // Primary-key equality: an identity lookup, and the row comes back.
+    let plan = database
+        .execute_sql("EXPLAIN SELECT balance FROM accounts WHERE id = 1")
+        .expect("explain pk");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Primary Key Lookup on accounts".to_owned())
+    );
+
+    // Secondary-index equality with every indexed column bound.
+    let plan = database
+        .execute_sql("EXPLAIN SELECT balance FROM accounts WHERE state = 'open'")
+        .expect("explain index");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Index Scan using accounts_state_idx on accounts (state)".to_owned())
+    );
+
+    // A predicate the fast path does not model falls to a full scan.
+    let plan = database
+        .execute_sql("EXPLAIN SELECT balance FROM accounts WHERE balance > 50")
+        .expect("explain scan");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Seq Scan on accounts".to_owned())
+    );
+
+    // NULL equality on a nullable column short-circuits to no rows.
+    // (A NULL comparison on the NOT NULL primary key is refused at
+    // coercion, identically in EXPLAIN and execution.)
+    let plan = database
+        .execute_sql("EXPLAIN SELECT balance FROM accounts WHERE nickname = NULL")
+        .expect("explain null");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Result (empty) on accounts (NULL equality)".to_owned())
+    );
+
+    // UPDATE and DELETE report the same access path as their SELECT probe.
+    let plan = database
+        .execute_sql("EXPLAIN UPDATE accounts SET balance = 1 WHERE id = 2")
+        .expect("explain update");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Primary Key Lookup on accounts".to_owned())
+    );
+    let plan = database
+        .execute_sql("EXPLAIN DELETE FROM accounts WHERE id = 2")
+        .expect("explain delete");
+    assert_eq!(
+        plan.rows[0][0],
+        Value::Text("Primary Key Lookup on accounts".to_owned())
+    );
+
+    // EXPLAIN ANALYZE is refused, matching PostgreSQL's execution vs plan
+    // distinction without running the statement.
+    assert!(
+        database
+            .execute_sql("EXPLAIN ANALYZE SELECT balance FROM accounts WHERE id = 1")
+            .is_err()
+    );
+}
+
+#[test]
 fn embedded_sql_matches_across_backends_and_reopens() {
     let temporary = tempdir().expect("temporary directory");
     exercise_sql(&temporary.path().join("temporary"));
