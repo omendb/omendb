@@ -100,16 +100,29 @@ primitive.
 ## Server UX and operations — medium severity
 
 - Implemented: persistent `omendbd`, SCRAM-SHA-256, table grants,
-  cancellation (57014), statement deadlines, result bounds, SIGKILL/reopen.
-- Missing: TLS, `EXPLAIN`, slow-statement logging, connection-pooling
-  guidance, metrics beyond lifecycle counters.
+  cancellation (57014), statement deadlines, result bounds, SIGKILL/reopen,
+  `EXPLAIN` (the executor's own access-path decision), slow-statement
+  logging (`--slow-statement-ms`, one structured stderr line), static
+  describe types (catalog/aggregate/arithmetic-derived, not probe samples).
+- TLS: explicitly declined, not silently missing — the server answers
+  `SSLRequest` with 'N' (`sslmode=require` fails immediately, `prefer`
+  proceeds cleartext). Policy until first-party TLS: loopback/private bind
+  or fronting proxy. Documented in `docs/pgwire-compatibility.md`.
+- Missing: connection-pooling guidance, metrics beyond lifecycle counters,
+  `current_user()` returning the SCRAM identity (trust connections answer
+  `omendb`).
 
 ## DX and ecosystem fit — medium severity
 
 - No published release; `cargo install` path untested end-to-end.
-- Untested against real clients: no `psql` session matrix, no major-ORM
-  (Prisma/Diesel/SQLAlchemy) compatibility evidence.
-- README (113 lines) predates the server-first posture.
+- Real-client evidence now exists: psql 17 session matrix
+  (`tests/project_psql_session.rs`, self-skips without psql) and sqlx
+  0.8 (pool, DDL, typed prepared statements, transactions, rollback
+  visibility). The sqlx matrix exposed and drove the fix for the
+  describe-probe type-inference bug. Untested: Prisma, Diesel,
+  SQLAlchemy, ActiveRecord.
+- README carries the alpha contract (works / session surface / fails
+  honestly / not yet) with the wire-compat stance.
 
 ## Correctness strengths (for balance)
 
