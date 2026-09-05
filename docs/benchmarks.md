@@ -35,10 +35,14 @@ engineering baselines, not marketing claims.
   full sync set (data-device, PMT/allocator metadata, directory), so
   single-writer latency is unchanged; throughput scales by amortization
   across concurrent commits.
-- **The SQL facade does not yet reach engine-tier write throughput**
-  (~146 ops/s at 8 threads vs ~511 direct): the facade serializes read
-  paths behind the writer mutex, so facade-level pipelining is the next
-  measured follow-up.
+- **The SQL facade does not reach engine-tier write throughput**
+  (~242 ops/s clean, 8 threads, vs ~511 direct). A Mutex-to-RwLock read
+  split of the facade's database guard was implemented and measured
+  NEUTRAL (242→245 ops/s writes; ~68k reads/s unchanged during write
+  waves), so the read-serialization hypothesis is disproven and the
+  split was reverted: the gap is per-commit mutation volume (a facade
+  insert stages row + 2 index entries + status + change ≈ 7 mutations
+  vs the engine probe's 3).
 - **Reads are fast and scale independently of history length** after the
   prefix-bounded index seek landed: unique-index lookups went from 324 to
   ~195k ops/s when exact-key probes replaced whole-tree scans.
@@ -55,17 +59,44 @@ engineering baselines, not marketing claims.
 3. SeerDB phantom validation now seeks change records past the snapshot CSN
    instead of scanning conflict history from the beginning.
 
+## Same-hardware pgbench differential (TPC-B, PostgreSQL wire)
+
+`scripts/pgbench/differential.sh` runs the TPC-B statement mix (point
+SELECT, two point UPDATEs, a secondary-key UPDATE, and an INSERT in one
+explicit transaction) through the real wire protocol against OmenDB's
+pgwire daemon and PostgreSQL 17.11 on the same machine, with identical
+schema, script, seed, and retry budget. Measured at scale 1, 4
+clients, 30 s:
+
+| Engine | TPS | Avg latency | Retried |
+|---|---|---|---|
+| PostgreSQL 17.11 (fsync on) | 8124 | 0.49 ms | 0% |
+| OmenDB (default) | 37.0 | 107 ms | 40% |
+| OmenDB (`--wal-first`) | 19.8 | 200 ms | 31% |
+
+WAL-first commit acks are QUALIFIED for crash correctness (3-mode
+process-crash matrix at the real 2 MiB bound;
+`crates/seerdb/tests/wal_first_process_crash.rs`) and cut single-writer
+commit latency ~44%, but under sustained multi-client load the
+deferred 2 MiB materialization stalls the publish lane behind the
+checkpoint, so the default stays off. The 40001-class retries in the
+differential are honest behavior: OmenDB's optimistic snapshots reject
+concurrent same-row writers where PostgreSQL's row locks wait;
+`--max-tries` on both engines makes the comparison fair.
+
+Phase timing inside one publication wave explains the gap: the MVCC
+version-store sync costs ~4.5 ms and `commit_group_at` (full B-tree
+clone + WAL append) another ~4.5 ms, while raw fsync on the same volume
+is 0.05 ms — the wave cost is publication-structure CPU, not the
+syscall. Collapsing those two phases toward PostgreSQL's single
+append+fsync is the measured next lever.
+
 ## Known follow-ups
 
-- Facade-level write pipelining: the SQL facade serializes behind the
-  writer mutex (~146 ops/s at 8 threads vs ~511 engine-tier after the
-  pipelined group-commit landing); pipelining facade reads/staging is
+- Publication-wave cost: the ~10 ms wave floor (version-store sync +
+  full candidate B-tree clone per wave) is the dominant write latency;
+  restructuring publication toward PostgreSQL's single-log append is
   the next measured lever.
-- WAL-first commit acknowledgment (`Options::wal_first_commits`) to
-  collapse the ~4 fsync-class barriers per wave toward PostgreSQL's
-  single-WAL-sync pattern; needs crash-matrix qualification through
-  the 2 MiB materialization threshold before it can be measured as a
-  default.
 - Serializable scan transactions: `RelationalDatabaseTransaction::
   scan_serializable` registers the table range as a read dependency, so
   mixed read-write transactions fail on phantom inserts. Plain `scan`

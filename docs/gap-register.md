@@ -70,21 +70,32 @@ primitive.
   `LENGTH`, ...), window functions, expression/partial indexes,
   `GROUPING SETS`. Function support blocks on the type system.
 
-## Durability performance — medium severity, understood
+## Durability performance — medium severity, root cause re-measured
 
 - Concurrent durable write throughput at the engine: 511 ops/s at 8
   threads (waves of 8; `examples/wave_probe.rs`), 976 ops/s at 16.
-  Through the relational facade: 146 ops/s — facade data reads still
-  serialize behind the wave's database guard.
-- Root cause of the remaining gap to PostgreSQL: each wave pays ~4
-  fsync-class barriers (data flush 46%, PMT metadata 41%, blobs 8%,
-  directory 4%; `docs/benchmarks.md`) while PostgreSQL pays one WAL sync
-  per commit group. `Options::wal_first_commits` (ack after one
-  group-synced WAL append; 2 MiB materialization threshold) implements
-  the PostgreSQL design but is experimental, unqualified at scale, and
-  not wired into OmenDB defaults.
-- No same-hardware pgbench differential exists yet; the alpha gates
-  require one for release evidence.
+  Through the relational facade: ~242 ops/s clean (was reported 146).
+- The facade read-serialization hypothesis is DISPROVEN: a
+  Mutex→RwLock split of the facade's database guard passed all suites
+  but measured neutral (242→245 ops/s; ~68k reads/s during waves
+  unchanged), so it was reverted. The facade gap is per-commit mutation
+  volume (~7 staged mutations per facade insert vs 3 in the engine
+  probe).
+- Same-hardware pgbench differential EXISTS now
+  (`scripts/pgbench/differential.sh`, TPC-B through the real wire):
+  PostgreSQL 17.11 8124 tps / 0.49 ms avg; OmenDB 37.0 tps / 107 ms
+  avg (40% serialization retries); OmenDB `--wal-first` 19.8 tps /
+  200 ms avg. Wave phase timing: MVCC version-store sync ~4.5 ms +
+  `commit_group_at` (full B-tree clone + WAL append) ~4.5 ms per
+  wave — publication-structure CPU, not fsync (raw fsync on the same
+  volume is 0.05 ms).
+- `Options::wal_first_commits` is now crash-QUALIFIED (3-mode
+  process-crash matrix at the real 2 MiB bound;
+  `crates/seerdb/tests/wal_first_process_crash.rs`) and wired into
+  `omendbd --wal-first`; it cuts single-writer commit latency ~44% but
+  stalls the publish lane under sustained multi-client load, so the
+  default stays off. The measured next lever is collapsing the wave's
+  two ~4.5 ms phases toward PostgreSQL's single append+fsync.
 
 ## Server UX and operations — medium severity
 
