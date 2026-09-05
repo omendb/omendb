@@ -32,6 +32,11 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
 | Authorization | Provisioned grants distinguish read, write, and schema-admin access; ungranted tables, including tables referenced by nested subqueries, deny access. | `wire_grant_enforcement_reader_writer_admin` |
 | Diagnostics | `RunningServer::status()` reports connection admission and tracked query/describe worker outcomes. | `persistent_server_reopens_durable_database_after_shutdown`, `query_worker_tracker_records_terminal_operation_outcomes` (unit) |
+| Slow statement log | `ServerConfig::slow_statement_threshold` / `--slow-statement-ms N` log statements (execution plus commit publication) above the threshold to stderr as one structured line: duration, authenticated user, single-line statement. Default off. | `omendbd_logs_slow_statements_when_threshold_set` |
+| EXPLAIN | `EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` reports the same access path the executor takes: primary-key lookup, index scan, NULL short-circuit, or seq scan. `EXPLAIN ANALYZE` is refused. Grant analysis recurses into the explained statement. | `explain_names_the_access_path_execution_takes`, `explain_reports_access_path_through_wire` |
+| Session functions | `version()` answers `OmenDB <version> (on PostgreSQL wire protocol)`; `current_user()`, `current_schema()`, `current_database()` answer for capability detection. | `psql_session_matrix_matches_alpha_contract`, `tests/project_sql.rs` |
+| SHOW | The compatibility GUCs clients probe: `server_version`, `server_encoding`, `client_encoding`, `transaction_isolation`, `standard_conforming_strings`, `max_connections`, `search_path`. Others are refused with the supported list. | `psql_session_matrix_matches_alpha_contract` |
+| Real client matrix | Interactive psql 17 runs the alpha contract: plain SQL in one session, capability detection, honest `feature not supported` failures for pg_catalog meta-commands (`\dt`, `\d`, `\l`) with the session staying usable, and explicit transaction blocks. | `tests/project_psql_session.rs` (self-skips without psql on PATH) |
 
 ## Wire protocol
 
@@ -88,13 +93,33 @@ oracle is intentionally narrower than the ordinary pgwire suite: its purpose is
 to catch semantic or metadata drift in behavior OmenDB already documents, not
 to imply PostgreSQL-complete protocol or SQL coverage.
 
+## TLS stance
+
+OmenDB does not terminate TLS. The server answers PostgreSQL `SSLRequest`
+negotiation with 'N' (no SSL), which is the honest protocol response:
+
+- `sslmode=require` fails immediately with `server does not support SSL`;
+- `sslmode=prefer` (the libpq default) falls back to the cleartext session;
+- `sslmode=disable` connects without negotiation.
+
+Until TLS termination exists, deployment policy is: bind to loopback or a
+private interface, or terminate TLS in front of the daemon (for example a
+local `stunnel`/HAProxy sidecar). Trust mode is already restricted to
+loopback listeners; a non-loopback bind requires provisioned SCRAM users
+first. Recording a client's TLS rejection in the daemon log is open work.
+
 ## Explicit gaps
 
 The following are outside the current compatibility claim and remain release
 or later compatibility work:
 
-- SSL negotiation, COPY, replication, notifications, cursors, portals with
-  incremental `max_rows`, and the wider PostgreSQL session-parameter surface;
+- TLS termination (see the stance above), COPY, replication, notifications,
+  cursors, portals with incremental `max_rows`, and the wider PostgreSQL
+  session-parameter surface;
+- `version()` and `current_user` answer generic values: `version()` names
+  OmenDB honestly rather than spoofing PostgreSQL, and `current_user`
+  reports `omendb` for trust-mode connections; SCRAM-authenticated roles
+  need their real identity threaded into session functions;
 - exhaustive SQLSTATE mapping; remaining execution-time `InvalidState` errors
   still report a generic internal wire error rather than their
   PostgreSQL-specific SQLSTATE;

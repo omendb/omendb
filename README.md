@@ -104,8 +104,10 @@ catalogs use trust mode on loopback only. Provision a SCRAM user through
 exists, startup requires SCRAM authentication. PostgreSQL `CancelRequest`
 messages are routed to the database's cooperative cancellation checkpoints;
 connection admission is bounded with `--max-connections`,
-`--statement-timeout-ms` adds a cooperative per-statement deadline, and
-`--max-result-bytes` caps the estimated response payload.
+`--statement-timeout-ms` adds a cooperative per-statement deadline,
+`--max-result-bytes` caps the estimated response payload, and
+`--slow-statement-ms N` logs statements (including commit publication) that
+exceed the threshold to stderr.
 
 The supported SQL and wire surface is deliberate and bounded, not a claim of
 PostgreSQL compatibility. See the
@@ -116,6 +118,32 @@ remains available for client experiments:
 ```bash
 cargo run --features pgwire --example pgwire_serve -- 5432
 ```
+
+## Alpha contract
+
+What the wire server promises today, verified by the ordinary and live-client
+test suites:
+
+- **Works:** the bounded SQL subset — single and joined `SELECT` (projection,
+  arithmetic, parameters, `IN`/`BETWEEN`, `NULL`, `DISTINCT`, ordering,
+  pagination, grouping, aggregates, set operations, subqueries), `INSERT`
+  (multi-row, `INSERT ... SELECT`, `RETURNING`), `UPDATE`/`DELETE`
+  (`RETURNING`, `FROM`/`USING`), DDL for tables, indexes, and foreign keys,
+  `EXPLAIN` reporting the access path execution actually takes, typed
+  scalars (integers, `FLOAT8`, `NUMERIC`, `DATE`, `TIMESTAMP`, `UUID`),
+  transaction blocks, and the typed embedded API.
+- **Session surface:** trust (loopback) and SCRAM-SHA-256 authentication,
+  role grants, statement deadlines, cancellation, `version()`, `SHOW` for
+  the compatibility GUCs, and a slow-statement log.
+- **Fails honestly:** unsupported syntax, joins in `EXPLAIN`, and
+  pg_catalog-dependent psql meta-commands (`\dt`, `\d`, `\l`) return
+  `feature not supported` errors — the connection stays usable. `version()`
+  names OmenDB, not PostgreSQL; clients that branch on version strings see
+  the truth.
+- **Not yet:** TLS termination (the server declines `SSLRequest`; terminate
+  TLS in front or bind private), `COPY`, replication, notifications, cursors,
+  incremental portals, pg_catalog, `CASE`/`COALESCE` and text/date function
+  breadth, serializable certification, and window functions.
 
 ## Development
 
