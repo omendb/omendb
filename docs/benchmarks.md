@@ -66,13 +66,19 @@ SELECT, two point UPDATEs, a secondary-key UPDATE, and an INSERT in one
 explicit transaction) through the real wire protocol against OmenDB's
 pgwire daemon and PostgreSQL 17.11 on the same machine, with identical
 schema, script, seed, and retry budget. Measured at scale 1, 4
-clients, 30 s:
+clients, 30 s. `pgbench_history` is now the stock unkeyed heap shape on
+both engines (OmenDB heap tables landed 2026-09-05); the earlier
+client-numbered history_id substitute — 37.0 tps — is superseded:
 
 | Engine | TPS | Avg latency | Retried |
 |---|---|---|---|
-| PostgreSQL 17.11 (fsync on) | 8124 | 0.49 ms | 0% |
-| OmenDB (default) | 37.0 | 107 ms | 40% |
-| OmenDB (`--wal-first`) | 19.8 | 200 ms | 31% |
+| PostgreSQL 17.11 (fsync on) | 7757 | 0.52 ms | 0% |
+| OmenDB (default, heap history) | 41.0 | 96 ms | 38% |
+| OmenDB (`--wal-first`, keyed-history era) | 19.8 | 200 ms | 31% |
+
+The stock heap INSERT is ~11% cheaper than the keyed substitute it
+replaced (37.0 -> 41.0 tps at the same retry profile) and removes the
+one-invocation-per-daemon constraint the keyed client-sequence imposed.
 
 WAL-first commit acks are QUALIFIED for crash correctness (3-mode
 process-crash matrix at the real 2 MiB bound;

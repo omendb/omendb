@@ -112,7 +112,7 @@ echo "-- OmenDB: run ($CLIENTS clients, ${DURATION}s) --"
 # client retries, PostgreSQL's row locks wait; without retries OmenDB's
 # hot-row conflicts would count as failures instead of work.
 "$PGBENCH" -h "$HOST" -p "$PORT" -U omendb -n -c "$CLIENTS" -T "$DURATION" -P 10 \
-  --max-tries 100 -D "scale=$SCALE" -D "hid=0" -D "mtime=$MTIME" \
+  --max-tries 100 -D "scale=$SCALE" -D "mtime=$MTIME" \
   -f "$SCRIPT_DIR/tpcb.sql" omendb 2>&1 | tail -12
 
 kill $OMENDAEMON 2>/dev/null || true
@@ -133,7 +133,7 @@ PGTARGET="$POSTGRES_URL dbname=$PSQLDB"
 
 echo "-- PostgreSQL: run ($CLIENTS clients, ${DURATION}s) --"
 "$PGBENCH" -d "$PGTARGET" -n -c "$CLIENTS" -T "$DURATION" -P 10 \
-  --max-tries 100 -D "scale=$SCALE" -D "hid=0" -D "mtime=$MTIME" \
+  --max-tries 100 -D "scale=$SCALE" -D "mtime=$MTIME" \
   -f "$SCRIPT_DIR/tpcb.sql" 2>&1 | tail -12
 
 PGTARGET="$POSTGRES_URL dbname=$PSQLDB"

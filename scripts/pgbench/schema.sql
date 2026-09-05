@@ -4,19 +4,21 @@
 --   pgbench_branches  :scale rows        (keyed bid)
 --   pgbench_tellers   10 * :scale rows   (keyed tid)
 --   pgbench_accounts  100000 * :scale rows (keyed aid)
---   pgbench_history   append-only log     (keyed client sequence)
+--   pgbench_history   append-only heap log (no key, exactly like stock)
 --
 -- Differences from stock pgbench DDL are stated here so the comparison
 -- stays honest:
---   * every table declares its PRIMARY KEY inline (stock pgbench
+--   * keyed tables declare their PRIMARY KEY inline (stock pgbench
 --     backfills them with ALTER TABLE, which is not in the alpha
 --     surface; the physical schema is the same after -i)
---   * pgbench_history gains a BIGINT history_id as client-numbered
---     sequence (:client_id * 2^40 + per-client counter). Stock
---     pgbench_history has no key at all; a keyed log table with the
---     same insert cost per row is the closest keyed shape.
+--   * pgbench_history is the stock shape: no key at all. OmenDB now
+--     supports heap tables, so the earlier keyed-substitute
+--     (client-numbered BIGINT history_id) is gone; both engines run
+--     the identical unkeyed INSERT.
 --   * mtime is supplied by the script as a timestamp literal, not
---     CURRENT_TIMESTAMP, which is outside the alpha SQL surface.
+--     CURRENT_TIMESTAMP: identical statements on both engines is the
+--     controlled comparison; clock values would only add skew between
+--     engines.
 --
 -- :scale is substituted by psql -v scale=N.
 
@@ -43,7 +45,6 @@ CREATE TABLE pgbench_accounts (
 );
 
 CREATE TABLE pgbench_history (
-    history_id BIGINT     PRIMARY KEY,
     tid        INT        NOT NULL,
     bid        INT        NOT NULL,
     aid        BIGINT     NOT NULL,
