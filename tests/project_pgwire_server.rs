@@ -322,6 +322,98 @@ async fn describe_reports_static_column_types_for_empty_results() {
 }
 
 #[tokio::test]
+async fn case_and_coalesce_evaluate_through_the_wire() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"));
+    let server = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+
+    client
+        .batch_execute("CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, NULL)")
+        .await
+        .expect("seed");
+
+    // Searched CASE with ELSE, in a prepared statement: describe must
+    // resolve the output type from the first arm.
+    let rows = client
+        .query(
+            "SELECT CASE WHEN val > 15 THEN 'high' ELSE 'low' END AS band FROM t ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("searched case");
+    let bands: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(bands, ["low", "high", "low"]);
+
+    // NULL falls through a condition without a matching ELSE to NULL.
+    let rows = client
+        .query(
+            "SELECT CASE WHEN val > 5 THEN 'gt5' END FROM t ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("null fallthrough");
+    let values: Vec<Option<String>> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(
+        values,
+        [Some("gt5".to_owned()), Some("gt5".to_owned()), None]
+    );
+
+    // Simple CASE compares the operand by equality.
+    let rows = client
+        .query(
+            "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("simple case");
+    let labels: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(labels, ["one", "two", "other"]);
+
+    // COALESCE over a nullable column and literals, composed with CASE.
+    let rows = client
+        .query(
+            "SELECT id, COALESCE(val, 0), CASE WHEN COALESCE(val, 0) > 15 THEN 'high' ELSE 'low' END FROM t ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("coalesce composition");
+    let triples: Vec<(i64, i64, String)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    assert_eq!(
+        triples,
+        [
+            (1, 10, "low".to_owned()),
+            (2, 20, "high".to_owned()),
+            (3, 0, "low".to_owned()),
+        ]
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shutdown server");
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
 async fn persistent_server_statement_timeout_cancels_before_execution() {
     let directory = tempdir().expect("tempdir");
     let config = pgwire_server::ServerConfig::new(

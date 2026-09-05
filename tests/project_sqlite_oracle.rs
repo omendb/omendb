@@ -235,6 +235,38 @@ fn exercise() -> Result<()> {
         "SELECT id, balance, state FROM accounts ORDER BY id",
         &[],
     )?;
+    // CASE/COALESCE: searched CASE with NULL fall-through, simple CASE,
+    // and COALESCE over columns and literals, all matching SQLite.
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, CASE WHEN balance > 50 THEN 'high' ELSE 'low' END FROM accounts ORDER BY id",
+        &[],
+    )?;
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, CASE WHEN state = 'open' THEN 1 END FROM accounts ORDER BY id",
+        &[],
+    )?;
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM accounts ORDER BY id",
+        &[],
+    )?;
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, COALESCE(state, 'unknown') FROM accounts ORDER BY id",
+        &[],
+    )?;
+    compare_query(
+        &mut database,
+        &connection,
+        "SELECT id, CASE WHEN COALESCE(state, 'closed') = 'closed' THEN 'closed-band' ELSE 'open-band' END FROM accounts ORDER BY id",
+        &[],
+    )?;
     compare_query(
         &mut database,
         &connection,

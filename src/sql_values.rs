@@ -59,6 +59,27 @@ pub(super) fn literal_value(expression: &Expr, params: &[Value]) -> Result<Value
                 .map(Value::Text)
                 .ok_or_else(|| unsupported("literal", "this literal type is not supported")),
         },
+        Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+            let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
+                return Err(unsupported("COALESCE", "at least one argument is required"));
+            };
+            if list.args.is_empty() {
+                return Err(unsupported("COALESCE", "at least one argument is required"));
+            }
+            for argument in &list.args {
+                let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expression,
+                )) = argument
+                else {
+                    return Err(unsupported("COALESCE", "arguments must be expressions"));
+                };
+                let value = literal_value(expression, params)?;
+                if !matches!(value, Value::Null) {
+                    return Ok(value);
+                }
+            }
+            Ok(Value::Null)
+        }
         Expr::Function(func) if function_has_no_arguments(func) => {
             session_function_value(&func.name.to_string().to_lowercase())
         }

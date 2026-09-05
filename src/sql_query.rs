@@ -701,12 +701,37 @@ fn non_negative_integer(expression: &Expr, params: &[Value], clause: &str) -> Re
 
 /// A projection term that evaluates per row instead of reading a fixed
 /// column or constant: binary arithmetic over nested operands.
+#[derive(Clone)]
 enum ComputedTerm {
     Column(usize),
     Literal(Value),
     Binary {
         op: BinaryOperator,
         left: Box<ComputedTerm>,
+        right: Box<ComputedTerm>,
+    },
+    /// CASE: the optional operand (simple CASE), when conditions with
+    /// their results, and the optional ELSE. Evaluates conditions in
+    /// source order. Searched-CASE conditions are comparison triples
+    /// over raw values; the simple form compares the operand by
+    /// equality with each condition's left side.
+    Case {
+        operand: Option<Box<ComputedTerm>>,
+        conditions: Vec<(ComputedCondition, ComputedTerm)>,
+        else_result: Option<Box<ComputedTerm>>,
+    },
+    /// COALESCE: first non-NULL argument in source order.
+    Coalesce(Vec<ComputedTerm>),
+}
+
+/// One CASE WHEN condition: a comparison over computed values.
+#[derive(Clone)]
+enum ComputedCondition {
+    /// Searched CASE: left op right evaluates to True (Unknown and
+    /// False both fall through, mirroring SQL three-valued logic).
+    Compare {
+        left: Box<ComputedTerm>,
+        op: BinaryOperator,
         right: Box<ComputedTerm>,
     },
 }
@@ -722,6 +747,49 @@ impl ComputedTerm {
                 let lhs = left.evaluate(values)?;
                 let rhs = right.evaluate(values)?;
                 arithmetic(op, &lhs, &rhs)
+            }
+            Self::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                let operand_value = match operand {
+                    Some(operand) => Some(operand.evaluate(values)?),
+                    None => None,
+                };
+                for (condition, result) in conditions {
+                    let matched = match condition {
+                        ComputedCondition::Compare { left, op, right } => {
+                            // Simple CASE: the operand compares by
+                            // equality with the condition's left side.
+                            // Searched CASE: the comparison evaluates
+                            // directly. Both fall through on Unknown
+                            // (NULL), matching SQL semantics.
+                            let (lhs, rhs) = if let Some(operand) = &operand_value {
+                                (operand.clone(), left.evaluate(values)?)
+                            } else {
+                                (left.evaluate(values)?, right.evaluate(values)?)
+                            };
+                            compare_values(&lhs, &rhs, op) == Truth::True
+                        }
+                    };
+                    if matched {
+                        return result.evaluate(values);
+                    }
+                }
+                match else_result {
+                    Some(result) => result.evaluate(values),
+                    None => Ok(Value::Null),
+                }
+            }
+            Self::Coalesce(arguments) => {
+                for argument in arguments {
+                    let value = argument.evaluate(values)?;
+                    if !matches!(value, Value::Null) {
+                        return Ok(value);
+                    }
+                }
+                Ok(Value::Null)
             }
         }
     }
@@ -751,6 +819,17 @@ impl ComputedTerm {
                     CT::I64
                 }
             }
+            // CASE/COALESCE arms may differ in type; PostgreSQL resolves
+            // the union at runtime. The first arm's static type is the
+            // best honest guess without a full type resolver.
+            Self::Case { conditions, .. } => conditions
+                .first()
+                .map(|(_, result)| result.static_type(table))
+                .unwrap_or(crate::ColumnType::I64),
+            Self::Coalesce(arguments) => arguments
+                .first()
+                .map(|argument| argument.static_type(table))
+                .unwrap_or(crate::ColumnType::I64),
         }
     }
 }
@@ -981,6 +1060,96 @@ fn plan_computed(
                 left: Box::new(left),
                 right: Box::new(right),
             })
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let planned_operand = match operand {
+                Some(operand) => Some(Box::new(plan_computed(operand, table, params)?)),
+                None => None,
+            };
+            let mut planned_conditions = Vec::with_capacity(conditions.len());
+            for when in conditions {
+                let condition = match (&planned_operand, &when.condition) {
+                    // Simple CASE: compare the operand with the WHEN value.
+                    (Some(_), expression) => {
+                        let left = plan_computed(expression, table, params)?;
+                        ComputedCondition::Compare {
+                            left: Box::new(left),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(ComputedTerm::Literal(Value::Null)),
+                        }
+                    }
+                    // Searched CASE: the WHEN expression must be a
+                    // comparison or NULL-test shape this tier models.
+                    (None, Expr::BinaryOp { left, op, right })
+                        if matches!(
+                            op,
+                            BinaryOperator::Eq
+                                | BinaryOperator::NotEq
+                                | BinaryOperator::Gt
+                                | BinaryOperator::Lt
+                                | BinaryOperator::GtEq
+                                | BinaryOperator::LtEq
+                        ) =>
+                    {
+                        let left = plan_computed(left, table, params)?;
+                        let right = plan_computed(right, table, params)?;
+                        ComputedCondition::Compare {
+                            left: Box::new(left),
+                            op: op.clone(),
+                            right: Box::new(right),
+                        }
+                    }
+                    (None, Expr::IsNull(inner)) => {
+                        let left = plan_computed(inner, table, params)?;
+                        ComputedCondition::Compare {
+                            left: Box::new(left),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(ComputedTerm::Literal(Value::Null)),
+                        }
+                    }
+                    (None, Expr::IsNotNull(inner)) => {
+                        let left = plan_computed(inner, table, params)?;
+                        ComputedCondition::Compare {
+                            left: Box::new(left),
+                            op: BinaryOperator::NotEq,
+                            right: Box::new(ComputedTerm::Literal(Value::Null)),
+                        }
+                    }
+                    (None, _) => return None,
+                };
+                let result = plan_computed(&when.result, table, params)?;
+                planned_conditions.push((condition, result));
+            }
+            let planned_else = match else_result {
+                Some(result) => Some(Box::new(plan_computed(result, table, params)?)),
+                None => None,
+            };
+            Some(ComputedTerm::Case {
+                operand: planned_operand,
+                conditions: planned_conditions,
+                else_result: planned_else,
+            })
+        }
+        Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+            let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
+                return None;
+            };
+            let mut arguments = Vec::with_capacity(list.args.len());
+            for argument in &list.args {
+                let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expression,
+                )) = argument
+                else {
+                    return None;
+                };
+                arguments.push(plan_computed(expression, table, params)?);
+            }
+            Some(ComputedTerm::Coalesce(arguments))
         }
         Expr::Value(_) | Expr::UnaryOp { .. } => literal_value(expression, params)
             .ok()
@@ -2971,15 +3140,16 @@ fn is_aggregate_query(select: &Select) -> bool {
         GroupByExpr::All(_) => return true,
         _ => {}
     }
-    select.projection.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::UnnamedExpr(Expr::Function(_))
-                | SelectItem::ExprWithAlias {
-                    expr: Expr::Function(_),
-                    ..
-                }
-        )
+    fn is_row_function(expression: &Expr) -> bool {
+        matches!(expression, Expr::Function(func)
+            if !func.name.to_string().eq_ignore_ascii_case("coalesce"))
+    }
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expression)
+        | SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => is_row_function(expression),
+        _ => false,
     })
 }
 

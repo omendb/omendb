@@ -727,6 +727,35 @@ pub(super) fn statement_access(
             }
             SqlExpr::Exists { subquery, .. } => collect_query_tables(subquery, read),
             SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => collect_expr_tables(inner, read),
+            SqlExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    collect_expr_tables(operand, read);
+                }
+                for when in conditions {
+                    collect_expr_tables(&when.condition, read);
+                    collect_expr_tables(&when.result, read);
+                }
+                if let Some(else_result) = else_result {
+                    collect_expr_tables(else_result, read);
+                }
+            }
+            SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+                if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                    for argument in &list.args {
+                        if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(expression),
+                        ) = argument
+                        {
+                            collect_expr_tables(expression, read);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
