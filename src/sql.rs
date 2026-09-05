@@ -185,6 +185,32 @@ fn execute_in_transaction_statement(
                 commit: None,
             })
         }
+        Statement::ShowVariable { variable } => {
+            let name = variable
+                .iter()
+                .map(|identifier| identifier.value.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            let value = match name.as_str() {
+                "server_version" => env!("CARGO_PKG_VERSION").to_owned(),
+                "server_encoding" | "client_encoding" => "UTF8".to_owned(),
+                "transaction_isolation" => "read committed".to_owned(),
+                "standard_conforming_strings" => "on".to_owned(),
+                "max_connections" => "128".to_owned(),
+                "search_path" => "public".to_owned(),
+                other => {
+                    let reason = format!(
+                        "unsupported configuration parameter {other}; supported parameters are server_version, server_encoding, client_encoding, transaction_isolation, standard_conforming_strings, max_connections, search_path"
+                    );
+                    return Err(unsupported("SHOW", &reason));
+                }
+            };
+            Ok(SqlResult::rows(
+                vec![SqlColumn { name }],
+                vec![vec![Value::Text(value)]],
+            ))
+        }
         Statement::Query(query) => query::execute_query(database, transaction, query, params),
         Statement::Insert(insert) => write::execute_insert(database, transaction, insert, params),
         Statement::Update(update) => write::execute_update(database, transaction, update, params),

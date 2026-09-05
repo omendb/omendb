@@ -59,9 +59,42 @@ pub(super) fn literal_value(expression: &Expr, params: &[Value]) -> Result<Value
                 .map(Value::Text)
                 .ok_or_else(|| unsupported("literal", "this literal type is not supported")),
         },
+        Expr::Function(func) if function_has_no_arguments(func) => {
+            session_function_value(&func.name.to_string().to_lowercase())
+        }
         _ => Err(unsupported(
             "expression",
             "only literals and simple column references are supported",
+        )),
+    }
+}
+
+fn function_has_no_arguments(func: &sqlparser::ast::Function) -> bool {
+    match &func.args {
+        sqlparser::ast::FunctionArguments::None => true,
+        sqlparser::ast::FunctionArguments::List(list) => {
+            list.args.is_empty() && list.clauses.is_empty()
+        }
+        sqlparser::ast::FunctionArguments::Subquery(_) => false,
+    }
+}
+
+/// Zero-argument session functions that clients call for capability
+/// detection and connection startup. They are properties of the server,
+/// not the statement, so they evaluate in any expression position that
+/// accepts a literal.
+pub(super) fn session_function_value(name: &str) -> Result<Value> {
+    match name {
+        "version" => Ok(Value::Text(format!(
+            "OmenDB {} (on PostgreSQL wire protocol)",
+            env!("CARGO_PKG_VERSION")
+        ))),
+        "current_user" | "user" => Ok(Value::Text("omendb".to_owned())),
+        "current_schema" => Ok(Value::Text("public".to_owned())),
+        "current_database" => Ok(Value::Text("omendb".to_owned())),
+        _ => Err(unsupported(
+            "function",
+            "this function is not supported; supported zero-argument functions are version(), current_user(), current_schema(), current_database()",
         )),
     }
 }
