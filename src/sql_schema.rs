@@ -583,10 +583,29 @@ pub(super) fn execute_create_table(
                         "use table-level UNIQUE or FOREIGN KEY constraints",
                     ));
                 }
+                // `DEFAULT NULL` is the one default OmenDB honors: the
+                // INSERT path already fills absent columns with NULL, so
+                // the clause is a no-op that common schema generators
+                // (pgbench, ORMs) emit unconditionally. Any other default
+                // expression is refused.
+                ColumnOption::Default(expression) => {
+                    if !matches!(
+                        expression,
+                        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: sqlparser::ast::Value::Null,
+                            ..
+                        })
+                    ) {
+                        return Err(unsupported(
+                            "CREATE TABLE",
+                            "DEFAULT is only supported as NULL; non-null defaults are not supported",
+                        ));
+                    }
+                }
                 _ => {
                     return Err(unsupported(
                         "CREATE TABLE",
-                        "only NULL, NOT NULL, and a single-column PRIMARY KEY are supported",
+                        "only NULL, NOT NULL, DEFAULT NULL, and a single-column PRIMARY KEY are supported",
                     ));
                 }
             }
@@ -766,9 +785,17 @@ pub(super) fn execute_create_table(
     }
 
     if column_primary.is_none() && !primary_seen {
-        return Err(DbError::InvalidState(
-            "SQL tables must define a PRIMARY KEY".to_owned(),
-        ));
+        // No PRIMARY KEY: a heap table. Rows get engine-allocated
+        // identities at insert; UPDATE and DELETE address rows through
+        // the scanned identity like any other table.
+        return database.create_table_with_schema_and_primary_key(
+            table,
+            None,
+            RelationalSchemaDefinition {
+                indexes: named_indexes,
+                foreign_keys: foreign_key_specs,
+            },
+        );
     }
 
     let primary_columns = primary_columns

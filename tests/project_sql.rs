@@ -357,6 +357,84 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn heap_tables_store_update_delete_and_reopen_without_collisions() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("heap-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    // A table with no PRIMARY KEY: rows get engine-allocated identities.
+    database
+        .execute_sql(
+            "CREATE TABLE history (tid BIGINT, delta BIGINT, mtime TIMESTAMP DEFAULT NULL)",
+        )
+        .expect("create heap table");
+    // Secondary indexes and UNIQUE constraints work over heap rows.
+    database
+        .execute_sql("CREATE INDEX history_tid_idx ON history (tid)")
+        .expect("index heap table");
+
+    database
+        .execute_sql(
+            "INSERT INTO history VALUES (1, 10, '2026-09-05 01:00:00'), (1, 20, '2026-09-05 01:01:00'), (2, 30, NULL)",
+        )
+        .expect("multi-row insert");
+    let result = database
+        .execute_sql("SELECT tid, delta, mtime FROM history ORDER BY tid, delta")
+        .expect("scan heap");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(
+        result.rows[1][2],
+        Value::Timestamp(
+            omendb::TimestampValue::from_micros(1_788_570_060_000_000).expect("mtime")
+        )
+    );
+
+    // UPDATE addresses rows by their stored identity; no column is
+    // protected on a heap table.
+    database
+        .execute_sql("UPDATE history SET delta = delta + 5 WHERE tid = 1")
+        .expect("update heap rows");
+    let result = database
+        .execute_sql("SELECT sum(delta) FROM history")
+        .expect("post-update sum");
+    assert_eq!(result.rows[0][0], Value::I64(70));
+
+    // DELETE by predicate removes exactly the matching rows.
+    database
+        .execute_sql("DELETE FROM history WHERE delta > 20")
+        .expect("delete heap rows");
+    let result = database
+        .execute_sql("SELECT count(*) FROM history")
+        .expect("post-delete count");
+    assert_eq!(result.rows[0][0], Value::U64(1));
+
+    // Reopen: committed heap rows survive, and new identities cannot
+    // collide with pre-crash ones (they derive from the durable
+    // transaction allocator, which never reuses after reopen).
+    database.close().expect("close");
+    let mut database = RelationalDatabase::open(config(&database_path)).expect("reopen database");
+    let result = database
+        .execute_sql("SELECT count(*) FROM history")
+        .expect("reopened count");
+    assert_eq!(result.rows[0][0], Value::U64(1));
+    database
+        .execute_sql("INSERT INTO history VALUES (3, 40, NULL), (4, 50, NULL)")
+        .expect("insert after reopen");
+    let result = database
+        .execute_sql("SELECT count(*), sum(delta) FROM history")
+        .expect("post-reopen totals");
+    assert_eq!(result.rows[0][0], Value::U64(3));
+    assert_eq!(result.rows[0][1], Value::I64(105));
+
+    // The index still resolves lookups over both generations of rows.
+    let result = database
+        .execute_sql("SELECT delta FROM history WHERE tid = 3")
+        .expect("index lookup after reopen");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::I64(40));
+}
+
+#[test]
 fn scalar_function_catalog_matches_postgresql_semantics() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("scalar-db");

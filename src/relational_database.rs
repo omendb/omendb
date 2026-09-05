@@ -748,6 +748,23 @@ impl RelationalDatabaseTransaction {
         Ok(())
     }
 
+    /// Stage one heap-table (primary-key-less) insert: the engine
+    /// allocates the durable row identity. Returns the row with its
+    /// allocated primary so callers can RETURNING-report it.
+    pub fn insert_heap(
+        &mut self,
+        store: &RelationalDatabase,
+        table: TableId,
+        mut row: Row,
+    ) -> Result<Row> {
+        let backend = self.backend(store)?;
+        let primary = backend.next_heap_identity(table)?;
+        row.primary = primary;
+        backend.insert(table, row.clone())?;
+        self.wrote = true;
+        Ok(row)
+    }
+
     /// Stage one row replacement plus derived index refreshes.
     pub fn update(&mut self, store: &RelationalDatabase, table: TableId, row: Row) -> Result<()> {
         self.backend(store)?.update(table, row)?;

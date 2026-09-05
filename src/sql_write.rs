@@ -4,8 +4,8 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    DbError, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, SqlColumn, SqlResult,
-    TableDefinition, Value,
+    DbError, Key, RelationalDatabase, RelationalDatabaseTransaction, Result, Row, SqlColumn,
+    SqlResult, TableDefinition, Value,
 };
 
 use super::query::{ResolvedSubqueries, join_predicate, row_matches};
@@ -118,10 +118,10 @@ pub(super) fn execute_insert(
         }
     }
 
+    let heap_table = database.catalog().primary_key(table.id).is_none();
     let mut affected = 0;
     for row_values in inserted_rows {
         transaction.check_operation_control()?;
-        let primary = sql_primary_key(table, &row_values)?;
         if let Some((_, positions)) = &returning_plan {
             returned_rows.push(
                 positions
@@ -130,14 +130,28 @@ pub(super) fn execute_insert(
                     .collect(),
             );
         }
-        transaction.insert(
-            database,
-            table.id,
-            Row {
-                primary,
-                values: row_values,
-            },
-        )?;
+        if heap_table {
+            // Heap rows have no caller-visible key: the engine allocates
+            // a durable identity at insert.
+            transaction.insert_heap(
+                database,
+                table.id,
+                Row {
+                    primary: Key::new(table.id.0, 0),
+                    values: row_values,
+                },
+            )?;
+        } else {
+            let primary = sql_primary_key(table, &row_values)?;
+            transaction.insert(
+                database,
+                table.id,
+                Row {
+                    primary,
+                    values: row_values,
+                },
+            )?;
+        }
         affected += 1;
     }
     if let Some((columns, _)) = returning_plan {
@@ -510,23 +524,24 @@ fn apply_assignments(
         let value = assignment_value(expression, table, row, params)?;
         updated.values[*position] = coerce_value(value, &table.columns[*position])?;
     }
-    let primary_changed = if let Some(columns) = database.catalog().primary_key(table.id) {
-        columns.iter().try_fold(false, |changed, column| {
+    // Heap tables have no primary key, so no column is protected; the
+    // stored identity is carried by row.primary and is never derived
+    // from the values.
+    if let Some(columns) = database.catalog().primary_key(table.id) {
+        let primary_changed = columns.iter().try_fold(false, |changed, column| {
             let position = table
                 .columns
                 .iter()
                 .position(|candidate| candidate.id == *column)
                 .ok_or_else(|| DbError::InvalidState("primary-key column is missing".to_owned()))?;
             Ok::<_, DbError>(changed || updated.values[position] != row.values[position])
-        })?
-    } else {
-        updated.values[0] != row.values[0]
-    };
-    if primary_changed {
-        return Err(DbError::InvalidState(
-            "updating the SQL primary key is not supported; delete and insert the row instead"
-                .to_owned(),
-        ));
+        })?;
+        if primary_changed {
+            return Err(DbError::InvalidState(
+                "updating the SQL primary key is not supported; delete and insert the row instead"
+                    .to_owned(),
+            ));
+        }
     }
     transaction.update(database, table.id, updated.clone())?;
     Ok(updated)

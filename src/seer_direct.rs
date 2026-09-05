@@ -17,7 +17,7 @@ use crate::relational::{
     TableDefinition, TableId, Value, encode_catalog, encode_row, foreign_key_values,
     index_values_key, row_from_storage_identity, row_identity_bytes, row_index_key,
 };
-use crate::{DbError, IndexId, Result};
+use crate::{DbError, IndexId, Key, Result};
 
 const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC1";
 const DIRECT_CATALOG_MARKER: &[u8] = b"\x00omendb/direct/catalog/v1";
@@ -770,6 +770,12 @@ pub(crate) struct DirectTransaction {
     table_trees: BTreeMap<TableId, TreeId>,
     index_trees: BTreeMap<IndexId, TreeId>,
     transaction: Transaction,
+    /// Heap (primary-key-less) inserts this transaction has staged. The
+    /// engine-allocated identity is derived from the durable transaction
+    /// ID so identities are unique without a durable counter: TxnIds
+    /// never reuse after reopen (the allocator watermark is restored),
+    /// and aborted transactions write no durable rows.
+    heap_inserts: u64,
 }
 
 impl DirectTransaction {
@@ -797,6 +803,7 @@ impl DirectTransaction {
             table_trees: store.table_trees.clone(),
             index_trees: store.index_trees.clone(),
             transaction,
+            heap_inserts: 0,
         })
     }
 
@@ -1006,6 +1013,23 @@ impl DirectTransaction {
 
     /// Stage a row insert plus its derived index entries; uniqueness is
     /// checked against the snapshot and this transaction's staged state.
+    /// Allocate one engine-owned identity for a heap (primary-key-less)
+    /// table insert. The durable transaction ID provides cross-restart
+    /// uniqueness; the low bits distinguish rows within one transaction.
+    pub(crate) fn next_heap_identity(&mut self, table: TableId) -> Result<Key> {
+        let txn = self.transaction.id().get();
+        let ordinal = self.heap_inserts;
+        self.heap_inserts = ordinal
+            .checked_add(1)
+            .ok_or_else(|| DbError::InvalidState("heap insert ordinal exhausted".to_owned()))?;
+        if ordinal >= 1 << 24 {
+            return Err(DbError::InvalidState(
+                "one transaction stages more heap rows than identities allow; use smaller INSERT statements".to_owned(),
+            ));
+        }
+        Ok(Key::new(table.0, (txn << 24) | ordinal))
+    }
+
     pub(crate) fn insert(&mut self, table: TableId, row: Row) -> Result<()> {
         let definition = self.catalog.table(table)?.clone();
         row.validate(&definition)?;

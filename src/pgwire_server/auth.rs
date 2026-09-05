@@ -242,6 +242,13 @@ pub fn provision_wire_user(
     salt.resize(SALT_LEN, b'0');
     let mut secret = salt.clone();
     secret.extend_from_slice(&gen_salted_password(password, &salt, SCRAM_ITERATIONS));
+    // Heap tables have no caller-visible key, so re-provisioning a user
+    // must replace their row explicitly (delete-then-insert, like the
+    // grants path) instead of relying on a key collision.
+    database.execute_sql_with_params(
+        "DELETE FROM pgwire_auth WHERE username = $1",
+        &[Value::Text(username.to_owned())],
+    )?;
     database.execute_sql_with_params(
         "INSERT INTO pgwire_auth (username, secret) VALUES ($1, $2)",
         &[Value::Text(username.to_owned()), Value::Bytes(secret)],
