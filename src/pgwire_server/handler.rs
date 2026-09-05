@@ -595,10 +595,11 @@ impl OmenDbHandler {
                 .iter()
                 .enumerate()
                 .map(|(position, column)| {
-                    (
-                        column.name.clone(),
-                        value_type(sample.and_then(|row| row.get(position))),
-                    )
+                    let ty = column
+                        .column_type
+                        .map(column_type_to_pg)
+                        .unwrap_or_else(|| value_type(sample.and_then(|row| row.get(position))));
+                    (column.name.clone(), ty)
                 })
                 .collect(),
         );

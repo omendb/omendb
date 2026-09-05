@@ -158,9 +158,7 @@ fn returning_plan(
         match item {
             SelectItem::Wildcard(options) if options.to_string().is_empty() => {
                 for (position, column) in table.columns.iter().enumerate() {
-                    columns.push(SqlColumn {
-                        name: column.name.clone(),
-                    });
+                    columns.push(SqlColumn::typed(column.name.clone(), column.data_type));
                     positions.push(position);
                 }
             }
@@ -172,9 +170,10 @@ fn returning_plan(
                     .ok_or_else(|| DbError::SqlUndefinedColumn {
                         name: identifier.value.clone(),
                     })?;
-                columns.push(SqlColumn {
-                    name: identifier.value.clone(),
-                });
+                columns.push(SqlColumn::typed(
+                    identifier.value.clone(),
+                    table.columns[position].data_type,
+                ));
                 positions.push(position);
             }
             _ => {
@@ -551,14 +550,13 @@ fn cross_table_scope<'a>(
     let mut combined_columns: Vec<SqlColumn> = target
         .columns
         .iter()
-        .map(|column| SqlColumn {
-            name: column.name.clone(),
-        })
+        .map(|column| SqlColumn::typed(column.name.clone(), column.data_type))
         .collect();
     for column in &from_table.columns {
-        combined_columns.push(SqlColumn {
-            name: format!("{}.{}", from_table.name, column.name),
-        });
+        combined_columns.push(SqlColumn::typed(
+            format!("{}.{}", from_table.name, column.name),
+            column.data_type,
+        ));
     }
     Ok((from_table, combined_columns))
 }

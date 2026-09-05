@@ -207,6 +207,121 @@ async fn explain_reports_access_path_through_wire() {
 }
 
 #[tokio::test]
+async fn describe_reports_static_column_types_for_empty_results() {
+    // Regression: the describe probe executes with benign parameter
+    // values, so a parameterized query probing to zero rows used to
+    // infer every result column as TEXT from missing samples. Typed
+    // clients (sqlx, tokio-postgres) cache describe metadata and then
+    // failed to decode even correct rows. Static projection types
+    // (catalog columns, aggregate kinds, computed promotion) are the
+    // honest source of truth.
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let mut database = RelationalDatabase::create(RelationalBackendConfig::new(&database_path))
+        .expect("create database");
+    database
+        .create_table(TableDefinition {
+            id: TableId(7),
+            name: "items".to_owned(),
+            columns: vec![
+                ColumnDefinition {
+                    id: ColumnId(1),
+                    name: "id".to_owned(),
+                    data_type: ColumnType::I64,
+                    nullable: false,
+                },
+                ColumnDefinition {
+                    id: ColumnId(2),
+                    name: "note".to_owned(),
+                    data_type: ColumnType::Text,
+                    nullable: true,
+                },
+            ],
+        })
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO items (id, note) VALUES (1, 'a')")
+        .expect("seed row");
+    database.close().expect("close seed database");
+
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"))
+            .with_create_if_missing(false);
+    let server = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+
+    // Prepare (drives Describe) with a parameter the probe binds to a
+    // value that matches nothing; the typed statement must still report
+    // the catalog types.
+    let typed = client
+        .prepare("SELECT id, note FROM items WHERE id = $1")
+        .await
+        .expect("prepare typed query");
+    assert_eq!(typed.columns()[0].name(), "id");
+    assert_eq!(
+        *typed.columns()[0].type_(),
+        tokio_postgres::types::Type::INT8
+    );
+    assert_eq!(typed.columns()[1].name(), "note");
+    assert_eq!(
+        *typed.columns()[1].type_(),
+        tokio_postgres::types::Type::TEXT
+    );
+
+    // And the same query executes and decodes typed values.
+    let row = client
+        .query_one("SELECT id, note FROM items WHERE id = $1", &[&1i64])
+        .await
+        .expect("execute typed query");
+    let id: i64 = row.get(0);
+    let note: String = row.get(1);
+    assert_eq!((id, note.as_str()), (1, "a"));
+
+    // Aggregates: COUNT is INT8, SUM inherits the argument type.
+    let aggregate = client
+        .prepare("SELECT count(*) AS n, sum(id) AS total FROM items")
+        .await
+        .expect("prepare aggregate");
+    assert_eq!(
+        *aggregate.columns()[0].type_(),
+        tokio_postgres::types::Type::INT8
+    );
+    assert_eq!(
+        *aggregate.columns()[1].type_(),
+        tokio_postgres::types::Type::INT8
+    );
+
+    // Arithmetic: int op int stays INT8; int op decimal promotes to NUMERIC.
+    let computed = client
+        .prepare("SELECT id + 1 AS next_id, id * 2.5 AS scaled FROM items WHERE id = $1")
+        .await
+        .expect("prepare computed");
+    assert_eq!(
+        *computed.columns()[0].type_(),
+        tokio_postgres::types::Type::INT8
+    );
+    assert_eq!(
+        *computed.columns()[1].type_(),
+        tokio_postgres::types::Type::NUMERIC
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shutdown server");
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
 async fn persistent_server_statement_timeout_cancels_before_execution() {
     let directory = tempdir().expect("tempdir");
     let config = pgwire_server::ServerConfig::new(

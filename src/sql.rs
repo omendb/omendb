@@ -51,6 +51,21 @@ mod result {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct SqlColumn {
         pub name: String,
+        /// The column's static result type when the projection determines
+        /// it (catalog column, typed literal, or computed term). `None`
+        /// means the type is only observable from result values (set-union
+        /// arms, expression fallbacks); wire servers then infer from a
+        /// sample row.
+        pub column_type: Option<crate::ColumnType>,
+    }
+
+    impl SqlColumn {
+        pub(crate) fn typed(name: impl Into<String>, column_type: crate::ColumnType) -> Self {
+            Self {
+                name: name.into(),
+                column_type: Some(column_type),
+            }
+        }
     }
 
     /// A bounded embedded SQL result.
@@ -207,7 +222,7 @@ fn execute_in_transaction_statement(
                 }
             };
             Ok(SqlResult::rows(
-                vec![SqlColumn { name }],
+                vec![SqlColumn::typed(name, crate::ColumnType::Text)],
                 vec![vec![Value::Text(value)]],
             ))
         }

@@ -156,9 +156,10 @@ fn explain_table_predicate(
 
 fn plan_result(line: String) -> SqlExplainResult {
     SqlExplainResult {
-        columns: vec![crate::SqlColumn {
-            name: "Query Plan".to_owned(),
-        }],
+        columns: vec![crate::SqlColumn::typed(
+            "Query Plan",
+            crate::ColumnType::Text,
+        )],
         rows: vec![vec![Value::Text(line)]],
     }
 }

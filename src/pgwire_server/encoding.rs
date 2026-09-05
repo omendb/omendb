@@ -310,7 +310,14 @@ pub(super) fn fields_from_result(
             .iter()
             .enumerate()
             .map(|(position, column)| {
-                let ty = value_type(sample.and_then(|row| row.get(position)));
+                // Static projection types come first: they hold even when
+                // no row matches (a parameterized describe probe runs with
+                // benign values). Sample inference is the fallback for
+                // genuinely dynamic shapes (set-union arms, subqueries).
+                let ty = column
+                    .column_type
+                    .map(column_type_to_pg)
+                    .unwrap_or_else(|| value_type(sample.and_then(|row| row.get(position))));
                 let field_format = format.format_for(position);
                 FieldInfo::new(column.name.clone(), None, None, ty, field_format)
             })

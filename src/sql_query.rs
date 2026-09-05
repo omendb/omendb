@@ -45,6 +45,7 @@ pub(super) fn execute_query(
                     let (expression, alias) = projection_expression(item)?;
                     Ok(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
+                        column_type: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -57,6 +58,7 @@ pub(super) fn execute_query(
             let value = literal_value(expression, params)?;
             columns.push(SqlColumn {
                 name: alias.unwrap_or_else(|| expression.to_string()),
+                column_type: value_static_type(&value),
             });
             row.push(value);
         }
@@ -723,6 +725,51 @@ impl ComputedTerm {
             }
         }
     }
+
+    /// The statically knowable result type, mirroring the `arithmetic`
+    /// promotion rules: a float operand makes float8, a decimal operand
+    /// (without float) makes decimal, and integers stay in the i64/u64
+    /// integer domain. Column positions resolve through the projection's
+    /// table.
+    fn static_type(&self, table: &TableDefinition) -> crate::ColumnType {
+        match self {
+            Self::Column(position) => table
+                .columns
+                .get(*position)
+                .map(|column| column.data_type)
+                .unwrap_or(crate::ColumnType::I64),
+            Self::Literal(value) => value_static_type(value).unwrap_or(crate::ColumnType::I64),
+            Self::Binary { left, right, .. } => {
+                use crate::ColumnType as CT;
+                let lhs = left.static_type(table);
+                let rhs = right.static_type(table);
+                if lhs == CT::Float64 || rhs == CT::Float64 {
+                    CT::Float64
+                } else if lhs == CT::Decimal || rhs == CT::Decimal {
+                    CT::Decimal
+                } else {
+                    CT::I64
+                }
+            }
+        }
+    }
+}
+
+/// Map a literal value to its static result type where one exists.
+/// NULL and parameters have no static type; they stay sample-inferred.
+pub(super) fn value_static_type(value: &Value) -> Option<crate::ColumnType> {
+    match value {
+        Value::Bool(_) => Some(crate::ColumnType::Bool),
+        Value::U64(_) | Value::I64(_) => Some(crate::ColumnType::I64),
+        Value::Text(_) => Some(crate::ColumnType::Text),
+        Value::Bytes(_) => Some(crate::ColumnType::Bytes),
+        Value::Float64(_) => Some(crate::ColumnType::Float64),
+        Value::Date(_) => Some(crate::ColumnType::Date),
+        Value::Timestamp(_) => Some(crate::ColumnType::Timestamp),
+        Value::Decimal(_) => Some(crate::ColumnType::Decimal),
+        Value::Uuid(_) => Some(crate::ColumnType::Uuid),
+        Value::Null => None,
+    }
 }
 
 /// SQL arithmetic promotion: both operands must be numeric. Integers
@@ -1107,9 +1154,7 @@ fn projection_plan(
         match item {
             SelectItem::Wildcard(options) if options.to_string().is_empty() => {
                 for (position, column) in table.columns.iter().enumerate() {
-                    columns.push(SqlColumn {
-                        name: column.name.clone(),
-                    });
+                    columns.push(SqlColumn::typed(column.name.clone(), column.data_type));
                     positions.push(Some(position));
                     literals.push(None);
                     computed.push(None);
@@ -1124,9 +1169,10 @@ fn projection_plan(
                     _ => None,
                 };
                 if let Some(position) = column_position(table, expression)? {
-                    columns.push(SqlColumn {
-                        name: alias.unwrap_or_else(|| table.columns[position].name.clone()),
-                    });
+                    columns.push(SqlColumn::typed(
+                        alias.unwrap_or_else(|| table.columns[position].name.clone()),
+                        table.columns[position].data_type,
+                    ));
                     positions.push(Some(position));
                     literals.push(None);
                     computed.push(None);
@@ -1139,6 +1185,7 @@ fn projection_plan(
                     })?;
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
+                        column_type: value_static_type(value),
                     });
                     positions.push(None);
                     literals.push(Some(value.clone()));
@@ -1146,16 +1193,19 @@ fn projection_plan(
                 } else if let Some(term) = plan_computed(expression, table, params) {
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
+                        column_type: Some(term.static_type(table)),
                     });
                     positions.push(None);
                     literals.push(None);
                     computed.push(Some(term));
                 } else {
+                    let literal = literal_value(expression, params)?;
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
+                        column_type: value_static_type(&literal),
                     });
                     positions.push(None);
-                    literals.push(Some(literal_value(expression, params)?));
+                    literals.push(Some(literal));
                     computed.push(None);
                 }
             }
@@ -1263,6 +1313,7 @@ fn execute_join_query(
         .iter()
         .map(|column| SqlColumn {
             name: format!("{}.{}", scope[0].0, column.name),
+            column_type: Some(column.data_type),
         })
         .collect();
 
@@ -1353,6 +1404,7 @@ fn execute_join_query(
         for column in &right.columns {
             combined_columns.push(SqlColumn {
                 name: format!("{right_name}.{}", column.name),
+                column_type: Some(column.data_type),
             });
         }
         scope.push((right_name, right));
@@ -1614,6 +1666,7 @@ fn joined_grouped_aggregates(
                     .to_owned(),
             ));
         }
+        let group_type = combined_columns[position].column_type;
         columns.push(SqlColumn {
             name: alias
                 .unwrap_or_else(|| {
@@ -1625,6 +1678,7 @@ fn joined_grouped_aggregates(
                         .to_owned()
                 })
                 .replace('.', ""),
+            column_type: group_type,
         });
     }
 
@@ -1634,6 +1688,7 @@ fn joined_grouped_aggregates(
     let mut final_columns: Vec<SqlColumn> = group_positions
         .iter()
         .map(|p| SqlColumn {
+            column_type: combined_columns[*p].column_type,
             name: combined_columns[*p]
                 .name
                 .split('.')
@@ -1653,7 +1708,10 @@ fn joined_grouped_aggregates(
                 func.name.to_string().to_lowercase()
             }
         };
-        final_columns.push(SqlColumn { name });
+        final_columns.push(SqlColumn {
+            name,
+            column_type: None,
+        });
     }
     let _ = columns;
 
@@ -1894,8 +1952,15 @@ fn joined_aggregates(
                 ));
             }
         };
+        let aggregate_type = match kind {
+            JoinedAggregate::CountStar | JoinedAggregate::CountColumn => {
+                Some(crate::ColumnType::I64)
+            }
+            _ => None,
+        };
         columns.push(SqlColumn {
             name: alias.unwrap_or_else(|| func_name.to_lowercase()),
+            column_type: aggregate_type,
         });
         plans.push((kind, arg.flatten()));
     }
@@ -2082,6 +2147,7 @@ fn join_projection_plan(
                 for (position, column) in combined_columns.iter().enumerate() {
                     columns.push(SqlColumn {
                         name: column.name.clone(),
+                        column_type: column.column_type,
                     });
                     positions.push(Some(position));
                     literals.push(None);
@@ -2091,6 +2157,7 @@ fn join_projection_plan(
                 let position = resolve(&Expr::Identifier(identifier.clone()))?;
                 columns.push(SqlColumn {
                     name: identifier.value.clone(),
+                    column_type: position.and_then(|p| combined_columns[p].column_type),
                 });
                 positions.push(position);
                 literals.push(None);
@@ -2099,6 +2166,7 @@ fn join_projection_plan(
                 let position = resolve(&Expr::CompoundIdentifier(parts.clone()))?;
                 columns.push(SqlColumn {
                     name: parts[parts.len() - 1].value.clone(),
+                    column_type: position.and_then(|p| combined_columns[p].column_type),
                 });
                 positions.push(position);
                 literals.push(None);
@@ -2109,6 +2177,7 @@ fn join_projection_plan(
                 let position = resolve(expr)?;
                 columns.push(SqlColumn {
                     name: alias.value.clone(),
+                    column_type: position.and_then(|p| combined_columns[p].column_type),
                 });
                 positions.push(position);
                 literals.push(None);
@@ -2121,9 +2190,13 @@ fn join_projection_plan(
                     SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                     _ => "literal".to_owned(),
                 };
-                columns.push(SqlColumn { name });
+                let literal = literal_value(expression, params)?;
+                columns.push(SqlColumn {
+                    name,
+                    column_type: value_static_type(&literal),
+                });
                 positions.push(None);
-                literals.push(Some(literal_value(expression, params)?));
+                literals.push(Some(literal));
                 computed.push(None);
             }
             other => {
@@ -2947,9 +3020,10 @@ fn execute_aggregate_query(
                     col.name
                 )));
             }
-            result_columns.push(SqlColumn {
-                name: alias.unwrap_or_else(|| col.name.clone()),
-            });
+            result_columns.push(SqlColumn::typed(
+                alias.unwrap_or_else(|| col.name.clone()),
+                col.data_type,
+            ));
         } else if let Expr::Function(func) = expr {
             let func_name = func.name.to_string().to_uppercase();
             let kind = match func_name.as_str() {
@@ -2998,15 +3072,30 @@ fn execute_aggregate_query(
             // the function alone ("count"), not the call text.
             let default_name = func_name.to_lowercase();
             let final_alias = alias.unwrap_or(default_name);
+            let aggregate_type = match kind {
+                crate::morsel::AggregateKind::Count => Some(crate::ColumnType::I64),
+                crate::morsel::AggregateKind::Avg => Some(crate::ColumnType::Float64),
+                _ => col_id.map(|id| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|column| column.id == id)
+                        .map(|column| column.data_type)
+                        .unwrap_or(crate::ColumnType::I64)
+                }),
+            };
             result_columns.push(SqlColumn {
                 name: final_alias.clone(),
+                column_type: aggregate_type,
             });
             analytical_query = analytical_query.with_aggregate(kind, col_id, final_alias);
         } else {
             let value = literal_value(expr, params)?;
+            let column_type = value_static_type(&value);
             constant_values[item_index] = Some(value);
             result_columns.push(SqlColumn {
                 name: alias.unwrap_or_else(|| expr.to_string()),
+                column_type,
             });
         }
     }
