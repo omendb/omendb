@@ -808,12 +808,12 @@ impl DirectTransaction {
     }
 
     /// Validate that current snapshot-plus-staged rows already satisfy one
-    /// newly created foreign-key definition. Reads at this transaction's
-    /// snapshot without registering ranges: the publication that follows
-    /// runs in a separate transaction, so registration here would fence
-    /// nothing.
+    /// newly created foreign-key definition. The reads register on this
+    /// scratch transaction, which is never committed; the publication
+    /// that follows runs in a separate transaction, so registration here
+    /// fences nothing.
     pub(crate) fn validate_one_foreign_key(
-        &self,
+        &mut self,
         foreign_key: &ForeignKeyDefinition,
     ) -> Result<()> {
         let parts = resolve_foreign_key_parts(&self.catalog, foreign_key)?;
@@ -879,29 +879,6 @@ impl DirectTransaction {
         let definition = self.catalog.table(table)?.clone();
         let tree = self.table_tree(table)?;
         self.scan_tree(tree, &definition)
-    }
-
-    /// Scan all rows of one table and register the full table range as a
-    /// transactional read dependency. A concurrent commit that writes any
-    /// row into this table after our snapshot makes our commit fail with a
-    /// serialization conflict, giving repeatable-read scans.
-    pub(crate) fn serializable_scan(&mut self, table: TableId) -> Result<Vec<Row>> {
-        let definition = self.catalog.table(table)?.clone();
-        let tree = self.table_tree(table)?;
-        let mut cursor = self
-            .transaction
-            .cursor(tree, &[], None)
-            .map_err(map_seer_error)?;
-        let mut rows = Vec::new();
-        while let Some((identity, bytes)) = cursor.next().transpose().map_err(map_seer_error)? {
-            rows.push(row_from_storage_identity(
-                &self.catalog,
-                &definition,
-                &identity,
-                &bytes,
-            )?);
-        }
-        Ok(rows)
     }
 
     fn scan_tree(&mut self, tree: TreeId, definition: &TableDefinition) -> Result<Vec<Row>> {
@@ -1914,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn serializable_scan_rejects_phantom_inserts() {
+    fn scan_rejects_phantom_inserts() {
         let (_directory, mut store) = store();
         store
             .create_table(table(), Some(vec![ColumnId(1)]))
@@ -1924,9 +1901,7 @@ mod tests {
             .expect("seed");
 
         let mut reader = store.begin_transaction().expect("begin reader");
-        let rows = reader
-            .serializable_scan(TableId(1))
-            .expect("serializable scan");
+        let rows = reader.scan(TableId(1)).expect("scan");
         assert_eq!(rows.len(), 1);
 
         // The reader stages a write of its own, so its publication must be

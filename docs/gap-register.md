@@ -51,14 +51,18 @@ has no unsigned 64-bit integer). Engine-level archive/restore
 (`crates/seerdb/src/db/archive.rs`) remains the physical-path
 primitive.
 
-## Isolation level — medium severity
+## Isolation level — closed (2026-09-05)
 
-- Snapshot isolation with write-conflict and cursor-range phantom
-  protection is implemented and tested (`scan_serializable`,
-  `src/serializable.rs`, ADR 0001).
-- Serializable certification (write-skew detection across the full
-  dependency graph) is incomplete. No user today can rely on SERIALIZABLE
-  semantics.
+- Serializable certification is implemented and tested: every read a
+  transaction performs registers an anti-dependency. Point reads
+  (`Transaction::get`) validate against queued writes at stage time and
+  against published current records at wave time (O(1) per read); scans
+  (`Transaction::scan`) register their exact range and get the same
+  phantom protection cursors always had. The classic write-skew and
+  doctors-on-call patterns now abort with SQLSTATE 40001.
+- Residual: SHOW TRANSACTION_ISOLATION still reports `read committed`;
+  reporting `serializable` accurately is a follow-up once the SQL-tier
+  BEGIN options surface isolation choice.
 
 ## SQL breadth — medium severity
 

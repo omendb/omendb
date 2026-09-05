@@ -283,6 +283,9 @@ struct StagedCommit {
     /// Registered read ranges (phantom checks), replayed by the publish
     /// lane against the durable change stream.
     read_ranges: BTreeSet<(TreeId, Vec<u8>, Option<Vec<u8>>)>,
+    /// Registered point reads, validated against queued writes at stage
+    /// time and against published current records at wave time.
+    point_reads: BTreeSet<(TreeId, Vec<u8>)>,
     changed_trees: BTreeSet<TreeId>,
     /// Key set written by this commit, for the queue's overlay indexes.
     write_keys: BTreeSet<(TreeId, Vec<u8>)>,
@@ -401,6 +404,12 @@ pub struct Transaction {
     created: BTreeSet<TreeId>,
     dropped: BTreeSet<TreeId>,
     read_ranges: BTreeSet<(TreeId, Vec<u8>, Option<Vec<u8>>)>,
+    /// Exact keys read through `get`, registered so a concurrent commit
+    /// that overwrites or deletes one after this transaction's snapshot
+    /// fails this transaction's commit (read-write anti-dependency).
+    /// Point reads validate through an O(1) current-record lookup at
+    /// publication instead of the range machinery's change-stream scan.
+    point_reads: BTreeSet<(TreeId, Vec<u8>)>,
     /// Snapshot-resolved tree visibility, computed once per tree: the fixed
     /// snapshot makes the answer immutable for the transaction's lifetime.
     tree_states: BTreeMap<TreeId, bool>,
@@ -530,6 +539,7 @@ impl TransactionDatabase {
             created: BTreeSet::new(),
             dropped: BTreeSet::new(),
             read_ranges: BTreeSet::new(),
+            point_reads: BTreeSet::new(),
             tree_states: BTreeMap::new(),
             state: TransactionState::Active,
             snapshot_registered: true,
@@ -1158,9 +1168,19 @@ impl Transaction {
     }
 
     /// Read one key through this transaction's snapshot and staged writes.
-    pub fn get(&self, tree: TreeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The read registers an anti-dependency: a concurrent commit that
+    /// overwrites or deletes this key after the transaction's snapshot
+    /// fails this transaction's commit, closing the write-skew hole a
+    /// snapshot point read would otherwise leave open.
+    pub fn get(&mut self, tree: TreeId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_active()?;
         self.check_tree_visible_for_read(tree)?;
+        if !self.writes.contains_key(&(tree, key.to_vec())) {
+            // Only snapshot-sourced reads register: a read served from this
+            // transaction's own staged write is not a snapshot dependency.
+            self.point_reads.insert((tree, key.to_vec()));
+        }
         if let Some(value) = self.writes.get(&(tree, key.to_vec())) {
             return Ok(value.clone());
         }
@@ -1244,8 +1264,13 @@ impl Transaction {
 
     /// Scan `[start,end)` in key order. `None` for `end` scans through the
     /// end of the tree.
+    ///
+    /// The scanned range registers a read dependency exactly as `cursor`
+    /// does: a concurrent commit writing inside the range after the
+    /// transaction's snapshot fails this transaction's commit (phantom
+    /// protection), so a scan-then-write transaction cannot fork history.
     pub fn scan(
-        &self,
+        &mut self,
         tree: TreeId,
         start: &[u8],
         end: Option<&[u8]>,
@@ -1256,6 +1281,8 @@ impl Transaction {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.read_ranges
+            .insert((tree, start.to_vec(), end.map(ToOwned::to_owned)));
         if end.is_some_and(|end| start > end) {
             return Err(Error::InvalidArgument(
                 "scan end must not precede scan start".into(),
@@ -1711,6 +1738,14 @@ fn stage_commit(
     if transaction.runtime.closed.load(Ordering::Acquire) {
         return Err(Error::InvalidArgument("database is closed".into()));
     }
+    // A point read of a key this commit also writes is subsumed by the
+    // write-write check on that key: any concurrent writer to the key
+    // already aborts this commit, so validating the read again is pure
+    // publish-lane cost. Prune those reads; the write-skew shape the
+    // certifier must catch is read K / write J != K, which stays.
+    transaction
+        .point_reads
+        .retain(|(tree, key)| !transaction.writes.contains_key(&(*tree, key.clone())));
     reject_unpublished_conflicts(transaction, &prepare.keys, &prepare.trees)?;
     {
         let publishing = lock_publishing(&transaction.runtime);
@@ -1766,6 +1801,7 @@ fn stage_commit(
         writes,
         tree_lifecycles,
         read_ranges: transaction.read_ranges.clone(),
+        point_reads: transaction.point_reads.clone(),
         changed_trees,
         write_keys,
         change_record,
@@ -1824,6 +1860,14 @@ fn reject_unpublished_conflicts(
                     current: CommitId::new(transaction.snapshot.get()),
                 });
             }
+        }
+    }
+    for (tree, key) in &transaction.point_reads {
+        if keys.contains(&(*tree, key.clone())) {
+            return Err(Error::SerializationConflict {
+                expected: CommitId::new(transaction.snapshot.get()),
+                current: CommitId::new(transaction.snapshot.get()),
+            });
         }
     }
     Ok(())
@@ -2271,6 +2315,22 @@ fn validate_against_published(
             return Err(Error::WriteConflict {
                 tree: *tree,
                 key: key.clone(),
+            });
+        }
+    }
+    // Read-write anti-dependency: every registered point read must still
+    // resolve to the version this transaction's snapshot saw. The current
+    // record carries the latest committer, so one lookup per read decides
+    // whether a concurrent transaction overwrote or deleted the key after
+    // our snapshot — the write-skew certification point.
+    for (tree, key) in &staged.point_reads {
+        let current_record = decode_current(db.get(&tree_key(*tree, key))?.as_deref())?;
+        let current_commit =
+            resolve_commit(statuses, current_record.transaction, current_record.commit)?;
+        if current_commit > staged.snapshot && current_record.transaction != staged.transaction {
+            return Err(Error::SerializationConflict {
+                expected: CommitId::new(staged.snapshot.get()),
+                current: CommitId::new(current.get()),
             });
         }
     }
@@ -3548,7 +3608,7 @@ mod tests {
         assert_eq!(first.commit().expect("first commit").csn.get(), 3);
         assert_eq!(second.commit().expect("disjoint commit").csn.get(), 4);
 
-        let reader = database.begin().expect("reader begin");
+        let mut reader = database.begin().expect("reader begin");
         assert_eq!(
             reader.get(tree, b"a").expect("read a"),
             Some(b"one".to_vec())
@@ -3579,7 +3639,7 @@ mod tests {
         ));
         second.abort().expect("abort loser");
 
-        let reader = database.begin().expect("reader begin");
+        let mut reader = database.begin().expect("reader begin");
         assert_eq!(
             reader.get(tree, b"key").expect("read winner"),
             Some(b"first".to_vec())
@@ -3630,7 +3690,7 @@ mod tests {
         });
         first.join().expect("first thread");
         second.join().expect("second thread");
-        let reader = database.begin().expect("reader");
+        let mut reader = database.begin().expect("reader");
         assert_eq!(
             reader.get(tree, b"a").expect("read a"),
             Some(b"one".to_vec())
@@ -3675,7 +3735,7 @@ mod tests {
             assert_eq!(change.commit.get(), (position + 1) as u64);
         }
         // Every write is visible exactly once at the final state.
-        let reader = database.begin().expect("reader");
+        let mut reader = database.begin().expect("reader");
         for worker in 0..THREADS {
             for step in 0..WRITES_PER_THREAD {
                 let key = format!("w{worker}-k{step}");
@@ -3717,7 +3777,7 @@ mod tests {
             .filter_map(|handle| handle.join().expect("join").ok())
             .count();
         assert_eq!(winners, 1, "first-committer-wins allows exactly one winner");
-        let reader = database.begin().expect("reader");
+        let mut reader = database.begin().expect("reader");
         assert!(reader.get(shared, b"contested").expect("read").is_some());
     }
 
@@ -3761,7 +3821,7 @@ mod tests {
         let second_tree = create.create_tree().expect("second tree");
         create.commit().expect("second tree commit");
 
-        let old = database.begin().expect("old snapshot");
+        let mut old = database.begin().expect("old snapshot");
         let mut writer = database.begin().expect("writer");
         writer.put(first_tree, b"one", b"1").expect("first write");
         writer.put(second_tree, b"two", b"2").expect("second write");
@@ -3769,7 +3829,7 @@ mod tests {
         assert_eq!(old.get(first_tree, b"one").expect("old first"), None);
         assert_eq!(old.get(second_tree, b"two").expect("old second"), None);
 
-        let current = database.begin().expect("current snapshot");
+        let mut current = database.begin().expect("current snapshot");
         assert_eq!(
             current.get(first_tree, b"one").expect("first"),
             Some(b"1".to_vec())
@@ -3884,7 +3944,7 @@ mod tests {
         seed.commit().expect("seed commit");
         drop(seed);
 
-        let old = database.begin().expect("old snapshot");
+        let mut old = database.begin().expect("old snapshot");
         let mut writer = database.begin().expect("writer");
         writer.put(tree, b"key", b"new").expect("new write");
         writer.commit().expect("new commit");
@@ -4162,6 +4222,137 @@ mod tests {
         current.abort().expect("abort");
         drop(current);
         reopened.close().expect("close reopened");
+    }
+
+    #[test]
+    fn point_read_write_skew_is_certified() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        // Seed the two rows the classic write-skew pattern reads.
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"a", b"on").expect("seed a");
+        seed.put(tree, b"b", b"on").expect("seed b");
+        seed.commit().expect("seed commit");
+
+        // Two concurrent transactions on one snapshot: each reads the
+        // other's write target, then writes its own read target.
+        let mut first = database.begin().expect("first begin");
+        let mut second = database.begin().expect("second begin");
+        assert_eq!(
+            first.get(tree, b"b").expect("first reads b"),
+            Some(b"on".to_vec())
+        );
+        assert_eq!(
+            second.get(tree, b"a").expect("second reads a"),
+            Some(b"on".to_vec())
+        );
+        first.put(tree, b"a", b"off").expect("first writes a");
+        second.put(tree, b"b", b"off").expect("second writes b");
+
+        first.commit().expect("first commits");
+        // Whichever order the commits race in, the second transaction's
+        // registered point read on the key the first one overwrote must
+        // fail its commit: serializability forbids both surviving.
+        let outcome = second.commit();
+        assert!(
+            matches!(outcome, Err(Error::SerializationConflict { .. })),
+            "write skew must be certified, got {outcome:?}"
+        );
+        second.abort().expect("abort skew loser");
+        database.close().expect("close");
+    }
+
+    #[test]
+    fn point_read_anti_dependency_survives_across_waves() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"k", b"v0").expect("seed");
+        seed.commit().expect("seed commit");
+
+        // The reader starts before the writer's commit lands, then the
+        // writer publishes; the reader's later write must fail on the
+        // stale point read even though no queue overlay is involved.
+        let mut reader = database.begin().expect("reader begin");
+        let mut writer = database.begin().expect("writer begin");
+        writer.put(tree, b"k", b"v1").expect("writer stages");
+        writer.commit().expect("writer commits");
+        assert_eq!(
+            reader.get(tree, b"k").expect("reader reads k"),
+            Some(b"v0".to_vec())
+        );
+        reader
+            .put(tree, b"other", b"x")
+            .expect("reader stages write");
+        let outcome = reader.commit();
+        assert!(
+            matches!(outcome, Err(Error::SerializationConflict { .. })),
+            "stale point read must abort, got {outcome:?}"
+        );
+        reader.abort().expect("abort stale reader");
+        database.close().expect("close");
+    }
+
+    #[test]
+    fn scan_then_write_conflicts_with_concurrent_insert_in_range() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"a", b"1").expect("seed a");
+        seed.commit().expect("seed commit");
+
+        // Scanner reads an unbounded range; a concurrent insert inside it
+        // must fail the scanner's commit when the scanner also writes.
+        let mut scanner = database.begin().expect("scanner begin");
+        let mut inserter = database.begin().expect("inserter begin");
+        let scanned = scanner.scan(tree, &[], None, usize::MAX).expect("scan");
+        assert_eq!(scanned.len(), 1);
+        inserter.put(tree, b"b", b"2").expect("inserter writes");
+        inserter.commit().expect("inserter commits");
+        scanner.put(tree, b"c", b"3").expect("scanner stages write");
+        let outcome = scanner.commit();
+        assert!(
+            matches!(outcome, Err(Error::SerializationConflict { .. })),
+            "phantom insert under a scan must abort, got {outcome:?}"
+        );
+        scanner.abort().expect("abort scanner");
+        database.close().expect("close");
+    }
+
+    #[test]
+    fn scan_without_write_never_conflicts() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut seed = database.begin().expect("seed begin");
+        seed.put(tree, b"a", b"1").expect("seed");
+        seed.commit().expect("seed commit");
+
+        // Read-only transactions always commit, even when concurrent
+        // writers change every key the reader scanned.
+        let mut reader = database.begin().expect("reader begin");
+        let scanned = reader.scan(tree, &[], None, usize::MAX).expect("scan");
+        assert_eq!(scanned.len(), 1);
+        let mut writer = database.begin().expect("writer begin");
+        writer.put(tree, b"a", b"2").expect("writer overwrites");
+        writer.commit().expect("writer commits");
+        reader.commit().expect("read-only commit succeeds");
+        database.close().expect("close");
+    }
+
+    #[test]
+    fn point_read_still_sees_own_staged_write() {
+        let (_directory, database) = database();
+        let tree = tree(&database);
+        let mut txn = database.begin().expect("begin");
+        txn.put(tree, b"k", b"staged").expect("stage write");
+        // The own-write read must both register (for anti-dependency)
+        // and return the staged value without a storage round-trip.
+        assert_eq!(
+            txn.get(tree, b"k").expect("own staged read"),
+            Some(b"staged".to_vec())
+        );
+        txn.commit().expect("commit after own-write read");
+        database.close().expect("close");
     }
 
     #[test]

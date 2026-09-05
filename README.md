@@ -48,9 +48,9 @@ slice rather than as isolated rewrites:
 3. **Server alpha:** in progress. The persistent daemon now supports multiple
    wire sessions, bounded connection admission, authentication policy,
    diagnostics, and clean shutdown/reopen behavior.
-4. **Measured acceleration:** add serializable certification, replication/CDC,
-   typed OLTP micro-plans, batch execution, and benchmark-led page, buffer,
-   WAL, and runtime optimizations.
+4. **Measured acceleration:** replication/CDC, typed OLTP micro-plans,
+   batch execution, and benchmark-led page, buffer, WAL, and runtime
+   optimizations. (Serializable certification landed; see gap register.)
 
 The current direct Rust API and exploratory wire example are development
 surfaces, not the target alpha product. SeerDB is an independent Apache-2.0

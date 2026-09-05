@@ -19,7 +19,6 @@ mod runtime;
 // motivated the transitional facade landed; the facade is the API surface.
 #[allow(dead_code, clippy::type_complexity)]
 mod seer_direct;
-mod serializable;
 mod session;
 mod sql;
 mod sql_dump;
@@ -50,10 +49,7 @@ pub use runtime::{
 };
 pub use seerdb::DBMetrics;
 pub use seerdb::PublicationTimingMetrics;
-pub use serializable::{
-    CertificationConflict, CertifierAlgorithm, CertifierMetrics, SerializableCertifier,
-    TransactionDependencySpec,
-};
+
 pub use session::{
     IndexScanRequest, RelationalDatabaseConfig, RelationalDatabaseSession, RelationalSessionConfig,
     RelationalSessionStatus,

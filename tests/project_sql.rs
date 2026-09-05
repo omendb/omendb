@@ -357,6 +357,143 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn serializable_certification_aborts_the_doctors_write_skew() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("skew-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    // Doctors on call: invariant is "at least one doctor stays on call".
+    // Both doctors read the pair, then each removes themselves — classic
+    // write skew, legal under snapshot isolation, forbidden serializably.
+    database
+        .execute_sql("CREATE TABLE doctors (name TEXT PRIMARY KEY, on_call BOOLEAN NOT NULL)")
+        .expect("create doctors");
+    database
+        .execute_sql("INSERT INTO doctors VALUES ('alice', true), ('bob', true)")
+        .expect("seed doctors");
+
+    // Both explicit transactions start on one snapshot before any commit.
+    let mut alice = database.begin().expect("alice begin");
+    let mut bob = database.begin().expect("bob begin");
+
+    let alice_view = alice
+        .execute_sql(&database, "SELECT count(*) FROM doctors WHERE on_call")
+        .expect("alice reads on-call count");
+    let bob_view = bob
+        .execute_sql(&database, "SELECT count(*) FROM doctors WHERE on_call")
+        .expect("bob reads on-call count");
+    assert_eq!(alice_view.rows[0][0], Value::U64(2));
+    assert_eq!(bob_view.rows[0][0], Value::U64(2));
+
+    // Each doctor sees two doctors on call and takes themselves off.
+    alice
+        .execute_sql(
+            &database,
+            "UPDATE doctors SET on_call = false WHERE name = 'alice'",
+        )
+        .expect("alice stages update");
+    bob.execute_sql(
+        &database,
+        "UPDATE doctors SET on_call = false WHERE name = 'bob'",
+    )
+    .expect("bob stages update");
+
+    alice.commit().expect("alice commits first");
+    // Bob's commit read rows (the full-table scan behind the count) that
+    // alice's commit changed, and wrote rows disjoint from alice's —
+    // the rw-antidependency cycle serializability forbids.
+    let outcome = bob.commit();
+    match outcome {
+        Err(omendb::DbError::SerializationConflict { .. }) => {}
+        Err(other) => panic!("expected serialization conflict, got {other:?}"),
+        Ok(_) => panic!("write skew committed: both doctors off call"),
+    }
+
+    // The survivor is alice's world: one doctor on call.
+    let result = database
+        .execute_sql("SELECT count(*) FROM doctors WHERE on_call")
+        .expect("post-commit count");
+    assert_eq!(result.rows[0][0], Value::U64(1));
+}
+
+#[test]
+fn serializable_certification_rejects_stale_point_read_writes() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("point-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    database
+        .execute_sql("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+        .expect("create accounts");
+    database
+        .execute_sql("INSERT INTO accounts VALUES (1, 100)")
+        .expect("seed account");
+
+    // A point read (primary-key lookup) that observes a value a committed
+    // writer has since overwritten must fail its own commit when it also
+    // writes — even when the writes touch disjoint keys.
+    let mut reader = database.begin().expect("reader begin");
+    let mut writer = database.begin().expect("writer begin");
+
+    let read = reader
+        .execute_sql(&database, "SELECT balance FROM accounts WHERE id = 1")
+        .expect("point read");
+    assert_eq!(read.rows[0][0], Value::I64(100));
+
+    writer
+        .execute_sql(&database, "UPDATE accounts SET balance = 50 WHERE id = 1")
+        .expect("writer overwrites the read row");
+    writer.commit().expect("writer commits");
+
+    // Reader still sees its snapshot value...
+    let still = reader
+        .execute_sql(&database, "SELECT balance FROM accounts WHERE id = 1")
+        .expect("snapshot re-read");
+    assert_eq!(still.rows[0][0], Value::I64(100));
+    // ...but its commit, which writes a disjoint key, must fail: the
+    // balance decision was made on overwritten data.
+    reader
+        .execute_sql(&database, "INSERT INTO accounts VALUES (2, 25)")
+        .expect("reader stages disjoint write");
+    let outcome = reader.commit();
+    match outcome {
+        Err(omendb::DbError::SerializationConflict { .. }) => {}
+        Err(other) => panic!("expected serialization conflict, got {other:?}"),
+        Ok(_) => panic!("stale point read committed"),
+    }
+}
+
+#[test]
+fn serializable_certification_lets_read_only_transactions_commit() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("readonly-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    database
+        .execute_sql("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)")
+        .expect("create table");
+    database
+        .execute_sql("INSERT INTO t VALUES (1, 1)")
+        .expect("seed row");
+
+    // A reader that scanned everything, followed by a writer that changes
+    // everything under it: the read-only commit still succeeds.
+    let mut reader = database.begin().expect("reader begin");
+    let scanned = reader
+        .execute_sql(&database, "SELECT count(*) FROM t")
+        .expect("scan");
+    assert_eq!(scanned.rows[0][0], Value::U64(1));
+
+    let mut writer = database.begin().expect("writer begin");
+    writer
+        .execute_sql(&database, "UPDATE t SET v = 2 WHERE id = 1")
+        .expect("writer stages");
+    writer.commit().expect("writer commits");
+
+    reader.commit().expect("read-only commit always succeeds");
+}
+
+#[test]
 fn heap_tables_store_update_delete_and_reopen_without_collisions() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("heap-db");

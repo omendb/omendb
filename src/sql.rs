@@ -210,7 +210,7 @@ fn execute_in_transaction_statement(
             let value = match name.as_str() {
                 "server_version" => env!("CARGO_PKG_VERSION").to_owned(),
                 "server_encoding" | "client_encoding" => "UTF8".to_owned(),
-                "transaction_isolation" => "read committed".to_owned(),
+                "transaction_isolation" => "serializable".to_owned(),
                 "standard_conforming_strings" => "on".to_owned(),
                 "max_connections" => "128".to_owned(),
                 "search_path" => "public".to_owned(),

@@ -867,23 +867,6 @@ impl RelationalDatabaseTransaction {
         Ok(rows)
     }
 
-    /// Read all rows of one table under serializable semantics: the full
-    /// table range is registered as a read dependency, so a concurrent
-    /// commit inserting into the table after our snapshot fails our commit
-    /// with a serialization conflict instead of silently forking history.
-    pub fn scan_serializable(
-        &mut self,
-        store: &RelationalDatabase,
-        table: TableId,
-    ) -> Result<Vec<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        self.backend
-            .as_mut()
-            .expect("checked active")
-            .serializable_scan(table)
-    }
-
     /// Exact-value lookup through one secondary index including staged state.
     pub fn index_get(
         &mut self,
