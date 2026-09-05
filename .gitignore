@@ -4,3 +4,4 @@
 *.db-wal
 .env
 .DS_Store
+seerdb.lock
