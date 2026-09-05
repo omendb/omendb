@@ -429,68 +429,74 @@ pub(super) fn execute_drop(
             "CASCADE/RESTRICT/PURGE are not required; drops refuse dependent objects",
         ));
     }
-    if names.len() != 1 {
-        return Err(unsupported("DROP", "exactly one object is required"));
-    }
-    match object_type {
-        ObjectType::Table => {
-            let name = simple_object_name(&names[0], "table")?.to_owned();
-            let Some(table) = database
-                .catalog()
-                .tables()
-                .find(|table| table.name == name)
-                .map(|table| table.id)
-            else {
-                if *if_exists {
-                    // A no-op drop still publishes nothing; report the
-                    // current position like an empty transaction.
-                    return Ok(database.commit_id());
+    // Multi-object drops (pgbench initializes with one DROP TABLE for all
+    // four tables) resolve every object first, then apply all mutations
+    // in one candidate so the catalog never shows a partial drop.
+    let mut mutations = Vec::new();
+    for name in names {
+        match object_type {
+            ObjectType::Table => {
+                let name = simple_object_name(name, "table")?.to_owned();
+                let Some(table) = database
+                    .catalog()
+                    .tables()
+                    .find(|table| table.name == name)
+                    .map(|table| table.id)
+                else {
+                    if *if_exists {
+                        continue;
+                    }
+                    return Err(DbError::InvalidState(format!(
+                        "table {name} does not exist"
+                    )));
+                };
+                // Refuse while foreign keys depend on this table: dropping
+                // it would strand child rows with no referenced index.
+                // CASCADE is the explicit path, and it is not supported
+                // yet.
+                if let Some(foreign_key) = database
+                    .catalog()
+                    .foreign_keys()
+                    .find(|foreign_key| foreign_key.referenced_table == table)
+                {
+                    return Err(DbError::InvalidState(format!(
+                        "table {name} is referenced by foreign key {}",
+                        foreign_key.id.0
+                    )));
                 }
-                return Err(DbError::InvalidState(format!(
-                    "table {name} does not exist"
-                )));
-            };
-            // Refuse while foreign keys depend on this table: dropping it
-            // would strand child rows with no referenced index. CASCADE is
-            // the explicit path, and it is not supported yet.
-            if let Some(foreign_key) = database
-                .catalog()
-                .foreign_keys()
-                .find(|foreign_key| foreign_key.referenced_table == table)
-            {
-                return Err(DbError::InvalidState(format!(
-                    "table {name} is referenced by foreign key {}",
-                    foreign_key.id.0
-                )));
+                mutations.push(SchemaMutation::DropTable { table });
             }
-            // One mutation: Catalog::drop_table removes the table, its
-            // indexes, and its owned foreign keys in the same candidate,
-            // and the orchestrator drops the physical trees for every
-            // object the candidate no longer maps.
-            database.apply_schema_mutations(&[SchemaMutation::DropTable { table }])
+            ObjectType::Index => {
+                let name = simple_object_name(name, "index")?.to_owned();
+                let Some(index) = database
+                    .catalog()
+                    .indexes()
+                    .find(|index| database.catalog().index_name(index.id) == Some(name.as_str()))
+                    .map(|index| index.id)
+                else {
+                    if *if_exists {
+                        continue;
+                    }
+                    return Err(DbError::InvalidState(format!(
+                        "index {name} does not exist"
+                    )));
+                };
+                mutations.push(SchemaMutation::DropIndex { index });
+            }
+            other => {
+                return Err(unsupported(
+                    "DROP",
+                    &format!("object type {other:?} is not supported"),
+                ));
+            }
         }
-        ObjectType::Index => {
-            let name = simple_object_name(&names[0], "index")?.to_owned();
-            let Some(index) = database
-                .catalog()
-                .indexes()
-                .find(|index| database.catalog().index_name(index.id) == Some(name.as_str()))
-                .map(|index| index.id)
-            else {
-                if *if_exists {
-                    return Ok(database.commit_id());
-                }
-                return Err(DbError::InvalidState(format!(
-                    "index {name} does not exist"
-                )));
-            };
-            database.apply_schema_mutations(&[SchemaMutation::DropIndex { index }])
-        }
-        other => Err(unsupported(
-            "DROP",
-            &format!("object type {other:?} is not supported"),
-        )),
     }
+    if mutations.is_empty() {
+        // A no-op drop still publishes nothing; report the current
+        // position like an empty transaction.
+        return Ok(database.commit_id());
+    }
+    database.apply_schema_mutations(&mutations)
 }
 
 pub(super) fn execute_create_table(

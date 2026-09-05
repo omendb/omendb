@@ -153,6 +153,9 @@ pub struct ServerConfig {
     pub statement_timeout: Option<Duration>,
     /// Optional estimated result-payload byte bound per wire statement.
     pub max_result_bytes: Option<usize>,
+    /// Ack commits after the group-synced WAL append instead of full
+    /// publication; trades recovery replay for commit latency.
+    pub wal_first_commits: bool,
 }
 
 impl ServerConfig {
@@ -166,6 +169,7 @@ impl ServerConfig {
             max_connections: 128,
             statement_timeout: None,
             max_result_bytes: None,
+            wal_first_commits: false,
         }
     }
 
@@ -194,6 +198,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_max_result_bytes(mut self, max_result_bytes: Option<usize>) -> Self {
         self.max_result_bytes = max_result_bytes;
+        self
+    }
+
+    /// Ack commits after the group-synced WAL append (WAL-first mode).
+    #[must_use]
+    pub fn with_wal_first_commits(mut self, wal_first_commits: bool) -> Self {
+        self.wal_first_commits = wal_first_commits;
         self
     }
 }
@@ -415,7 +426,10 @@ impl RunningServer {
             )));
         }
         let database_path = config.database_path;
-        let backend = crate::RelationalBackendConfig::new(database_path.clone());
+        let mut backend = crate::RelationalBackendConfig::new(database_path.clone());
+        if config.wal_first_commits {
+            backend = backend.with_wal_first_commits();
+        }
         let database = if database_path_exists(&database_path) {
             RelationalDatabase::open(backend)?
         } else if config.create_if_missing {

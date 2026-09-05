@@ -1845,7 +1845,11 @@ fn publish_with_lane(runtime: &Runtime, _lane: std::sync::MutexGuard<'_, ()>) ->
     // only while transactions not yet in the queue are running; the
     // single-client path sees none and never waits.
     let mut waits = 0;
-    let mut last_queued = 0;
+    // Baseline is the queue depth at entry, not zero: a leader that already
+    // drained work into the queue must not wait just because the queue is
+    // non-empty. It waits only for commits that land AFTER it took the lane
+    // (a growing queue), which is the coalescing this window exists for.
+    let mut last_queued = staged_queue_len(runtime);
     while waits < MAX_COALESCE_WAITS {
         let queued = staged_queue_len(runtime);
         let pending = runtime.pending_transactions.load(Ordering::Acquire);
