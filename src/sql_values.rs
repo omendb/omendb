@@ -113,9 +113,32 @@ pub(super) fn session_function_value(name: &str) -> Result<Value> {
         "current_user" | "user" => Ok(Value::Text("omendb".to_owned())),
         "current_schema" => Ok(Value::Text("public".to_owned())),
         "current_database" => Ok(Value::Text("omendb".to_owned())),
+        // now()/CURRENT_TIMESTAMP read the real clock; CURRENT_DATE is
+        // the same instant truncated to days. The wire formats both as
+        // PostgreSQL text, matching PG's clock_timestamp() semantics.
+        "now" | "current_timestamp" => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_micros() as i64)
+                .map_err(|_| DbError::InvalidState("system clock precedes the epoch".to_owned()))?;
+            Ok(Value::Timestamp(
+                crate::sql_types::TimestampValue::from_micros(micros).map_err(|_| {
+                    DbError::InvalidState("system clock is out of range".to_owned())
+                })?,
+            ))
+        }
+        "current_date" => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_micros() as i64)
+                .map_err(|_| DbError::InvalidState("system clock precedes the epoch".to_owned()))?;
+            let days = i32::try_from(micros.div_euclid(86_400_000_000))
+                .map_err(|_| DbError::InvalidState("system date is out of range".to_owned()))?;
+            Ok(Value::Date(crate::sql_types::DateValue(days)))
+        }
         _ => Err(unsupported(
             "function",
-            "this function is not supported; supported zero-argument functions are version(), current_user(), current_schema(), current_database()",
+            "this function is not supported; supported zero-argument functions are version(), current_user(), current_schema(), current_database(), now(), current_date()",
         )),
     }
 }

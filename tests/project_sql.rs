@@ -357,6 +357,64 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn clock_functions_evaluate_and_round_trip() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("clock-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+    database
+        .execute_sql(
+            "CREATE TABLE events (id BIGINT PRIMARY KEY, created_at TIMESTAMP, created_on DATE)",
+        )
+        .expect("create table");
+
+    // CURRENT_TIMESTAMP inserts a real timestamp and reads back.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64;
+    database
+        .execute_sql("INSERT INTO events (id, created_at, created_on) VALUES (1, CURRENT_TIMESTAMP, CURRENT_DATE)")
+        .expect("insert with clock functions");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_micros() as i64;
+    let result = database
+        .execute_sql("SELECT created_at, created_on FROM events WHERE id = 1")
+        .expect("read back");
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::Timestamp(timestamp) => {
+            assert!(
+                (before..=after).contains(&timestamp.0),
+                "CURRENT_TIMESTAMP is the real clock: {} not in [{before},{after}]",
+                timestamp.0
+            );
+        }
+        other => panic!("created_at is a timestamp: {other:?}"),
+    }
+    match &result.rows[0][1] {
+        Value::Date(date) => {
+            let today = before.div_euclid(86_400_000_000);
+            assert!((today - 1..=today + 1).contains(&i64::from(date.0)));
+        }
+        other => panic!("created_on is a date: {other:?}"),
+    }
+
+    // now() is the same clock; SELECT renders both in literal positions.
+    let result = database.execute_sql("SELECT now()").expect("select now");
+    match &result.rows[0][0] {
+        Value::Timestamp(timestamp) => {
+            assert!(
+                (before..=after + 60_000_000).contains(&timestamp.0),
+                "now() is the real clock"
+            );
+        }
+        other => panic!("now() is a timestamp: {other:?}"),
+    }
+}
+
+#[test]
 fn explain_names_the_access_path_execution_takes() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("explain-db");
