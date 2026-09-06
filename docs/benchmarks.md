@@ -72,13 +72,26 @@ client-numbered history_id substitute — 37.0 tps — is superseded:
 
 | Engine | TPS | Avg latency | Retried |
 |---|---|---|---|
-| PostgreSQL 17.11 (fsync on) | 7757 | 0.52 ms | 0% |
-| OmenDB (default, heap history) | 41.0 | 96 ms | 38% |
+| PostgreSQL 17.11 (fsync on) | 7950 | 0.50 ms | 0% |
+| OmenDB (default `--sync-class device`, heap history) | 41.0 | 96 ms | 38% |
+| OmenDB (`--sync-class kernel`, heap history) | 88.8 | 45 ms | 42% |
 | OmenDB (`--wal-first`, keyed-history era) | 19.8 | 200 ms | 31% |
 
 The stock heap INSERT is ~11% cheaper than the keyed substitute it
 replaced (37.0 -> 41.0 tps at the same retry profile) and removes the
 one-invocation-per-daemon constraint the keyed client-sequence imposed.
+
+The sync-class rows carry the 2026-09-06 finding: on macOS the default
+device barrier (`F_FULLFSYNC`, ~4.2 ms/sync) tripled the wave's sync
+cost, while `--sync-class kernel` (plain `fsync`, ~0.03 ms/sync — the
+class PostgreSQL's installed build uses via `open_datasync`) doubles
+measured TPS (41.0 -> 88.8 at the same 38-42% retry profile). The
+kernel class survives process and kernel crash (the crash matrix
+passes under both classes) but not power loss on consumer SSDs; the
+device class stays the default because this engine never trades
+correctness for speed. `wave_cost_probe` / `fsync_dimensions` /
+`fsync_latency_probe` (crates/seerdb/examples) reproduce every number
+above.
 
 WAL-first commit acks are QUALIFIED for crash correctness (3-mode
 process-crash matrix at the real 2 MiB bound;
@@ -90,12 +103,15 @@ differential are honest behavior: OmenDB's optimistic snapshots reject
 concurrent same-row writers where PostgreSQL's row locks wait;
 `--max-tries` on both engines makes the comparison fair.
 
-Phase timing inside one publication wave explains the gap: the MVCC
-version-store sync costs ~4.5 ms and `commit_group_at` (full B-tree
-clone + WAL append) another ~4.5 ms, while raw fsync on the same volume
-is 0.05 ms — the wave cost is publication-structure CPU, not the
-syscall. Collapsing those two phases toward PostgreSQL's single
-append+fsync is the measured next lever.
+The earlier phase attribution (version-store sync ~4.5 ms +
+`commit_group_at` ~4.5 ms vs 0.05 ms raw fsync) pointed at
+publication-structure CPU; the 2026-09-06 measurement corrected it —
+those phases were each one F_FULLFSYNC device barrier (~4.2 ms), and
+the syscall class was the whole story. Under the kernel class the
+remaining per-wave costs are the three sync-bearing phases themselves
+(collapsing them toward one per wave) and the per-group B-tree clone —
+the next measured levers, now visible at ~223 us/txn scale instead of
+~13 ms.
 
 ## Known follow-ups
 
