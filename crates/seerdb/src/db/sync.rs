@@ -19,6 +19,7 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "macos")]
 use std::os::unix::io::AsRawFd;
 
 use crate::db::SyncClass;
