@@ -32,10 +32,11 @@ pub use morsel::{
 };
 pub use packed::{PACKED_PAGE_BYTES, PackBudget, PackReport, PackedPage, PackedRange, pack_sorted};
 pub use relational::{
-    Catalog, ColumnDefinition, ColumnId, ColumnType, ConstraintId, ConstraintTiming,
-    ForeignKeyDefinition, IndexDefinition, NamedForeignKeyDefinition, NamedIndexDefinition,
-    ReferentialAction, RelationalMutation, RelationalSchemaDefinition, Row, TableDefinition,
-    TableId, Value, decode_row, encode_row,
+    ArithmeticOperator, Catalog, ColumnDefinition, ColumnId, ColumnType, ConstraintId,
+    ConstraintTiming, ForeignKeyDefinition, IndexDefinition, IndexExpression, IndexKeyPart,
+    IndexPredicate, NamedForeignKeyDefinition, NamedIndexDefinition, ReferentialAction,
+    RelationalMutation, RelationalSchemaDefinition, Row, TableDefinition, TableId, Value,
+    decode_row, encode_row,
 };
 pub use relational_database::{
     CancellationToken, OperationControl, RELATIONAL_SQL_BATCH_LIMIT, RelationalBackendConfig,

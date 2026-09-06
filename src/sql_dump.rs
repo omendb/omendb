@@ -55,7 +55,14 @@ pub fn dump_sql(database: &mut RelationalDatabase) -> Result<String> {
         for table in &tables {
             let primary_columns = catalog.primary_key(table.id);
             for index in catalog.indexes_for(table.id) {
-                if primary_columns == Some(index.columns.as_slice()) {
+                let index_is_plain_columns = primary_columns.is_some_and(|primary| {
+                    index.parts.len() == primary.len()
+                        && index.parts.iter().all(|part| {
+                            part.as_column()
+                                .is_some_and(|column| primary.contains(&column))
+                        })
+                });
+                if index_is_plain_columns {
                     continue;
                 }
                 let name = catalog
@@ -64,16 +71,41 @@ pub fn dump_sql(database: &mut RelationalDatabase) -> Result<String> {
                     .unwrap_or_else(|| generated_index_name(table, index.id.0));
                 let unique = if index.unique { "UNIQUE " } else { "" };
                 let columns = index
-                    .columns
+                    .parts
                     .iter()
-                    .map(|column| quote_identifier(&column_name(table, *column)))
+                    .map(|part| match part {
+                        crate::IndexKeyPart::Column(column) => {
+                            quote_identifier(&column_name(table, *column))
+                        }
+                        crate::IndexKeyPart::Expression(expression) => {
+                            expression.to_sql_text(table).expect("valid table")
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
+                // A partial index carries its WHERE clause so the
+                // restore rebuilds the same filtered semantics.
+                let predicate = index.predicate.as_ref().map(|predicate| {
+                    let terms = predicate
+                        .terms
+                        .iter()
+                        .map(|(column, value)| {
+                            format!(
+                                "{} = {}",
+                                quote_identifier(&column_name(table, *column)),
+                                literal_text(value)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    format!(" WHERE {terms}")
+                });
                 let _ = writeln!(
                     out,
-                    "CREATE {unique}INDEX {} ON {} ({columns});",
+                    "CREATE {unique}INDEX {} ON {} ({columns}){};",
                     quote_identifier(&name),
                     quote_identifier(&table.name),
+                    predicate.unwrap_or_default(),
                 );
             }
         }
@@ -281,6 +313,25 @@ fn quote_identifier(name: &str) -> String {
 
 fn quote_string(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Render one stored predicate value as a SQL literal.
+fn literal_text(value: &crate::Value) -> String {
+    match value {
+        crate::Value::Null => "NULL".to_owned(),
+        crate::Value::Bool(value) => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        crate::Value::I64(value) => value.to_string(),
+        crate::Value::U64(value) => value.to_string(),
+        crate::Value::Text(value) => quote_string(value),
+        crate::Value::Float64(value) => value.0.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 fn generated_index_name(table: &crate::TableDefinition, index_id: u64) -> String {

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, CommitId, IndexDefinition, IndexId, Key,
+    ColumnDefinition, ColumnId, ColumnType, CommitId, IndexDefinition, IndexId, IndexKeyPart, Key,
     RelationalDatabase, RelationalDatabaseTransaction, Row, TableDefinition, TableId, Value,
 };
 use serde::Deserialize;
@@ -102,19 +102,31 @@ fn install_schema(database: &mut RelationalDatabase) {
         IndexDefinition {
             id: STATUS_INDEX,
             table: DOCUMENTS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(3)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(3)),
+            ],
+            predicate: None,
             unique: false,
         },
         IndexDefinition {
             id: OWNER_INDEX,
             table: DOCUMENTS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(4)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(4)),
+            ],
+            predicate: None,
             unique: false,
         },
         IndexDefinition {
             id: UPDATED_INDEX,
             table: DOCUMENTS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(6)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(6)),
+            ],
+            predicate: None,
             unique: false,
         },
     ] {

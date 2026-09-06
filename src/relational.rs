@@ -12,7 +12,7 @@ const CATALOG_MAGIC: [u8; 4] = *b"DBCT";
 /// Maximum cascade generations per triggering delete statement.
 pub(crate) const MAX_CASCADE_DEPTH: usize = 64;
 
-const CATALOG_VERSION: u16 = 5;
+const CATALOG_VERSION: u16 = 6;
 const CATALOG_KEY_TENANT: u64 = u64::MAX;
 
 // The temporary kernel is still a OmenDB-owned byte store. Keep the
@@ -112,8 +112,236 @@ pub struct Catalog {
 pub struct IndexDefinition {
     pub id: IndexId,
     pub table: TableId,
-    pub columns: Vec<ColumnId>,
+    pub parts: Vec<IndexKeyPart>,
     pub unique: bool,
+    /// Rows indexed only when this conjunction holds; `None` indexes
+    /// every row.
+    pub predicate: Option<IndexPredicate>,
+}
+
+/// One key component of an index: a plain column or a computed
+/// expression over the row's columns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexKeyPart {
+    Column(ColumnId),
+    Expression(IndexExpression),
+}
+
+impl IndexKeyPart {
+    /// The plain column this part indexes, when it is one.
+    pub fn as_column(&self) -> Option<ColumnId> {
+        match self {
+            Self::Column(column) => Some(*column),
+            Self::Expression(_) => None,
+        }
+    }
+}
+
+/// An index-key expression over stable column IDs: the typed subset the
+/// write path can evaluate for every mutated row without re-parsing
+/// SQL. Arithmetic and CASE mirror the SQL tier's `ComputedTerm`
+/// semantics; NULL propagates and skips the row (NULL keys never match).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexExpression {
+    /// One column's value.
+    Column(ColumnId),
+    /// `left op right` with SQL NULL propagation and overflow checks.
+    Arithmetic {
+        left: Box<IndexExpression>,
+        op: ArithmeticOperator,
+        right: Box<IndexExpression>,
+    },
+}
+
+/// Binary arithmetic with the SQL tier's checked semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArithmeticOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// A partial-index predicate: a conjunction of column = value equality
+/// terms. The dominant WHERE shape (`status = 'pending'`); other
+/// predicates are refused at DDL time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexPredicate {
+    pub terms: Vec<(ColumnId, Value)>,
+}
+
+impl IndexExpression {
+    /// Render the expression as re-loadable SQL text for dumps and
+    /// EXPLAIN. Column IDs resolve through the owning table definition.
+    pub fn to_sql_text(&self, table: &TableDefinition) -> Result<String> {
+        match self {
+            Self::Column(column) => {
+                let column = table.column(*column)?;
+                Ok(format!("\"{}\"", column.name.replace('"', "\"\"")))
+            }
+            Self::Arithmetic { left, op, right } => {
+                let op = match op {
+                    ArithmeticOperator::Add => " + ",
+                    ArithmeticOperator::Subtract => " - ",
+                    ArithmeticOperator::Multiply => " * ",
+                    ArithmeticOperator::Divide => " / ",
+                };
+                Ok(format!(
+                    "({}{}{})",
+                    left.to_sql_text(table)?,
+                    op,
+                    right.to_sql_text(table)?
+                ))
+            }
+        }
+    }
+
+    /// Evaluate the expression for one row; `None` when any operand is
+    /// NULL (SQL NULL propagation). Arithmetic mirrors the SQL tier's
+    /// checked semantics.
+    pub fn evaluate(&self, table: &TableDefinition, row: &Row) -> Result<Option<Value>> {
+        match self {
+            Self::Column(column) => Ok(Some(row.value(table, *column)?.clone())),
+            Self::Arithmetic { left, op, right } => {
+                let Some(left) = left.evaluate(table, row)? else {
+                    return Ok(None);
+                };
+                let Some(right) = right.evaluate(table, row)? else {
+                    return Ok(None);
+                };
+                apply_arithmetic(*op, &left, &right).map(Some)
+            }
+        }
+    }
+
+    /// Feed every referenced column to the sink; used for validation and
+    /// drop-column participation checks.
+    pub fn referenced_columns(&self, sink: &mut dyn FnMut(ColumnId) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Column(column) => sink(*column),
+            Self::Arithmetic { left, right, .. } => {
+                left.referenced_columns(sink)?;
+                right.referenced_columns(sink)
+            }
+        }
+    }
+}
+
+/// Checked binary arithmetic over the numeric Value shapes the SQL tier
+/// supports; NULL operands were filtered by the caller. Same-shape
+/// integers stay exact (i64+i64, u64+u64); a float operand promotes the
+/// result to float64, matching the SQL tier's arithmetic promotion.
+fn apply_arithmetic(op: ArithmeticOperator, left: &Value, right: &Value) -> Result<Value> {
+    use crate::sql_types::F64;
+    match (left, right) {
+        (Value::Float64(a), Value::Float64(b)) => {
+            let (a, b) = (a.0, b.0);
+            let result = match op {
+                ArithmeticOperator::Add => a + b,
+                ArithmeticOperator::Subtract => a - b,
+                ArithmeticOperator::Multiply => a * b,
+                ArithmeticOperator::Divide => {
+                    if b == 0.0 {
+                        return Err(DbError::InvalidState(
+                            "division by zero in index expression".to_owned(),
+                        ));
+                    }
+                    a / b
+                }
+            };
+            Ok(Value::Float64(F64(result)))
+        }
+        (Value::Float64(a), other) | (other, Value::Float64(a)) => {
+            let b = other.as_f64_for_arithmetic().ok_or_else(|| {
+                DbError::InvalidState("index expression operands must be numeric".to_owned())
+            })?;
+            let a = a.0;
+            let result = match op {
+                ArithmeticOperator::Add => a + b,
+                ArithmeticOperator::Subtract => a - b,
+                ArithmeticOperator::Multiply => a * b,
+                ArithmeticOperator::Divide => {
+                    if b == 0.0 {
+                        return Err(DbError::InvalidState(
+                            "division by zero in index expression".to_owned(),
+                        ));
+                    }
+                    a / b
+                }
+            };
+            Ok(Value::Float64(F64(result)))
+        }
+        (Value::I64(a), Value::I64(b)) => {
+            let checked = match op {
+                ArithmeticOperator::Add => a.checked_add(*b),
+                ArithmeticOperator::Subtract => a.checked_sub(*b),
+                ArithmeticOperator::Multiply => a.checked_mul(*b),
+                ArithmeticOperator::Divide => {
+                    if *b == 0 {
+                        return Err(DbError::InvalidState(
+                            "division by zero in index expression".to_owned(),
+                        ));
+                    }
+                    a.checked_div(*b)
+                }
+            };
+            checked
+                .map(Value::I64)
+                .ok_or_else(|| DbError::InvalidState("index expression overflow".to_owned()))
+        }
+        (Value::U64(a), Value::U64(b)) => {
+            let checked = match op {
+                ArithmeticOperator::Add => a.checked_add(*b),
+                ArithmeticOperator::Subtract => a.checked_sub(*b),
+                ArithmeticOperator::Multiply => a.checked_mul(*b),
+                ArithmeticOperator::Divide => {
+                    if *b == 0 {
+                        return Err(DbError::InvalidState(
+                            "division by zero in index expression".to_owned(),
+                        ));
+                    }
+                    a.checked_div(*b)
+                }
+            };
+            checked
+                .map(Value::U64)
+                .ok_or_else(|| DbError::InvalidState("index expression overflow".to_owned()))
+        }
+        // Mixed i64/u64 promotes to float64: either order can exceed the
+        // other shape, so no exact integer result exists.
+        (Value::I64(a), Value::U64(b)) | (Value::U64(b), Value::I64(a)) => {
+            let (a, b) = (*a as f64, *b as f64);
+            let result = match op {
+                ArithmeticOperator::Add => a + b,
+                ArithmeticOperator::Subtract => a - b,
+                ArithmeticOperator::Multiply => a * b,
+                ArithmeticOperator::Divide => {
+                    if b == 0.0 {
+                        return Err(DbError::InvalidState(
+                            "division by zero in index expression".to_owned(),
+                        ));
+                    }
+                    a / b
+                }
+            };
+            Ok(Value::Float64(F64(result)))
+        }
+        _ => Err(DbError::InvalidState(
+            "index expression operands must be numeric".to_owned(),
+        )),
+    }
+}
+
+impl IndexPredicate {
+    /// Does this row satisfy the predicate (and so belong in the index)?
+    pub fn matches(&self, table: &TableDefinition, row: &Row) -> Result<bool> {
+        for (column, expected) in &self.terms {
+            if row.value(table, *column)? != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// One index included in an atomic schema publication.
@@ -384,21 +612,41 @@ impl Catalog {
     }
 
     fn validate_index_columns(&self, index: &IndexDefinition) -> Result<()> {
-        if index.columns.is_empty() {
+        if index.parts.is_empty() {
             return Err(DbError::InvalidState(format!(
-                "index {} must define at least one column",
+                "index {} must define at least one key part",
                 index.id.0
             )));
         }
         let table = self.table(index.table)?;
         let mut columns = std::collections::BTreeSet::new();
-        for column in &index.columns {
-            table.column(*column)?;
-            if !columns.insert(*column) {
+        let mut referenced = |column: ColumnId| -> Result<()> {
+            table.column(column)?;
+            if !columns.insert(column) {
                 return Err(DbError::InvalidState(format!(
                     "index {} repeats column {}",
                     index.id.0, column.0
                 )));
+            }
+            Ok(())
+        };
+        for part in &index.parts {
+            match part {
+                IndexKeyPart::Column(column) => referenced(*column)?,
+                IndexKeyPart::Expression(expression) => {
+                    expression.referenced_columns(&mut |column| referenced(column))?
+                }
+            }
+        }
+        if let Some(predicate) = &index.predicate {
+            for (column, value) in &predicate.terms {
+                let definition = table.column(*column)?;
+                if !value.matches(definition.data_type) {
+                    return Err(DbError::InvalidState(format!(
+                        "index {} predicate value has the wrong type for column {}",
+                        index.id.0, definition.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -446,7 +694,12 @@ impl Catalog {
         if !self.indexes.values().any(|index| {
             index.table == foreign_key.referenced_table
                 && index.unique
-                && index.columns == foreign_key.referenced_columns
+                && index.predicate.is_none()
+                && index.parts.len() == foreign_key.referenced_columns.len()
+                && index.parts.iter().all(|part| match part {
+                    IndexKeyPart::Column(column) => foreign_key.referenced_columns.contains(column),
+                    IndexKeyPart::Expression(_) => false,
+                })
         }) {
             return Err(DbError::InvalidState(format!(
                 "foreign key {} requires a unique index on referenced columns",
@@ -716,11 +969,28 @@ impl Catalog {
                 column.0
             )));
         }
-        if self
-            .indexes
-            .values()
-            .any(|index| index.table == table && index.columns.contains(&column))
-        {
+        if self.indexes.values().any(|index| {
+            index.table == table
+                && index.parts.iter().any(|part| match part {
+                    IndexKeyPart::Column(index_column) => *index_column == column,
+                    IndexKeyPart::Expression(expression) => {
+                        let mut found = false;
+                        expression
+                            .referenced_columns(&mut |index_column| {
+                                found = found || index_column == column;
+                                Ok(())
+                            })
+                            .ok();
+                        found
+                    }
+                })
+                || index.predicate.as_ref().is_some_and(|predicate| {
+                    predicate
+                        .terms
+                        .iter()
+                        .any(|(index_column, _)| *index_column == column)
+                })
+        }) {
             return Err(DbError::InvalidState(format!(
                 "cannot {operation} column {}; it participates in a secondary index",
                 column.0
@@ -768,6 +1038,16 @@ impl Value {
             return Ok(());
         }
         self.encode(bytes)
+    }
+
+    /// Numeric view for index-expression arithmetic promotion.
+    pub(crate) fn as_f64_for_arithmetic(&self) -> Option<f64> {
+        match self {
+            Self::I64(v) => Some(*v as f64),
+            Self::U64(v) => Some(*v as f64),
+            Self::Float64(v) => Some(v.0),
+            _ => None,
+        }
     }
 
     pub(crate) fn matches(&self, data_type: ColumnType) -> bool {
@@ -1195,9 +1475,23 @@ pub(crate) fn row_index_key(
     index: &IndexDefinition,
     row: &Row,
 ) -> Result<Option<Vec<u8>>> {
-    let mut values = Vec::with_capacity(index.columns.len());
-    for column in &index.columns {
-        let value = row.value(table, *column)?;
+    if let Some(predicate) = &index.predicate
+        && !predicate.matches(table, row)?
+    {
+        return Ok(None);
+    }
+    let mut values: Vec<Value> = Vec::with_capacity(index.parts.len());
+    for part in &index.parts {
+        let value: Value = match part {
+            IndexKeyPart::Column(column) => row.value(table, *column)?.clone(),
+            IndexKeyPart::Expression(expression) => {
+                match expression.evaluate(table, row)? {
+                    Some(value) => value,
+                    // NULL never matches an index equality lookup.
+                    None => return Ok(None),
+                }
+            }
+        };
         if matches!(value, Value::Null) {
             return Ok(None);
         }
@@ -1226,22 +1520,30 @@ pub(crate) fn index_values_key(
     index: &IndexDefinition,
     values: &[Value],
 ) -> Result<Vec<u8>> {
-    if values.len() != index.columns.len() {
+    if values.len() != index.parts.len() {
         return Err(DbError::InvalidState(format!(
             "index {} requires {} values, got {}",
             index.id.0,
-            index.columns.len(),
+            index.parts.len(),
             values.len()
         )));
     }
     let mut bytes = Vec::new();
-    for (value, column_id) in values.iter().zip(&index.columns) {
-        let column = table.column(*column_id)?;
-        if !value.matches(column.data_type) {
-            return Err(DbError::InvalidState(format!(
-                "index {} value has the wrong type for column {}",
-                index.id.0, column.name
-            )));
+    for (value, part) in values.iter().zip(&index.parts) {
+        match part {
+            IndexKeyPart::Column(column_id) => {
+                let column = table.column(*column_id)?;
+                if !value.matches(column.data_type) {
+                    return Err(DbError::InvalidState(format!(
+                        "index {} value has the wrong type for column {}",
+                        index.id.0, column.name
+                    )));
+                }
+            }
+            // Expression parts accept the static result type they were
+            // validated against at DDL time; the key bytes are the same
+            // encoding the write path produced.
+            IndexKeyPart::Expression(_) => {}
         }
         value.encode_for_key(&mut bytes)?;
     }
@@ -1374,11 +1676,31 @@ pub(crate) fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>> {
     for index in catalog.indexes.values() {
         bytes.extend_from_slice(&index.id.0.to_le_bytes());
         bytes.extend_from_slice(&index.table.0.to_le_bytes());
-        put_u32(&mut bytes, index.columns.len())?;
-        for column in &index.columns {
-            bytes.extend_from_slice(&column.0.to_le_bytes());
+        put_u32(&mut bytes, index.parts.len())?;
+        for part in &index.parts {
+            match part {
+                IndexKeyPart::Column(column) => {
+                    bytes.push(0);
+                    bytes.extend_from_slice(&column.0.to_le_bytes());
+                }
+                IndexKeyPart::Expression(expression) => {
+                    bytes.push(1);
+                    encode_index_expression(&mut bytes, expression)?;
+                }
+            }
         }
         bytes.push(u8::from(index.unique));
+        match &index.predicate {
+            Some(predicate) => {
+                bytes.push(1);
+                put_u32(&mut bytes, predicate.terms.len())?;
+                for (column, value) in &predicate.terms {
+                    bytes.extend_from_slice(&column.0.to_le_bytes());
+                    value.encode(&mut bytes)?;
+                }
+            }
+            None => bytes.push(0),
+        }
         match catalog.index_names.get(&index.id) {
             Some(name) => {
                 bytes.push(1);
@@ -1411,6 +1733,84 @@ pub(crate) fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>> {
         }
     }
     Ok(bytes)
+}
+
+/// Encode one index expression tree. Tags: 0 column, 1 arithmetic.
+fn encode_index_expression(bytes: &mut Vec<u8>, expression: &IndexExpression) -> Result<()> {
+    match expression {
+        IndexExpression::Column(column) => {
+            bytes.push(0);
+            bytes.extend_from_slice(&column.0.to_le_bytes());
+        }
+        IndexExpression::Arithmetic { left, op, right } => {
+            bytes.push(1);
+            encode_index_expression(bytes, left)?;
+            encode_index_expression(bytes, right)?;
+            bytes.push(match op {
+                ArithmeticOperator::Add => 0,
+                ArithmeticOperator::Subtract => 1,
+                ArithmeticOperator::Multiply => 2,
+                ArithmeticOperator::Divide => 3,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Decode one index expression tree written by `encode_index_expression`.
+fn decode_index_expression(cursor: &mut CatalogCursor) -> Result<IndexExpression> {
+    match cursor.byte()? {
+        0 => Ok(IndexExpression::Column(ColumnId(cursor.u16()?))),
+        1 => {
+            let left = decode_index_expression(cursor)?;
+            let right = decode_index_expression(cursor)?;
+            let op = match cursor.byte()? {
+                0 => ArithmeticOperator::Add,
+                1 => ArithmeticOperator::Subtract,
+                2 => ArithmeticOperator::Multiply,
+                3 => ArithmeticOperator::Divide,
+                _ => {
+                    return Err(DbError::Corruption {
+                        artifact: "catalog",
+                        reason: "invalid index expression operator".to_owned(),
+                    });
+                }
+            };
+            Ok(IndexExpression::Arithmetic {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            })
+        }
+        _ => Err(DbError::Corruption {
+            artifact: "catalog",
+            reason: "invalid index expression tag".to_owned(),
+        }),
+    }
+}
+
+/// Decode one stored `Value` using the row codec's tag scheme.
+fn decode_value(cursor: &mut CatalogCursor) -> Result<Value> {
+    let tag = cursor.byte()?;
+    let value = match tag {
+        0 => Value::Null,
+        2 => Value::Bool(cursor.byte()? != 0),
+        3 => Value::I64(cursor.u64()? as i64),
+        4 => Value::U64(cursor.u64()?),
+        5 => {
+            // Value::encode writes put_bytes: a u32 length prefix then the
+            // bytes; bytes_value reads exactly that shape.
+            let bytes = cursor.bytes_value()?;
+            Value::Text(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        _ => {
+            return Err(DbError::Corruption {
+                artifact: "catalog",
+                reason: "unsupported index predicate value tag".to_owned(),
+            });
+        }
+    };
+    Ok(value)
 }
 
 pub(crate) fn decode_catalog(bytes: &[u8]) -> Result<Catalog> {
@@ -1483,22 +1883,53 @@ pub(crate) fn decode_catalog(bytes: &[u8]) -> Result<Catalog> {
     for _ in 0..cursor.u32()? {
         let id = IndexId(cursor.u64()?);
         let table = TableId(cursor.u64()?);
-        let column_count = cursor.u32()? as usize;
-        if column_count == 0 || column_count > 4096 {
+        let part_count = cursor.u32()? as usize;
+        if part_count == 0 || part_count > 4096 {
             return Err(DbError::Corruption {
                 artifact: "catalog",
-                reason: "invalid index column count".to_owned(),
+                reason: "invalid index key part count".to_owned(),
             });
         }
-        let mut columns = Vec::with_capacity(column_count);
-        for _ in 0..column_count {
-            columns.push(ColumnId(cursor.u16()?));
+        let mut parts = Vec::with_capacity(part_count);
+        for _ in 0..part_count {
+            match cursor.byte()? {
+                0 => parts.push(IndexKeyPart::Column(ColumnId(cursor.u16()?))),
+                1 => parts.push(IndexKeyPart::Expression(decode_index_expression(
+                    &mut cursor,
+                )?)),
+                _ => {
+                    return Err(DbError::Corruption {
+                        artifact: "catalog",
+                        reason: "invalid index key part tag".to_owned(),
+                    });
+                }
+            }
         }
+        let unique = cursor.byte()? != 0;
+        let predicate = if cursor.byte()? != 0 {
+            let term_count = cursor.u32()? as usize;
+            if term_count == 0 || term_count > 256 {
+                return Err(DbError::Corruption {
+                    artifact: "catalog",
+                    reason: "invalid index predicate term count".to_owned(),
+                });
+            }
+            let mut terms = Vec::with_capacity(term_count);
+            for _ in 0..term_count {
+                let column = ColumnId(cursor.u16()?);
+                let value = decode_value(&mut cursor)?;
+                terms.push((column, value));
+            }
+            Some(IndexPredicate { terms })
+        } else {
+            None
+        };
         let index = IndexDefinition {
             id,
             table,
-            columns,
-            unique: cursor.byte()? != 0,
+            parts,
+            unique,
+            predicate,
         };
         catalog.validate_index_columns(&index)?;
         if catalog.indexes.insert(index.id, index).is_some() {

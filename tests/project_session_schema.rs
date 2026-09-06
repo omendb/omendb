@@ -2,7 +2,7 @@ use std::path::Path;
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, DbError, ForeignKeyDefinition,
-    IndexDefinition, IndexId, Key, NamedForeignKeyDefinition, NamedIndexDefinition,
+    IndexDefinition, IndexId, IndexKeyPart, Key, NamedForeignKeyDefinition, NamedIndexDefinition,
     OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
     RelationalSchemaDefinition, RelationalSessionConfig, RowIdentity, TableDefinition, TableId,
     Value,
@@ -109,7 +109,8 @@ fn parents_schema() -> RelationalSchemaDefinition {
             definition: IndexDefinition {
                 id: PARENT_ID_INDEX,
                 table: PARENTS,
-                columns: vec![ColumnId(1)],
+                parts: vec![IndexKeyPart::Column(ColumnId(1))],
+                predicate: None,
                 unique: true,
             },
             name: Some("parents_parent_id".to_owned()),
@@ -124,7 +125,8 @@ fn children_schema() -> RelationalSchemaDefinition {
             definition: IndexDefinition {
                 id: CHILD_STATE_INDEX,
                 table: CHILDREN,
-                columns: vec![ColumnId(3)],
+                parts: vec![IndexKeyPart::Column(ColumnId(3))],
+                predicate: None,
                 unique: false,
             },
             name: Some("children_state".to_owned()),
@@ -246,7 +248,8 @@ fn exercise(directory: &Path) -> SchemaObservation {
             IndexDefinition {
                 id: CHILD_ITEM_INDEX,
                 table: CHILDREN,
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: false,
             },
             "children_item_id".to_owned(),

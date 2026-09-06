@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use omendb::{
-    ColumnId, DbError, IndexDefinition, IndexId, Key, OperationControl, RelationalDatabaseConfig,
-    RelationalDatabaseSession, Row, TableId, Value,
+    ColumnId, DbError, IndexDefinition, IndexId, IndexKeyPart, Key, OperationControl,
+    RelationalDatabaseConfig, RelationalDatabaseSession, Row, TableId, Value,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -258,19 +258,22 @@ fn create_schema(session: &RelationalDatabaseSession, control: &OperationControl
         IndexDefinition {
             id: VALUE_INDEX,
             table: TABLE,
-            columns: vec![ColumnId(1)],
+            parts: vec![IndexKeyPart::Column(ColumnId(1))],
+            predicate: None,
             unique: false,
         },
         IndexDefinition {
             id: OWNER_INDEX,
             table: TABLE,
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: false,
         },
         IndexDefinition {
             id: PAYLOAD_INDEX,
             table: TABLE,
-            columns: vec![ColumnId(3)],
+            parts: vec![IndexKeyPart::Column(ColumnId(3))],
+            predicate: None,
             unique: false,
         },
     ] {

@@ -2,8 +2,8 @@ use std::path::Path;
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
-    IndexId, Key, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId,
-    Value,
+    IndexId, IndexKeyPart, Key, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition,
+    TableId, Value,
 };
 
 pub const USERS_TABLE: TableId = TableId(1);
@@ -126,25 +126,41 @@ pub fn install_schema(database: &mut RelationalDatabase) {
         IndexDefinition {
             id: USER_PRIMARY_INDEX,
             table: USERS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(2)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(2)),
+            ],
+            predicate: None,
             unique: true,
         },
         IndexDefinition {
             id: PROJECT_PRIMARY_INDEX,
             table: PROJECTS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(2)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(2)),
+            ],
+            predicate: None,
             unique: true,
         },
         IndexDefinition {
             id: PROJECT_SLUG_INDEX,
             table: PROJECTS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(3)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(3)),
+            ],
+            predicate: None,
             unique: true,
         },
         IndexDefinition {
             id: MEMBERSHIP_USER_INDEX,
             table: MEMBERSHIPS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(3)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(3)),
+            ],
+            predicate: None,
             unique: false,
         },
     ] {

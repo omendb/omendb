@@ -9,7 +9,7 @@
 //! ```
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, RelationalBackendConfig,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexKeyPart, RelationalBackendConfig,
     RelationalDatabase, Row, TableDefinition, TableId, Value,
 };
 
@@ -79,7 +79,8 @@ fn main() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(1),
             table: TableId(1),
-            columns: vec![ColumnId(3)],
+            parts: vec![IndexKeyPart::Column(ColumnId(3))],
+            predicate: None,
             unique: true,
         })
         .expect("unique index");
@@ -87,7 +88,8 @@ fn main() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(2),
             table: TableId(1),
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: false,
         })
         .expect("secondary index");

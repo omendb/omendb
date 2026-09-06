@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, RelationalBackendConfig,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexKeyPart, RelationalBackendConfig,
     RelationalDatabase, Result, Row, RowIdentity, TableDefinition, TableId, Value,
 };
 
@@ -151,7 +151,8 @@ fn main() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(1),
             table: TableId(1),
-            columns: vec![ColumnId(3)],
+            parts: vec![IndexKeyPart::Column(ColumnId(3))],
+            predicate: None,
             unique: true,
         })
         .expect("create index");
@@ -159,7 +160,8 @@ fn main() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(2),
             table: TableId(1),
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: false,
         })
         .expect("create user_id index");
@@ -362,7 +364,8 @@ fn main() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(1),
             table: TableId(1),
-            columns: vec![ColumnId(3)],
+            parts: vec![IndexKeyPart::Column(ColumnId(3))],
+            predicate: None,
             unique: true,
         })
         .expect("create index");

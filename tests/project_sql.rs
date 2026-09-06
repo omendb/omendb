@@ -357,6 +357,172 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn partial_indexes_filter_writes_and_accelerate_qualified_queries() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("partial-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    // The flagship partial-index pattern: a unique key over only the
+    // active rows, so soft-deleted rows never collide.
+    database
+        .execute_sql(
+            "CREATE TABLE tenants (
+                id BIGINT PRIMARY KEY,
+                org BIGINT NOT NULL,
+                active BOOLEAN NOT NULL,
+                state TEXT NOT NULL
+            )",
+        )
+        .expect("create tenants");
+    database
+        .execute_sql("CREATE UNIQUE INDEX one_active_per_org ON tenants (org) WHERE active")
+        .expect("create partial unique index");
+
+    database
+        .execute_sql("INSERT INTO tenants VALUES (1, 10, true, 'open'), (2, 20, true, 'open')")
+        .expect("seed active rows");
+
+    // Inactive rows are outside the index: any number may share org 10.
+    database
+        .execute_sql("INSERT INTO tenants VALUES (3, 10, false, 'closed')")
+        .expect("inactive row bypasses the unique index");
+    database
+        .execute_sql("UPDATE tenants SET active = false WHERE id = 1")
+        .expect("deactivation removes the row from the index");
+
+    // With org 10's active row gone, a new active row may take it.
+    database
+        .execute_sql("INSERT INTO tenants VALUES (4, 10, true, 'open')")
+        .expect("reactivated org after deactivation");
+
+    // The unique predicate still holds for concurrent active rows.
+    let error = database
+        .execute_sql("INSERT INTO tenants VALUES (5, 10, true, 'open')")
+        .expect_err("two active rows in one org must collide");
+    assert!(error.to_string().contains("duplicate"), "got: {error}");
+
+    // The planner uses the partial index when the query implies its
+    // predicate, and EXPLAIN names it.
+    let explained = database
+        .execute_sql("EXPLAIN SELECT id FROM tenants WHERE org = 10 AND active = true")
+        .expect("explain qualified query");
+    let Value::Text(plan) = &explained.rows[0][0] else {
+        panic!(
+            "EXPLAIN result must be text, got {:?}",
+            explained.rows[0][0]
+        );
+    };
+    assert!(
+        plan.contains("Index Scan using one_active_per_org"),
+        "plan was: {plan}"
+    );
+
+    // Results through the partial index are exact.
+    let result = database
+        .execute_sql("SELECT id FROM tenants WHERE org = 10 AND active = true")
+        .expect("qualified lookup");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Value::I64(4));
+
+    // Without the predicate the index does not apply: EXPLAIN falls
+    // back to a sequential scan.
+    let explained = database
+        .execute_sql("EXPLAIN SELECT id FROM tenants WHERE org = 10")
+        .expect("explain unqualified query");
+    let Value::Text(plan) = &explained.rows[0][0] else {
+        panic!(
+            "EXPLAIN result must be text, got {:?}",
+            explained.rows[0][0]
+        );
+    };
+    assert!(plan.contains("Seq Scan"), "plan was: {plan}");
+
+    // Dump renders the partial index (with its WHERE clause) and a
+    // restore rebuilds it with the same semantics.
+    let dump = omendb::dump_sql(&mut database).expect("dump");
+    assert!(
+        dump.contains("one_active_per_org") && dump.contains("WHERE"),
+        "dump must render the partial index: {dump}"
+    );
+    let restore_directory = tempfile::tempdir().expect("restore directory");
+    let mut restored = RelationalDatabase::create(config(&restore_directory.path().join("db")))
+        .expect("create restored database");
+    omendb::restore_sql(&mut restored, &dump).expect("restore");
+    let result = restored
+        .execute_sql("SELECT id FROM tenants WHERE org = 10 AND active = true")
+        .expect("qualified lookup on restored database");
+    assert_eq!(result.rows[0][0], Value::I64(4));
+    let error = restored
+        .execute_sql("INSERT INTO tenants VALUES (6, 20, true, 'open')")
+        .expect_err("partial uniqueness survives restore");
+    assert!(error.to_string().contains("duplicate"), "got: {error}");
+}
+
+#[test]
+fn expression_indexes_compute_keys_and_match_queries() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("expr-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    database
+        .execute_sql(
+            "CREATE TABLE positions (
+                id BIGINT PRIMARY KEY,
+                x BIGINT NOT NULL,
+                y BIGINT NOT NULL
+            )",
+        )
+        .expect("create positions");
+    database
+        .execute_sql("CREATE INDEX manhattan_idx ON positions (x + y)")
+        .expect("create expression index");
+    database
+        .execute_sql("INSERT INTO positions VALUES (1, 3, 4), (2, 10, 20), (3, 0, 7)")
+        .expect("seed positions");
+
+    // The expression key is computed per row: x + y.
+    let result = database
+        .execute_sql("SELECT id FROM positions WHERE x + y = 7")
+        .expect("expression lookup");
+    // (3,4)=7 and (0,7)=7.
+    assert_eq!(result.rows.len(), 2);
+
+    // EXPLAIN shows the expression index with the rendered expression.
+    let explained = database
+        .execute_sql("EXPLAIN SELECT id FROM positions WHERE x + y = 7")
+        .expect("explain expression lookup");
+    let Value::Text(plan) = &explained.rows[0][0] else {
+        panic!(
+            "EXPLAIN result must be text, got {:?}",
+            explained.rows[0][0]
+        );
+    };
+    assert!(
+        plan.contains("Index Scan using manhattan_idx"),
+        "plan was: {plan}"
+    );
+    assert!(plan.contains("+"), "plan was: {plan}");
+
+    // Reopen: the catalog round-trips the expression tree.
+    database.close().expect("close");
+    let mut database = RelationalDatabase::open(config(&database_path)).expect("reopen database");
+    let result = database
+        .execute_sql("SELECT id FROM positions WHERE x + y = 7")
+        .expect("expression lookup after reopen");
+    assert_eq!(result.rows.len(), 2);
+    let explained = database
+        .execute_sql("EXPLAIN SELECT id FROM positions WHERE x + y = 7")
+        .expect("explain after reopen");
+    let Value::Text(plan) = &explained.rows[0][0] else {
+        panic!(
+            "EXPLAIN result must be text, got {:?}",
+            explained.rows[0][0]
+        );
+    };
+    assert!(plan.contains("manhattan_idx"), "plan was: {plan}");
+}
+
+#[test]
 fn window_functions_match_postgresql_semantics() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("window-db");

@@ -5,7 +5,8 @@
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
-    RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId, Value,
+    IndexKeyPart, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId,
+    Value,
 };
 use tempfile::tempdir;
 
@@ -66,7 +67,8 @@ fn setup() -> (tempfile::TempDir, RelationalDatabase) {
             .create_index(IndexDefinition {
                 id: omendb::IndexId(table.0),
                 table,
-                columns: vec![ColumnId(1)],
+                parts: vec![IndexKeyPart::Column(ColumnId(1))],
+                predicate: None,
                 unique: true,
             })
             .expect("primary index");
@@ -253,7 +255,8 @@ fn cascade_depth_bound_rejects_deeper_than_max_chains() {
         .create_index(IndexDefinition {
             id: omendb::IndexId(70),
             table: CHAIN,
-            columns: vec![ColumnId(1)],
+            parts: vec![IndexKeyPart::Column(ColumnId(1))],
+            predicate: None,
             unique: true,
         })
         .expect("chain index");

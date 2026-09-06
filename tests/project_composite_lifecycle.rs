@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, NamedIndexDefinition,
-    RelationalDatabase, RelationalSchemaDefinition, Row, TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, IndexKeyPart, Key,
+    NamedIndexDefinition, RelationalDatabase, RelationalSchemaDefinition, Row, TableDefinition,
+    TableId, Value,
 };
 use tempfile::tempdir;
 
@@ -69,7 +70,8 @@ fn schema() -> RelationalSchemaDefinition {
                 definition: IndexDefinition {
                     id: STATE_INDEX,
                     table: ITEMS,
-                    columns: vec![ColumnId(3)],
+                    parts: vec![IndexKeyPart::Column(ColumnId(3))],
+                    predicate: None,
                     unique: false,
                 },
                 name: Some("composite_item_state".to_owned()),
@@ -78,7 +80,11 @@ fn schema() -> RelationalSchemaDefinition {
                 definition: IndexDefinition {
                     id: VERSION_INDEX,
                     table: ITEMS,
-                    columns: vec![ColumnId(1), ColumnId(4)],
+                    parts: vec![
+                        IndexKeyPart::Column(ColumnId(1)),
+                        IndexKeyPart::Column(ColumnId(4)),
+                    ],
+                    predicate: None,
                     unique: false,
                 },
                 name: Some("composite_item_version".to_owned()),

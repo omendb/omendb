@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, Key, RelationalDatabase, Row,
-    TableDefinition, TableId, Value,
+    ColumnDefinition, ColumnId, ColumnType, IndexDefinition, IndexId, IndexKeyPart, Key,
+    RelationalDatabase, Row, TableDefinition, TableId, Value,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -131,7 +131,11 @@ fn exercise_r3_operational_lifecycle(directory: &Path) {
         .create_index(IndexDefinition {
             id: ORDER_STATUS_INDEX,
             table: ORDERS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(3)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(3)),
+            ],
+            predicate: None,
             unique: false,
         })
         .expect("create status index");
@@ -224,7 +228,11 @@ fn exercise_r3_operational_lifecycle(directory: &Path) {
         .create_index(IndexDefinition {
             id: ORDER_PRIORITY_INDEX,
             table: ORDERS_TABLE,
-            columns: vec![ColumnId(1), ColumnId(5)],
+            parts: vec![
+                IndexKeyPart::Column(ColumnId(1)),
+                IndexKeyPart::Column(ColumnId(5)),
+            ],
+            predicate: None,
             unique: false,
         })
         .expect("create priority index");

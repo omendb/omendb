@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, GovernorConfig, IndexDefinition, IndexId, Key,
-    OverloadPolicy, Reactor, ReactorConfig, RelationalBackendConfig, RelationalDatabase, Row,
+    ColumnDefinition, ColumnId, ColumnType, GovernorConfig, IndexDefinition, IndexId, IndexKeyPart,
+    Key, OverloadPolicy, Reactor, ReactorConfig, RelationalBackendConfig, RelationalDatabase, Row,
     TableDefinition, TableId, Value, WorkClass,
 };
 use tempfile::tempdir;
@@ -90,7 +90,8 @@ fn exercise_governed_database_workload(directory: &Path) {
         .create_index(IndexDefinition {
             id: ORDER_STATUS_INDEX,
             table: ORDERS_TABLE,
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: false,
         })
         .expect("create order index");

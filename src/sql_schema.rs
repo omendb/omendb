@@ -1,8 +1,10 @@
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, ColumnOption, CreateIndex, CreateTable, DataType,
+    AlterTable, AlterTableOperation, ColumnOption, CreateIndex, CreateTable, DataType, Expr,
     NullsDistinctOption, ObjectType, Statement, TableConstraint, TimezoneInfo,
 };
 
+use super::values::{coerce_value, literal_value};
+use crate::Value;
 use crate::{
     ColumnDefinition, ColumnId, ColumnType, CommitId, ConstraintId, DbError, IndexId,
     NamedForeignKeyDefinition, NamedIndexDefinition, RelationalDatabase,
@@ -25,20 +27,24 @@ pub(super) fn execute_create_index(
         || !create.include.is_empty()
         || create.nulls_distinct.is_some()
         || !create.with.is_empty()
-        || create.predicate.is_some()
         || !create.index_options.is_empty()
         || !create.alter_options.is_empty()
     {
         return Err(unsupported(
             "CREATE INDEX",
-            "only a plain non-concurrent index over named columns is supported",
+            "only a plain non-concurrent index is supported",
         ));
     }
     let index_name = simple_object_name(name, "index")?.to_owned();
     let table_name = simple_object_name(&create.table_name, "table")?;
-    let (table_id, columns, index_id) = {
+    let predicate = create
+        .predicate
+        .as_ref()
+        .map(|expression| index_predicate(database.catalog(), table_name, expression))
+        .transpose()?;
+    let (table_id, parts, index_id) = {
         let table = find_table(database.catalog(), table_name)?;
-        let mut columns = Vec::with_capacity(create.columns.len());
+        let mut parts = Vec::with_capacity(create.columns.len());
         for index_column in &create.columns {
             if index_column.operator_class.is_some()
                 || index_column.column.options.asc == Some(false)
@@ -47,19 +53,10 @@ pub(super) fn execute_create_index(
             {
                 return Err(unsupported(
                     "CREATE INDEX",
-                    "only ascending plain column keys are supported",
+                    "only ascending keys are supported",
                 ));
             }
-            let position = column_position(table, &index_column.column.expr)?.ok_or_else(|| {
-                DbError::InvalidState(format!(
-                    "index column {} does not exist",
-                    index_column.column.expr
-                ))
-            })?;
-            let column = table.columns.get(position).ok_or_else(|| {
-                DbError::InvalidState("index column position is invalid".to_owned())
-            })?;
-            columns.push(column.id);
+            parts.push(index_key_part(table, &index_column.column.expr)?);
         }
         let index_id = database
             .catalog()
@@ -69,14 +66,15 @@ pub(super) fn execute_create_index(
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| DbError::InvalidState("no SQL index ID is available".to_owned()))?;
-        (table.id, columns, IndexId(index_id))
+        (table.id, parts, IndexId(index_id))
     };
     database.create_named_index(
         crate::IndexDefinition {
             id: index_id,
             table: table_id,
-            columns,
+            parts,
             unique: create.unique,
+            predicate,
         },
         index_name,
     )
@@ -305,8 +303,12 @@ fn alter_table_mutation(
                         index: crate::IndexDefinition {
                             id: IndexId(index_id),
                             table: table.id,
-                            columns: simple_index_columns(table, &unique.columns, "UNIQUE")?,
+                            parts: simple_index_columns(table, &unique.columns, "UNIQUE")?
+                                .into_iter()
+                                .map(crate::IndexKeyPart::Column)
+                                .collect(),
                             unique: true,
+                            predicate: None,
                         },
                         name: primary_object_name(
                             unique.name.as_ref(),
@@ -723,8 +725,12 @@ pub(super) fn execute_create_table(
                     definition: crate::IndexDefinition {
                         id: IndexId(next_index_id),
                         table: table.id,
-                        columns: simple_index_columns(&table, &unique.columns, "UNIQUE")?,
+                        parts: simple_index_columns(&table, &unique.columns, "UNIQUE")?
+                            .into_iter()
+                            .map(crate::IndexKeyPart::Column)
+                            .collect(),
                         unique: true,
+                        predicate: None,
                     },
                     name: primary_object_name(unique.name.as_ref(), unique.index_name.as_ref())?,
                 });
@@ -809,8 +815,13 @@ pub(super) fn execute_create_table(
             definition: crate::IndexDefinition {
                 id: IndexId(next_index_id),
                 table: table.id,
-                columns: primary_columns.clone(),
+                parts: primary_columns
+                    .clone()
+                    .into_iter()
+                    .map(crate::IndexKeyPart::Column)
+                    .collect(),
                 unique: true,
+                predicate: None,
             },
             name: primary_name,
         },
@@ -848,6 +859,165 @@ fn column_id_by_name(table: &TableDefinition, name: &str, role: &str) -> Result<
         .find(|column| column.name == name)
         .map(|column| column.id)
         .ok_or_else(|| DbError::InvalidState(format!("{role} column {name} does not exist")))
+}
+
+/// Translate one WHERE/INDEX key expression into the typed index tree
+/// the catalog persists. Shared by DDL (CREATE INDEX) and the planner
+/// (matching `expr = literal` equality terms to expression index parts).
+pub(super) fn plan_index_expression(
+    table: &TableDefinition,
+    expression: &Expr,
+) -> Result<crate::IndexExpression> {
+    use crate::{ArithmeticOperator, IndexExpression};
+
+    if let Some(position) = column_position(table, expression)? {
+        return Ok(IndexExpression::Column(table.columns[position].id));
+    }
+    let Expr::BinaryOp { left, op, right } = expression else {
+        return Err(unsupported(
+            "expression",
+            "only columns and +, -, *, / arithmetic over them are supported here",
+        ));
+    };
+    let op = match op {
+        sqlparser::ast::BinaryOperator::Plus => ArithmeticOperator::Add,
+        sqlparser::ast::BinaryOperator::Minus => ArithmeticOperator::Subtract,
+        sqlparser::ast::BinaryOperator::Multiply => ArithmeticOperator::Multiply,
+        sqlparser::ast::BinaryOperator::Divide => ArithmeticOperator::Divide,
+        other => {
+            return Err(unsupported(
+                "expression",
+                &format!("operator {other} is not supported here"),
+            ));
+        }
+    };
+    Ok(IndexExpression::Arithmetic {
+        left: Box::new(plan_index_expression(table, left)?),
+        op,
+        right: Box::new(plan_index_expression(table, right)?),
+    })
+}
+
+/// Translate one index key expression: a plain column or a supported
+/// arithmetic shape. The typed tree persists in the catalog, so the write
+/// path never re-parses SQL.
+fn index_key_part(table: &TableDefinition, expression: &Expr) -> Result<crate::IndexKeyPart> {
+    use crate::{ArithmeticOperator, IndexExpression, IndexKeyPart};
+
+    // Plain column.
+    if let Some(position) = column_position(table, expression)? {
+        return Ok(IndexKeyPart::Column(table.columns[position].id));
+    }
+
+    pub(super) fn plan_expression(
+        table: &TableDefinition,
+        expression: &Expr,
+    ) -> Result<IndexExpression> {
+        if let Some(position) = column_position(table, expression)? {
+            return Ok(IndexExpression::Column(table.columns[position].id));
+        }
+        let Expr::BinaryOp { left, op, right } = expression else {
+            return Err(unsupported(
+                "CREATE INDEX",
+                "index keys support columns and +, -, *, / arithmetic over them",
+            ));
+        };
+        let op = match op {
+            sqlparser::ast::BinaryOperator::Plus => ArithmeticOperator::Add,
+            sqlparser::ast::BinaryOperator::Minus => ArithmeticOperator::Subtract,
+            sqlparser::ast::BinaryOperator::Multiply => ArithmeticOperator::Multiply,
+            sqlparser::ast::BinaryOperator::Divide => ArithmeticOperator::Divide,
+            other => {
+                return Err(unsupported(
+                    "CREATE INDEX",
+                    &format!("index expression operator {other} is not supported"),
+                ));
+            }
+        };
+        Ok(IndexExpression::Arithmetic {
+            left: Box::new(plan_expression(table, left)?),
+            op,
+            right: Box::new(plan_expression(table, right)?),
+        })
+    }
+
+    Ok(IndexKeyPart::Expression(plan_expression(
+        table, expression,
+    )?))
+}
+
+/// Translate a partial-index WHERE clause into the supported predicate:
+/// a conjunction of `column = literal` equality terms.
+fn index_predicate(
+    catalog: &crate::Catalog,
+    table_name: &str,
+    expression: &Expr,
+) -> Result<crate::IndexPredicate> {
+    let table = find_table(catalog, table_name)?;
+    let mut terms = Vec::new();
+    collect_equality_terms_static(table, expression, &mut terms)?;
+    Ok(crate::IndexPredicate { terms })
+}
+
+/// Collect `column = literal` terms from an AND chain. Literals only:
+/// predicate values are stored in the catalog and must be stable.
+fn collect_equality_terms_static(
+    table: &TableDefinition,
+    expression: &Expr,
+    terms: &mut Vec<(crate::ColumnId, Value)>,
+) -> Result<()> {
+    match expression {
+        Expr::Nested(inner) => collect_equality_terms_static(table, inner, terms),
+        // `WHERE bool_col` is PostgreSQL's shorthand for `bool_col = true`:
+        // the canonical partial-index shape over an active/deleted flag.
+        Expr::Identifier(_) => {
+            let Some(position) = column_position(table, expression)? else {
+                return Err(unsupported(
+                    "CREATE INDEX",
+                    "a bare partial-index term must name a boolean column",
+                ));
+            };
+            let column = &table.columns[position];
+            if column.data_type != ColumnType::Bool {
+                return Err(unsupported(
+                    "CREATE INDEX",
+                    "a bare partial-index term must be a boolean column; compare other types explicitly",
+                ));
+            }
+            terms.push((column.id, Value::Bool(true)));
+            Ok(())
+        }
+        Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::And => {
+            collect_equality_terms_static(table, left, terms)?;
+            collect_equality_terms_static(table, right, terms)
+        }
+        Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::Eq => {
+            let (column_expression, value_expression) = match (
+                column_position(table, left)?,
+                column_position(table, right)?,
+            ) {
+                (Some(_), None) => (left, right),
+                (None, Some(_)) => (right, left),
+                _ => {
+                    return Err(unsupported(
+                        "CREATE INDEX",
+                        "partial index WHERE must be column = literal equality terms",
+                    ));
+                }
+            };
+            let position = column_position(table, column_expression)?.expect("matched side");
+            let value = coerce_value(
+                literal_value(value_expression, &[])?,
+                &table.columns[position],
+            )?;
+            terms.push((table.columns[position].id, value));
+            Ok(())
+        }
+        _ => Err(unsupported(
+            "CREATE INDEX",
+            "partial index WHERE must be a conjunction of column = literal equalities (or a bare boolean column)",
+        )),
+    }
 }
 
 fn simple_index_columns(

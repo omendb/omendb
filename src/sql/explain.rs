@@ -20,8 +20,9 @@ use super::{statement_kind, table_from_join, unsupported};
 pub(crate) enum AccessPath {
     /// One row fetched through its exact primary-key identity.
     PrimaryKeyLookup { table: String },
-    /// Rows fetched through one secondary index whose full column list
-    /// the predicate binds.
+    /// Rows fetched through one secondary index whose full key the
+    /// predicate binds; `columns` names each key part (a column or a
+    /// rendered expression).
     IndexScan {
         table: String,
         index: String,
@@ -121,7 +122,8 @@ fn explain_table_predicate(
         Some(PredicatePlan::NullShortCircuit) => AccessPath::NullShortCircuit {
             table: table.name.clone(),
         },
-        Some(PredicatePlan::IndexScan { index_id, .. }) => {
+        Some(PredicatePlan::IndexScan { index_id, .. })
+        | Some(PredicatePlan::ExpressionIndexScan { index_id, .. }) => {
             let definition = database
                 .catalog()
                 .index(index_id)
@@ -134,15 +136,18 @@ fn explain_table_predicate(
                     .unwrap_or("unnamed")
                     .to_owned(),
                 columns: definition
-                    .columns
+                    .parts
                     .iter()
-                    .map(|column| {
-                        table
+                    .map(|part| match part {
+                        crate::IndexKeyPart::Column(column) => table
                             .columns
                             .iter()
                             .find(|candidate| candidate.id == *column)
                             .map(|candidate| candidate.name.clone())
-                            .unwrap_or_else(|| format!("column {}", column.0))
+                            .unwrap_or_else(|| format!("column {}", column.0)),
+                        crate::IndexKeyPart::Expression(expression) => expression
+                            .to_sql_text(table)
+                            .unwrap_or_else(|_| format!("expression over table {}", table.name)),
                     })
                     .collect(),
             }

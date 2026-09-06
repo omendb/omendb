@@ -1264,7 +1264,17 @@ fn resolve_foreign_key_parts(
     let referenced_definition = catalog.table(foreign_key.referenced_table)?.clone();
     let referenced_index = catalog
         .indexes_for(foreign_key.referenced_table)
-        .find(|index| index.unique && index.columns == foreign_key.referenced_columns)
+        .find(|index| {
+            index.unique
+                && index.predicate.is_none()
+                && index.parts.len() == foreign_key.referenced_columns.len()
+                && index.parts.iter().all(|part| match part {
+                    crate::IndexKeyPart::Column(column) => {
+                        foreign_key.referenced_columns.contains(column)
+                    }
+                    crate::IndexKeyPart::Expression(_) => false,
+                })
+        })
         .cloned()
         .ok_or_else(|| {
             DbError::InvalidState(format!(
@@ -1765,6 +1775,7 @@ fn map_seer_error(error: SeerError) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::IndexKeyPart;
     use crate::{ColumnDefinition, ColumnType, Key, Value};
     use tempfile::tempdir;
 
@@ -1813,7 +1824,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: false,
             })
             .expect("create index");
@@ -1973,7 +1985,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: true,
             })
             .expect("create index");
@@ -2037,7 +2050,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: false,
             })
             .expect("create non-unique email index");
@@ -2045,7 +2059,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(2),
                 table: TableId(2),
-                columns: vec![ColumnId(1)],
+                parts: vec![IndexKeyPart::Column(ColumnId(1))],
+                predicate: None,
                 unique: true,
             })
             .expect("create unique order index");
@@ -2183,7 +2198,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: true,
             })
             .expect("create unique index");
@@ -2234,7 +2250,8 @@ mod tests {
         let duplicate_index = IndexDefinition {
             id: IndexId(9),
             table: TableId(2),
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: true,
         };
         assert!(
@@ -2368,7 +2385,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: true,
             })
             .expect("create index");
@@ -2392,7 +2410,8 @@ mod tests {
             .create_index(IndexDefinition {
                 id: IndexId(1),
                 table: TableId(1),
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: true,
             })
             .expect("create unique index");

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use omendb::{
-    ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId, Key,
+    ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId, IndexKeyPart, Key,
     OperationControl, RelationalBackendConfig, RelationalDatabaseConfig, RelationalDatabaseSession,
     RelationalSessionConfig, Row, TableDefinition, TableId, Value,
 };
@@ -89,7 +89,8 @@ fn main() -> Result<()> {
             IndexDefinition {
                 id: STATE_INDEX,
                 table: TABLE,
-                columns: vec![ColumnId(2)],
+                parts: vec![IndexKeyPart::Column(ColumnId(2))],
+                predicate: None,
                 unique: false,
             },
         )

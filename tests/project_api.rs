@@ -2,8 +2,8 @@ use std::path::Path;
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
-    IndexId, Key, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition, TableId,
-    Value,
+    IndexId, IndexKeyPart, Key, RelationalBackendConfig, RelationalDatabase, Row, TableDefinition,
+    TableId, Value,
 };
 use tempfile::tempdir;
 
@@ -93,7 +93,8 @@ fn exercise_project_api(directory: &Path) {
         .create_index(IndexDefinition {
             id: USER_ID_INDEX,
             table: USERS,
-            columns: vec![ColumnId(1)],
+            parts: vec![IndexKeyPart::Column(ColumnId(1))],
+            predicate: None,
             unique: true,
         })
         .expect("user ID index");
@@ -101,7 +102,8 @@ fn exercise_project_api(directory: &Path) {
         .create_index(IndexDefinition {
             id: USER_EMAIL_INDEX,
             table: USERS,
-            columns: vec![ColumnId(2)],
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
             unique: true,
         })
         .expect("user email index");

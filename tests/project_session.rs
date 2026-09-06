@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use omendb::{
     CancellationToken, ColumnDefinition, ColumnId, ColumnType, DbError, IndexDefinition, IndexId,
-    Key, OperationControl, RelationalBackendConfig, RelationalDatabase, RelationalSessionConfig,
-    TableDefinition, TableId, TransactionErrorClass, Value,
+    IndexKeyPart, Key, OperationControl, RelationalBackendConfig, RelationalDatabase,
+    RelationalSessionConfig, TableDefinition, TableId, TransactionErrorClass, Value,
 };
 use tempfile::tempdir;
 
@@ -56,7 +56,8 @@ fn exercise_lifecycle(directory: &Path) {
             IndexDefinition {
                 id: VALUE_INDEX,
                 table: TABLE,
-                columns: vec![ColumnId(1)],
+                parts: vec![IndexKeyPart::Column(ColumnId(1))],
+                predicate: None,
                 unique: true,
             },
         )
