@@ -50,6 +50,14 @@ required-features = ["pgwire"]
 name = "pgwire_serve"
 required-features = ["pgwire"]
 
+[[example]]
+name = "sql_tier_probe"
+required-features = ["pgwire"]
+
+[[example]]
+name = "wire_tier_probe"
+required-features = ["pgwire"]
+
 [[bin]]
 name = "omendbd"
 path = "src/bin/omendbd.rs"

@@ -1644,6 +1644,19 @@ impl Drop for Transaction {
             let _ = self.runtime.release_snapshot(self.id);
             self.snapshot_registered = false;
         }
+        if self.pending_counted {
+            // A transaction dropped without commit or abort still held a
+            // pending-committer slot (wire-server probes and any caller that
+            // discards a snapshot early). Group-commit leaders wait only for
+            // committers that can still arrive, so a dropped slot that never
+            // releases makes every later commit leader sleep out the full
+            // coalescing window. Release it here, mirroring the read-only
+            // commit and abort paths.
+            self.runtime
+                .pending_transactions
+                .fetch_sub(1, Ordering::AcqRel);
+            self.pending_counted = false;
+        }
     }
 }
 
@@ -2946,6 +2959,64 @@ mod tests {
         let mut transaction = database.begin().expect("begin");
         transaction.put(tree, key, key).expect("put");
         transaction.commit().expect("commit");
+    }
+
+    #[test]
+    fn dropped_active_transaction_releases_pending_committer_slot() {
+        let (directory, database) = database();
+        let owned = tree(&database);
+
+        // Begin a transaction and drop it without commit or abort: the
+        // shape every wire-server probe (describe, grants, autocommit reads)
+        // uses. Drop must release the pending-committer slot, or every
+        // later commit leader sees a phantom pending committer and sleeps
+        // out the full coalescing window.
+        {
+            let transaction = database.begin().expect("begin");
+            let _ = transaction;
+        }
+        assert_eq!(
+            database
+                .runtime
+                .pending_transactions
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "dropped active transaction leaked a pending-committer slot"
+        );
+
+        // Read-only commits never stage, but they hold a slot between begin
+        // and commit; commit must release it too.
+        {
+            let mut transaction = database.begin().expect("begin read-only");
+            let _ = transaction.get(owned, b"missing").expect("point read");
+            transaction.commit().expect("commit read-only");
+        }
+        assert_eq!(
+            database
+                .runtime
+                .pending_transactions
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "read-only commit leaked a pending-committer slot"
+        );
+
+        // And a writing commit releases its slot at stage time.
+        {
+            let mut transaction = database.begin().expect("begin writer");
+            transaction.put(owned, b"k", b"v").expect("put");
+            transaction.commit().expect("commit writer");
+        }
+        assert_eq!(
+            database
+                .runtime
+                .pending_transactions
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "writing commit leaked a pending-committer slot"
+        );
+
+        drop(database);
+        drop(directory);
     }
 
     #[test]
