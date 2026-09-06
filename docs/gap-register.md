@@ -64,15 +64,25 @@ primitive.
   reporting `serializable` accurately is a follow-up once the SQL-tier
   BEGIN options surface isolation choice.
 
-## SQL breadth — medium severity
+## SQL breadth — closed (2026-09-06)
 
 - Strong core: joins (inner/non-equi/cross/left/right/full, USING,
   NATURAL), scalar/IN/EXISTS subqueries, aggregates, set operations,
   `RETURNING`, `UPDATE ... FROM`, `DELETE ... USING`
   (`docs/pgwire-compatibility.md`).
-- Missing: scalar functions (`CASE`, `COALESCE`, `UPPER`, `LOWER`,
-  `LENGTH`, ...), window functions, expression/partial indexes,
-  `GROUPING SETS`. Function support blocks on the type system.
+- Landed across item 7: `CASE`/`COALESCE`; clock functions
+  (`now()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`); the scalar catalog
+  (text: `upper`/`lower`/`length`/`btrim`/`ltrim`/`rtrim`; numeric:
+  `abs`/`round`/`floor`/`ceil`; datetime: `EXTRACT`/`date_part`/
+  `date_trunc`); heap tables (no PRIMARY KEY) with engine-allocated
+  durable identities; serializable certification (write-skew aborts
+  with SQLSTATE 40001); window functions (ranking, offsets, values,
+  running aggregates with PostgreSQL default frames); partial and
+  expression indexes (catalog format v6).
+- Residual: `GROUPING SETS` remains unsupported; window frames and
+  named windows are refused honestly; index expressions cover
+  arithmetic only; `nth_value` and explicit `lag`/`lead` offsets are
+  refused honestly.
 
 ## Durability performance — medium severity, root cause re-measured
 
