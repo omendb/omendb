@@ -322,6 +322,129 @@ async fn describe_reports_static_column_types_for_empty_results() {
 }
 
 #[tokio::test]
+async fn window_functions_evaluate_and_describe_through_the_wire() {
+    let directory = tempdir().expect("tempdir");
+    let database_path = directory.path().join("db");
+    let config =
+        pgwire_server::ServerConfig::new(&database_path, "127.0.0.1:0".parse().expect("addr"));
+    let server = pgwire_server::RunningServer::start(config)
+        .await
+        .expect("start persistent server");
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("connect");
+    let connection_task = tokio::spawn(connection);
+
+    client
+        .batch_execute(
+            "CREATE TABLE w (id BIGINT PRIMARY KEY, grp BIGINT NOT NULL, amount BIGINT NOT NULL)",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO w VALUES (1, 10, 100), (2, 10, 100), (3, 10, 300), (4, 20, 200)",
+        )
+        .await
+        .expect("seed");
+
+    // Ranking with ties through a prepared statement; describe resolves
+    // the window column as int8 without executing the query.
+    let prepared = client
+        .prepare("SELECT id, rank() OVER (ORDER BY amount, id) FROM w ORDER BY id")
+        .await
+        .expect("prepare window rank");
+    let columns = prepared.columns();
+    assert_eq!(columns[0].name(), "id");
+    assert_eq!(columns[1].name(), "rank");
+    assert_eq!(columns[1].type_(), &tokio_postgres::types::Type::INT8);
+    let rows = client.query(&prepared, &[]).await.expect("window rank");
+    // Ordered by (amount, id) there is no tie: 100(1), 100(2), 200(4),
+    // 300(3) — ranks 1..4. Reported in statement order (by id): the
+    // id=3 row carries rank 4 and the id=4 row rank 3.
+    let ranks: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+    assert_eq!(ranks, [1, 2, 4, 3]);
+
+    // Partitioned running sum and lag with an edge NULL.
+    client
+        .batch_execute("INSERT INTO w VALUES (5, 10, 300)")
+        .await
+        .expect("seed tie");
+    let rows = client
+        .query(
+            "SELECT id, sum(amount) OVER (PARTITION BY grp ORDER BY amount, id), lag(amount) OVER (PARTITION BY grp ORDER BY amount, id) FROM w ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("running sum and lag");
+    // Group 10 by (amount, id): 100(1), 100(2), 300(3), 300(5):
+    // cumulative 100, 200, 500, 800; lag NULL, 100, 100, 300.
+    let sum_for = |id: i64| -> i64 {
+        rows.iter()
+            .find(|row| row.get::<_, i64>(0) == id)
+            .map(|row| row.get(1))
+            .expect("sum row")
+    };
+    assert_eq!(sum_for(1), 100);
+    assert_eq!(sum_for(2), 200);
+    assert_eq!(sum_for(3), 500);
+    assert_eq!(sum_for(5), 800);
+    let lag_of = |id: i64| -> Option<i64> {
+        rows.iter()
+            .find(|row| row.get::<_, i64>(0) == id)
+            .map(|row| row.get(2))
+            .expect("lag row")
+    };
+    assert_eq!(lag_of(1), None);
+    assert_eq!(lag_of(2), Some(100));
+    assert_eq!(lag_of(5), Some(300));
+
+    // count(*) OVER with no ORDER BY: the whole-partition count.
+    let rows = client
+        .query(
+            "SELECT id, count(*) OVER (PARTITION BY grp) FROM w ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("partition count");
+    let counts: Vec<(i64, i64)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+    assert_eq!(counts, [(1, 4), (2, 4), (3, 4), (4, 1), (5, 4)]);
+
+    // Refused shapes surface as clean errors and leave the session usable.
+    let error = client
+        .query(
+            "SELECT sum(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w",
+            &[],
+        )
+        .await
+        .expect_err("frames refused");
+    let message = error
+        .as_db_error()
+        .expect("wire frame refusal is a database error")
+        .message()
+        .to_owned();
+    assert!(
+        message.contains("window frames"),
+        "actual error message: {message}"
+    );
+    let rows = client
+        .query("SELECT count(*) FROM w", &[])
+        .await
+        .expect("session still usable");
+    let count: i64 = rows[0].get(0);
+    assert_eq!(count, 5);
+
+    drop(client);
+    let _ = connection_task.await;
+}
+
+#[tokio::test]
 async fn case_and_coalesce_evaluate_through_the_wire() {
     let directory = tempdir().expect("tempdir");
     let database_path = directory.path().join("db");

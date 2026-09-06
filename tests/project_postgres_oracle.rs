@@ -283,6 +283,45 @@ async fn documented_wire_subset_matches_live_postgresql() -> Result<()> {
     )
     .await?;
 
+    // Window functions: ranking with ties, partitioned running sums,
+    // lag/lead, and whole-partition aggregates with no ORDER BY must
+    // byte-match the live PostgreSQL oracle.
+    compare_query(
+        &omendb,
+        &postgres,
+        "SELECT id, balance, rank() OVER (ORDER BY balance), dense_rank() OVER (ORDER BY balance) FROM oracle_accounts ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    // Window sum/avg over integers diverge by type (OmenDB returns the
+    // argument type / float8, PostgreSQL returns NUMERIC) - the same
+    // documented divergence as OmenDB's plain aggregates - so the oracle
+    // compares the window shapes whose result types agree.
+    compare_query(
+        &omendb,
+        &postgres,
+        "SELECT id, lag(balance) OVER (PARTITION BY group_id ORDER BY balance), lead(balance) OVER (PARTITION BY group_id ORDER BY balance) FROM oracle_accounts ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    compare_query(
+        &omendb,
+        &postgres,
+        "SELECT id, count(*) OVER (PARTITION BY group_id), min(balance) OVER (PARTITION BY group_id) FROM oracle_accounts ORDER BY id",
+        &[],
+    )
+    .await?;
+
+    compare_query(
+        &omendb,
+        &postgres,
+        "SELECT id, row_number() OVER (PARTITION BY group_id ORDER BY balance, id) FROM oracle_accounts ORDER BY id",
+        &[],
+    )
+    .await?;
+
     let updated_balance = 55_i64;
     let updated_id = 2_i64;
     compare_query(

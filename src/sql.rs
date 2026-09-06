@@ -44,6 +44,9 @@ mod write;
 #[path = "sql/explain.rs"]
 mod explain;
 
+#[path = "sql/window.rs"]
+pub(crate) mod window;
+
 mod result {
     use crate::{CommitId, Value};
 
@@ -744,7 +747,14 @@ pub(super) fn statement_access(
                     collect_expr_tables(else_result, read);
                 }
             }
-            SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+            SqlExpr::Function(func)
+                if func.name.to_string().eq_ignore_ascii_case("coalesce")
+                    || func.over.is_some() =>
+            {
+                // COALESCE and window calls (OVER ...) can carry column
+                // references in their arguments; grant analysis must see
+                // them so a role cannot read a column through lag(amount)
+                // that a plain projection would refuse.
                 if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
                     for argument in &list.args {
                         if let sqlparser::ast::FunctionArg::Unnamed(
@@ -753,6 +763,14 @@ pub(super) fn statement_access(
                         {
                             collect_expr_tables(expression, read);
                         }
+                    }
+                }
+                if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
+                    for expression in &spec.partition_by {
+                        collect_expr_tables(expression, read);
+                    }
+                    for term in &spec.order_by {
+                        collect_expr_tables(&term.expr, read);
                     }
                 }
             }

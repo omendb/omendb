@@ -142,8 +142,16 @@ test suites:
   the truth.
 - **Not yet:** TLS termination (the server declines `SSLRequest`; terminate
   TLS in front or bind private), `COPY`, replication, notifications, cursors,
-  incremental portals, pg_catalog, `CASE`/`COALESCE` and text/date function
-  breadth, serializable certification, and window functions.
+  incremental portals, and pg_catalog. Window functions are in: ranking
+  (`row_number`, `rank`, `dense_rank`), offsets (`lag`, `lead`), values
+  (`first_value`, `last_value`), and aggregates (`count`, `sum`, `avg`,
+  `min`, `max`) over `PARTITION BY`/`ORDER BY`, with PostgreSQL default
+  frames (whole partition without ORDER BY, running prefix with) and
+  explicit frames/named windows refused honestly. `sum`/`avg` over
+  integers return the argument type / `float8`, not PostgreSQL's NUMERIC
+  (documented divergence, same as OmenDB's plain aggregates). Serializable
+  certification: read-write transactions certify first-committer-wins
+  (write-skew aborts with SQLSTATE 40001).
 
 ## Development
 

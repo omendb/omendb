@@ -86,7 +86,9 @@ pub(super) fn execute_query(
         return Err(unsupported("SELECT", "only plain DISTINCT is supported"));
     }
     let scalars = resolve_scalar_subqueries(database, transaction, &select.projection, params)?;
-    let projection = projection_plan_for_select(select, table, params, &scalars)?;
+    let windows = crate::sql::window::window_calls(select, table)?;
+    let projection =
+        projection_plan_for_select(select, table, params, &scalars, windows.as_deref())?;
     let order = order_plan(query.order_by.as_ref(), table)?;
     let (offset, limit) = query_window(query, params)?;
     if limit == 0 {
@@ -122,10 +124,15 @@ pub(super) fn execute_query(
         validate_order_rows(&matching_rows, table, &order)?;
         matching_rows.sort_by(|left, right| compare_rows(left, right, &order));
     }
+    let window_values = match &windows {
+        Some(calls) => crate::sql::window::evaluate_window_columns(&matching_rows, calls)?,
+        None => Vec::new(),
+    };
     let mut projected_rows = Vec::with_capacity(matching_rows.len());
-    for row in matching_rows {
+    for (row_index, row) in matching_rows.into_iter().enumerate() {
         transaction.check_operation_control()?;
-        projected_rows.push(project_row(&projection, &row)?);
+        let window_row = window_values.get(row_index).cloned().unwrap_or_default();
+        projected_rows.push(project_values(&projection, &row.values, &window_row)?);
     }
     let projected_rows = if select.distinct.is_some() {
         apply_distinct(projected_rows)
@@ -1241,10 +1248,10 @@ fn plan_computed(
 }
 
 #[derive(Clone, Copy)]
-struct OrderTerm {
-    position: usize,
-    ascending: bool,
-    nulls_first: bool,
+pub(crate) struct OrderTerm {
+    pub(crate) position: usize,
+    pub(crate) ascending: bool,
+    pub(crate) nulls_first: bool,
 }
 
 fn order_plan(order_by: Option<&OrderBy>, table: &TableDefinition) -> Result<Vec<OrderTerm>> {
@@ -1314,7 +1321,7 @@ fn validate_order_rows(rows: &[Row], table: &TableDefinition, terms: &[OrderTerm
     Ok(())
 }
 
-fn compare_rows(left: &Row, right: &Row, terms: &[OrderTerm]) -> Ordering {
+pub(crate) fn compare_rows(left: &Row, right: &Row, terms: &[OrderTerm]) -> Ordering {
     for term in terms {
         let left_value = &left.values[term.position];
         let right_value = &right.values[term.position];
@@ -1358,6 +1365,9 @@ struct ProjectionPlan {
     literals: Vec<Option<Value>>,
     /// Per-row arithmetic expressions, checked before positions.
     computed: Vec<Option<ComputedTerm>>,
+    /// Window output columns: the index into the per-row window values
+    /// the plain-SELECT path evaluates before projection.
+    windows: Vec<Option<usize>>,
 }
 
 fn projection_plan_for_select(
@@ -1365,9 +1375,10 @@ fn projection_plan_for_select(
     table: &TableDefinition,
     params: &[Value],
     scalars: &ScalarSubqueries,
+    windows: Option<&[crate::sql::window::WindowCall]>,
 ) -> Result<ProjectionPlan> {
     // Plain DISTINCT is applied post-projection by the caller.
-    projection_plan(select, table, params, scalars)
+    projection_plan(select, table, params, scalars, windows)
 }
 
 fn projection_plan(
@@ -1375,6 +1386,7 @@ fn projection_plan(
     table: &TableDefinition,
     params: &[Value],
     scalars: &ScalarSubqueries,
+    windows: Option<&[crate::sql::window::WindowCall]>,
 ) -> Result<ProjectionPlan> {
     if select.select_modifiers.is_some()
         || select.top.is_some()
@@ -1401,6 +1413,8 @@ fn projection_plan(
     let mut positions = Vec::new();
     let mut literals = Vec::new();
     let mut computed: Vec<Option<ComputedTerm>> = Vec::new();
+    let mut window_columns = Vec::new();
+    let mut next_window = 0usize;
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(options) if options.to_string().is_empty() => {
@@ -1409,6 +1423,7 @@ fn projection_plan(
                     positions.push(Some(position));
                     literals.push(None);
                     computed.push(None);
+                    window_columns.push(None);
                 }
             }
             SelectItem::UnnamedExpr(expression)
@@ -1427,6 +1442,7 @@ fn projection_plan(
                     positions.push(Some(position));
                     literals.push(None);
                     computed.push(None);
+                    window_columns.push(None);
                 } else if let Expr::Subquery(_) = expression {
                     let key = expression.to_string();
                     let value = scalars.get(&key).ok_or_else(|| {
@@ -1441,6 +1457,30 @@ fn projection_plan(
                     positions.push(None);
                     literals.push(Some(value.clone()));
                     computed.push(None);
+                    window_columns.push(None);
+                } else if let Expr::Function(func) = expression
+                    && func.over.is_some()
+                {
+                    let Some(windows) = windows else {
+                        return Err(unsupported(
+                            "SELECT",
+                            "window functions are only supported in a plain SELECT",
+                        ));
+                    };
+                    let call = windows.get(next_window).ok_or_else(|| {
+                        DbError::InvalidState(
+                            "window call was not resolved before projection".to_owned(),
+                        )
+                    })?;
+                    next_window += 1;
+                    columns.push(SqlColumn {
+                        name: alias.unwrap_or_else(|| func.name.to_string().to_ascii_lowercase()),
+                        column_type: Some(call.static_type(table)),
+                    });
+                    positions.push(None);
+                    literals.push(None);
+                    computed.push(None);
+                    window_columns.push(Some(next_window - 1));
                 } else if let Some(term) = plan_computed(expression, table, params) {
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
@@ -1449,6 +1489,7 @@ fn projection_plan(
                     positions.push(None);
                     literals.push(None);
                     computed.push(Some(term));
+                    window_columns.push(None);
                 } else {
                     let literal = literal_value(expression, params)?;
                     columns.push(SqlColumn {
@@ -1458,6 +1499,7 @@ fn projection_plan(
                     positions.push(None);
                     literals.push(Some(literal));
                     computed.push(None);
+                    window_columns.push(None);
                 }
             }
             _ => return Err(unsupported("SELECT", "this projection is not supported")),
@@ -1471,28 +1513,37 @@ fn projection_plan(
     while computed.len() < columns.len() {
         computed.push(None);
     }
+    while window_columns.len() < columns.len() {
+        window_columns.push(None);
+    }
     Ok(ProjectionPlan {
         columns,
         positions,
         literals,
         computed,
+        windows: window_columns,
     })
 }
 
-fn project_row(projection: &ProjectionPlan, row: &Row) -> Result<Vec<Value>> {
-    project_values(projection, &row.values)
-}
-
-fn project_values(projection: &ProjectionPlan, values: &[Value]) -> Result<Vec<Value>> {
+fn project_values(
+    projection: &ProjectionPlan,
+    values: &[Value],
+    window_values: &[Value],
+) -> Result<Vec<Value>> {
     let mut output = Vec::with_capacity(projection.columns.len());
-    for ((position, literal), computed) in projection
+    for (((position, literal), computed), window) in projection
         .positions
         .iter()
         .zip(&projection.literals)
         .zip(&projection.computed)
+        .zip(&projection.windows)
     {
         if let Some(term) = computed {
             output.push(term.evaluate(values)?);
+        } else if let Some(index) = window {
+            output.push(window_values.get(*index).cloned().ok_or_else(|| {
+                DbError::InvalidState("row is missing a window value".to_owned())
+            })?);
         } else {
             output.push(match (position, literal) {
                 (Some(position), None) => values.get(*position).cloned().ok_or_else(|| {
@@ -1779,7 +1830,7 @@ fn execute_join_query(
     let projection = join_projection_plan(select, &combined_columns, params)?;
     let projected = combined_rows
         .into_iter()
-        .map(|row| project_values(&projection, &row))
+        .map(|row| project_values(&projection, &row, &[]))
         .collect::<Result<Vec<_>>>()?;
     let projected = if select.distinct.is_some() {
         apply_distinct(projected)
@@ -2461,11 +2512,16 @@ fn join_projection_plan(
     while computed.len() < columns.len() {
         computed.push(None);
     }
+    let mut window_columns = Vec::new();
+    while window_columns.len() < columns.len() {
+        window_columns.push(None);
+    }
     Ok(ProjectionPlan {
         columns,
         positions,
         literals,
         computed,
+        windows: window_columns,
     })
 }
 
@@ -3224,10 +3280,12 @@ fn is_aggregate_query(select: &Select) -> bool {
     }
     fn is_row_function(expression: &Expr) -> bool {
         // Row functions evaluate per row (COALESCE, the scalar catalog);
-        // everything else that parses as a function is an aggregate.
+        // window calls get their own phase; everything else that parses
+        // as a function is an aggregate.
         matches!(expression, Expr::Function(func)
             if !func.name.to_string().eq_ignore_ascii_case("coalesce")
-                && scalar_function_arity(&func.name.to_string()).is_none())
+                && scalar_function_arity(&func.name.to_string()).is_none()
+                && func.over.is_none())
     }
     select.projection.iter().any(|item| match item {
         SelectItem::UnnamedExpr(expression)

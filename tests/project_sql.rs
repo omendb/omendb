@@ -357,6 +357,166 @@ fn update_assignment_arithmetic_matches_read_modify_write() {
 }
 
 #[test]
+fn window_functions_match_postgresql_semantics() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database_path = directory.path().join("window-db");
+    let mut database = RelationalDatabase::create(config(&database_path)).expect("create database");
+
+    // Sales rows chosen to exercise ties, partitions, and deterministic
+    // evaluation independent of scan order.
+    database
+        .execute_sql("CREATE TABLE sales (rep TEXT PRIMARY KEY, region TEXT NOT NULL, amount BIGINT NOT NULL)")
+        .expect("create sales");
+    for (region, rep, amount) in [
+        ("east", "ana", 100),
+        ("east", "bob", 100),
+        ("east", "cid", 300),
+        ("west", "dee", 200),
+        ("west", "eva", 200),
+        ("west", "fin", 400),
+    ] {
+        database
+            .execute_sql(&format!(
+                "INSERT INTO sales VALUES ('{rep}', '{region}', {amount})"
+            ))
+            .expect("seed sales");
+    }
+
+    // Ranking with ties: rank leaves gaps after ties, dense_rank does not.
+    let result = database
+        .execute_sql(
+            "SELECT rep, amount, rank() OVER (ORDER BY amount), dense_rank() OVER (ORDER BY amount) FROM sales ORDER BY rep",
+        )
+        .expect("rank and dense_rank");
+    assert_eq!(result.rows.len(), 6);
+    let by_rep: std::collections::BTreeMap<String, Vec<Value>> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let Value::Text(rep) = &row[0] else {
+                panic!("rep must be text");
+            };
+            (rep.clone(), row.clone())
+        })
+        .collect();
+    let rank_dense = |rep: &str| {
+        let row = &by_rep[rep];
+        let (Value::I64(rank), Value::I64(dense)) = (&row[2], &row[3]) else {
+            panic!("{rep} ranks must be i64");
+        };
+        (*rank, *dense)
+    };
+    // Ordered by amount: 100,100,200,200,300,400. ana/bob tie at rank 1;
+    // dee/eva tie at rank 3 (gap past the first tie); cid 300 is rank 5;
+    // fin 400 is rank 6. Dense ranks: 1,1,2,2,3,4.
+    assert_eq!(rank_dense("ana"), (1, 1));
+    assert_eq!(rank_dense("bob"), (1, 1));
+    assert_eq!(rank_dense("dee"), (3, 2));
+    assert_eq!(rank_dense("eva"), (3, 2));
+    assert_eq!(rank_dense("cid"), (5, 3));
+    assert_eq!(rank_dense("fin"), (6, 4));
+
+    // Partitioned running sum (default frame: running prefix).
+    let result = database
+        .execute_sql(
+            "SELECT rep, sum(amount) OVER (PARTITION BY region ORDER BY amount) FROM sales ORDER BY rep",
+        )
+        .expect("running sum");
+    let cumulative = |rep: &str, expected: i64| {
+        let row = result
+            .rows
+            .iter()
+            .find(|row| matches!(&row[0], Value::Text(name) if name == rep))
+            .unwrap_or_else(|| panic!("missing {rep}"));
+        assert_eq!(row[1], Value::I64(expected), "cumulative sum for {rep}");
+    };
+    // East by amount: 100, 200 (100+100), 500 (+300). West: 200, 400, 800.
+    cumulative("ana", 100);
+    cumulative("bob", 200);
+    cumulative("cid", 500);
+    cumulative("dee", 200);
+    cumulative("eva", 400);
+    cumulative("fin", 800);
+
+    // lag/lead default offset 1; NULL at partition edges.
+    let result = database
+        .execute_sql(
+            "SELECT rep, lag(amount) OVER (PARTITION BY region ORDER BY amount), lead(amount) OVER (PARTITION BY region ORDER BY amount) FROM sales ORDER BY rep",
+        )
+        .expect("lag and lead");
+    let offset_value = |rep: &str, column: usize| {
+        result
+            .rows
+            .iter()
+            .find(|row| matches!(&row[0], Value::Text(name) if name == rep))
+            .unwrap_or_else(|| panic!("missing {rep}"))
+            .get(column)
+            .cloned()
+            .expect("offset column")
+    };
+    assert_eq!(offset_value("ana", 1), Value::Null);
+    assert_eq!(offset_value("bob", 1), Value::I64(100));
+    assert_eq!(offset_value("cid", 1), Value::I64(100));
+    assert_eq!(offset_value("cid", 2), Value::Null);
+    assert_eq!(offset_value("dee", 2), Value::I64(200));
+
+    // row_number with a tiebreaker; first_value/last_value per partition.
+    let result = database
+        .execute_sql(
+            "SELECT rep, row_number() OVER (ORDER BY amount, rep), first_value(amount) OVER (PARTITION BY region ORDER BY amount), last_value(amount) OVER (PARTITION BY region ORDER BY amount) FROM sales ORDER BY rep",
+        )
+        .expect("row_number and value functions");
+    let row_for = |rep: &str| {
+        result
+            .rows
+            .iter()
+            .find(|row| matches!(&row[0], Value::Text(name) if name == rep))
+            .unwrap_or_else(|| panic!("missing {rep}"))
+            .clone()
+    };
+    assert_eq!(row_for("ana")[1], Value::I64(1));
+    assert_eq!(row_for("fin")[1], Value::I64(6));
+    assert_eq!(row_for("ana")[2], Value::I64(100));
+    assert_eq!(row_for("cid")[3], Value::I64(300));
+    assert_eq!(row_for("fin")[2], Value::I64(200));
+    assert_eq!(row_for("fin")[3], Value::I64(400));
+
+    // count(*) over partitions with no ORDER BY: whole-partition count.
+    let result = database
+        .execute_sql("SELECT count(*) OVER (PARTITION BY region) FROM sales ORDER BY rep")
+        .expect("partition count");
+    for row in &result.rows {
+        assert_eq!(row[0], Value::U64(3));
+    }
+
+    // Unsupported shapes fail honestly and leave the session usable.
+    for (sql, message) in [
+        (
+            "SELECT nth_value(amount, 2) OVER (ORDER BY amount) FROM sales",
+            "nth_value",
+        ),
+        (
+            "SELECT sum(amount) OVER w FROM sales WINDOW w AS (PARTITION BY region)",
+            "named window",
+        ),
+        (
+            "SELECT sum(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM sales",
+            "window frames",
+        ),
+    ] {
+        let error = database.execute_sql(sql).expect_err("refused");
+        assert!(
+            error.to_string().contains(message),
+            "{sql} should refuse about {message}, got: {error}"
+        );
+    }
+    let result = database
+        .execute_sql("SELECT count(*) FROM sales")
+        .expect("session still usable");
+    assert_eq!(result.rows[0][0], Value::U64(6));
+}
+
+#[test]
 fn serializable_certification_aborts_the_doctors_write_skew() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database_path = directory.path().join("skew-db");
