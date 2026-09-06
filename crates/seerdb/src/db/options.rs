@@ -19,6 +19,33 @@ pub enum BlobStorageMode {
     Segmented,
 }
 
+/// The durability class each publication sync uses.
+///
+/// On Linux both classes call the same fsync family and differ only
+/// marginally. On macOS the difference is the whole performance story:
+/// Rust std's `sync_data`/`sync_all` map to `F_FULLFSYNC`, a device
+/// barrier measured at ~4.2 ms on this host, while a plain `fsync(2)`
+/// flushes only to the volatile disk cache at ~0.03 ms. PostgreSQL's
+/// macOS builds use plain fsync (or `open_datasync`), which is exactly
+/// the KernelBarrier class: safe against process and kernel crash, not
+/// against power loss on consumer SSDs that acknowledge flushes early.
+///
+/// The default keeps the stronger barrier: this engine never trades
+/// correctness, and a deployment that can accept kernel-crash-only
+/// durability (battery-backed storage, containers on managed hosts,
+/// CI) opts in explicitly and sees the ~100x sync-latency difference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncClass {
+    /// Device barrier (macOS `F_FULLFSYNC`): survives power loss even on
+    /// consumer SSDs. The strongest available class. Default.
+    #[default]
+    DeviceBarrier,
+    /// Kernel-page-cache barrier (plain `fsync(2)`): survives process
+    /// and kernel crash; on power loss the disk cache may lose the last
+    /// writes. PostgreSQL's installed macOS default class.
+    KernelBarrier,
+}
+
 /// Configuration options for a database instance.
 ///
 /// The alpha on-disk format uses the fixed [`crate::PAGE_SIZE`] page size.
@@ -61,6 +88,13 @@ pub struct Options {
     /// reopen under ~500 ms of replay at current throughput. Default:
     /// 2 MiB; 0 disables automatic materialization.
     pub wal_materialize_bytes: u64,
+
+    /// Durability class for every publication sync (WAL, pages, PMT
+    /// metadata, MVCC version store). See [`SyncClass`]. Default:
+    /// `DeviceBarrier` (macOS `F_FULLFSYNC`, ~4.2 ms/sync on this host);
+    /// `KernelBarrier` matches PostgreSQL's installed macOS class at
+    /// ~0.03 ms/sync.
+    pub sync_class: SyncClass,
 }
 
 impl Default for Options {
@@ -74,6 +108,7 @@ impl Default for Options {
             max_wal_bytes: 64 * 1024 * 1024,
             wal_first_commits: false,
             wal_materialize_bytes: 2 * 1024 * 1024,
+            sync_class: SyncClass::default(),
         }
     }
 }

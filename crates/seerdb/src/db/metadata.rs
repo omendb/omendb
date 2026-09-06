@@ -333,7 +333,7 @@ impl DB {
             // boundary.
             let file = OpenOptions::new().write(true).open(&log_path)?;
             file.set_len(parsed.valid_len as u64)?;
-            file.sync_all()?;
+            super::sync::sync_file_all(&file, self.options.sync_class)?;
             crate::storage::record_durability_sync();
         }
 
@@ -423,7 +423,7 @@ impl DB {
         if FAIL_NEXT_META_LOG_SYNC.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected metadata log sync failure").into());
         }
-        file.sync_all()?;
+        super::sync::sync_file_all(&file, self.options.sync_class)?;
         crate::storage::record_durability_sync();
 
         let header_bytes = u64::from(!existed) * META_LOG_HEADER_SIZE as u64;
@@ -496,7 +496,7 @@ impl DB {
         if parsed.valid_len < bytes.len() {
             let file = OpenOptions::new().write(true).open(&log_path)?;
             file.set_len(parsed.valid_len as u64)?;
-            file.sync_all()?;
+            super::sync::sync_file_all(&file, self.options.sync_class)?;
             crate::storage::record_durability_sync();
         }
         let (pmt, allocator, depth) = Self::resolve_meta_log(&parsed, checkpoint_id)?;

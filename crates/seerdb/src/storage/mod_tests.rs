@@ -13,6 +13,7 @@ fn runtime_invariants_cover_pmt_and_generation_state() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -44,6 +45,7 @@ fn runtime_invariants_reject_overlapping_physical_offset_owners() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -77,6 +79,7 @@ fn buffer_stages_versioned_writeback_without_aliasing_generations() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -123,6 +126,7 @@ fn large_generation_streams_through_small_buffer_pool() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -163,6 +167,7 @@ fn streamed_generation_sync_failure_remains_retryable() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -202,6 +207,7 @@ fn failed_device_write_leaves_buffer_image_dirty_for_retry() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -232,6 +238,7 @@ fn failed_device_sync_leaves_buffer_image_dirty_for_recovery() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -260,6 +267,7 @@ fn load_from_disk_rejects_malformed_page() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -286,6 +294,7 @@ fn flush_writes_only_logically_dirty_pages() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -321,6 +330,7 @@ fn read_node_uses_pmt_and_buffer_boundary() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -354,6 +364,7 @@ fn reuses_retired_physical_pages_after_generation_completion() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -391,6 +402,7 @@ fn empty_buffer_pool_returns_typed_error() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();
@@ -418,6 +430,7 @@ fn capacity_preflight_rejects_before_page_io() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();

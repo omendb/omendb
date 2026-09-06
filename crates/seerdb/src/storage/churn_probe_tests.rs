@@ -14,6 +14,7 @@ fn engine_free_list_tracks_scattered_churn() {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: crate::db::SyncClass::default(),
         },
     )
     .unwrap();

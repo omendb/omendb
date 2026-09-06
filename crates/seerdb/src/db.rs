@@ -85,6 +85,7 @@ mod segmented_blob_publication;
 mod single_write;
 #[path = "db/snapshot.rs"]
 mod snapshot;
+pub(crate) mod sync;
 #[path = "db/transaction.rs"]
 mod transaction;
 #[cfg(test)]
@@ -136,7 +137,7 @@ use wal_recovery::{
     validate_wal_key_length, validate_wal_put_lengths,
 };
 
-pub use options::{BlobStorageMode, Options};
+pub use options::{BlobStorageMode, Options, SyncClass};
 pub use read_view::ReadView;
 pub(super) use reports::elapsed_nanos;
 pub use reports::{

@@ -26,6 +26,7 @@ pub(super) fn build(
         use_odirect: options.use_odirect,
         sync_writes: options.sync_writes,
         create: !catalog.read_only,
+        sync_class: options.sync_class,
     };
     let device = if catalog.check_only {
         Device::open_read_only(&paths.data, &device_opts)?

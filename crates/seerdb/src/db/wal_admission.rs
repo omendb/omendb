@@ -74,10 +74,13 @@ impl DB {
                 }
                 let synced = (|| {
                     let policy = self.wal.sync_policy();
+                    let class = self.options.sync_class;
                     let file = self.wal_append_handle()?;
                     match policy {
-                        SyncPolicy::SyncAll => file.sync_all(),
-                        SyncPolicy::FDataSync | SyncPolicy::None => file.sync_data(),
+                        SyncPolicy::SyncAll => super::sync::sync_file_all(file, class),
+                        SyncPolicy::FDataSync | SyncPolicy::None => {
+                            super::sync::sync_file_data(file, class)
+                        }
                     }
                 })();
                 if let Err(error) = synced {

@@ -5,7 +5,7 @@
 //! ```text
 //! omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N]
 //!         [--statement-timeout-ms N] [--max-result-bytes N] [--wal-first]
-//!         [--slow-statement-ms N]
+//!         [--sync-class device|kernel] [--slow-statement-ms N]
 //! ```
 
 #![cfg(feature = "pgwire")]
@@ -24,6 +24,7 @@ type ParsedArgs = Option<(
     Option<Duration>,
     Option<usize>,
     bool,
+    omendb::SyncClass,
     Option<Duration>,
 )>;
 
@@ -45,6 +46,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         statement_timeout,
         max_result_bytes,
         wal_first,
+        sync_class,
         slow_statement_ms,
     )) = parse_args(std::env::args().skip(1))?
     else {
@@ -60,6 +62,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_statement_timeout(statement_timeout)
                 .with_max_result_bytes(max_result_bytes)
                 .with_wal_first_commits(wal_first)
+                .with_sync_class(sync_class)
                 .with_slow_statement_threshold(slow_statement_ms),
         )
         .await?;
@@ -80,6 +83,7 @@ fn parse_args(
     let mut statement_timeout = None;
     let mut max_result_bytes = None;
     let mut wal_first = false;
+    let mut sync_class = omendb::SyncClass::default();
     let mut slow_statement_ms = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -98,6 +102,15 @@ fn parse_args(
                     Some(required_value(&mut args, "--max-result-bytes")?.parse::<usize>()?);
             }
             "--wal-first" => wal_first = true,
+            "--sync-class" => match required_value(&mut args, "--sync-class")?.as_str() {
+                "device" => sync_class = omendb::SyncClass::DeviceBarrier,
+                "kernel" => sync_class = omendb::SyncClass::KernelBarrier,
+                other => {
+                    return Err(
+                        format!("unknown sync class: {other} (expected device or kernel)").into(),
+                    );
+                }
+            },
             "--slow-statement-ms" => {
                 slow_statement_ms = Some(Duration::from_millis(
                     required_value(&mut args, "--slow-statement-ms")?.parse::<u64>()?,
@@ -105,7 +118,7 @@ fn parse_args(
             }
             "--help" | "-h" => {
                 println!(
-                    "usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N] [--statement-timeout-ms N] [--max-result-bytes N] [--wal-first] [--slow-statement-ms N]"
+                    "usage: omendbd --path DB_DIR [--bind HOST:PORT] [--max-connections N] [--statement-timeout-ms N] [--max-result-bytes N] [--wal-first] [--sync-class device|kernel] [--slow-statement-ms N]"
                 );
                 return Ok(None);
             }
@@ -120,6 +133,7 @@ fn parse_args(
         statement_timeout,
         max_result_bytes,
         wal_first,
+        sync_class,
         slow_statement_ms,
     )))
 }

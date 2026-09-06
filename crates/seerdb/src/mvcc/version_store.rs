@@ -240,11 +240,15 @@ pub(crate) struct VersionStore {
     file: File,
     offsets: BTreeMap<VersionId, u64>,
     next_id: VersionId,
+    sync_class: crate::db::SyncClass,
 }
 
 impl VersionStore {
     /// Create a new empty version store and its parent directory entry.
-    pub(crate) fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(crate) fn create<P: AsRef<Path>>(
+        path: P,
+        sync_class: crate::db::SyncClass,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -255,11 +259,12 @@ impl VersionStore {
             file,
             offsets: BTreeMap::new(),
             next_id: VersionId::new(1),
+            sync_class,
         })
     }
 
     /// Open an existing store, indexing valid frames and refusing corruption.
-    pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(path: P, sync_class: crate::db::SyncClass) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let mut store = Self {
@@ -267,6 +272,7 @@ impl VersionStore {
             file,
             offsets: BTreeMap::new(),
             next_id: VersionId::new(1),
+            sync_class,
         };
         store.scan_existing()?;
         Ok(store)
@@ -321,7 +327,7 @@ impl VersionStore {
         if FAIL_NEXT_VERSION_SYNC.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected MVCC version sync failure").into());
         }
-        self.file.sync_data()?;
+        crate::db::sync::sync_file_data(&self.file, self.sync_class)?;
         Ok(())
     }
 
@@ -342,7 +348,7 @@ impl VersionStore {
         if temporary.exists() {
             std::fs::remove_file(&temporary)?;
         }
-        let mut compacted = Self::create(&temporary)?;
+        let mut compacted = Self::create(&temporary, self.sync_class)?;
         for id in retained {
             let mut record = self.get(*id)?;
             record.previous = record
@@ -355,7 +361,7 @@ impl VersionStore {
         compacted.sync()?;
         drop(compacted);
 
-        self.file.sync_data()?;
+        crate::db::sync::sync_file_data(&self.file, self.sync_class)?;
         #[cfg(test)]
         if FAIL_NEXT_COMPACTION_RENAME.with(|failure| failure.replace(false)) {
             return Err(std::io::Error::other("injected version compaction rename failure").into());
@@ -540,7 +546,7 @@ mod tests {
     fn appends_and_reopens_logical_predecessors() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         let first = store
             .append(None, TxnId::new(7), CommitSeq::new(1), None)
             .expect("append first");
@@ -550,7 +556,7 @@ mod tests {
         store.sync().expect("sync");
         drop(store);
 
-        let mut reopened = VersionStore::open(&path).expect("open");
+        let mut reopened = VersionStore::open(&path, Default::default()).expect("open");
         assert_eq!(reopened.len(), 2);
         assert_eq!(reopened.get(first).expect("first").value, None);
         assert_eq!(
@@ -569,7 +575,7 @@ mod tests {
     fn truncated_tail_is_discarded_on_reopen() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         store
             .append(None, TxnId::new(1), CommitSeq::new(1), Some(b"value"))
             .expect("append");
@@ -583,7 +589,7 @@ mod tests {
             .set_len(length - 2)
             .expect("truncate");
 
-        let mut reopened = VersionStore::open(&path).expect("open truncated");
+        let mut reopened = VersionStore::open(&path, Default::default()).expect("open truncated");
         assert_eq!(reopened.len(), 0);
         let id = reopened
             .append(None, TxnId::new(2), CommitSeq::new(2), Some(b"next"))
@@ -595,7 +601,7 @@ mod tests {
     fn current_record_resolves_append_history() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         let head = store
             .append(None, TxnId::new(1), CommitSeq::new(1), Some(b"old"))
             .expect("append");
@@ -632,7 +638,7 @@ mod tests {
     fn compaction_preserves_ids_and_append_frontier() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         let first = store
             .append(None, TxnId::new(1), CommitSeq::new(1), Some(b"one"))
             .expect("first");
@@ -672,7 +678,8 @@ mod tests {
         assert_eq!(next, VersionId::new(4));
         store.sync().expect("sync compacted store");
         drop(store);
-        let mut reopened = VersionStore::open(&path).expect("reopen compacted store");
+        let mut reopened =
+            VersionStore::open(&path, Default::default()).expect("reopen compacted store");
         assert_eq!(
             reopened.get(second).expect("reopened second").value,
             Some(b"two".to_vec())
@@ -687,7 +694,7 @@ mod tests {
     fn checksum_corruption_is_rejected() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         store
             .append(None, TxnId::new(1), CommitSeq::new(1), Some(b"value"))
             .expect("append");
@@ -698,7 +705,7 @@ mod tests {
         file.seek(SeekFrom::Start(length - 1)).expect("seek");
         file.write_all(&[0xFF]).expect("corrupt");
         assert!(matches!(
-            VersionStore::open(&path),
+            VersionStore::open(&path, Default::default()),
             Err(Error::Corruption(message)) if message.contains("checksum")
         ));
     }
@@ -707,7 +714,7 @@ mod tests {
     fn unknown_predecessor_is_rejected() {
         let directory = tempdir().expect("tempdir");
         let path = directory.path().join("seerdb.mvcc");
-        let mut store = VersionStore::create(&path).expect("create");
+        let mut store = VersionStore::create(&path, Default::default()).expect("create");
         assert!(matches!(
             store.append(
                 Some(VersionId::new(99)),

@@ -101,6 +101,11 @@ pub struct ServerConfig {
     /// Ack commits after the group-synced WAL append instead of full
     /// publication; trades recovery replay for commit latency.
     pub wal_first_commits: bool,
+    /// Publication-sync durability class. Defaults to the device barrier
+    /// (power-loss safe; ~4.2 ms/sync on macOS F_FULLFSYNC); the kernel
+    /// barrier class (~0.03 ms/sync) survives process and kernel crash
+    /// only. See `crate::SyncClass`.
+    pub sync_class: crate::SyncClass,
     /// Log statements that take longer than this to execute (including
     /// commit publication) to the server log. `None` disables slow
     /// statement logging.
@@ -119,6 +124,7 @@ impl ServerConfig {
             statement_timeout: None,
             max_result_bytes: None,
             wal_first_commits: false,
+            sync_class: crate::SyncClass::default(),
             slow_statement_threshold: None,
         }
     }
@@ -155,6 +161,13 @@ impl ServerConfig {
     #[must_use]
     pub fn with_wal_first_commits(mut self, wal_first_commits: bool) -> Self {
         self.wal_first_commits = wal_first_commits;
+        self
+    }
+
+    /// Select the publication-sync durability class.
+    #[must_use]
+    pub fn with_sync_class(mut self, sync_class: crate::SyncClass) -> Self {
+        self.sync_class = sync_class;
         self
     }
 
@@ -388,6 +401,7 @@ impl RunningServer {
         if config.wal_first_commits {
             backend = backend.with_wal_first_commits();
         }
+        backend = backend.with_sync_class(config.sync_class);
         let database = if database_path_exists(&database_path) {
             RelationalDatabase::open(backend)?
         } else if config.create_if_missing {

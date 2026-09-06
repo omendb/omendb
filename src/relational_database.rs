@@ -16,7 +16,7 @@ use crate::relational::{
 use crate::row_identity::encode_legacy_key;
 pub use crate::seer_direct::SchemaMutation;
 use crate::seer_direct::{DirectSeerStore, DirectTransaction};
-use crate::{CommitId, DbError, Key, Result, RowIdentity, TableId, Value};
+use crate::{CommitId, DbError, Key, Result, RowIdentity, SyncClass, TableId, Value};
 
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -144,6 +144,14 @@ pub struct RelationalBackendConfig {
     /// page materialization and the authority frame to flush/checkpoint/
     /// close. Trades crash-recovery replay work for commit latency.
     pub wal_first_commits: bool,
+    /// Durability class for every publication sync. The default
+    /// (`DeviceBarrier`) survives power loss on consumer SSDs (macOS
+    /// `F_FULLFSYNC`, ~4.2 ms/sync on the measured host); `KernelBarrier`
+    /// survives process and kernel crash (plain `fsync`, ~0.03 ms/sync)
+    /// at a ~60x commit-latency difference — the class PostgreSQL's
+    /// macOS build installs by default. Choose the barrier that matches
+    /// the storage's actual loss model.
+    pub sync_class: SyncClass,
 }
 
 impl RelationalBackendConfig {
@@ -152,6 +160,7 @@ impl RelationalBackendConfig {
         Self {
             path: path.into(),
             wal_first_commits: false,
+            sync_class: SyncClass::default(),
         }
     }
 
@@ -159,6 +168,13 @@ impl RelationalBackendConfig {
     #[must_use]
     pub fn with_wal_first_commits(mut self) -> Self {
         self.wal_first_commits = true;
+        self
+    }
+
+    /// Select the publication-sync durability class.
+    #[must_use]
+    pub fn with_sync_class(mut self, sync_class: SyncClass) -> Self {
+        self.sync_class = sync_class;
         self
     }
 }
@@ -639,6 +655,7 @@ fn options_from_config(config: &RelationalBackendConfig) -> seerdb::db::Options 
     if config.wal_first_commits {
         options.wal_first_commits = true;
     }
+    options.sync_class = config.sync_class;
     options
 }
 

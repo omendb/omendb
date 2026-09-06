@@ -26,12 +26,17 @@ pub struct DeviceOptions {
     pub sync_writes: bool,
     /// Create the file if it doesn't exist.
     pub create: bool,
+    /// Durability class for the data-device barrier (see
+    /// `crate::db::options::SyncClass`). The kernel-barrier class pays
+    /// ~0.03 ms per sync where the device barrier pays ~4.2 ms on macOS.
+    pub sync_class: crate::db::SyncClass,
 }
 
 impl Default for DeviceOptions {
     fn default() -> Self {
         Self {
             use_odirect: true,
+            sync_class: crate::db::SyncClass::default(),
             sync_writes: false,
             create: true,
         }
@@ -48,6 +53,8 @@ pub struct Device {
     use_odirect: bool,
     /// Whether to sync after writes.
     sync_writes: bool,
+    /// Durability class for the data-device barrier.
+    sync_class: crate::db::SyncClass,
     /// Test-only deterministic sync failure hook.
     #[cfg(any(test, feature = "fault-injection"))]
     fail_next_sync: AtomicBool,
@@ -94,6 +101,7 @@ impl Device {
             file: self.file.try_clone()?,
             use_odirect: self.use_odirect,
             sync_writes: false,
+            sync_class: self.sync_class,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_sync: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -135,6 +143,7 @@ impl Device {
             file,
             use_odirect: options.use_odirect,
             sync_writes: options.sync_writes,
+            sync_class: options.sync_class,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_sync: AtomicBool::new(false),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -262,13 +271,13 @@ impl Device {
         Ok(())
     }
 
-    /// Sync all data to disk.
+    /// Sync all data to disk under the configured durability class.
     pub fn sync(&self) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected device sync failure"));
         }
-        self.file.sync_data()
+        crate::db::sync::sync_file_data(&self.file, self.sync_class)
     }
 
     /// Inject one deterministic sync failure for recovery tests.
@@ -427,6 +436,7 @@ mod tests {
             use_odirect: false, // disable O_DIRECT for testing
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
 
         let mut device = Device::open(&path, &options).unwrap();
@@ -448,6 +458,7 @@ mod tests {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
 
         let mut device = Device::open(&path, &options).unwrap();
@@ -478,6 +489,7 @@ mod tests {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
 
         let mut device = Device::open(&path, &options).unwrap();
@@ -496,6 +508,7 @@ mod tests {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
 
         let device = Device::open(&path, &options).unwrap();
@@ -513,6 +526,7 @@ mod tests {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
 
         let device = Device::open(&path, &options).unwrap();
@@ -536,6 +550,7 @@ mod tests {
             use_odirect: false,
             sync_writes: false,
             create: true,
+            sync_class: Default::default(),
         };
         let mut device = Device::open(&path, &options).unwrap();
         let page = [0xA5u8; PAGE_SIZE];

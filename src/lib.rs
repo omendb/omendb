@@ -50,6 +50,7 @@ pub use runtime::{
 };
 pub use seerdb::DBMetrics;
 pub use seerdb::PublicationTimingMetrics;
+pub use seerdb::db::SyncClass;
 
 pub use session::{
     IndexScanRequest, RelationalDatabaseConfig, RelationalDatabaseSession, RelationalSessionConfig,

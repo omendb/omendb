@@ -439,16 +439,18 @@ pub struct Cursor<'a> {
 impl TransactionDatabase {
     /// Create a new transactional database at `path`.
     pub fn create<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
+        let sync_class = options.sync_class;
         let db = DB::create(path, options)?;
-        let versions = VersionStore::create(db.directory().join(VERSION_STORE_FILE))?;
+        let versions = VersionStore::create(db.directory().join(VERSION_STORE_FILE), sync_class)?;
         db.sync_directory_entry()?;
         Self::from_db(db, versions)
     }
 
     /// Open an existing transactional database at `path`.
     pub fn open<P: AsRef<Path>>(path: P, options: Options) -> Result<Self> {
+        let sync_class = options.sync_class;
         let db = DB::open(path, options)?;
-        let versions = VersionStore::open(db.directory().join(VERSION_STORE_FILE))?;
+        let versions = VersionStore::open(db.directory().join(VERSION_STORE_FILE), sync_class)?;
         Self::from_db(db, versions)
     }
 
@@ -3972,9 +3974,11 @@ mod tests {
             decode_status(&status_bytes).expect("decode status"),
             CommitSeq::new(4)
         );
-        let mut version_store =
-            VersionStore::open(directory.path().join("db").join(VERSION_STORE_FILE))
-                .expect("open version store");
+        let mut version_store = VersionStore::open(
+            directory.path().join("db").join(VERSION_STORE_FILE),
+            Default::default(),
+        )
+        .expect("open version store");
         let previous = version_store
             .get(current.undo_head.expect("undo head"))
             .expect("previous version");
