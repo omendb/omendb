@@ -75,6 +75,7 @@ client-numbered history_id substitute — 37.0 tps — is superseded:
 | PostgreSQL 17.11 (fsync on) | 7950 | 0.50 ms | 0% |
 | OmenDB (default `--sync-class device`, heap history) | 41.0 | 96 ms | 38% |
 | OmenDB (`--sync-class kernel`, heap history) | 88.8 | 45 ms | 42% |
+| OmenDB (`--sync-class kernel`, pending-slot fix, 1 client) | 152 | 6.6 ms | — |
 | OmenDB (`--wal-first`, keyed-history era) | 19.8 | 200 ms | 31% |
 
 The stock heap INSERT is ~11% cheaper than the keyed substitute it
@@ -92,6 +93,19 @@ device class stays the default because this engine never trades
 correctness for speed. `wave_cost_probe` / `fsync_dimensions` /
 `fsync_latency_probe` (crates/seerdb/examples) reproduce every number
 above.
+
+The 2026-09-06 wire-tier attribution closed the gap between the 223 us
+engine wave and the ~8 ms full-stack commit: the wire server's describe,
+grants, and autocommit-read paths drop active transactions, and
+`Drop for Transaction` leaked one pending-committer slot per drop, so
+every commit leader saw a phantom "will-stage-soon" transaction and
+slept the full 4x750 us coalescing window (~4.6 ms). Releasing the slot
+in Drop took single-client TPC-B from 8.18 to 6.6 ms/txn (122 -> 152
+tps) with no engine-internal change; `examples/sql_tier_probe.rs` and
+`examples/wire_tier_probe.rs` reproduce the tier split (embedded 1.16
+ms/txn vs wire 6.7 before the fix, 1.9 after). The 4-client differential
+is unchanged by the fix: its ~50 ms latency is the multi-writer
+serialization documented below, not the single-client commit path.
 
 WAL-first commit acks are QUALIFIED for crash correctness (3-mode
 process-crash matrix at the real 2 MiB bound;
