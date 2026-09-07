@@ -322,6 +322,14 @@ async fn documented_wire_subset_matches_live_postgresql() -> Result<()> {
     )
     .await?;
 
+    for sql in [
+        "SELECT count(*) OVER () FROM oracle_accounts LIMIT 1 OFFSET 1",
+        "SELECT id, min(balance) OVER (ORDER BY group_id), count(*) OVER (ORDER BY group_id) FROM oracle_accounts ORDER BY id",
+        "SELECT id, last_value(balance) OVER (PARTITION BY group_id ORDER BY id) FROM oracle_accounts ORDER BY id",
+    ] {
+        compare_query(&omendb, &postgres, sql, &[]).await?;
+    }
+
     let updated_balance = 55_i64;
     let updated_id = 2_i64;
     compare_query(

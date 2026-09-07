@@ -596,11 +596,11 @@ fn window_functions_match_postgresql_semantics() {
             .unwrap_or_else(|| panic!("missing {rep}"));
         assert_eq!(row[1], Value::I64(expected), "cumulative sum for {rep}");
     };
-    // East by amount: 100, 200 (100+100), 500 (+300). West: 200, 400, 800.
-    cumulative("ana", 100);
+    // Ordering peers share their frame: East 200, 200, 500; West 400, 400, 800.
+    cumulative("ana", 200);
     cumulative("bob", 200);
     cumulative("cid", 500);
-    cumulative("dee", 200);
+    cumulative("dee", 400);
     cumulative("eva", 400);
     cumulative("fin", 800);
 

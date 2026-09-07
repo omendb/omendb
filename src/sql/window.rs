@@ -6,17 +6,17 @@
 //! runs between row matching and row projection in the plain-SELECT path
 //! and appends one column per window call; the projection plan resolves
 //! those columns positionally. Named windows and explicit frames are
-//! refused honestly — the default frame is the whole partition for
-//! ranking/value functions and the running-prefix (RANGE UNBOUNDED
-//! PRECEDING..CURRENT ROW) for aggregates, which is what the alpha
-//! surface needs.
+//! refused. The default frame is the whole partition without ORDER BY;
+//! with ORDER BY it ends at the current row's final ordering peer.
+//! Ranking and offset functions operate on the partition independently
+//! of that frame.
 
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, SelectItem, WindowType};
 
 use crate::morsel::{AggregateAccumulator, AggregateKind};
 use crate::{Result, Row, TableDefinition, Value};
 
-use super::query::{OrderTerm, compare_rows};
+use super::query::{OrderTerm, compare_order_terms, compare_rows};
 use super::{column_position, unsupported};
 
 /// One window function call resolved from the projection.
@@ -91,7 +91,7 @@ fn window_call(
             if spec.window_frame.is_some() {
                 return Err(unsupported(
                     "OVER",
-                    "window frames are not supported; the default frame (whole partition for ranking and value functions, running prefix for aggregates) applies",
+                    "window frames are not supported; the default frame (whole partition without ORDER BY, prefix through ordering peers with ORDER BY) applies",
                 ));
             }
             let mut partition = Vec::new();
@@ -327,15 +327,36 @@ fn frame_values(rows: &[Row], ordered: &[usize], call: &WindowCall) -> Vec<Value
     let argument = call
         .argument
         .expect("value functions validate an argument at plan time");
-    let source = if call.name == "first_value" {
-        ordered.first().copied()
-    } else {
-        ordered.last().copied()
-    };
-    let value = source
-        .map(|source| rows[source].values[argument].clone())
-        .unwrap_or(Value::Null);
-    vec![value; ordered.len()]
+    if call.name == "first_value" || call.order_by.is_empty() {
+        let source = if call.name == "first_value" {
+            ordered.first()
+        } else {
+            ordered.last()
+        };
+        let value = source
+            .map(|&index| rows[index].values[argument].clone())
+            .unwrap_or(Value::Null);
+        return vec![value; ordered.len()];
+    }
+    let mut output = Vec::with_capacity(ordered.len());
+    let mut start = 0;
+    while start < ordered.len() {
+        let end = peer_group_end(rows, ordered, &call.order_by, start);
+        let value = rows[ordered[end - 1]].values[argument].clone();
+        output.resize(end, value);
+        start = end;
+    }
+    output
+}
+
+fn peer_group_end(rows: &[Row], ordered: &[usize], order: &[OrderTerm], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < ordered.len()
+        && compare_order_terms(&rows[ordered[start]], &rows[ordered[end]], order).is_eq()
+    {
+        end += 1;
+    }
+    end
 }
 
 fn aggregate_kind(name: &str) -> Result<AggregateKind> {
@@ -355,7 +376,7 @@ fn aggregate_kind(name: &str) -> Result<AggregateKind> {
 fn running_aggregates(rows: &[Row], ordered: &[usize], call: &WindowCall) -> Result<Vec<Value>> {
     // Without ORDER BY the default frame is the whole partition: every
     // row sees the full aggregate (PostgreSQL semantics). With ORDER BY
-    // the default frame is the running prefix through the current row.
+    // the default frame includes the running prefix and all ordering peers.
     if call.order_by.is_empty() {
         let mut whole = AggregateAccumulator::new(aggregate_kind(&call.name)?);
         for &row_index in ordered {
@@ -369,14 +390,17 @@ fn running_aggregates(rows: &[Row], ordered: &[usize], call: &WindowCall) -> Res
     }
     let mut accumulator = AggregateAccumulator::new(aggregate_kind(&call.name)?);
     let mut output = Vec::with_capacity(ordered.len());
-    for &row_index in ordered {
-        let value = call
-            .argument
-            .map(|position| &rows[row_index].values[position]);
-        // The accumulator skips NULLs for every aggregate except count(*),
-        // which is exactly the SQL window default.
-        accumulator.update(value)?;
-        output.push(accumulator.clone().finalize());
+    let mut start = 0;
+    while start < ordered.len() {
+        let end = peer_group_end(rows, ordered, &call.order_by, start);
+        for &row_index in &ordered[start..end] {
+            let value = call
+                .argument
+                .map(|position| &rows[row_index].values[position]);
+            accumulator.update(value)?;
+        }
+        output.resize(end, accumulator.clone().finalize());
+        start = end;
     }
     Ok(output)
 }

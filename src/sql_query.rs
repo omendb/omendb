@@ -106,7 +106,8 @@ pub(super) fn execute_query(
         None => transaction.scan(database, table.id, usize::MAX)?,
     };
     let required_rows = offset.saturating_add(limit);
-    let can_stop_after_window = order.is_empty() && select.distinct.is_none();
+    // Window functions need the full filtered partition before pagination.
+    let can_stop_after_window = order.is_empty() && select.distinct.is_none() && windows.is_none();
     let mut matching_rows = Vec::new();
     for row in rows {
         transaction.check_operation_control()?;
@@ -1532,6 +1533,11 @@ fn validate_order_rows(rows: &[Row], table: &TableDefinition, terms: &[OrderTerm
 }
 
 pub(crate) fn compare_rows(left: &Row, right: &Row, terms: &[OrderTerm]) -> Ordering {
+    // Statement pagination is deterministic; window peers use only SQL terms.
+    compare_order_terms(left, right, terms).then_with(|| left.primary.cmp(&right.primary))
+}
+
+pub(crate) fn compare_order_terms(left: &Row, right: &Row, terms: &[OrderTerm]) -> Ordering {
     for term in terms {
         let left_value = &left.values[term.position];
         let right_value = &right.values[term.position];
@@ -1563,10 +1569,7 @@ pub(crate) fn compare_rows(left: &Row, right: &Row, terms: &[OrderTerm]) -> Orde
             }
         }
     }
-    // Make pagination deterministic when the requested ordering is not
-    // unique. The scan already uses canonical primary-key order, but keeping
-    // the tie-breaker explicit makes that contract independent of the store.
-    left.primary.cmp(&right.primary)
+    Ordering::Equal
 }
 
 struct ProjectionPlan {
