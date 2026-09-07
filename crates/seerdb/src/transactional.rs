@@ -2354,18 +2354,38 @@ fn validate_against_published(
 
 /// Reject commits whose registered read ranges saw a phantom: any concurrent
 /// commit after the transaction's snapshot that wrote inside the range.
+///
+/// Change records are keyed `prefix + commit.to_be_bytes()`, so they sort
+/// in commit order: the scan starts at `snapshot + 1`, and the B-tree seek
+/// skips every record at or below the snapshot instead of decoding it.
+/// Work is proportional to commits since the snapshot, not to history.
 fn validate_staged_range_dependencies(
     staged: &StagedCommit,
     db: &DB,
     current: CommitSeq,
 ) -> Result<()> {
     for (tree, start, end) in &staged.read_ranges {
-        let prefix = CHANGE_RECORD_PREFIX;
-        for (key, value) in db.range(prefix, &prefix_end(prefix))? {
+        let first = staged
+            .snapshot
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?;
+        let scan_start = change_record_key(CommitSeq::new(first));
+        // Inclusive of `current`: a commit at the head itself is a
+        // registered-range phantom candidate. The pre-wave head read by
+        // validate_against_published is `current`, and records above it
+        // are not yet visible, so they are excluded by the end bound
+        // rather than decoded and filtered.
+        let last = current
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?;
+        let scan_end = change_record_key(CommitSeq::new(last));
+        for (key, value) in db.range(&scan_start, &scan_end)? {
             let Some(commit) = decode_change_commit(&key) else {
                 continue;
             };
-            if commit <= staged.snapshot || commit > current {
+            if commit > current {
                 continue;
             }
             let change = decode_change(&key, &value)?;
