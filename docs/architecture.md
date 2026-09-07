@@ -60,8 +60,10 @@ for both projects; SeerDB's former standalone repository is not a second
 implementation source.
 
 The current development dependency is a workspace path dependency. Registry
-releases remain independent: publish and qualify a SeerDB prerelease first,
-then release OmenDB against that exact SeerDB version. Neither package version
+releases remain independent: publish and qualify the Apache-2.0 `durable-fs`
+crate from `crates/durable-fs`, then SeerDB, then OmenDB against that SeerDB
+version. External consumers pin `durable-fs` to an OmenDB Git revision until
+a registry release is available. Neither package version
 is inherited from the workspace.
 
 ## OmenDB and SeerDB boundary

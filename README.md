@@ -59,6 +59,8 @@ commit several statements together.
 OmenDB owns SQL, schemas, rows, indexes, and relational semantics. SeerDB owns
 transactional ordered-KV storage and durability. Both are developed in this
 workspace; SeerDB remains an independently versioned Apache-2.0 crate.
+Shared filesystem durability primitives live in the independently versioned
+Apache-2.0 crate [`durable-fs`](crates/durable-fs).
 
 Logical SQL dump and restore are available through the bundled tool:
 

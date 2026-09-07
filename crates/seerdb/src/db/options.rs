@@ -34,17 +34,10 @@ pub enum BlobStorageMode {
 /// correctness, and a deployment that can accept kernel-crash-only
 /// durability (battery-backed storage, containers on managed hosts,
 /// CI) opts in explicitly and sees the ~100x sync-latency difference.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SyncClass {
-    /// Device barrier (macOS `F_FULLFSYNC`): survives power loss even on
-    /// consumer SSDs. The strongest available class. Default.
-    #[default]
-    DeviceBarrier,
-    /// Kernel-page-cache barrier (plain `fsync(2)`): survives process
-    /// and kernel crash; on power loss the disk cache may lose the last
-    /// writes. PostgreSQL's installed macOS default class.
-    KernelBarrier,
-}
+///
+/// Shared with other engines through `durable-fs`, and re-exported here
+/// for SeerDB consumers.
+pub use durable_fs::SyncClass;
 
 /// Configuration options for a database instance.
 ///

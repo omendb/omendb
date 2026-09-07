@@ -12,7 +12,7 @@ categories = ["database-implementations"]
 
 [workspace]
 resolver = "3"
-members = ["crates/seerdb"]
+members = ["crates/seerdb", "crates/durable-fs"]
 
 # Keep release builds suitable for storage-engine benchmarking and alpha
 # qualification across every workspace member.

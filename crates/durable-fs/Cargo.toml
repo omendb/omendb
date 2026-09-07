@@ -1,0 +1,18 @@
+[package]
+name = "durable-fs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Class-selected durability primitives: sync classes, directory fsync, atomic publication"
+license = "Apache-2.0"
+repository = "https://github.com/omendb/omendb"
+readme = "README.md"
+keywords = ["database", "fsync", "durability", "atomic", "storage"]
+categories = ["database-implementations", "filesystem"]
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
