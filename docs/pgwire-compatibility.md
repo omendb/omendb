@@ -126,3 +126,21 @@ or later compatibility work:
 - query-result execution-memory quotas; the result-payload bound is an
   estimated pre-encoding check and is not a full memory quota; and
 - process-level kill/reopen coverage at each durable publication seam.
+
+## Parameter and window semantics
+
+Positional parameters are discovered from parsed SQL, so comments, string
+literals, and quoted identifiers do not contribute parameter positions. The
+maximum position is 65,535, matching the wire parameter-count field; invalid
+or larger positions return a SQL error before allocating a type vector.
+
+Window functions evaluate the full filtered partition before LIMIT/OFFSET.
+Without window ORDER BY, the default frame is the whole partition. With
+ORDER BY, aggregates and value functions use the prefix through the current
+row's final ordering peer, following the
+[PostgreSQL default frame](https://www.postgresql.org/docs/current/tutorial-window.html).
+The statement's deterministic primary-key tie-breaker does not split window
+peer groups. Explicit frames and named windows remain unsupported.
+
+Regressions live in `tests/project_sql_parameters.rs`,
+`tests/project_sql_windows.rs`, and the PostgreSQL wire and live-oracle suites.

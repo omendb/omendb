@@ -56,7 +56,7 @@ impl OmenDbHandler {
         statement: &ParsedStatement,
         control: &OperationControl,
     ) -> PgWireResult<Vec<Type>> {
-        let count = ParsedStatement::placeholder_count(&statement.sql);
+        let count = statement.parameter_count;
         let database = read_lock_with_control(&self.database, control)?;
         let inferred = database
             .sql_parameter_types(&statement.sql)

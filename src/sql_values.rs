@@ -421,6 +421,14 @@ pub(super) fn parameter_index(name: &str) -> Result<usize> {
     let one_based = digits.parse::<usize>().map_err(|_| {
         DbError::SqlParameter(format!("placeholder {name} has an invalid position"))
     })?;
+    // ParameterDescription encodes the count as an unsigned 16-bit field.
+    // Enforce the bound before any positional type vector can be allocated.
+    if one_based > u16::MAX as usize {
+        return Err(DbError::SqlParameter(format!(
+            "placeholder {name} exceeds the maximum of {} parameters",
+            u16::MAX
+        )));
+    }
     one_based
         .checked_sub(1)
         .ok_or_else(|| DbError::SqlParameter(format!("placeholder {name} must start at 1")))

@@ -285,6 +285,7 @@ pub(crate) fn describe_parameters(
     source: &str,
 ) -> Result<Vec<Option<ColumnType>>> {
     let statement = parse_one(source)?;
+    parameter_indexes(&statement)?;
     let mut inferred = ParameterInference::default();
     match &statement {
         Statement::Insert(insert) => {
@@ -561,7 +562,7 @@ fn parse_one(source: &str) -> Result<Statement> {
     Ok(statement)
 }
 
-fn validate_parameters(statement: &Statement, params: &[Value]) -> Result<()> {
+fn parameter_indexes(statement: &Statement) -> Result<BTreeSet<usize>> {
     let mut indexes = BTreeSet::new();
     if let ControlFlow::Break(error) = visit_expressions(statement, |expression| {
         let Expr::Value(value) = expression else {
@@ -580,6 +581,17 @@ fn validate_parameters(statement: &Statement, params: &[Value]) -> Result<()> {
     }) {
         return Err(error);
     }
+    Ok(indexes)
+}
+
+#[cfg(feature = "pgwire")]
+pub(crate) fn parameter_count(source: &str) -> Result<usize> {
+    let indexes = parameter_indexes(&parse_one(source)?)?;
+    Ok(indexes.last().map_or(0, |index| index + 1))
+}
+
+fn validate_parameters(statement: &Statement, params: &[Value]) -> Result<()> {
+    let indexes = parameter_indexes(statement)?;
     if indexes.is_empty() {
         return if params.is_empty() {
             Ok(())

@@ -3708,3 +3708,49 @@ async fn wire_grant_enforcement_reader_writer_admin() {
         Some(&SqlState::INSUFFICIENT_PRIVILEGE)
     );
 }
+
+#[tokio::test]
+async fn prepare_uses_sql_placeholders_and_rejects_excessive_positions() {
+    let directory = tempdir().unwrap();
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse().unwrap(),
+    ))
+    .await
+    .unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={} user=omendb",
+            server.local_addr().port()
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection_task = tokio::spawn(connection);
+    for sql in [
+        "SELECT 1 /* $999 */",
+        "SELECT 1 -- $999",
+        "SELECT 1 AS \"$999\"",
+        "SELECT 'it''s $999'",
+    ] {
+        let statement = client.prepare(sql).await.expect("non-placeholder SQL");
+        assert!(statement.params().is_empty(), "{sql}");
+        assert_eq!(client.query(&statement, &[]).await.unwrap().len(), 1);
+    }
+    for sql in [
+        "SELECT $0",
+        "SELECT $65536",
+        "SELECT $99999999999999999999999999999999999999",
+    ] {
+        let error = client.prepare(sql).await.expect_err("bounded placeholder");
+        assert!(
+            error.as_db_error().is_some(),
+            "server must report a SQL error"
+        );
+        assert_eq!(client.simple_query("SELECT 1").await.unwrap().len(), 3);
+    }
+    drop(client);
+    connection_task.await.unwrap().unwrap();
+    server.shutdown().await.unwrap();
+}

@@ -16,48 +16,15 @@ use pgwire::error::PgWireResult;
 pub(super) const TX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A wire-parsed statement: raw SQL plus the parameter types the client
-/// declared at Parse time. Placeholder count is derived by scanning the SQL
-/// text so ParameterDescription reports the arity the engine will enforce.
+/// declared at Parse time. The SQL parser owns placeholder discovery and bounds.
 #[derive(Debug, Clone)]
 pub(super) struct ParsedStatement {
     pub(super) sql: String,
     pub(super) parameter_types: Vec<Option<Type>>,
+    pub(super) parameter_count: usize,
 }
 
-impl ParsedStatement {
-    pub(super) fn placeholder_count(sql: &str) -> usize {
-        let mut max_placeholder = 0usize;
-        let mut in_single_quote = false;
-        let mut chars = sql.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\'' => in_single_quote = !in_single_quote,
-                '$' if !in_single_quote => {
-                    let mut number = 0usize;
-                    let mut saw_digit = false;
-                    while let Some(d) = chars.peek() {
-                        if let Some(digit) = d.to_digit(10) {
-                            number = number * 10 + digit as usize;
-                            saw_digit = true;
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    if saw_digit {
-                        max_placeholder = max_placeholder.max(number);
-                    }
-                }
-                _ => {}
-            }
-        }
-        max_placeholder
-    }
-}
-
-/// Parser that keeps the client's declared parameter types and derives
-/// placeholder arity from the SQL text. Result schemas are computed by
-/// execution probes in the describe handlers, not here.
+/// Preserve declared types and use the SQL tier's parsed parameter positions.
 pub(super) struct PlaceholderParser;
 
 #[async_trait]
@@ -73,14 +40,16 @@ impl pgwire::api::stmt::QueryParser for PlaceholderParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        let parameter_count = crate::sql::parameter_count(sql).map_err(super::map_db_error)?;
         Ok(ParsedStatement {
+            parameter_count,
             sql: sql.to_owned(),
             parameter_types: types.to_vec(),
         })
     }
 
     fn get_parameter_types(&self, stmt: &ParsedStatement) -> PgWireResult<Vec<Type>> {
-        Ok((0..ParsedStatement::placeholder_count(&stmt.sql))
+        Ok((0..stmt.parameter_count)
             .map(|index| {
                 stmt.parameter_types
                     .get(index)
