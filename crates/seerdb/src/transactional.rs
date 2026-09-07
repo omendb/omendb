@@ -1969,18 +1969,6 @@ fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: DrainedCommits<'_>
     }
 
     let head = db.durability_status().commit_position;
-    // Assignment happens here, under the lane with the database handle held:
-    // wave members take head+1..=head+n in queue order, so published
-    // sequence numbers are contiguous and collision-free by construction.
-    for (position, staged) in queue.queue.iter_mut().enumerate() {
-        let assigned = head
-            .csn
-            .get()
-            .checked_add(position as u64 + 1)
-            .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?;
-        staged.assigned = CommitSeq::new(assigned);
-    }
-
     // Build phase: validate each member against the settled published state
     // and build its physical mutations (before-images, current records),
     // member by member in queue order. Staging enqueued only overlay-
@@ -1996,8 +1984,19 @@ fn publish_drained(db: &mut DB, runtime: &Runtime, mut queue: DrainedCommits<'_>
         let statuses = lock_statuses(runtime);
         let mut members: VecDeque<StagedCommit> = VecDeque::new();
         for mut staged in queue.queue.drain(..) {
-            let outcome = validate_against_published(&staged, db, &statuses)
-                .and_then(|()| build_mutations(&mut staged, db, &mut version_store));
+            let outcome = validate_against_published(&staged, db, &statuses).and_then(|()| {
+                // Only surviving members consume CSNs: physical publication
+                // advances by the number of batches, not the original queue
+                // length. Assign before encoding, but reuse this position if
+                // mutation construction rejects the member.
+                let assigned = head
+                    .csn
+                    .get()
+                    .checked_add(members.len() as u64 + 1)
+                    .ok_or_else(|| Error::Wal("commit sequence exhausted".into()))?;
+                staged.assigned = CommitSeq::new(assigned);
+                build_mutations(&mut staged, db, &mut version_store)
+            });
             match outcome {
                 Ok(()) => members.push_back(staged),
                 Err(error) => {
@@ -2979,6 +2978,72 @@ mod tests {
         let mut transaction = database.begin().expect("begin");
         transaction.put(tree, key, key).expect("put");
         transaction.commit().expect("commit");
+    }
+
+    #[test]
+    fn rejected_wave_member_does_not_consume_commit_sequence() {
+        let (directory, database) = database();
+        let owned = tree(&database);
+        let mut stale = database.begin().expect("begin stale writer");
+        stale
+            .put(owned, b"conflict", b"stale")
+            .expect("stage stale write");
+        commit_key(&database, owned, b"conflict");
+        let head = database.commit_sequence().expect("head");
+        let mut survivor = database.begin().expect("begin survivor");
+        survivor
+            .put(owned, b"survivor", b"value")
+            .expect("stage survivor");
+
+        // Enqueue both before publication so the published-state conflict
+        // rejects the first member of the same wave as the valid write.
+        let rejected = stage_commit(&mut stale).expect("enqueue stale writer");
+        let committed = stage_commit(&mut survivor).expect("enqueue survivor");
+        publish_with_lane(&database.runtime, lock_publish(&database.runtime))
+            .expect("publish wave");
+        assert!(matches!(
+            &*rejected
+                .recv()
+                .expect("rejected outcome")
+                .expect_err("conflict"),
+            Error::WriteConflict { .. }
+        ));
+        let position = committed
+            .recv()
+            .expect("survivor outcome")
+            .expect("survivor commits");
+        let expected = CommitSeq::new(head.get() + 1);
+        assert_eq!(position.csn, expected);
+        assert_eq!(
+            database.commit_sequence().expect("published head"),
+            expected
+        );
+        let changes = database.read_changes(expected, 2).expect("change stream");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].transaction, survivor.id());
+        drop(stale);
+        drop(survivor);
+        database.close().expect("close");
+        drop(database);
+
+        let reopened = TransactionDatabase::open(directory.path().join("db"), Options::for_test())
+            .expect("reopen");
+        let mut read = reopened.begin().expect("begin read");
+        assert_eq!(
+            read.get(owned, b"survivor").expect("survivor visible"),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            read.get(owned, b"conflict").expect("winner visible"),
+            Some(b"conflict".to_vec())
+        );
+        drop(read);
+        commit_key(&reopened, owned, b"next");
+        assert_eq!(
+            reopened.commit_sequence().expect("next head"),
+            CommitSeq::new(expected.get() + 1)
+        );
+        reopened.close().expect("close reopened");
     }
 
     #[test]
