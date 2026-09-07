@@ -144,3 +144,8 @@ peer groups. Explicit frames and named windows remain unsupported.
 
 Regressions live in `tests/project_sql_parameters.rs`,
 `tests/project_sql_windows.rs`, and the PostgreSQL wire and live-oracle suites.
+
+At session capacity, the server still accepts cancellation through a separate
+pool of at most eight readers. Each reader has a one-second deadline and
+accepts only a fixed-size cancellation packet; ordinary startup cannot bypass
+the session limit. Completed session and control tasks are reaped while serving.

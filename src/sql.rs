@@ -3,8 +3,7 @@
 //! This module is an adapter, not a second relational engine. The parser owns
 //! SQL syntax; the catalog, row validation, transaction lifecycle, and
 //! backend publication remain owned by the typed facade. Keeping that split
-//! explicit lets the same statements qualify Temporary and Seer backends and
-//! keeps a future replacement Rust storage engine behind the same boundary.
+//! explicit keeps SQL evaluation above the SeerDB-backed relational facade.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;

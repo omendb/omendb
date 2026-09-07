@@ -2,9 +2,9 @@
 
 Evidence-backed register of open product gaps, ordered by quality dimension.
 This is the input to roadmap prioritization, not a commitment list: items move
-into `ai/brief.md` (active work) and `docs/alpha-release-gates.md` (release
+into the project task tracker and `docs/alpha-release-gates.md` (release
 evidence) when they become active. Evidence citations refer to tests, source
-files, or measured baselines in this repository. Last audited 2026-09-03 (post logical-backup landing).
+files, or measured baselines in this repository. Repository maintenance audit: 2026-09-07.
 
 ## Type system — LANDED 2026-08-30
 
@@ -60,9 +60,8 @@ primitive.
   (`Transaction::scan`) register their exact range and get the same
   phantom protection cursors always had. The classic write-skew and
   doctors-on-call patterns now abort with SQLSTATE 40001.
-- Residual: SHOW TRANSACTION_ISOLATION still reports `read committed`;
-  reporting `serializable` accurately is a follow-up once the SQL-tier
-  BEGIN options surface isolation choice.
+- `SHOW TRANSACTION_ISOLATION` reports `serializable`. SQL-level selection
+  of alternative isolation modes remains outside the current surface.
 
 ## SQL breadth — closed (2026-09-06)
 
@@ -84,32 +83,14 @@ primitive.
   arithmetic only; `nth_value` and explicit `lag`/`lead` offsets are
   refused honestly.
 
-## Durability performance — medium severity, root cause re-measured
+## Durability performance — open
 
-- Concurrent durable write throughput at the engine: 511 ops/s at 8
-  threads (waves of 8; `examples/wave_probe.rs`), 976 ops/s at 16.
-  Through the relational facade: ~242 ops/s clean (was reported 146).
-- The facade read-serialization hypothesis is DISPROVEN: a
-  Mutex→RwLock split of the facade's database guard passed all suites
-  but measured neutral (242→245 ops/s; ~68k reads/s during waves
-  unchanged), so it was reverted. The facade gap is per-commit mutation
-  volume (~7 staged mutations per facade insert vs 3 in the engine
-  probe).
-- Same-hardware pgbench differential EXISTS now
-  (`scripts/pgbench/differential.sh`, TPC-B through the real wire):
-  PostgreSQL 17.11 8124 tps / 0.49 ms avg; OmenDB 37.0 tps / 107 ms
-  avg (40% serialization retries); OmenDB `--wal-first` 19.8 tps /
-  200 ms avg. Wave phase timing: MVCC version-store sync ~4.5 ms +
-  `commit_group_at` (full B-tree clone + WAL append) ~4.5 ms per
-  wave — publication-structure CPU, not fsync (raw fsync on the same
-  volume is 0.05 ms).
-- `Options::wal_first_commits` is now crash-QUALIFIED (3-mode
-  process-crash matrix at the real 2 MiB bound;
-  `crates/seerdb/tests/wal_first_process_crash.rs`) and wired into
-  `omendbd --wal-first`; it cuts single-writer commit latency ~44% but
-  stalls the publish lane under sustained multi-client load, so the
-  default stays off. The measured next lever is collapsing the wave's
-  two ~4.5 ms phases toward PostgreSQL's single append+fsync.
+The workload-specific baselines and reproduction commands live in
+[`docs/benchmarks.md`](benchmarks.md). Comparisons must match sync class,
+transaction size, concurrency, schema, and cache state. Engine-level group
+commit and wire-level throughput are separate measurements; a result from
+one does not qualify the other. No competitive performance gate is closed
+by the correctness or maintenance tests.
 
 ## Server UX and operations — medium severity
 
@@ -135,8 +116,8 @@ primitive.
   visibility). The sqlx matrix exposed and drove the fix for the
   describe-probe type-inference bug. Untested: Prisma, Diesel,
   SQLAlchemy, ActiveRecord.
-- README carries the alpha contract (works / session surface / fails
-  honestly / not yet) with the wire-compat stance.
+- README provides the server/API entry points. Detailed contracts live in
+  `docs/pgwire-compatibility.md` and `docs/alpha-release-gates.md`.
 
 ## Correctness strengths (for balance)
 
