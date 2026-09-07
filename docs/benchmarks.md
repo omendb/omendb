@@ -76,6 +76,7 @@ client-numbered history_id substitute — 37.0 tps — is superseded:
 | OmenDB (default `--sync-class device`, heap history) | 41.0 | 96 ms | 38% |
 | OmenDB (`--sync-class kernel`, heap history) | 88.8 | 45 ms | 42% |
 | OmenDB (`--sync-class kernel`, pending-slot fix, 1 client) | 152 | 6.6 ms | — |
+| OmenDB (`--sync-class kernel`, + phantom-scan bound, 1 client) | 152 | ~5 ms | — |
 | OmenDB (`--wal-first`, keyed-history era) | 19.8 | 200 ms | 31% |
 
 The stock heap INSERT is ~11% cheaper than the keyed substitute it
@@ -106,6 +107,16 @@ tps) with no engine-internal change; `examples/sql_tier_probe.rs` and
 ms/txn vs wire 6.7 before the fix, 1.9 after). The 4-client differential
 is unchanged by the fix: its ~50 ms latency is the multi-writer
 serialization documented below, not the single-client commit path.
+
+The 2026-09-07 phantom-scan bound closed the last unattributed commit
+cost: `validate_staged_range_dependencies` scanned the entire
+change-record prefix per registered read range per commit (O(total
+history), unbounded). Change records sort by commit sequence, so the
+scan now starts at snapshot+1 and the B-tree seek skips all history.
+Embedded TPC-B 1.16 -> 0.59 ms/txn, COMMIT 1.07 -> 0.44 ms; wire
+simple-protocol 1.05 ms/txn. The serializable suite caught the
+first cut's exclusive end bound (a phantom at exactly the head must
+conflict) — the landed bound is inclusive.
 
 WAL-first commit acks are QUALIFIED for crash correctness (3-mode
 process-crash matrix at the real 2 MiB bound;
