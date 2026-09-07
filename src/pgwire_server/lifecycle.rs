@@ -222,6 +222,8 @@ pub(super) struct ServerState {
     accepted_connections: AtomicU64,
     rejected_connections: AtomicU64,
     max_connections: usize,
+    #[cfg(test)]
+    retained_connection_tasks: AtomicUsize,
     query_workers: Arc<QueryWorkers>,
 }
 
@@ -320,6 +322,8 @@ impl ServerState {
             accepted_connections: AtomicU64::new(0),
             rejected_connections: AtomicU64::new(0),
             max_connections,
+            #[cfg(test)]
+            retained_connection_tasks: AtomicUsize::new(0),
             query_workers: Arc::new(QueryWorkers::new()),
         }
     }
@@ -544,8 +548,13 @@ async fn run_accept_loop(
     let slots = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
     let mut connections = JoinSet::new();
     let result = loop {
+        #[cfg(test)]
+        state
+            .retained_connection_tasks
+            .store(connections.len(), Ordering::Release);
         tokio::select! {
             _ = state.wait_for_shutdown() => break Ok(()),
+            _ = connections.join_next(), if !connections.is_empty() => {},
             accepted = listener.accept() => {
                 let (socket, _peer) = match accepted {
                     Ok(accepted) => accepted,
@@ -600,4 +609,53 @@ pub async fn spawn(
     let addr = listener.local_addr()?;
     let handle = tokio::spawn(serve(database, listener));
     Ok((addr, handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_connections_are_reaped_while_listener_is_running() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let server = RunningServer::start(
+            ServerConfig::new(directory.path().join("db"), "127.0.0.1:0".parse().unwrap())
+                .with_max_connections(1),
+        )
+        .await
+        .expect("start server");
+        for _ in 0..3 {
+            let socket = tokio::net::TcpStream::connect(server.local_addr())
+                .await
+                .expect("connect");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while server
+                    .state
+                    .retained_connection_tasks
+                    .load(Ordering::Acquire)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("connection task registered");
+            drop(socket);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while server
+                    .state
+                    .retained_connection_tasks
+                    .load(Ordering::Acquire)
+                    != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed task reaped without shutdown or another connection");
+            assert_eq!(server.status().active_connections, 0);
+            assert!(!server.status().shutting_down);
+        }
+        server.shutdown().await.expect("shutdown server");
+    }
 }
