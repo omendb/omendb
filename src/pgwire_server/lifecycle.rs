@@ -16,6 +16,8 @@ use super::auth::{HandlerFactory, build_factory};
 use super::{OperationControl, SharedDatabase, map_db_error, pg_error};
 use crate::{CancellationToken, DbError, RelationalDatabase};
 
+const MAX_CAPACITY_CANCEL_CONNECTIONS: usize = 8;
+
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 pub(crate) fn read_lock(
@@ -91,7 +93,9 @@ pub struct ServerConfig {
     pub bind_addr: std::net::SocketAddr,
     /// Create the database directory when it does not exist.
     pub create_if_missing: bool,
-    /// Maximum number of connection tasks admitted at once.
+    /// Maximum number of session connections admitted at once. At capacity,
+    /// up to eight additional sockets may read a bounded cancel packet for
+    /// at most one second; those sockets cannot start a session.
     pub max_connections: usize,
     /// Optional cooperative deadline for each wire statement and describe.
     /// `None` disables the deadline; zero is an immediate deadline.
@@ -200,6 +204,7 @@ pub enum ServerError {
 /// A bounded diagnostic projection of the server lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerStatus {
+    /// Admitted session connections, excluding bounded cancel-only readers.
     pub active_connections: usize,
     pub accepted_connections: u64,
     pub rejected_connections: u64,
@@ -547,6 +552,8 @@ async fn run_accept_loop(
 ) -> std::io::Result<()> {
     let slots = Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS)));
     let mut connections = JoinSet::new();
+    let mut control_connections = JoinSet::new();
+    let control_slots = Arc::new(Semaphore::new(MAX_CAPACITY_CANCEL_CONNECTIONS));
     let result = loop {
         #[cfg(test)]
         state
@@ -555,6 +562,7 @@ async fn run_accept_loop(
         tokio::select! {
             _ = state.wait_for_shutdown() => break Ok(()),
             _ = connections.join_next(), if !connections.is_empty() => {},
+            _ = control_connections.join_next(), if !control_connections.is_empty() => {},
             accepted = listener.accept() => {
                 let (socket, _peer) = match accepted {
                     Ok(accepted) => accepted,
@@ -564,8 +572,20 @@ async fn run_accept_loop(
                 let permit = match Arc::clone(&slots).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        state.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                        drop(socket);
+                        let Ok(control_permit) = Arc::clone(&control_slots).try_acquire_owned() else {
+                            state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            drop(socket);
+                            continue;
+                        };
+                        let cancellations = Arc::clone(&factory.handler.cancellations);
+                        let task_state = Arc::clone(&state);
+                        control_connections.spawn(async move {
+                            let _permit = control_permit;
+                            let mut socket = socket;
+                            if !super::cancellation::receive_capacity_cancel(&mut socket, &cancellations).await {
+                                task_state.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
                         continue;
                     }
                 };
@@ -590,7 +610,9 @@ async fn run_accept_loop(
     // running blocking task.
     factory.handler.cancellations.cancel_all();
     connections.abort_all();
+    control_connections.abort_all();
     while connections.join_next().await.is_some() {}
+    while control_connections.join_next().await.is_some() {}
     factory.handler.query_workers.wait_for_idle().await;
     state.active_connections.store(0, Ordering::Release);
     result
@@ -614,6 +636,134 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_request_works_at_session_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Arc::new(RwLock::new(
+            RelationalDatabase::create(crate::RelationalBackendConfig::new(
+                directory.path().join("db"),
+            ))
+            .unwrap(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(ServerState::new(1));
+        let factory = build_factory(
+            &database,
+            address,
+            Arc::clone(&state.query_workers),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let server = tokio::spawn(run_accept_loop(listener, factory, Arc::clone(&state), 1));
+        let dsn = format!("host=127.0.0.1 port={} user=omendb", address.port());
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        assert!(
+            tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .is_err()
+        );
+        let cancel = client.cancel_token();
+        let (release, released) = std::sync::mpsc::channel();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let locked_database = Arc::clone(&database);
+        let lock_thread = std::thread::spawn(move || {
+            let _lock = locked_database.write().unwrap();
+            locked.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        acquired.recv_timeout(Duration::from_secs(2)).unwrap();
+        let query = tokio::spawn(async move { client.batch_execute("SELECT 1").await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.status().active_operations == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let sent = cancel.cancel_query(tokio_postgres::NoTls).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(2), query).await;
+        let _ = release.send(());
+        lock_thread.join().unwrap();
+        state.request_shutdown();
+        server.await.unwrap().unwrap();
+        let _ = connection.await;
+        sent.expect("send cancellation at capacity");
+        let error = outcome
+            .expect("cancelled query must finish before lock release")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_capacity_control_connections_are_bounded_and_expire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let server = RunningServer::start(
+            ServerConfig::new(directory.path().join("db"), "127.0.0.1:0".parse().unwrap())
+                .with_max_connections(1),
+        )
+        .await
+        .unwrap();
+        let session = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.status().active_connections != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut controls = Vec::new();
+        for _ in 0..MAX_CAPACITY_CANCEL_CONNECTIONS {
+            let mut socket = tokio::net::TcpStream::connect(server.local_addr())
+                .await
+                .unwrap();
+            socket.write_all(&[0]).await.unwrap();
+            controls.push(socket);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.status().accepted_connections != 1 + MAX_CAPACITY_CANCEL_CONNECTIONS as u64
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut overflow = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_millis(500), overflow.read(&mut byte))
+            .await
+            .expect("excess control connection rejected immediately");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for mut socket in controls {
+                assert!(matches!(socket.read(&mut byte).await, Ok(0) | Err(_)));
+            }
+        })
+        .await
+        .expect("partial startup controls expired");
+        assert_eq!(server.status().active_connections, 1);
+        assert_eq!(
+            server.status().rejected_connections,
+            MAX_CAPACITY_CANCEL_CONNECTIONS as u64 + 1
+        );
+        drop(session);
+        server.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn completed_connections_are_reaped_while_listener_is_running() {
