@@ -1,12 +1,37 @@
 # OmenDB
 
-OmenDB is a server-first relational database system in development, written in Rust and built on [SeerDB](crates/seerdb). It targets PostgreSQL-class single-node OLTP with PostgreSQL ecosystem compatibility at deliberate external boundaries. A direct embedded Rust API remains useful for integration and testing, but it is a secondary deployment surface—not the product boundary.
+Relational database server in Rust, built on [SeerDB](crates/seerdb).
+OmenDB targets single-node OLTP and PostgreSQL ecosystem integration through
+an experimental PostgreSQL wire interface. A direct Rust API is also available.
 
-> **Developer preview:** The relational `0.1.0-alpha.*` line is reserved but not alpha-ready. APIs, persistence formats, supported platforms, and performance are subject to change. The current direct API is a qualification surface; a releasable alpha must satisfy the server-first storage and server gates. PostgreSQL wire support is experimental and feature-gated. See [`docs/architecture.md`](docs/architecture.md) for the design and [`docs/alpha-release-gates.md`](docs/alpha-release-gates.md) for the release contract.
+**Developer preview.** The server alpha is still in development. SQL coverage,
+APIs, persistence formats, and supported platforms are subject to change.
+See the [release gates](docs/alpha-release-gates.md) for the release contract.
 
-## Quick start
+## Run the server
 
-OmenDB is not currently published to crates.io. Use it as a Git dependency or clone this repository. The direct Rust API is currently the smallest working surface, and this example opens the persistent SeerDB-backed engine:
+From a checkout with Rust installed:
+
+```sh
+cargo run --features pgwire --bin omendbd -- \
+  --path ./omendb-data --bind 127.0.0.1:5432
+```
+
+The daemon opens or creates the database and closes it on Ctrl-C. An empty
+authentication catalog permits trust authentication on loopback only. Provision
+SCRAM users before enabling authenticated access; see the [runbook](docs/runbook.md).
+The server does not terminate TLS.
+
+The current interface supports a bounded SQL subset, transaction blocks,
+multiple client sessions, cancellation, and configurable connection, statement,
+and result limits. PostgreSQL wire support does not imply full PostgreSQL SQL
+or client compatibility. Check the [compatibility matrix](docs/pgwire-compatibility.md)
+and [SQL gap register](docs/gap-register.md) before integrating a client.
+
+## Use from Rust
+
+OmenDB is not currently published to crates.io. Use a Git dependency or this
+workspace to access the direct API:
 
 ```rust
 use omendb::{RelationalBackendConfig, RelationalDatabase};
@@ -25,140 +50,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The target directory must not already exist when creating a database.
-`RelationalBackendConfig::new(path)` selects the persistent SeerDB-backed
-storage engine — the only backend; SeerDB owns durability end to end.
+`create` requires a directory that does not already exist. Each direct SQL
+write is one transaction; use `execute_sql_batch` or a typed transaction to
+commit several statements together.
 
-The SQL layer is deliberately bounded rather than PostgreSQL-compatible. It
-supports the tested subset of schema changes, `SELECT`, `INSERT`, `UPDATE`,
-`DELETE`, parameters, joins, aggregates, indexes, and constraints. Unsupported
-syntax returns `DbError::SqlUnsupported`; use the typed API when you need
-control over transaction, snapshot, or backend behavior.
+## Storage and tools
 
-## Deployment roadmap
+OmenDB owns SQL, schemas, rows, indexes, and relational semantics. SeerDB owns
+transactional ordered-KV storage and durability. Both are developed in this
+workspace; SeerDB remains an independently versioned Apache-2.0 crate.
 
-The roadmap is server-first, with SeerDB and OmenDB advancing as one vertical
-slice rather than as isolated rewrites:
+Logical SQL dump and restore are available through the bundled tool:
 
-1. **SeerDB foundation:** the transaction, MVCC, cursor, change-position, and
-   group-commit slices are implemented; page-level multi-writer installation
-   remains open.
-2. **OmenDB integration:** complete. The direct SeerDB store owns the catalog,
-   tables, indexes, and relational transactions.
-3. **Server alpha:** in progress. The persistent daemon now supports multiple
-   wire sessions, bounded connection admission, authentication policy,
-   diagnostics, and clean shutdown/reopen behavior.
-4. **Measured acceleration:** replication/CDC, typed OLTP micro-plans,
-   batch execution, and benchmark-led page, buffer, WAL, and runtime
-   optimizations. (Serializable certification landed; see gap register.)
-
-The current direct Rust API and exploratory wire example are development
-surfaces, not the target alpha product. SeerDB is an independent Apache-2.0
-Rust crate developed in this monorepo and published on its own version line.
-OmenDB owns SQL, schema, row/index encoding, and relational semantics; SeerDB
-owns generic ordered-KV storage and transaction durability. Alternate storage
-engines are an integration concern, not a first-party engine matrix.
-
-Each direct SQL write is one transaction. Use `execute_sql_batch` (or its
-parameterized variant) or a typed transaction with
-`RelationalDatabaseTransaction::execute_sql_with_params` when
-several statements should share one atomic and durable publication. The
-reproducible baseline is available with:
-
-```bash
-cargo run --release --example alpha_oltp -- \
-  --backend all --rows 512 --operations 1000 --batch-size 1
-```
-
-The baseline reports workload metadata and latency but makes no competitive
-performance claim; `--batch-size` measures the explicit transaction trade-off.
-
-## Logical dump and restore
-
-Move data in and out with plain SQL:
-
-```bash
+```sh
 cargo run --bin omendb-tool -- dump --path ./omendb-data > backup.sql
 cargo run --bin omendb-tool -- restore --path ./fresh-db --input backup.sql
 ```
 
-Dumps render one read-consistent snapshot: tables with inline primary
-keys, data as multi-row INSERTs in scan order, secondary indexes, and
-foreign keys last. The format restores into OmenDB and into PostgreSQL
-(within the documented divergences in `docs/gap-register.md`), so it
-doubles as a migration and differential-testing tool.
-
-## PostgreSQL wire server
-
-Run the persistent daemon with:
-
-```bash
-cargo run --features pgwire --bin omendbd -- \
-  --path ./omendb-data --bind 127.0.0.1:5432
-```
-
-The daemon opens or creates the database, accepts multiple PostgreSQL wire
-sessions, and closes the durable handle on Ctrl-C. Empty authentication
-catalogs use trust mode on loopback only. Provision a SCRAM user through
-`pgwire_server::provision_wire_user` before starting the daemon; once a user
-exists, startup requires SCRAM authentication. PostgreSQL `CancelRequest`
-messages are routed to the database's cooperative cancellation checkpoints;
-connection admission is bounded with `--max-connections`,
-`--statement-timeout-ms` adds a cooperative per-statement deadline,
-`--max-result-bytes` caps the estimated response payload, and
-`--slow-statement-ms N` logs statements (including commit publication) that
-exceed the threshold to stderr.
-
-The supported SQL and wire surface is deliberate and bounded, not a claim of
-PostgreSQL compatibility. See the
-[`docs/pgwire-compatibility.md`](docs/pgwire-compatibility.md) development
-matrix for tested behavior and explicit gaps. The throwaway seeded example
-remains available for client experiments:
-
-```bash
-cargo run --features pgwire --example pgwire_serve -- 5432
-```
-
-## Alpha contract
-
-What the wire server promises today, verified by the ordinary and live-client
-test suites:
-
-- **Works:** the bounded SQL subset — single and joined `SELECT` (projection,
-  arithmetic, parameters, `IN`/`BETWEEN`, `NULL`, `DISTINCT`, ordering,
-  pagination, grouping, aggregates, set operations, subqueries), `INSERT`
-  (multi-row, `INSERT ... SELECT`, `RETURNING`), `UPDATE`/`DELETE`
-  (`RETURNING`, `FROM`/`USING`), DDL for tables, indexes, and foreign keys,
-  `EXPLAIN` reporting the access path execution actually takes, typed
-  scalars (integers, `FLOAT8`, `NUMERIC`, `DATE`, `TIMESTAMP`, `UUID`),
-  transaction blocks, and the typed embedded API.
-- **Session surface:** trust (loopback) and SCRAM-SHA-256 authentication,
-  role grants, statement deadlines, cancellation, `version()`, `SHOW` for
-  the compatibility GUCs, and a slow-statement log.
-- **Fails honestly:** unsupported syntax, joins in `EXPLAIN`, and
-  pg_catalog-dependent psql meta-commands (`\dt`, `\d`, `\l`) return
-  `feature not supported` errors — the connection stays usable. `version()`
-  names OmenDB, not PostgreSQL; clients that branch on version strings see
-  the truth.
-- **Not yet:** TLS termination (the server declines `SSLRequest`; terminate
-  TLS in front or bind private), `COPY`, replication, notifications, cursors,
-  incremental portals, and pg_catalog. Window functions are in: ranking
-  (`row_number`, `rank`, `dense_rank`), offsets (`lag`, `lead`), values
-  (`first_value`, `last_value`), and aggregates (`count`, `sum`, `avg`,
-  `min`, `max`) over `PARTITION BY`/`ORDER BY`, with PostgreSQL default
-  frames (whole partition without ORDER BY, running prefix with) and
-  explicit frames/named windows refused honestly. `sum`/`avg` over
-  integers return the argument type / `float8`, not PostgreSQL's NUMERIC
-  (documented divergence, same as OmenDB's plain aggregates). Serializable
-  certification: read-write transactions certify first-committer-wins
-  (write-skew aborts with SQLSTATE 40001).
+See the [architecture](docs/architecture.md), [operational runbook](docs/runbook.md),
+and [benchmark documentation](docs/benchmarks.md) for design, recovery, and
+measurement details.
 
 ## Development
 
-```bash
+```sh
 cargo fmt --all -- --check
 cargo test --all-features --all-targets
 cargo clippy --all-features --all-targets -- -D warnings
 ```
 
-SeerDB is an independently versioned Apache-2.0 crate under `crates/seerdb/`; OmenDB remains AGPL-3.0-only. See [`docs/runbook.md`](docs/runbook.md) for operational guidance (health checks, verification, maintenance, and recovery), [`SECURITY.md`](SECURITY.md) for vulnerability reports and [`LICENSE`](LICENSE) for OmenDB licensing terms.
+OmenDB is [AGPL-3.0-only](LICENSE). SeerDB has its own license under
+[`crates/seerdb`](crates/seerdb). Report vulnerabilities according to
+[SECURITY.md](SECURITY.md).
