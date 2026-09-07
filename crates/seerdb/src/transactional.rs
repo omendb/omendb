@@ -510,6 +510,19 @@ impl TransactionDatabase {
                 "transaction database is fenced; reopen required".into(),
             ));
         }
+        #[cfg(test)]
+        tests::pause_begin(tests::BeginPause::CheckedOpen);
+        // Admission holds the registry before sampling the head. GC either
+        // observes this snapshot or finishes its watermark read before we
+        // sample a head at least as new as the state it is pruning.
+        // This path takes only registry -> published_position, never db.
+        let mut snapshots =
+            self.runtime.active_snapshots.lock().map_err(|_| {
+                Error::Corruption("active snapshot registry mutex is poisoned".into())
+            })?;
+        if self.runtime.closed.load(Ordering::Acquire) {
+            return Err(Error::InvalidArgument("database is closed".into()));
+        }
         let (snapshot, snapshot_position) = {
             let position =
                 self.runtime.published_position.lock().map_err(|_| {
@@ -517,21 +530,13 @@ impl TransactionDatabase {
                 })?;
             (position.csn, *position)
         };
-        // Register under no database guard at all. GC computes retention
-        // floors under the database guard with the publish lane held, and
-        // every wave install updates the mirrored head first, so a GC pass
-        // and a begin can interleave: either GC sees this snapshot (it
-        // registered before the GC's watermark read) or the GC's pruning
-        // floor predates it, which is safe because pruning is bounded by
-        // the same guard-ordered wave publication the head mirror tracks.
+        #[cfg(test)]
+        tests::pause_begin(tests::BeginPause::SampledHead);
+        snapshots.insert(TxnId::new(id), snapshot);
         self.runtime
             .pending_transactions
             .fetch_add(1, Ordering::AcqRel);
-        self.runtime
-            .active_snapshots
-            .lock()
-            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
-            .insert(TxnId::new(id), snapshot);
+        drop(snapshots);
         Ok(Transaction {
             runtime: Arc::clone(&self.runtime),
             id: TxnId::new(id),
@@ -728,13 +733,19 @@ impl TransactionDatabase {
             .db
             .lock()
             .map_err(|_| Error::Corruption("transaction database mutex is poisoned".into()))?;
-        if !self
+        // Match maintenance's db -> versions -> registry order. Keep
+        // admission excluded through the closed transition, so a begin that
+        // already passed the fast closed check cannot register after close.
+        let versions = self
             .runtime
-            .active_snapshots
+            .versions
             .lock()
-            .map_err(|_| Error::Corruption("active snapshot registry mutex is poisoned".into()))?
-            .is_empty()
-        {
+            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?;
+        let snapshots =
+            self.runtime.active_snapshots.lock().map_err(|_| {
+                Error::Corruption("active snapshot registry mutex is poisoned".into())
+            })?;
+        if !snapshots.is_empty() {
             return Err(Error::InvalidArgument(
                 "cannot close database while transactions are active".into(),
             ));
@@ -742,11 +753,7 @@ impl TransactionDatabase {
         if self.runtime.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.runtime
-            .versions
-            .lock()
-            .map_err(|_| Error::Corruption("MVCC version store mutex is poisoned".into()))?
-            .sync()?;
+        versions.sync()?;
         db.close()?;
         self.runtime.closed.store(true, Ordering::Release);
         Ok(())
@@ -2958,6 +2965,128 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BeginPause {
+        CheckedOpen,
+        SampledHead,
+    }
+
+    type BeginHook = (BeginPause, Box<dyn FnOnce()>);
+    thread_local! {
+        static BEGIN_HOOK: std::cell::RefCell<Option<BeginHook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pause_begin(point: BeginPause) {
+        BEGIN_HOOK.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().is_some_and(|(at, _)| *at == point) {
+                let (_, pause) = hook.take().expect("matching hook");
+                pause();
+            }
+        });
+    }
+
+    #[test]
+    fn beginning_snapshot_remains_readable_when_gc_runs() {
+        let (_directory, database) = database();
+        let owned = tree(&database);
+        commit_key(&database, owned, b"old");
+        let mut writer = database.begin().expect("begin writer");
+        writer.put(owned, b"old", b"new").expect("stage update");
+        let committed = stage_commit(&mut writer).expect("enqueue update");
+        let mut writer = Some(writer);
+        let (sampled_tx, sampled_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                BEGIN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some((
+                        BeginPause::SampledHead,
+                        Box::new(move || {
+                            sampled_tx.send(()).expect("signal sampled head");
+                            resume_rx.recv().expect("resume begin");
+                        }),
+                    ));
+                });
+                database.begin().expect("begin reader")
+            });
+            sampled_rx.recv().expect("wait for sampled head");
+            publish_with_lane(&database.runtime, lock_publish(&database.runtime))
+                .expect("publish update");
+            committed
+                .recv()
+                .expect("update outcome")
+                .expect("update commits");
+            // Force GC into the sampling/registration gap if that gap is
+            // unprotected. With admission locked, begin must register first.
+            let admission_locked = match database.runtime.active_snapshots.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(error) => panic!("snapshot registry: {error}"),
+            };
+            if !admission_locked {
+                drop(writer.take());
+                database.gc_versions().expect("GC before registration");
+            }
+            resume_tx.send(()).expect("resume reader");
+            let mut reader = reader.join().expect("reader thread");
+            if admission_locked {
+                drop(writer.take());
+                database.gc_versions().expect("GC after registration");
+            }
+            assert_eq!(
+                reader.get(owned, b"old").expect("snapshot value"),
+                Some(b"old".to_vec())
+            );
+        });
+        database.close().expect("close");
+    }
+
+    #[test]
+    fn beginning_transaction_rechecks_close_before_registration() {
+        let (_directory, database) = database();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let beginning = scope.spawn(|| {
+                BEGIN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some((
+                        BeginPause::CheckedOpen,
+                        Box::new(move || {
+                            checked_tx.send(()).expect("signal open check");
+                            resume_rx.recv().expect("resume begin");
+                        }),
+                    ));
+                });
+                database.begin()
+            });
+            checked_rx.recv().expect("wait for open check");
+            database.close().expect("close before registration");
+            resume_tx.send(()).expect("resume begin");
+            assert!(matches!(
+                beginning.join().expect("begin thread"),
+                Err(Error::InvalidArgument(_))
+            ));
+        });
+        assert_eq!(
+            database
+                .runtime
+                .oldest_active_snapshot()
+                .expect("snapshots"),
+            None
+        );
+        assert_eq!(
+            database
+                .runtime
+                .pending_transactions
+                .load(Ordering::Acquire),
+            0
+        );
+    }
 
     fn database() -> (tempfile::TempDir, TransactionDatabase) {
         let directory = tempdir().expect("temporary directory");
