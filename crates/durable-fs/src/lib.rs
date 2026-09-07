@@ -43,7 +43,7 @@
 //!
 //! # Atomic publication
 //!
-//! [`atomic_write`] is the buffered shape: write a `.tmp` sibling, sync
+//! [`atomic_write`] is the buffered shape: write a unique temporary sibling, sync
 //! it, rename over the target, sync the parent directory. A crash leaves
 //! either the old or the new content, never a partial mix. Streaming
 //! publishers (large segments, compacted logs) compose the same steps
@@ -55,7 +55,8 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What a "sync" means on this platform.
 ///
@@ -180,41 +181,70 @@ pub fn fsync_dir_chain(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically replace `path` with `data`: write the `.tmp` sibling,
+/// Atomically replace `path` with `data`: write a unique temporary sibling,
 /// sync it, rename over the target, sync the parent directory.
 ///
 /// A crash leaves either the old or the new content, never a partial
-/// mix. A leftover `.tmp` from a crashed publish is harmless; the next
-/// publish truncates and overwrites it. The temporary file is removed
-/// on failure before returning the error.
+/// mix. Temporary files left by a crash are not reused. Failures before
+/// rename leave the target unchanged and attempt to remove the temporary
+/// file. A directory-sync error after rename may leave the new content
+/// visible without confirming its durability.
 ///
 /// For payloads too large to buffer (streaming segments, compacted
 /// logs), compose [`sync_file_all`], [`std::fs::rename`], and
 /// [`fsync_dir`] directly instead.
 pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension("tmp");
-    let write = || -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)?;
+    let (temporary, file) = create_temporary_sibling(path)?;
+    let publish = || -> io::Result<()> {
+        let mut file = file;
         file.write_all(data)?;
         file.flush()?;
         // Always the device barrier: this is a publication sync, not an
         // append-shaped one, and the class knob exists for the hot paths.
         file.sync_all()?;
-        Ok(())
+        drop(file);
+        std::fs::rename(&temporary, path)
     };
-    if let Err(error) = write() {
+    if let Err(error) = publish() {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
-    std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fsync_dir(parent)?;
+    fsync_dir(publication_parent(path))
+}
+
+fn publication_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_temporary_sibling(path: &Path) -> io::Result<(PathBuf, File)> {
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    let filename = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "publication requires a filename",
+        )
+    })?;
+    for _ in 0..128 {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = filename.to_os_string();
+        temporary_name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+        let temporary = publication_parent(path).join(temporary_name);
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique publication temporary file",
+    ))
 }
 
 #[cfg(test)]
@@ -255,10 +285,7 @@ mod tests {
         fs::write(&path, b"old").expect("old");
         atomic_write(&path, b"new content").expect("publish");
         assert_eq!(fs::read(&path).expect("read"), b"new content");
-        assert!(
-            !path.with_extension("tmp").exists(),
-            "temporary file must not survive a successful publish"
-        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -269,6 +296,75 @@ mod tests {
         let path = directory.path().join("missing/artifact");
         assert!(atomic_write(&path, b"new").is_err());
         assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn atomic_write_tmp_destination_preserves_open_old_file() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("artifact.tmp");
+        fs::write(&path, b"old").expect("old");
+        let mut old_file = File::open(&path).expect("open old inode");
+        atomic_write(&path, b"new content").expect("publish");
+        let mut old_contents = Vec::new();
+        old_file
+            .read_to_end(&mut old_contents)
+            .expect("read old inode");
+        assert_eq!(
+            old_contents, b"old",
+            "publication must not modify the old inode"
+        );
+        assert_eq!(fs::read(path).expect("read new inode"), b"new content");
+    }
+
+    #[test]
+    fn atomic_write_concurrent_sibling_destinations_do_not_collide() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let barrier = &barrier;
+                let path = directory.path().join(format!("artifact.{index}"));
+                scope.spawn(move || {
+                    let contents = vec![index as u8; 4096];
+                    barrier.wait();
+                    for _ in 0..8 {
+                        atomic_write(&path, &contents).expect("publish distinct destination");
+                        assert_eq!(fs::read(&path).expect("read own destination"), contents);
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 8);
+    }
+
+    #[test]
+    fn atomic_write_rename_failure_removes_temporary_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let destination = directory.path().join("existing-directory");
+        fs::create_dir(&destination).expect("create directory");
+        assert!(atomic_write(&destination, b"new").is_err());
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_accepts_bare_filename() {
+        const CHILD: &str = "DURABLE_FS_BARE_FILENAME_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            atomic_write(Path::new("artifact"), b"new").expect("publish relative filename");
+            assert_eq!(fs::read("artifact").unwrap(), b"new");
+            return;
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::atomic_write_accepts_bare_filename"])
+            .current_dir(directory.path())
+            .env(CHILD, "1")
+            .output()
+            .expect("run with isolated current directory");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]
