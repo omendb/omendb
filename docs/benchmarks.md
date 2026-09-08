@@ -11,6 +11,7 @@ engineering baselines, not marketing claims.
 |---|---|
 | Point insert (single-row commit) | ~70 ops/s |
 | Batched insert (100 rows/batch) | ~2,800–3,000 rows/s |
+| Batched mixed OLTP (batch-size 32, 4,000 ops, 80/20 read/write) | ~2,236 ops/s |
 | Concurrent point insert (8 threads, engine tier) | ~511 ops/s |
 | Concurrent point insert (16 threads, engine tier) | ~976 ops/s |
 | Concurrent point insert (8 threads, SQL facade) | ~146 ops/s |
@@ -58,6 +59,17 @@ engineering baselines, not marketing claims.
    serialization conflict instead of publishing a duplicate.
 3. SeerDB phantom validation now seeks change records past the snapshot CSN
    instead of scanning conflict history from the beginning.
+4. B-tree leaf splits balance entry byte mass, not entry count
+   (`fix/btree-mass-split`). A count-balanced split could leave one half of
+   a heterogeneously sized leaf nearly full — change-record entries
+   (several-hundred-byte values) beside small status records — so the
+   post-split insert escaped as a wave-terminal PageFull that surfaced as
+   "storage corruption: publication failed: PageFull" for every wave
+   waiter. Batched mixed workloads hit this deterministically
+   (`alpha_oltp --batch-size 32` failed mid-run); a full page of mixed
+   sizes now always leaves room in each half for one more entry, and a
+   capacity failure that still escapes maps to the retryable storage
+   capacity class, never fabricated corruption.
 
 ## Same-hardware pgbench differential (TPC-B, PostgreSQL wire)
 

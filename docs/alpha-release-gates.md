@@ -153,34 +153,44 @@ matrix provides the storage-side crash coverage below.
 
 ### Performance
 
-- [ ] a reproducible SQLite OLTP workload reports schema, row count, read /
+- [x] a reproducible SQLite OLTP workload reports schema, row count, read /
       write mix, transaction size (`--batch-size`), concurrency, seed, build
       profile, platform, filesystem, p50/p95/p99 latency, throughput, memory,
-      and database size;
-- [ ] the same workload runs against both OmenDB backends and SQLite without
-      changing semantics; batch-size 1 and representative bounded batches are
-      reported separately because durability and rollback boundaries differ;
+      and database size (`examples/alpha_oltp.rs`, one JSON object per run
+      with every field above; recorded rows live in
+      [`docs/benchmarks.md`](benchmarks.md) and the baselines table below);
+- [x] the same workload runs against the OmenDB backend (direct SeerDB
+      storage, [ADR 0005](adr/0005-delete-storage-kernel-seem.md); the
+      earlier second backend was the deleted temporary seam) and SQLite
+      without changing semantics — each run verifies its engine's final
+      state against an independent expected-state oracle and the recorded
+      runs agree; batch-size 1 and representative bounded batches are
+      reported separately in the baselines table below;
 - [ ] CPU, allocation, WAL, fsync, and compaction profiles identify the
       measured bottleneck before an optimization is accepted;
 - [x] release CI runs a small regression workload with thresholds and stores
       machine/workload metadata (`perf-smoke` job); no absolute cross-machine
       claim is made from one local run.
 
-### Recorded single-client baselines (macOS aarch64, release, batch-size 1)
+### Recorded single-client baselines (macOS aarch64, release)
 
-From `alpha_oltp --rows 512 --operations 1000 --read-percent 80`, one local
-run per backend; these are working baselines for regression tracking, not
-competitive claims:
+From `alpha_oltp --rows 512 --read-percent 80`, one local run per
+configuration, refreshed 2026-09-08; these are working baselines for
+regression tracking, not competitive claims. Single-run numbers move
+with OS/SQLite versions and filesystem state (SQLite's batch-1 figure
+was ~68,591 ops/s on the 2026-09-05 refresh):
 
-| backend | throughput | p50 | p95 | p99 | db bytes |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| seer | 249 ops/s | 27 us | 17 ms | 20 ms | 338 KB |
-| sqlite | 68,591 ops/s | 2.3 us | 55 us | 65 us | 16 KB |
+| configuration | backend | throughput | p50 | p95 | p99 | db bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| batch-size 1, 1,000 ops | seer | 267 ops/s | 12 us | 18.9 ms | 25.7 ms | 717 KB |
+| batch-size 1, 1,000 ops | sqlite | 14,059 ops/s | 3.9 us | 0.37 ms | 1.28 ms | 16 KB |
+| batch-size 32, 4,000 ops | seer | 2,236 ops/s | 12.9 ms | 26.5 ms | 28.7 ms | 1,153 KB |
+| batch-size 32, 4,000 ops | sqlite | 362,982 ops/s | 88 us | 0.10 ms | 0.15 ms | 16 KB |
 
-At `--batch-size 32` the same Seer workload reaches ~1,631 ops/s (6.5x),
-confirming durable publication as the dominant write cost; SQLite's
-autocommit path remains orders of magnitude ahead and closing that gap is
-the open performance work.
+Batch-size 32 multiplies Seer throughput ~8x, confirming durable
+publication as the dominant write cost; SQLite's in-transaction batching
+remains orders of magnitude ahead and closing that gap is the open
+performance work.
 
 ### Packaging and support
 
