@@ -75,6 +75,7 @@ client-numbered history_id substitute — 37.0 tps — is superseded:
 | PostgreSQL 17.11 (fsync on) | 7950 | 0.50 ms | 0% |
 | OmenDB (default `--sync-class device`, heap history) | 41.0 | 96 ms | 38% |
 | OmenDB (`--sync-class kernel`, heap history) | 88.8 | 45 ms | 42% |
+| OmenDB (default `--sync-class device`, wire-COMMIT guard removed, 4 clients) | 88-95 | 43-45 ms | 37-39% |
 | OmenDB (`--sync-class kernel`, pending-slot fix, 1 client) | 152 | 6.6 ms | — |
 | OmenDB (`--sync-class kernel`, + phantom-scan bound, 1 client) | 152 | ~5 ms | — |
 | OmenDB (`--wal-first`, keyed-history era) | 19.8 | 200 ms | 31% |
@@ -117,6 +118,36 @@ Embedded TPC-B 1.16 -> 0.59 ms/txn, COMMIT 1.07 -> 0.44 ms; wire
 simple-protocol 1.05 ms/txn. The serializable suite caught the
 first cut's exclusive end bound (a phantom at exactly the head must
 conflict) — the landed bound is inclusive.
+
+The 2026-09-08 wire-COMMIT guard removal closed the last wire-tier
+serialization: the handler's Commit arm held an exclusive outer write
+guard on the shared database RwLock across the engine `commit()`
+(bound to an unused `_database` variable), serializing the staging
+that ADR 0004's group-commit lane is designed to run concurrently —
+every publication wave collapsed to a singleton (measured members=1.00
+across 3008 waves under `OMENDB_COMMIT_TRACE`; instrumentation since
+removed). The guard protects nothing on the commit path: the commit
+chain takes only `self`, publication is serialized by the engine's
+publish lane, and schema changes are fenced by the catalog-marker
+range registered at begin. Removing it restores real wave grouping
+(members 2-3 typical, 4 at peak). Interleaved same-database A/B
+(baseline first each round, scale 4, TPC-B mix, 30 s): 4 clients
+41-43 -> 88-95 tps and 92-97 -> 43-45 ms latency (2.1-2.2x); 8
+clients 41 -> 96 tps and 192 -> 78 ms (2.3x). Balance conservation
+holds exactly after all runs (branches = tellers = accounts =
+history delta = -308,296 across 16,192 committed transactions); the
+8-client 1.1% failed transactions are 40001 retry-exhaustion under
+contention (8 writers on 4 branches, 32,574 retry attempts), not
+corruption — the guarded baseline reaches zero failures only because
+its serialization keeps concurrent writers from contending at all.
+The wave-singleton abort observed on 2026-09-07 (pgbench abort after 8
+transactions, non-retryable) was the pre-overhaul CSN-gap bug
+(`e15b7bc`), unmasked by guard removal: a rejected wave member left
+a sequence gap that fenced the database; a pre-overhaul worktree
+repro confirmed it and the fix holds under the unguarded commit.
+Recorded reproduction: `scripts/pgbench/differential.sh 4 4 30` with
+and without the guard; wave histograms via the removed
+`OMENDB_COMMIT_TRACE` gating.
 
 WAL-first commit acks are QUALIFIED for crash correctness (3-mode
 process-crash matrix at the real 2 MiB bound;

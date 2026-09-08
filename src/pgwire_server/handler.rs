@@ -259,8 +259,17 @@ impl OmenDbHandler {
                 }
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
+                //
+                // No outer write guard: the engine's group-commit lane
+                // (ADR 0004) already serializes publication and stages
+                // concurrently under its own prepare mutex, and schema
+                // changes are fenced by the catalog-marker range every
+                // transaction registers at begin. Holding the exclusive
+                // guard across commit() serializes staging too, collapsing
+                // every wave to a singleton (measured members=1.00 across
+                // 3008 waves) and blocking all readers for the wave
+                // duration; the lane is the only serialization needed.
                 block.transaction.set_operation_control(control);
-                let _database = write_lock_with_control(&self.database, control)?;
                 block.transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
