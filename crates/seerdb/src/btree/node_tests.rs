@@ -176,6 +176,44 @@ fn test_split_leaf() {
 }
 
 #[test]
+fn test_split_balances_entry_mass_with_heterogeneous_sizes() {
+    // A count-balanced split leaves the large-entry half nearly full:
+    // five ~700-byte entries plus one more 700-byte entry overflow a
+    // half page, while the small-entry half is nearly empty. The split
+    // midpoint must balance entry bytes so either half can accept one
+    // more entry of any size that fits an empty page.
+    let mut node = Node::new_leaf();
+    let large = vec![b'L'; 700];
+    for i in 0..3 {
+        node.insert(format!("large_{:03}", i).as_bytes(), &large)
+            .unwrap();
+    }
+    // Small entries fill the page so a further large insert would fail;
+    // sizes are deliberately heterogeneous (3 x ~706 bytes, ~80 x ~10).
+    for i in 0..80 {
+        node.insert(format!("sml_{:03}", i).as_bytes(), b"s")
+            .unwrap();
+    }
+    assert!(node.count() >= 2);
+    // The page is full: one more large entry cannot fit.
+    assert!(matches!(
+        node.insert(b"zzz_would_overflow", &large),
+        Err(InsertError::PageFull)
+    ));
+
+    let (_median, mut right) = node.split().unwrap();
+    // Both halves must accept one more large entry: exactly the alpha_oltp
+    // batch-32 failure shape (change-record leaves beside small records).
+    let probe = b"zzz_large_probe";
+    let more = vec![b'M'; 700];
+    node.insert(probe, &more)
+        .expect("left half must fit another large entry");
+    right
+        .insert(probe, &more)
+        .expect("right half must fit another large entry");
+}
+
+#[test]
 fn test_checksum_roundtrip() {
     let mut node = Node::new_leaf();
     node.insert(b"key", b"value").unwrap();

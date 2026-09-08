@@ -1743,6 +1743,12 @@ fn map_seer_error(error: SeerError) -> DbError {
             requested: required,
             available,
         },
+        // A page-capacity admission failure is a pre-publication certain
+        // no-op, not corruption: the transaction is retryable.
+        SeerError::PageFull => DbError::StorageCapacity {
+            requested: 1,
+            available: 0,
+        },
         SeerError::DatabaseBusy => DbError::StorageBusy {
             operation: "direct SeerDB",
             reason: "another writer owns the database".to_owned(),

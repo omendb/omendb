@@ -1740,6 +1740,10 @@ fn materialize_failure(failure: Arc<Error>) -> Error {
             current: *current,
         },
         Error::TreeNotFound(tree) => Error::TreeNotFound(*tree),
+        // Capacity admission failures happen before the WAL append, so the
+        // group is a certain no-op; the capacity condition is retryable and
+        // must not surface as terminal corruption to the wave's waiters.
+        Error::PageFull => Error::PageFull,
         other => Error::Corruption(format!("publication failed: {other:?}")),
     }
 }

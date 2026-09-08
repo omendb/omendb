@@ -1,5 +1,7 @@
 //! B-tree node split and rebuild ownership.
 
+use super::PAGE_SIZE;
+use super::page_format::SLOT_SIZE;
 use super::{Node, SplitError, ValueRef, ValueType};
 
 impl Node {
@@ -9,13 +11,19 @@ impl Node {
     /// For leaves, the median and all greater keys move right. For internal
     /// nodes, the median moves to the parent and keys greater than it move
     /// right.
+    ///
+    /// The midpoint balances the byte mass of the two halves, not the
+    /// entry count. Entries vary widely in size (a change-record leaf
+    /// beside small status records), so a count-balanced split can leave
+    /// one half nearly full; a byte-balanced split guarantees each half
+    /// has room for one more entry of any size that fits an empty page.
     pub fn split(&mut self) -> Result<(Vec<u8>, Node), SplitError> {
         let count = self.count();
         if count < 2 {
             return Err(SplitError::TooFewKeys);
         }
 
-        let mid = count / 2;
+        let mid = self.split_midpoint(count);
         let median_key = self.key(mid).ok_or(SplitError::Corruption)?;
 
         let mut right = if self.is_leaf() {
@@ -111,5 +119,42 @@ impl Node {
         }
 
         Ok((median_key, right))
+    }
+
+    /// Choose a leaf split midpoint that balances the byte mass of the
+    /// two halves. Falls back to the count midpoint when sizes are
+    /// unavailable. Always keeps at least one entry on each side.
+    fn split_midpoint(&self, count: usize) -> usize {
+        let midpoint = count / 2;
+        if !self.is_leaf() {
+            return midpoint;
+        }
+        let entry_bytes = |index: usize| -> Option<usize> {
+            let offset = self.slot_offset(index);
+            let upper = (0..count)
+                .map(|other| self.slot_offset(other))
+                .filter(|&other_offset| other_offset > offset)
+                .min()
+                .unwrap_or(PAGE_SIZE);
+            // Slot overhead is charged per entry so the mass reflects both
+            // the encoded entry and its fixed bookkeeping cost.
+            Some(upper.saturating_sub(offset) + SLOT_SIZE)
+        };
+        let total: usize = (0..count)
+            .map(|index| entry_bytes(index).unwrap_or(0))
+            .sum();
+        let mut best = midpoint;
+        let mut best_distance = usize::MAX;
+        for candidate in 1..count {
+            let left: usize = (0..candidate)
+                .map(|index| entry_bytes(index).unwrap_or(0))
+                .sum();
+            let distance = left.abs_diff(total - left);
+            if distance < best_distance {
+                best_distance = distance;
+                best = candidate;
+            }
+        }
+        best
     }
 }

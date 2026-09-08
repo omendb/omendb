@@ -1698,3 +1698,39 @@ fn snapshot_watermark_releases_when_transaction_finishes() {
     );
     database.close().expect("close");
 }
+
+#[test]
+fn heterogeneous_batch_commits_do_not_lose_the_split_boundary() {
+    // Regression: change-record leaves hold sequential keys with large
+    // values beside small status records; a count-balanced split left one
+    // half nearly full and the post-split insert escaped as a wave-
+    // terminal PageFull ("storage corruption: publication failed:
+    // PageFull"). The split midpoint balances entry mass, so a full page
+    // of mixed sizes always leaves room in both halves for one more
+    // entry that fits an empty page.
+    let (_directory, database) = database();
+    let owned = tree(&database);
+    // Change-record-shaped values: several hundred bytes, like a
+    // batched transaction's encoded write set.
+    let large: Vec<u8> = (0..700).map(|byte| (byte % 251) as u8).collect();
+    for round in 0..16u64 {
+        let mut transaction = database.begin().expect("begin");
+        for index in 0..32u64 {
+            // A small key set forces repeated versions of the same keys,
+            // building heterogeneous-mass pages in the change-record region.
+            let key = format!("key-{}", (round * 7 + index) % 13);
+            transaction
+                .put(owned, key.as_bytes(), &large)
+                .expect("stage write");
+        }
+        transaction
+            .commit()
+            .unwrap_or_else(|error| panic!("round {round} commit: {error}"));
+    }
+    // The committed state is fully readable after the churn.
+    let mut reader = database.begin().expect("begin reader");
+    let value = reader.get(owned, b"key-0").expect("read committed value");
+    assert_eq!(value.as_deref(), Some(large.as_slice()));
+    drop(reader);
+    database.close().expect("close");
+}
