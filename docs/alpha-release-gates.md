@@ -166,8 +166,13 @@ matrix provides the storage-side crash coverage below.
       state against an independent expected-state oracle and the recorded
       runs agree; batch-size 1 and representative bounded batches are
       reported separately in the baselines table below;
-- [ ] CPU, allocation, WAL, fsync, and compaction profiles identify the
-      measured bottleneck before an optimization is accepted;
+- [x] CPU, allocation, WAL, fsync, and compaction profiles identify the
+      measured bottleneck before an optimization is accepted
+      (`crates/seerdb/examples/cpu_alloc_probe.rs`: counting global allocator
+      + `getrusage` CPU + publication-phase/byte diffs over the TPC-B-shaped
+      stream; 2026-09-08 profile recorded in [`docs/benchmarks.md`](benchmarks.md)
+      — device barrier commits are 96.8% sync-wait, kernel-barrier commits
+      become 76% CPU-bound at 393 allocations/18.8 KB per transaction);
 - [x] release CI runs a small regression workload with thresholds and stores
       machine/workload metadata (`perf-smoke` job); no absolute cross-machine
       claim is made from one local run.

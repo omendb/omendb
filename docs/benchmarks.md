@@ -181,6 +181,41 @@ remaining per-wave costs are the three sync-bearing phases themselves
 the next measured levers, now visible at ~223 us/txn scale instead of
 ~13 ms.
 
+## CPU, allocation, and publication profile
+
+`cpu_alloc_probe` (crates/seerdb/examples/cpu_alloc_probe.rs) is the
+performance gate's profiling instrument: a counting global allocator
+plus `getrusage` CPU sampling around the same TPC-B-shaped single-write
+stream `wave_cost_probe` drives, with SeerDB's cumulative
+publication-phase timings and byte counters diffed over the run. It
+makes the acceptance question answerable before any optimization is
+proposed: what does the commit path spend, and where.
+
+Measured 2026-09-08 (400 txns, keyspace 10,000, release, macOS aarch64,
+stable across consecutive runs):
+
+| dimension | device barrier (default) | kernel barrier |
+|---|---:|---:|
+| wall per txn | 13.75 ms | 218 us |
+| CPU (user+system) share | 3.2% | 76.3% |
+| allocations per txn | 393 (18.8 KB) | 393 (18.8 KB) |
+| data_flush share | 33.1% | 38.7% |
+| metadata_write share | 32.9% | 22.9-23.3% |
+| WAL bytes per txn | 293 | 293 |
+| metadata bytes per txn | 591 | 591 |
+
+Reading the profile: under the default device barrier the commit path is
+96.8% sync-wait (CPU 3.2%) — durability barriers, not computation, own
+the single-writer latency, confirming the wave-floor attribution at
+batch-1 scale. Under the kernel barrier the same phases shrink to ~10%
+of an 8.5x shorter wall and CPU becomes the dominant cost (76%); at that
+point the per-transaction allocation volume (393 allocations, 18.8 KB)
+is the next measured lever, ahead of the per-wave candidate clone.
+Blob/directory/manifest/history phases report zero for this workload
+honestly: blob separation triggers only for large values and
+manifest/history artifacts update on generation boundaries, not per
+wave.
+
 ## Known follow-ups
 
 - Publication-wave cost: the ~10 ms wave floor (version-store sync +
