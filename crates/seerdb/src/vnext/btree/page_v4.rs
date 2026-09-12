@@ -117,13 +117,11 @@ impl<'a> PageRef<'a> {
         let count = read_u32(data, 8).ok_or(PageError("missing slot count"))? as usize;
         let lower = read_u32(data, 12).ok_or(PageError("missing lower bound"))? as usize;
         let upper = read_u32(data, 16).ok_or(PageError("missing upper bound"))? as usize;
-        let prefix_offset =
-            read_u32(data, 20).ok_or(PageError("missing prefix offset"))? as usize;
+        let prefix_offset = read_u32(data, 20).ok_or(PageError("missing prefix offset"))? as usize;
         let prefix_len = read_u32(data, 24).ok_or(PageError("missing prefix length"))? as usize;
         let high_offset =
             read_u32(data, 28).ok_or(PageError("missing high-fence offset"))? as usize;
-        let high_len =
-            read_u32(data, 32).ok_or(PageError("missing high-fence length"))? as usize;
+        let high_len = read_u32(data, 32).ok_or(PageError("missing high-fence length"))? as usize;
         let right_raw = read_u64(data, 36).ok_or(PageError("missing right sibling"))?;
         let leftmost_raw = read_u64(data, 44).ok_or(PageError("missing leftmost child"))?;
 
@@ -208,12 +206,8 @@ impl<'a> PageRef<'a> {
         if self.header.prefix_len == 0 {
             return Ok(&[]);
         }
-        checked_slice(
-            self.data,
-            self.header.prefix_offset,
-            self.header.prefix_len,
-        )
-        .ok_or(PageError("prefix is malformed"))
+        checked_slice(self.data, self.header.prefix_offset, self.header.prefix_len)
+            .ok_or(PageError("prefix is malformed"))
     }
 
     pub(super) fn follow_right(&self, key: &[u8]) -> Result<Option<PageId>, PageError> {
@@ -245,7 +239,10 @@ impl<'a> PageRef<'a> {
                 Ordering::Greater => hi = mid,
             }
         }
-        Ok(found.map_or_else(|| Err(lo), Ok))
+        Ok(match found {
+            Some(index) => Ok(index),
+            None => Err(lo),
+        })
     }
 
     pub(super) fn child_for_key(&self, key: &[u8]) -> Result<PageId, PageError> {
@@ -255,8 +252,7 @@ impl<'a> PageRef<'a> {
         let insertion = match self.search(key)? {
             Ok(index) => {
                 let mut upper = index + 1;
-                while upper < self.header.count
-                    && self.compare_key(upper, key)? == Ordering::Equal
+                while upper < self.header.count && self.compare_key(upper, key)? == Ordering::Equal
                 {
                     upper += 1;
                 }
@@ -358,7 +354,10 @@ impl<'a> PageRef<'a> {
             spans.push((slot.offset, end));
 
             let key = self.full_key(index)?;
-            if previous.as_deref().is_some_and(|prev| prev > key.as_slice()) {
+            if previous
+                .as_deref()
+                .is_some_and(|prev| prev > key.as_slice())
+            {
                 return Err(PageError("page keys are not sorted"));
             }
             previous = Some(key);
@@ -439,11 +438,10 @@ impl<'a> PageRef<'a> {
         }
         let start = HEADER_SIZE + index * SLOT_SIZE;
         let offset = read_u32(self.data, start).ok_or(PageError("slot offset missing"))? as usize;
-        let key_len = read_u16(self.data, start + 4).ok_or(PageError("slot key length missing"))?
-            as usize;
-        let payload_len =
-            read_u16(self.data, start + 6).ok_or(PageError("slot payload length missing"))?
-                as usize;
+        let key_len =
+            read_u16(self.data, start + 4).ok_or(PageError("slot key length missing"))? as usize;
+        let payload_len = read_u16(self.data, start + 6)
+            .ok_or(PageError("slot payload length missing"))? as usize;
         let head = read_u32(self.data, start + 8).ok_or(PageError("slot head missing"))?;
         Ok(Slot {
             offset,
@@ -529,7 +527,6 @@ pub(super) fn try_insert_inline(
     if suffix_len > u16::MAX as usize {
         return Err(PageError("key suffix exceeds v4 slot length"));
     }
-    drop(page);
 
     let entry_len = suffix_len
         .checked_add(1)
@@ -542,13 +539,7 @@ pub(super) fn try_insert_inline(
         return Ok(InsertResult::Full);
     }
 
-    insert_slot_and_entry(
-        data,
-        insertion,
-        &key[prefix.len()..],
-        TAG_INLINE,
-        value,
-    )?;
+    insert_slot_and_entry(data, insertion, &key[prefix.len()..], TAG_INLINE, value)?;
     Ok(InsertResult::Inserted)
 }
 
@@ -568,7 +559,8 @@ pub(super) fn try_insert_internal(
         return Ok(InsertResult::FollowRight(right));
     }
     let insertion = match page.search(key)? {
-        Ok(index) | Err(index) => index,
+        Ok(_) => return Ok(InsertResult::Duplicate),
+        Err(index) => index,
     };
     let prefix = page.prefix()?.to_vec();
     if !key.starts_with(&prefix) {
@@ -578,7 +570,6 @@ pub(super) fn try_insert_internal(
     if suffix_len > u16::MAX as usize {
         return Err(PageError("separator suffix exceeds v4 slot length"));
     }
-    drop(page);
 
     let entry_len = suffix_len
         .checked_add(8)
@@ -607,7 +598,6 @@ pub(super) fn remove_leaf(data: &mut [u8], key: &[u8]) -> Result<RemoveResult, P
         Err(_) => return Ok(RemoveResult::Missing),
     };
     let count = page.count();
-    drop(page);
 
     let start = HEADER_SIZE + index * SLOT_SIZE;
     let end = HEADER_SIZE + count * SLOT_SIZE;
@@ -640,7 +630,8 @@ where
         return Err(PageError("cannot split fewer than two entries"));
     }
     let total = (0..count).try_fold(0usize, |sum, index| {
-        sum.checked_add(cost(index)).ok_or(PageError("split cost overflow"))
+        sum.checked_add(cost(index))
+            .ok_or(PageError("split cost overflow"))
     })?;
     let mut left = 0usize;
     let mut best = 1usize;
@@ -713,7 +704,6 @@ fn insert_slot_and_entry(
     if insertion > count || suffix.len() > u16::MAX as usize || payload.len() > u16::MAX as usize {
         return Err(PageError("leaf insertion metadata exceeds slot bounds"));
     }
-    drop(page);
 
     let entry_len = suffix.len() + 1 + payload.len();
     let entry_offset = upper
@@ -755,7 +745,6 @@ fn insert_internal_slot(
     if insertion > count || suffix.len() > u16::MAX as usize {
         return Err(PageError("internal insertion metadata exceeds slot bounds"));
     }
-    drop(page);
 
     let entry_len = suffix.len() + 8;
     let entry_offset = upper
@@ -810,7 +799,9 @@ where
         return Err(PageError("page size is outside v4 bounds"));
     }
     if high_fence.is_some() != right_sibling.is_some() {
-        return Err(PageError("high fence and right sibling must appear together"));
+        return Err(PageError(
+            "high fence and right sibling must appear together",
+        ));
     }
     let mut data = vec![0u8; page_size];
     let mut upper = page_size;
@@ -859,9 +850,7 @@ where
             EncodedPayload::Leaf(LeafValueOwned::Blob(pointer)) => {
                 (Some(TAG_BLOB), pointer.to_bytes().to_vec())
             }
-            EncodedPayload::Leaf(LeafValueOwned::Tombstone) => {
-                (Some(TAG_TOMBSTONE), Vec::new())
-            }
+            EncodedPayload::Leaf(LeafValueOwned::Tombstone) => (Some(TAG_TOMBSTONE), Vec::new()),
             EncodedPayload::Child(child) => {
                 if child.get() == NONE_PAGE {
                     return Err(PageError("reserved page id used as child"));
@@ -919,16 +908,8 @@ where
     write_u32(&mut data, 24, prefix_len as u32)?;
     write_u32(&mut data, 28, high_offset as u32)?;
     write_u32(&mut data, 32, high_len as u32)?;
-    write_u64(
-        &mut data,
-        36,
-        right_sibling.map_or(NONE_PAGE, PageId::get),
-    )?;
-    write_u64(
-        &mut data,
-        44,
-        leftmost_child.map_or(NONE_PAGE, PageId::get),
-    )?;
+    write_u64(&mut data, 36, right_sibling.map_or(NONE_PAGE, PageId::get))?;
+    write_u64(&mut data, 44, leftmost_child.map_or(NONE_PAGE, PageId::get))?;
     PageRef::parse(&data)?.validate_full()?;
     Ok(data)
 }
@@ -1055,7 +1036,10 @@ mod tests {
             .into_iter()
             .map(|entry| entry.key)
             .collect();
-        assert_eq!(keys, vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+        assert_eq!(
+            keys,
+            vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
     }
 
     #[test]
@@ -1083,7 +1067,27 @@ mod tests {
         let page = build_internal(512, None, None, PageId::new(1), &entries)
             .expect("internal page builds");
         let parsed = PageRef::parse(&page).expect("page parses");
-        assert_eq!(parsed.child_for_key(b"a").expect("left route"), PageId::new(1));
-        assert_eq!(parsed.child_for_key(b"m").expect("right route"), PageId::new(2));
+        assert_eq!(
+            parsed.child_for_key(b"a").expect("left route"),
+            PageId::new(1)
+        );
+        assert_eq!(
+            parsed.child_for_key(b"m").expect("right route"),
+            PageId::new(2)
+        );
+    }
+
+    #[test]
+    fn internal_duplicate_separator_is_rejected() {
+        let entries = vec![InternalEntryOwned {
+            key: b"m".to_vec(),
+            child: PageId::new(2),
+        }];
+        let mut page = build_internal(512, None, None, PageId::new(1), &entries)
+            .expect("internal page builds");
+        assert_eq!(
+            try_insert_internal(&mut page, b"m", PageId::new(3)).expect("duplicate checks"),
+            InsertResult::Duplicate
+        );
     }
 }
