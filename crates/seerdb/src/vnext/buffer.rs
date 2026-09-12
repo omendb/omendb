@@ -335,22 +335,20 @@ impl BufferPool {
             PublishResult::Published => {
                 // `installing` prevents victim selection until our own pin is
                 // established. Translation readers may also pin immediately.
-                let guard = self
-                    .try_pin_reference(key, reference)?
-                    .ok_or_else(|| self.frame_transition(
+                let guard = self.try_pin_reference(key, reference)?.ok_or_else(|| {
+                    self.frame_transition(
                         slot.id,
                         FrameTransitionError::WrongState {
                             expected: FrameState::Resident,
                             actual: slot.meta.state(),
                         },
-                    ))?;
+                    )
+                })?;
                 slot.installing.store(false, Ordering::Release);
                 Ok(Some(guard))
             }
             PublishResult::Existing(_) => {
-                self.metrics
-                    .duplicate_loads
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.duplicate_loads.fetch_add(1, Ordering::Relaxed);
                 self.discard_unpublished(slot)?;
                 Ok(None)
             }
@@ -433,7 +431,9 @@ impl BufferPool {
 
                     match slot.meta.try_begin_evict() {
                         Ok(()) => {}
-                        Err(FrameTransitionError::Pinned | FrameTransitionError::WrongState { .. }) => {
+                        Err(
+                            FrameTransitionError::Pinned | FrameTransitionError::WrongState { .. },
+                        ) => {
                             self.metrics
                                 .eviction_refusals
                                 .fetch_add(1, Ordering::Relaxed);
@@ -716,7 +716,10 @@ mod tests {
                 .get(&key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing page"))?;
             if page.len() != destination.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "page size mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "page size mismatch",
+                ));
             }
             destination.copy_from_slice(page);
             Ok(())
@@ -804,9 +807,8 @@ mod tests {
             inner,
             reads_meet: Barrier::new(2),
         });
-        let pool = Arc::new(
-            BufferPool::new(4, TEST_PAGE_SIZE, device.clone()).expect("pool creates"),
-        );
+        let pool =
+            Arc::new(BufferPool::new(4, TEST_PAGE_SIZE, device.clone()).expect("pool creates"));
 
         let mut workers = Vec::new();
         for _ in 0..2 {
