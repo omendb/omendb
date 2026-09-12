@@ -5,12 +5,14 @@
 //! a second permanent backend; they are the new ownership/concurrency model
 //! being qualified before cutover.
 
+mod btree;
 mod buffer;
 mod frame;
 mod ids;
 mod object;
 mod translation;
 
+pub use btree::{BTreeLookup, BTreeObject, BTreeReadError};
 pub use buffer::{
     BufferError, BufferPool, BufferStats, PageGuard, PageIo, PageIoOperation, PageWriteGuard,
 };
