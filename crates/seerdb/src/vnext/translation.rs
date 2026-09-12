@@ -42,7 +42,10 @@ impl TranslationTable {
     /// Construct a table with a power-of-two shard count.
     #[must_use]
     pub fn with_shards(shard_count: usize) -> Self {
-        assert!(shard_count.is_power_of_two(), "translation shards must be a nonzero power of two");
+        assert!(
+            shard_count.is_power_of_two(),
+            "translation shards must be a nonzero power of two"
+        );
         let shards = (0..shard_count)
             .map(|_| RwLock::new(HashMap::new()))
             .collect::<Vec<_>>()
@@ -84,11 +87,7 @@ impl TranslationTable {
 
     /// Remove a translation only if it still points at the expected frame
     /// incarnation. Delayed eviction therefore cannot delete a newer mapping.
-    pub fn remove_if(
-        &self,
-        key: PageKey,
-        expected: FrameRef,
-    ) -> Result<bool, TranslationError> {
+    pub fn remove_if(&self, key: PageKey, expected: FrameRef) -> Result<bool, TranslationError> {
         let shard = self.shard(key);
         let mut guard = self.shards[shard].write().map_err(|_| TranslationError)?;
         if guard.get(&key).copied() == Some(expected) {
@@ -132,7 +131,7 @@ impl Default for TranslationTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{FrameId, FrameIncarnation, StorageObjectId, PageId};
+    use crate::vnext::{FrameId, FrameIncarnation, PageId, StorageObjectId};
     use std::sync::Arc;
 
     fn key(object: u64, page: u64) -> PageKey {
@@ -168,7 +167,9 @@ mod tests {
             PublishResult::Published
         );
         assert_eq!(
-            table.publish_if_absent(page, frame(2, 1)).expect("duplicate"),
+            table
+                .publish_if_absent(page, frame(2, 1))
+                .expect("duplicate"),
             PublishResult::Existing(frame(1, 1))
         );
         assert_eq!(table.get(page).expect("lookup"), Some(frame(1, 1)));
@@ -181,13 +182,17 @@ mod tests {
         table
             .publish_if_absent(page, frame(7, 2))
             .expect("publish succeeds");
-        assert!(!table
-            .remove_if(page, frame(7, 1))
-            .expect("stale removal is safe"));
+        assert!(
+            !table
+                .remove_if(page, frame(7, 1))
+                .expect("stale removal is safe")
+        );
         assert_eq!(table.get(page).expect("lookup"), Some(frame(7, 2)));
-        assert!(table
-            .remove_if(page, frame(7, 2))
-            .expect("current removal succeeds"));
+        assert!(
+            table
+                .remove_if(page, frame(7, 2))
+                .expect("current removal succeeds")
+        );
     }
 
     #[test]

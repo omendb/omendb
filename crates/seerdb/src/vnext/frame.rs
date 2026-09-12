@@ -5,7 +5,7 @@
 //! invariants independently of any particular page representation.
 
 use super::ids::FrameIncarnation;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// Lifecycle state of one fixed buffer-frame slot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -131,8 +131,7 @@ impl FrameMeta {
 
         let current = self.incarnation.load(Ordering::Relaxed);
         let Some(next) = current.checked_add(1).and_then(FrameIncarnation::new) else {
-            self.state
-                .store(FrameState::Free as u8, Ordering::Release);
+            self.state.store(FrameState::Free as u8, Ordering::Release);
             return Err(FrameTransitionError::IncarnationExhausted);
         };
         self.incarnation.store(next.get(), Ordering::Release);
@@ -382,12 +381,19 @@ mod tests {
         let pin = frame.try_pin().expect("resident frame pins");
         let writer = pin.try_write().expect("writer acquires");
         drop(writer);
-        assert_eq!(frame.try_begin_writeback(), Err(FrameTransitionError::Pinned));
+        assert_eq!(
+            frame.try_begin_writeback(),
+            Err(FrameTransitionError::Pinned)
+        );
         assert_eq!(frame.try_begin_evict(), Err(FrameTransitionError::Dirty));
         drop(pin);
-        frame.try_begin_writeback().expect("unpinned dirty frame writes");
+        frame
+            .try_begin_writeback()
+            .expect("unpinned dirty frame writes");
         frame.finish_writeback().expect("writeback completes");
-        frame.try_begin_evict().expect("clean unpinned frame evicts");
+        frame
+            .try_begin_evict()
+            .expect("clean unpinned frame evicts");
     }
 
     #[test]
