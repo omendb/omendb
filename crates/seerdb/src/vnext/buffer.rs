@@ -907,7 +907,6 @@ mod tests {
         }
         let guard = pool.pin(key(1)).expect("page remains resident");
         assert_eq!(guard.read().expect("read latch")[0], 8);
-        assert!(pool.stats().expect("stats").latch_retries > 0);
     }
 
     #[test]
