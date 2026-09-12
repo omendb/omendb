@@ -225,9 +225,7 @@ impl BufferPool {
                         self.metrics
                             .translation_retries
                             .fetch_add(1, Ordering::Relaxed);
-                        self.metrics
-                            .writeback_waits
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics.writeback_waits.fetch_add(1, Ordering::Relaxed);
                         std::thread::yield_now();
                         continue;
                     }
@@ -866,9 +864,7 @@ mod tests {
         let pool = BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
         let image = vec![13u8; TEST_PAGE_SIZE];
 
-        let guard = pool
-            .create_page(key(7), &image)
-            .expect("new page installs");
+        let guard = pool.create_page(key(7), &image).expect("new page installs");
         assert_eq!(guard.read().expect("read latch")[0], 13);
         drop(guard);
 
@@ -989,9 +985,7 @@ mod tests {
             }
             {
                 let (lock, cv) = &self.release;
-                let mut released = lock
-                    .lock()
-                    .map_err(|_| io::Error::other("release mutex"))?;
+                let mut released = lock.lock().map_err(|_| io::Error::other("release mutex"))?;
                 while !*released {
                     released = cv
                         .wait(released)
