@@ -1,5 +1,7 @@
 //! Storage-kernel vNext identities that are independent of any access method.
 
+use std::num::NonZeroU64;
+
 /// Stable identity of one storage object managed by the vNext kernel.
 ///
 /// A storage object is a physical/logical structure that participates in the
@@ -76,11 +78,10 @@ impl PageKey {
     }
 }
 
-/// Process-local identity of one resident buffer frame.
+/// Process-local identity of one buffer-frame slot.
 ///
-/// Frame identities are never persisted and must never be used as logical page
-/// identities or recovery references. `usize` is intentional because a frame
-/// is an in-process slot rather than a disk-format field.
+/// A slot can be reused for many logical pages over the lifetime of a process,
+/// so a `FrameId` alone is not a stable reference to resident page contents.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FrameId(usize);
 
@@ -95,6 +96,55 @@ impl FrameId {
     #[must_use]
     pub const fn index(self) -> usize {
         self.0
+    }
+}
+
+/// Nonzero process-local incarnation of a buffer-frame slot.
+///
+/// Incarnations advance whenever a free slot is reserved for a new page. They
+/// are never persisted; their sole purpose is to prevent stale `FrameId`
+/// references from becoming valid again after slot reuse (the ABA problem).
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FrameIncarnation(NonZeroU64);
+
+impl FrameIncarnation {
+    pub(crate) fn new(value: u64) -> Option<Self> {
+        NonZeroU64::new(value).map(Self)
+    }
+
+    /// Return the process-local incarnation number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Stale-safe process-local reference to one resident frame incarnation.
+///
+/// Translation tables and long-lived diagnostics must use this pair rather
+/// than a bare `FrameId`. The pair is still process-local and must never appear
+/// in durable metadata.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FrameRef {
+    frame: FrameId,
+    incarnation: FrameIncarnation,
+}
+
+impl FrameRef {
+    pub(crate) const fn new(frame: FrameId, incarnation: FrameIncarnation) -> Self {
+        Self { frame, incarnation }
+    }
+
+    /// Return the underlying frame slot.
+    #[must_use]
+    pub const fn frame(self) -> FrameId {
+        self.frame
+    }
+
+    /// Return the slot incarnation represented by this reference.
+    #[must_use]
+    pub const fn incarnation(self) -> FrameIncarnation {
+        self.incarnation
     }
 }
 
@@ -118,8 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_id_is_explicitly_process_local() {
+    fn frame_reference_includes_nonzero_incarnation() {
         let frame = FrameId::new(17);
-        assert_eq!(frame.index(), 17);
+        let incarnation = FrameIncarnation::new(3).expect("nonzero incarnation");
+        let reference = FrameRef::new(frame, incarnation);
+        assert_eq!(reference.frame(), frame);
+        assert_eq!(reference.incarnation().get(), 3);
+        assert!(FrameIncarnation::new(0).is_none());
     }
 }
