@@ -44,11 +44,7 @@ pub struct MvccRecord {
 
 impl MvccRecord {
     #[must_use]
-    pub const fn new(
-        owner: RecordOwner,
-        undo_head: Option<VersionId>,
-        value: MvccValue,
-    ) -> Self {
+    pub const fn new(owner: RecordOwner, undo_head: Option<VersionId>, value: MvccValue) -> Self {
         Self {
             owner,
             undo_head,
@@ -267,17 +263,16 @@ impl TransactionStatusTable {
                 RecordVisibility::NewerCommit(csn)
             }),
             RecordOwner::Transaction(txn) if reader == Some(txn) => Ok(RecordVisibility::Visible),
-            RecordOwner::Transaction(txn) => match self
-                .status(txn)?
-                .ok_or(StatusTableError::UnknownTxn(txn))?
-            {
-                TransactionStatus::Active => Ok(RecordVisibility::Active),
-                TransactionStatus::Aborted => Ok(RecordVisibility::Aborted),
-                TransactionStatus::Committed(csn) if csn <= snapshot => {
-                    Ok(RecordVisibility::Visible)
+            RecordOwner::Transaction(txn) => {
+                match self.status(txn)?.ok_or(StatusTableError::UnknownTxn(txn))? {
+                    TransactionStatus::Active => Ok(RecordVisibility::Active),
+                    TransactionStatus::Aborted => Ok(RecordVisibility::Aborted),
+                    TransactionStatus::Committed(csn) if csn <= snapshot => {
+                        Ok(RecordVisibility::Visible)
+                    }
+                    TransactionStatus::Committed(csn) => Ok(RecordVisibility::NewerCommit(csn)),
                 }
-                TransactionStatus::Committed(csn) => Ok(RecordVisibility::NewerCommit(csn)),
-            },
+            }
         }
     }
 
@@ -289,7 +284,9 @@ impl TransactionStatusTable {
         let mut entries = self.shards[shard]
             .write()
             .map_err(|_| StatusTableError::Poisoned(shard))?;
-        let status = entries.get_mut(&txn).ok_or(StatusTableError::UnknownTxn(txn))?;
+        let status = entries
+            .get_mut(&txn)
+            .ok_or(StatusTableError::UnknownTxn(txn))?;
         if *status != TransactionStatus::Active {
             return Err(StatusTableError::InvalidTransition {
                 txn,
@@ -381,7 +378,10 @@ mod tests {
         ];
         for record in records {
             let encoded = record.to_bytes().expect("record encodes");
-            assert_eq!(MvccRecord::from_bytes(&encoded).expect("record decodes"), record);
+            assert_eq!(
+                MvccRecord::from_bytes(&encoded).expect("record decodes"),
+                record
+            );
         }
     }
 
@@ -441,11 +441,15 @@ mod tests {
         let snapshot = CommitSeq::new(20);
 
         assert_eq!(
-            statuses.visibility(row, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(row, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Active
         );
         assert_eq!(
-            statuses.visibility(index, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(index, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Active
         );
         assert_eq!(
@@ -459,11 +463,15 @@ mod tests {
             .commit(txn, CommitSeq::new(19))
             .expect("commit publishes");
         assert_eq!(
-            statuses.visibility(row, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(row, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Visible
         );
         assert_eq!(
-            statuses.visibility(index, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(index, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Visible
         );
     }
@@ -492,11 +500,7 @@ mod tests {
         statuses.abort(aborted).expect("transaction aborts");
         assert_eq!(
             statuses
-                .visibility(
-                    RecordOwner::Transaction(aborted),
-                    None,
-                    CommitSeq::new(100)
-                )
+                .visibility(RecordOwner::Transaction(aborted), None, CommitSeq::new(100))
                 .expect("visibility"),
             RecordVisibility::Aborted
         );
