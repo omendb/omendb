@@ -6,7 +6,7 @@
 //! does not recreate the old monolithic runtime/publication lock.
 
 use super::{
-    CommitDecision, CommitPosition, CommitSeq, LoggedMutation, Lsn, LogEncodeError,
+    CommitDecision, CommitPosition, CommitSeq, LogEncodeError, LoggedMutation, Lsn,
     StorageObjectDescriptor, TxnId, mutation_digest,
 };
 
@@ -165,10 +165,7 @@ impl Transaction {
 
     /// Publish a durable decision to readers.
     pub fn mark_visible(&mut self) -> Result<(), TransactionError> {
-        self.transition(
-            TransactionPhase::DurableDecision,
-            TransactionPhase::Visible,
-        )
+        self.transition(TransactionPhase::DurableDecision, TransactionPhase::Visible)
     }
 
     /// Abort before a durable commit decision exists.
@@ -257,11 +254,8 @@ mod tests {
             b"one".to_vec(),
         )
         .expect("put stages");
-        txn.stage_ordered_delete(
-            object(13, ObjectAuthority::Authoritative),
-            b"beta".to_vec(),
-        )
-        .expect("delete stages");
+        txn.stage_ordered_delete(object(13, ObjectAuthority::Authoritative), b"beta".to_vec())
+            .expect("delete stages");
 
         assert_eq!(txn.mutations().len(), 2);
         assert_eq!(txn.mutations()[0].ordinal(), 0);
@@ -320,10 +314,7 @@ mod tests {
         let mut txn = Transaction::new(TxnId::new(29), CommitSeq::new(20));
         txn.begin_validation().expect("validation begins");
         assert!(matches!(
-            txn.stage_ordered_delete(
-                object(31, ObjectAuthority::Authoritative),
-                b"late".to_vec()
-            ),
+            txn.stage_ordered_delete(object(31, ObjectAuthority::Authoritative), b"late".to_vec()),
             Err(TransactionError::WrongPhase {
                 expected: TransactionPhase::Active,
                 actual: TransactionPhase::Validating,
