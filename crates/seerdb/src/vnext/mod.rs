@@ -13,6 +13,7 @@ mod log;
 mod log_io;
 mod object;
 mod recovery;
+mod segment_log;
 mod translation;
 mod txn;
 
@@ -34,6 +35,7 @@ pub use log_io::{
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
+pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
 pub use txn::{Transaction, TransactionError, TransactionPhase};
 
