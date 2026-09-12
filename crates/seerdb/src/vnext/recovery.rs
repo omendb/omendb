@@ -123,9 +123,7 @@ impl RecoveryAssembler {
                 if !self.terminal.insert(txn) {
                     return Err(RecoveryError::RecordAfterTerminal(txn));
                 }
-                if let Some(previous) = self
-                    .last_csn
-                    .filter(|previous| decision.csn() <= *previous)
+                if let Some(previous) = self.last_csn.filter(|previous| decision.csn() <= *previous)
                 {
                     return Err(RecoveryError::NonMonotonicCommitSeq {
                         previous,
