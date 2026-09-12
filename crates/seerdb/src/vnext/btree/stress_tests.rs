@@ -80,10 +80,7 @@ fn logical_vnext(result: BTreeLookup) -> Option<Vec<u8>> {
 
 #[test]
 fn randomized_insert_delete_lookup_matches_legacy_across_page_sizes() {
-    for (case, page_size) in [384usize, 512, 768, 1024, 2048]
-        .into_iter()
-        .enumerate()
-    {
+    for (case, page_size) in [384usize, 512, 768, 1024, 2048].into_iter().enumerate() {
         let device = Arc::new(MemoryPageIo::default());
         let buffer = BufferPool::new(96, page_size, device).expect("buffer creates");
         let tree = BTreeObject::create(descriptor(100 + case as u64), &buffer)
@@ -123,16 +120,17 @@ fn randomized_insert_delete_lookup_matches_legacy_across_page_sizes() {
                             .lookup(key.as_bytes())
                             .expect("legacy lookup succeeds"),
                     );
-                    assert_eq!(vnext, old, "lookup differs at page_size={page_size} step={step}");
+                    assert_eq!(
+                        vnext, old,
+                        "lookup differs at page_size={page_size} step={step}"
+                    );
                 }
             }
 
             if step % 97 == 0 {
                 for probe in 0..inserted.len() {
-                    let probe_key = format!(
-                        "key-{probe:04}-{:08x}",
-                        probe.wrapping_mul(2_654_435_761)
-                    );
+                    let probe_key =
+                        format!("key-{probe:04}-{:08x}", probe.wrapping_mul(2_654_435_761));
                     let vnext = logical_vnext(
                         tree.lookup(&buffer, probe_key.as_bytes())
                             .expect("vNext probe succeeds"),
@@ -260,7 +258,8 @@ fn duplicate_inserts_fail_without_changing_existing_value() {
     let device = Arc::new(MemoryPageIo::default());
     let buffer = BufferPool::new(8, 512, device).expect("buffer creates");
     let tree = BTreeObject::create(descriptor(149), &buffer).expect("tree creates");
-    tree.insert(&buffer, b"same", b"first").expect("first insert");
+    tree.insert(&buffer, b"same", b"first")
+        .expect("first insert");
     assert!(matches!(
         tree.insert(&buffer, b"same", b"second"),
         Err(super::BTreeError::DuplicateKey)
