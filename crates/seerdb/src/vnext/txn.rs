@@ -16,9 +16,11 @@ pub enum TransactionPhase {
     Active,
     Validating,
     Prepared,
+    WalAppended,
     DurableDecision,
     Visible,
     Aborted,
+    RecoveryRequired,
     Released,
 }
 
@@ -34,6 +36,8 @@ pub enum TransactionError {
     DerivedMutation(super::StorageObjectId),
     #[error("transaction contains more mutations than the vNext log ordinal can represent")]
     TooManyMutations,
+    #[error("durable LSN {durable:?} does not match appended decision LSN {appended:?}")]
+    WalLsnMismatch { appended: Lsn, durable: Lsn },
     #[error(transparent)]
     LogEncoding(#[from] LogEncodeError),
 }
@@ -45,6 +49,7 @@ pub struct Transaction {
     phase: TransactionPhase,
     mutations: Vec<LoggedMutation>,
     commit_seq: Option<CommitSeq>,
+    decision_lsn: Option<Lsn>,
     position: Option<CommitPosition>,
 }
 
@@ -58,6 +63,7 @@ impl Transaction {
             phase: TransactionPhase::Active,
             mutations: Vec::new(),
             commit_seq: None,
+            decision_lsn: None,
             position: None,
         }
     }
@@ -80,6 +86,11 @@ impl Transaction {
     #[must_use]
     pub fn mutations(&self) -> &[LoggedMutation] {
         &self.mutations
+    }
+
+    #[must_use]
+    pub const fn decision_lsn(&self) -> Option<Lsn> {
+        self.decision_lsn
     }
 
     #[must_use]
@@ -131,6 +142,7 @@ impl Transaction {
     }
 
     /// Record successful validation and assign the transaction's visibility CSN.
+    /// No WAL bytes have been written yet, so this state remains safely abortable.
     pub fn mark_prepared(&mut self, csn: CommitSeq) -> Result<(), TransactionError> {
         self.transition(TransactionPhase::Validating, TransactionPhase::Prepared)?;
         self.commit_seq = Some(csn);
@@ -150,11 +162,30 @@ impl Transaction {
         Ok(CommitDecision::new(self.id, csn, mutation_count, digest))
     }
 
-    /// Mark the commit decision durable at the returned WAL end position.
+    /// Record successful physical append of the commit decision. From this point
+    /// an abort is unsafe because the appended decision may survive a crash even
+    /// before an explicit durability barrier.
+    pub fn mark_wal_appended(&mut self, lsn: Lsn) -> Result<(), TransactionError> {
+        self.transition(TransactionPhase::Prepared, TransactionPhase::WalAppended)?;
+        self.decision_lsn = Some(lsn);
+        Ok(())
+    }
+
+    /// Mark the appended commit decision durable at its exact WAL end position.
     pub fn mark_durable(&mut self, lsn: Lsn) -> Result<CommitPosition, TransactionError> {
-        self.require_phase(TransactionPhase::Prepared)?;
+        self.require_phase(TransactionPhase::WalAppended)?;
+        let appended = self.decision_lsn.ok_or(TransactionError::WrongPhase {
+            expected: TransactionPhase::WalAppended,
+            actual: self.phase,
+        })?;
+        if lsn != appended {
+            return Err(TransactionError::WalLsnMismatch {
+                appended,
+                durable: lsn,
+            });
+        }
         let csn = self.commit_seq.ok_or(TransactionError::WrongPhase {
-            expected: TransactionPhase::Prepared,
+            expected: TransactionPhase::WalAppended,
             actual: self.phase,
         })?;
         let position = CommitPosition::new(csn, lsn);
@@ -163,12 +194,29 @@ impl Transaction {
         Ok(position)
     }
 
+    /// Mark an append/sync/publication outcome ambiguous. This state cannot be
+    /// aborted or released in-process; reopen/recovery must resolve it.
+    pub fn mark_recovery_required(&mut self) -> Result<(), TransactionError> {
+        match self.phase {
+            TransactionPhase::Prepared
+            | TransactionPhase::WalAppended
+            | TransactionPhase::DurableDecision => {
+                self.phase = TransactionPhase::RecoveryRequired;
+                Ok(())
+            }
+            actual => Err(TransactionError::WrongPhase {
+                expected: TransactionPhase::Prepared,
+                actual,
+            }),
+        }
+    }
+
     /// Publish a durable decision to readers.
     pub fn mark_visible(&mut self) -> Result<(), TransactionError> {
         self.transition(TransactionPhase::DurableDecision, TransactionPhase::Visible)
     }
 
-    /// Abort before a durable commit decision exists.
+    /// Abort only while no commit decision may have reached the physical WAL.
     pub fn abort(&mut self) -> Result<(), TransactionError> {
         match self.phase {
             TransactionPhase::Active
@@ -176,6 +224,7 @@ impl Transaction {
             | TransactionPhase::Prepared => {
                 self.phase = TransactionPhase::Aborted;
                 self.commit_seq = None;
+                self.decision_lsn = None;
                 Ok(())
             }
             actual => Err(TransactionError::WrongPhase {
@@ -279,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_state_machine_assigns_csn_before_durable_lsn() {
+    fn commit_state_machine_separates_append_durability_and_visibility() {
         let mut txn = Transaction::new(TxnId::new(19), CommitSeq::new(12));
         txn.stage_ordered_put(
             object(23, ObjectAuthority::Authoritative),
@@ -301,6 +350,9 @@ mod tests {
         );
 
         let lsn = Lsn::from_wal_position(2, 4096).expect("lsn packs");
+        txn.mark_wal_appended(lsn).expect("append records");
+        assert_eq!(txn.phase(), TransactionPhase::WalAppended);
+        assert_eq!(txn.decision_lsn(), Some(lsn));
         let position = txn.mark_durable(lsn).expect("decision becomes durable");
         assert_eq!(position.csn, CommitSeq::new(13));
         assert_eq!(position.lsn, lsn);
@@ -310,7 +362,37 @@ mod tests {
     }
 
     #[test]
-    fn writes_freeze_when_validation_begins_and_abort_is_terminal_until_release() {
+    fn appended_or_uncertain_transaction_cannot_abort() {
+        let mut txn = Transaction::new(TxnId::new(37), CommitSeq::new(20));
+        txn.begin_validation().expect("validation begins");
+        txn.mark_prepared(CommitSeq::new(21)).expect("prepared");
+        let lsn = Lsn::from_wal_position(0, 100).expect("lsn");
+        txn.mark_wal_appended(lsn).expect("append records");
+        assert!(txn.abort().is_err());
+        txn.mark_recovery_required().expect("outcome becomes uncertain");
+        assert_eq!(txn.phase(), TransactionPhase::RecoveryRequired);
+        assert!(txn.abort().is_err());
+        assert!(txn.release().is_err());
+    }
+
+    #[test]
+    fn durable_barrier_must_name_the_exact_appended_decision_lsn() {
+        let mut txn = Transaction::new(TxnId::new(41), CommitSeq::new(30));
+        txn.begin_validation().expect("validation begins");
+        txn.mark_prepared(CommitSeq::new(31)).expect("prepared");
+        let appended = Lsn::from_wal_position(1, 128).expect("appended lsn");
+        let wrong = Lsn::from_wal_position(1, 129).expect("wrong lsn");
+        txn.mark_wal_appended(appended).expect("append records");
+        assert!(matches!(
+            txn.mark_durable(wrong),
+            Err(TransactionError::WalLsnMismatch { .. })
+        ));
+        assert_eq!(txn.phase(), TransactionPhase::WalAppended);
+        txn.mark_durable(appended).expect("correct barrier succeeds");
+    }
+
+    #[test]
+    fn writes_freeze_when_validation_begins_and_clean_preappend_state_can_abort() {
         let mut txn = Transaction::new(TxnId::new(29), CommitSeq::new(20));
         txn.begin_validation().expect("validation begins");
         assert!(matches!(
@@ -320,7 +402,8 @@ mod tests {
                 actual: TransactionPhase::Validating,
             })
         ));
-        txn.abort().expect("validation may abort");
+        txn.mark_prepared(CommitSeq::new(21)).expect("prepared");
+        txn.abort().expect("preappend prepare may abort");
         assert_eq!(txn.phase(), TransactionPhase::Aborted);
         txn.release().expect("abort releases");
         assert_eq!(txn.phase(), TransactionPhase::Released);
