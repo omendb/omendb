@@ -10,10 +10,10 @@
 //! until reopen. Callers may retry only failures that happen while building a
 //! batch before the device is touched.
 
-use super::{CommitDecision, CommitSeq, LogEncodeError, LogRecord, Lsn, Transaction, TxnId};
+use super::{CommitSeq, LogEncodeError, LogRecord, Lsn, Transaction, TxnId};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Physical log operations that may make a commit outcome uncertain.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -212,11 +212,11 @@ impl DurableLog {
 mod tests {
     use super::*;
     use crate::vnext::{
-        parse_log_prefix_frames, CommitPosition, ObjectAuthority, RecoveryAssembler,
-        StorageObjectDescriptor, StorageObjectId, TransactionPhase,
+        CommitPosition, ObjectAuthority, RecoveryAssembler, StorageObjectDescriptor,
+        StorageObjectId, TransactionPhase, parse_log_prefix_frames,
     };
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Default)]
     struct MemoryState {
@@ -237,10 +237,7 @@ mod tests {
         }
 
         fn durable_offset(&self) -> u64 {
-            self.state
-                .lock()
-                .expect("memory log lock")
-                .durable_offset
+            self.state.lock().expect("memory log lock").durable_offset
         }
 
         fn fail_next_append_after(&self, bytes: usize) {
@@ -319,10 +316,7 @@ mod tests {
 
         log.sync_through(second_ticket.decision_lsn())
             .expect("group sync succeeds");
-        assert_eq!(
-            log.durable_lsn(),
-            Some(second_ticket.decision_lsn())
-        );
+        assert_eq!(log.durable_lsn(), Some(second_ticket.decision_lsn()));
         first
             .mark_durable(first_ticket.decision_lsn())
             .expect("first becomes durable");
@@ -381,9 +375,11 @@ mod tests {
             status,
             super::super::LogParseStatus::Complete | super::super::LogParseStatus::Incomplete
         ));
-        assert!(!frames
-            .iter()
-            .any(|frame| matches!(frame.record(), LogRecord::Commit(_))));
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame.record(), LogRecord::Commit(_)))
+        );
     }
 
     #[test]
