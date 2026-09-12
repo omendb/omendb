@@ -12,7 +12,7 @@ mod ids;
 mod object;
 mod translation;
 
-pub use btree::{BTreeError, BTreeLookup, BTreeObject};
+pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
 pub use buffer::{
     BufferError, BufferPool, BufferStats, PageGuard, PageIo, PageIoOperation, PageWriteGuard,
 };
