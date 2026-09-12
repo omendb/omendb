@@ -78,9 +78,15 @@ pub enum FrameTransitionError {
     /// A live pin still protects the frame from writeback completion or reuse.
     #[error("frame is still pinned")]
     Pinned,
+    /// Writeback was requested for a clean frame.
+    #[error("clean frame has nothing to write back")]
+    Clean,
     /// Clean eviction was requested for a dirty frame.
     #[error("dirty frame requires writeback before eviction")]
     Dirty,
+    /// Another writer owns the optimistic write latch.
+    #[error("frame already has an active writer")]
+    WriteBusy,
     /// The optimistic version counter cannot advance without wrapping.
     #[error("frame version counter is exhausted")]
     VersionExhausted,
@@ -177,14 +183,18 @@ impl FrameMeta {
     /// page latch, but the first correctness baseline intentionally refuses
     /// writeback while any guard can still mutate or borrow the frame.
     pub fn try_begin_writeback(&self) -> Result<(), FrameTransitionError> {
+        let state = self.state();
+        if state != FrameState::Resident {
+            return Err(FrameTransitionError::WrongState {
+                expected: FrameState::Resident,
+                actual: state,
+            });
+        }
         if self.pin_count() != 0 {
             return Err(FrameTransitionError::Pinned);
         }
         if !self.is_dirty() {
-            return Err(FrameTransitionError::WrongState {
-                expected: FrameState::Resident,
-                actual: self.state(),
-            });
+            return Err(FrameTransitionError::Clean);
         }
         self.transition(FrameState::Resident, FrameState::Writeback)
     }
@@ -194,9 +204,33 @@ impl FrameMeta {
         if self.pin_count() != 0 {
             return Err(FrameTransitionError::Pinned);
         }
-        self.transition(FrameState::Writeback, FrameState::Resident)?;
+        let state = self.state();
+        if state != FrameState::Writeback {
+            return Err(FrameTransitionError::WrongState {
+                expected: FrameState::Writeback,
+                actual: state,
+            });
+        }
+
+        // Clear dirty while pins are still excluded by Writeback state. If a
+        // concurrent abort wins the state transition, restore dirty because the
+        // writeback no longer proved the resident image durable.
         self.dirty.store(false, Ordering::Release);
-        Ok(())
+        match self.state.compare_exchange(
+            FrameState::Writeback as u8,
+            FrameState::Resident as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(actual) => {
+                self.dirty.store(true, Ordering::Release);
+                Err(FrameTransitionError::WrongState {
+                    expected: FrameState::Writeback,
+                    actual: FrameState::decode(actual),
+                })
+            }
+        }
     }
 
     /// Reopen a failed writeback while preserving the dirty bit for retry.
@@ -206,6 +240,13 @@ impl FrameMeta {
 
     /// Detach one clean unpinned frame from page lookup before reuse.
     pub fn try_begin_evict(&self) -> Result<(), FrameTransitionError> {
+        let state = self.state();
+        if state != FrameState::Resident {
+            return Err(FrameTransitionError::WrongState {
+                expected: FrameState::Resident,
+                actual: state,
+            });
+        }
         if self.pin_count() != 0 {
             return Err(FrameTransitionError::Pinned);
         }
@@ -279,30 +320,41 @@ impl FramePin<'_> {
 
     /// Attempt to acquire exclusive mutation ownership of this pinned frame.
     pub fn try_write(&self) -> Result<FrameWriteLatch<'_>, FrameTransitionError> {
-        if self.meta.state() != FrameState::Resident {
+        let state = self.meta.state();
+        if state != FrameState::Resident {
             return Err(FrameTransitionError::WrongState {
                 expected: FrameState::Resident,
-                actual: self.meta.state(),
+                actual: state,
             });
         }
         let version = self.meta.version.load(Ordering::Acquire);
         if version & 1 == 1 {
-            return Err(FrameTransitionError::WrongState {
-                expected: FrameState::Resident,
-                actual: FrameState::Resident,
-            });
+            return Err(FrameTransitionError::WriteBusy);
         }
         if version >= u64::MAX - 1 {
             return Err(FrameTransitionError::VersionExhausted);
         }
-        self.meta
-            .version
-            .compare_exchange(version, version + 1, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| FrameTransitionError::WrongState {
-                expected: FrameState::Resident,
-                actual: self.meta.state(),
-            })?;
-        Ok(FrameWriteLatch { meta: self.meta })
+        match self.meta.version.compare_exchange(
+            version,
+            version + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Exclusive mutation ownership always implies eventual
+                // writeback; callers cannot accidentally mutate a clean page
+                // and forget to mark it dirty.
+                self.meta.dirty.store(true, Ordering::Release);
+                Ok(FrameWriteLatch { meta: self.meta })
+            }
+            Err(_) if self.meta.state() != FrameState::Resident => {
+                Err(FrameTransitionError::WrongState {
+                    expected: FrameState::Resident,
+                    actual: self.meta.state(),
+                })
+            }
+            Err(_) => Err(FrameTransitionError::WriteBusy),
+        }
     }
 }
 
@@ -322,7 +374,8 @@ pub struct FrameWriteLatch<'a> {
 }
 
 impl FrameWriteLatch<'_> {
-    /// Mark the frame as containing changes that need eventual materialization.
+    /// Mark the frame dirty explicitly. Acquiring a write latch already does
+    /// this; the method exists for code whose mutation point wants to state it.
     pub fn mark_dirty(&self) {
         self.meta.dirty.store(true, Ordering::Release);
     }
@@ -360,6 +413,7 @@ mod tests {
         assert_eq!(before.get(), 0);
         {
             let writer = pin.try_write().expect("write ownership");
+            assert!(meta.is_dirty());
             writer.mark_dirty();
             assert!(!pin.validate(before));
         }
@@ -367,7 +421,17 @@ mod tests {
         let after = pin.optimistic_version().expect("new stable version");
         assert_eq!(after.get(), 2);
         assert!(pin.validate(after));
-        assert!(meta.is_dirty());
+    }
+
+    #[test]
+    fn second_writer_is_rejected_while_version_is_odd() {
+        let meta = FrameMeta::new_resident();
+        let first = meta.try_pin().expect("first pin");
+        let second = meta.try_pin().expect("second pin");
+        let writer = first.try_write().expect("first writer");
+        assert!(matches!(second.try_write(), Err(FrameTransitionError::WriteBusy)));
+        drop(writer);
+        second.try_write().expect("writer after release");
     }
 
     #[test]
@@ -375,8 +439,7 @@ mod tests {
         let meta = FrameMeta::new_resident();
         let pin = meta.try_pin().expect("resident pin");
         {
-            let writer = pin.try_write().expect("write ownership");
-            writer.mark_dirty();
+            let _writer = pin.try_write().expect("write ownership");
         }
         assert_eq!(
             meta.try_begin_writeback(),
@@ -391,12 +454,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_writeback_preserves_dirty_state() {
+        let meta = FrameMeta::new_resident();
+        let pin = meta.try_pin().expect("resident pin");
+        {
+            let _writer = pin.try_write().expect("write ownership");
+        }
+        drop(pin);
+        meta.try_begin_writeback().expect("freeze dirty frame");
+        meta.abort_writeback().expect("reopen after failed write");
+        assert_eq!(meta.state(), FrameState::Resident);
+        assert!(meta.is_dirty());
+    }
+
+    #[test]
     fn dirty_frame_cannot_be_cleanly_evicted() {
         let meta = FrameMeta::new_resident();
         let pin = meta.try_pin().expect("resident pin");
         {
-            let writer = pin.try_write().expect("write ownership");
-            writer.mark_dirty();
+            let _writer = pin.try_write().expect("write ownership");
         }
         drop(pin);
         assert_eq!(meta.try_begin_evict(), Err(FrameTransitionError::Dirty));
