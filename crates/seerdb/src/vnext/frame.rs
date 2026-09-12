@@ -5,7 +5,12 @@
 //! invariants independently of any particular page representation.
 
 use super::ids::FrameIncarnation;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+const STATE_BITS: usize = 3;
+const STATE_MASK: usize = (1 << STATE_BITS) - 1;
+const PIN_ONE: usize = 1 << STATE_BITS;
+const MAX_PINS: usize = usize::MAX >> STATE_BITS;
 
 /// Lifecycle state of one fixed buffer-frame slot.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -19,7 +24,7 @@ pub enum FrameState {
 }
 
 impl FrameState {
-    fn from_raw(raw: u8) -> Self {
+    fn from_raw(raw: usize) -> Self {
         match raw {
             0 => Self::Free,
             1 => Self::Loading,
@@ -29,6 +34,18 @@ impl FrameState {
             _ => unreachable!("frame state is only written from FrameState"),
         }
     }
+}
+
+const fn lifecycle_word(state: FrameState, pins: usize) -> usize {
+    (pins << STATE_BITS) | state as usize
+}
+
+fn lifecycle_state(word: usize) -> FrameState {
+    FrameState::from_raw(word & STATE_MASK)
+}
+
+const fn lifecycle_pins(word: usize) -> usize {
+    word >> STATE_BITS
 }
 
 /// Stable optimistic image version captured by a reader.
@@ -66,9 +83,13 @@ pub enum FrameTransitionError {
 }
 
 /// Atomic lifecycle metadata for a single frame slot.
+///
+/// Lifecycle state and pin count share one atomic word. Pin acquisition CASes
+/// only while the frame is resident; writeback and eviction CAS only from the
+/// exact resident-with-zero-pins word. This makes the exclusion invariant
+/// atomic instead of checking the pin counter before a separate state CAS.
 pub struct FrameMeta {
-    state: AtomicU8,
-    pins: AtomicUsize,
+    lifecycle: AtomicUsize,
     version: AtomicU64,
     incarnation: AtomicU64,
     dirty: AtomicBool,
@@ -79,8 +100,7 @@ impl FrameMeta {
     #[must_use]
     pub const fn new_free() -> Self {
         Self {
-            state: AtomicU8::new(FrameState::Free as u8),
-            pins: AtomicUsize::new(0),
+            lifecycle: AtomicUsize::new(lifecycle_word(FrameState::Free, 0)),
             version: AtomicU64::new(0),
             incarnation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
@@ -91,8 +111,7 @@ impl FrameMeta {
     #[must_use]
     pub const fn new_resident() -> Self {
         Self {
-            state: AtomicU8::new(FrameState::Resident as u8),
-            pins: AtomicUsize::new(0),
+            lifecycle: AtomicUsize::new(lifecycle_word(FrameState::Resident, 0)),
             version: AtomicU64::new(0),
             incarnation: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
@@ -102,13 +121,13 @@ impl FrameMeta {
     /// Return the current lifecycle state.
     #[must_use]
     pub fn state(&self) -> FrameState {
-        FrameState::from_raw(self.state.load(Ordering::Acquire))
+        lifecycle_state(self.lifecycle.load(Ordering::Acquire))
     }
 
     /// Return the number of live pins.
     #[must_use]
     pub fn pin_count(&self) -> usize {
-        self.pins.load(Ordering::Acquire)
+        lifecycle_pins(self.lifecycle.load(Ordering::Acquire))
     }
 
     /// Return whether the resident image has been modified.
@@ -127,11 +146,14 @@ impl FrameMeta {
     ///
     /// The returned incarnation is unique for this slot until the process ends.
     pub fn begin_load(&self) -> Result<FrameIncarnation, FrameTransitionError> {
-        self.transition(FrameState::Free, FrameState::Loading)?;
+        self.transition_unpinned(FrameState::Free, FrameState::Loading)?;
 
         let current = self.incarnation.load(Ordering::Relaxed);
         let Some(next) = current.checked_add(1).and_then(FrameIncarnation::new) else {
-            self.state.store(FrameState::Free as u8, Ordering::Release);
+            self.lifecycle.store(
+                lifecycle_word(FrameState::Free, 0),
+                Ordering::Release,
+            );
             return Err(FrameTransitionError::IncarnationExhausted);
         };
         self.incarnation.store(next.get(), Ordering::Release);
@@ -141,44 +163,54 @@ impl FrameMeta {
 
     /// Publish successfully loaded bytes as resident.
     pub fn finish_load(&self) -> Result<(), FrameTransitionError> {
-        self.transition(FrameState::Loading, FrameState::Resident)
+        self.transition_unpinned(FrameState::Loading, FrameState::Resident)
     }
 
     /// Abandon a failed load and make the frame reusable.
     pub fn abort_load(&self) -> Result<(), FrameTransitionError> {
         self.dirty.store(false, Ordering::Release);
-        self.transition(FrameState::Loading, FrameState::Free)
+        self.transition_unpinned(FrameState::Loading, FrameState::Free)
     }
 
     /// Pin a resident frame.
     ///
-    /// The state and incarnation are rechecked after incrementing the pin count.
-    /// If eviction or reuse raced with us, the transient pin is immediately
-    /// returned and the caller observes a miss instead of a stale page.
+    /// State and pin count are changed by one CAS. The incarnation is checked
+    /// after the CAS to reject the only remaining ABA case: a slot that was
+    /// evicted and reloaded between the optimistic lifecycle load and CAS.
     #[must_use]
     pub fn try_pin(&self) -> Option<FramePin<'_>> {
-        if self.state() != FrameState::Resident {
-            return None;
+        let mut observed = self.lifecycle.load(Ordering::Acquire);
+        loop {
+            if lifecycle_state(observed) != FrameState::Resident {
+                return None;
+            }
+            let pins = lifecycle_pins(observed);
+            if pins == MAX_PINS {
+                return None;
+            }
+            let incarnation = self.incarnation()?;
+            match self.lifecycle.compare_exchange_weak(
+                observed,
+                observed + PIN_ONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if self.incarnation() != Some(incarnation) {
+                        self.unpin();
+                        return None;
+                    }
+                    return Some(FramePin {
+                        meta: self,
+                        incarnation,
+                    });
+                }
+                Err(actual) => observed = actual,
+            }
         }
-        let incarnation = self.incarnation()?;
-        self.pins.fetch_add(1, Ordering::AcqRel);
-        if self.state() != FrameState::Resident || self.incarnation() != Some(incarnation) {
-            self.pins.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        Some(FramePin {
-            meta: self,
-            incarnation,
-        })
     }
 
     /// Begin conservative writeback of a dirty, unpinned resident image.
-    ///
-    /// After winning the state CAS we drain only pins that raced between the
-    /// pre-CAS zero-pin check and the CAS. A pin that was already established
-    /// before the check would have made the transition fail. This closes the
-    /// subtle window where writeback could otherwise start while a failed
-    /// racing pin was still unwinding.
     pub fn try_begin_writeback(&self) -> Result<(), FrameTransitionError> {
         if !self.is_dirty() {
             return Err(FrameTransitionError::Clean);
@@ -199,12 +231,12 @@ impl FrameMeta {
             });
         }
         self.dirty.store(false, Ordering::Release);
-        self.transition(FrameState::Writeback, FrameState::Resident)
+        self.transition_unpinned(FrameState::Writeback, FrameState::Resident)
     }
 
     /// Reopen a frame after failed writeback while preserving dirty state.
     pub fn abort_writeback(&self) -> Result<(), FrameTransitionError> {
-        self.transition(FrameState::Writeback, FrameState::Resident)
+        self.transition_unpinned(FrameState::Writeback, FrameState::Resident)
     }
 
     /// Begin eviction of a clean, unpinned resident frame.
@@ -217,47 +249,60 @@ impl FrameMeta {
 
     /// Finish eviction and return the slot to the free list.
     pub fn finish_evict(&self) -> Result<(), FrameTransitionError> {
-        self.transition(FrameState::Evicting, FrameState::Free)
+        self.transition_unpinned(FrameState::Evicting, FrameState::Free)
     }
 
     fn begin_exclusive_state(&self, next: FrameState) -> Result<(), FrameTransitionError> {
-        if self.pin_count() != 0 {
-            return Err(FrameTransitionError::Pinned);
-        }
-        self.transition(FrameState::Resident, next)?;
-
-        // A pin may have observed Resident immediately before our CAS and then
-        // incremented after the zero-pin check. Because state is now nonresident,
-        // that pin must fail its post-increment validation and decrement again.
-        let mut spins = 0usize;
-        while self.pin_count() != 0 {
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+        let expected = lifecycle_word(FrameState::Resident, 0);
+        match self.lifecycle.compare_exchange(
+            expected,
+            lifecycle_word(next, 0),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(actual)
+                if lifecycle_state(actual) == FrameState::Resident
+                    && lifecycle_pins(actual) != 0 =>
+            {
+                Err(FrameTransitionError::Pinned)
             }
-            spins = spins.saturating_add(1);
+            Err(actual) => Err(FrameTransitionError::WrongState {
+                expected: FrameState::Resident,
+                actual: lifecycle_state(actual),
+            }),
         }
-        Ok(())
     }
 
-    fn transition(
+    fn transition_unpinned(
         &self,
         expected: FrameState,
         next: FrameState,
     ) -> Result<(), FrameTransitionError> {
-        self.state
+        self.lifecycle
             .compare_exchange(
-                expected as u8,
-                next as u8,
+                lifecycle_word(expected, 0),
+                lifecycle_word(next, 0),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .map(|_| ())
-            .map_err(|actual| FrameTransitionError::WrongState {
-                expected,
-                actual: FrameState::from_raw(actual),
+            .map_err(|actual| {
+                if lifecycle_state(actual) == expected && lifecycle_pins(actual) != 0 {
+                    FrameTransitionError::Pinned
+                } else {
+                    FrameTransitionError::WrongState {
+                        expected,
+                        actual: lifecycle_state(actual),
+                    }
+                }
             })
+    }
+
+    fn unpin(&self) {
+        let previous = self.lifecycle.fetch_sub(PIN_ONE, Ordering::AcqRel);
+        debug_assert_eq!(lifecycle_state(previous), FrameState::Resident);
+        debug_assert_ne!(lifecycle_pins(previous), 0);
     }
 }
 
@@ -335,7 +380,7 @@ impl FramePin<'_> {
 
 impl Drop for FramePin<'_> {
     fn drop(&mut self) {
-        self.meta.pins.fetch_sub(1, Ordering::AcqRel);
+        self.meta.unpin();
     }
 }
 
@@ -376,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn live_pin_blocks_writeback_and_eviction() {
+    fn live_pin_atomically_blocks_writeback_and_eviction() {
         let frame = FrameMeta::new_resident();
         let pin = frame.try_pin().expect("resident frame pins");
         let writer = pin.try_write().expect("writer acquires");
@@ -436,5 +481,19 @@ mod tests {
         ));
         drop(first);
         assert!(second_pin.try_write().is_ok());
+    }
+
+    #[test]
+    fn multiple_pins_share_the_atomic_lifecycle_word() {
+        let frame = FrameMeta::new_resident();
+        let first = frame.try_pin().expect("first pin");
+        let second = frame.try_pin().expect("second pin");
+        assert_eq!(frame.pin_count(), 2);
+        assert_eq!(frame.try_begin_evict(), Err(FrameTransitionError::Pinned));
+        drop(first);
+        assert_eq!(frame.pin_count(), 1);
+        drop(second);
+        assert_eq!(frame.pin_count(), 0);
+        frame.try_begin_evict().expect("unpinned frame evicts");
     }
 }
