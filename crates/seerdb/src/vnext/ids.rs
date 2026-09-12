@@ -24,7 +24,7 @@ impl StorageObjectId {
     }
 }
 
-/// Stable logical identity of one page inside the storage kernel.
+/// Stable logical identity of one page inside a storage object.
 ///
 /// `PageId` is intentionally distinct from a physical byte offset, frame
 /// number, WAL position, page version, or B-tree-local array index. Physical
@@ -43,6 +43,36 @@ impl PageId {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// Complete logical page identity used by translation and page I/O.
+///
+/// Page numbers are scoped to their storage object so access methods can
+/// allocate independently without manufacturing globally unique page IDs.
+#[derive(Debug, Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PageKey {
+    object: StorageObjectId,
+    page: PageId,
+}
+
+impl PageKey {
+    /// Construct an object-scoped page key.
+    #[must_use]
+    pub const fn new(object: StorageObjectId, page: PageId) -> Self {
+        Self { object, page }
+    }
+
+    /// Return the owning storage object.
+    #[must_use]
+    pub const fn object(self) -> StorageObjectId {
+        self.object
+    }
+
+    /// Return the logical page identity within the object.
+    #[must_use]
+    pub const fn page(self) -> PageId {
+        self.page
     }
 }
 
@@ -78,6 +108,13 @@ mod tests {
         let page = PageId::new(u64::MAX);
         assert_eq!(object.get(), u64::MAX - 1);
         assert_eq!(page.get(), u64::MAX);
+    }
+
+    #[test]
+    fn page_key_keeps_object_and_page_domains_explicit() {
+        let key = PageKey::new(StorageObjectId::new(11), PageId::new(29));
+        assert_eq!(key.object(), StorageObjectId::new(11));
+        assert_eq!(key.page(), PageId::new(29));
     }
 
     #[test]
