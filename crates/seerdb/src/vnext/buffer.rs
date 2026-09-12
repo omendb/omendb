@@ -3,10 +3,14 @@
 //! The hot cache-hit path uses a sharded translation lookup, atomic frame pin,
 //! and frame-local byte latch. There is no database-wide or buffer-wide mutex.
 //! Misses reserve a frame before I/O; translation is published only after the
-//! bytes and logical identity are initialized and the frame is resident.
+//! bytes and logical identity are initialized and the frame is resident with an
+//! installer pin.
 //!
 //! This is deliberately a correctness/measurement baseline. Page translation,
-//! eviction, byte latching, and I/O policy remain replaceable seams.
+//! eviction policy, byte latching, wait policy, and I/O remain replaceable
+//! seams. The lifecycle itself is strict: transient writeback is not mistaken
+//! for a stale translation, dirty eviction materializes before reuse, and a
+//! frame slot is always identified by both slot and incarnation.
 
 use super::frame::{FrameMeta, FramePin, FrameState, FrameTransitionError, FrameWriteLatch};
 use super::ids::{FrameId, FrameIncarnation, FrameRef, PageKey};
@@ -41,6 +45,10 @@ pub enum BufferError {
     EmptyPool,
     #[error("buffer page size must be nonzero")]
     InvalidPageSize,
+    #[error("page image has {actual} bytes; buffer page size is {expected}")]
+    PageSizeMismatch { expected: usize, actual: usize },
+    #[error("logical page {0:?} is already resident")]
+    PageAlreadyResident(PageKey),
     #[error("buffer frame {0:?} is outside this pool")]
     FrameOutOfRange(FrameId),
     #[error("no evictable buffer frame is currently available")]
@@ -77,8 +85,10 @@ pub struct BufferStats {
     pub translation_lookups: u64,
     pub translation_retries: u64,
     pub stale_translations: u64,
+    pub writeback_waits: u64,
     pub loads: u64,
     pub load_failures: u64,
+    pub new_pages: u64,
     pub duplicate_loads: u64,
     pub pins: u64,
     pub latch_retries: u64,
@@ -104,8 +114,10 @@ struct BufferMetrics {
     translation_lookups: AtomicU64,
     translation_retries: AtomicU64,
     stale_translations: AtomicU64,
+    writeback_waits: AtomicU64,
     loads: AtomicU64,
     load_failures: AtomicU64,
+    new_pages: AtomicU64,
     duplicate_loads: AtomicU64,
     pins: AtomicU64,
     latch_retries: AtomicU64,
@@ -125,10 +137,6 @@ struct FrameSlot {
     page: RwLock<Option<PageKey>>,
     bytes: RwLock<Box<[u8]>>,
     referenced: AtomicBool,
-    // Serializes allocation/publication for this slot without participating in
-    // ordinary cache hits. It closes the tiny Resident-but-not-yet-published
-    // window after a load without introducing a global allocation mutex.
-    installing: AtomicBool,
 }
 
 impl FrameSlot {
@@ -139,9 +147,20 @@ impl FrameSlot {
             page: RwLock::new(None),
             bytes: RwLock::new(vec![0u8; page_size].into_boxed_slice()),
             referenced: AtomicBool::new(false),
-            installing: AtomicBool::new(false),
         }
     }
+}
+
+enum PinAttempt<'a> {
+    Pinned(FramePin<'a>),
+    Busy,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum WritebackTarget {
+    Resident,
+    Evicting,
 }
 
 /// Fixed-frame concurrent buffer pool.
@@ -195,20 +214,34 @@ impl BufferPool {
                 .translation_lookups
                 .fetch_add(1, Ordering::Relaxed);
             if let Some(reference) = self.translation.get(key)? {
-                if let Some(guard) = self.try_pin_reference(key, reference)? {
-                    if !counted_miss {
-                        self.metrics.hits.fetch_add(1, Ordering::Relaxed);
+                match self.try_pin_reference(reference)? {
+                    PinAttempt::Pinned(pin) => {
+                        if !counted_miss {
+                            self.metrics.hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Ok(self.guard_from_pin(key, reference, pin));
                     }
-                    return Ok(guard);
+                    PinAttempt::Busy => {
+                        self.metrics
+                            .translation_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .writeback_waits
+                            .fetch_add(1, Ordering::Relaxed);
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    PinAttempt::Stale => {
+                        self.metrics
+                            .stale_translations
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .translation_retries
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = self.translation.remove_if(key, reference)?;
+                        continue;
+                    }
                 }
-                self.metrics
-                    .stale_translations
-                    .fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .translation_retries
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = self.translation.remove_if(key, reference)?;
-                continue;
             }
 
             if !counted_miss {
@@ -222,6 +255,72 @@ impl BufferPool {
 
             if let Some(guard) = self.load_miss(key)? {
                 return Ok(guard);
+            }
+        }
+    }
+
+    /// Install a newly allocated logical page directly into the buffer.
+    ///
+    /// The image is marked dirty before translation publication. If a duplicate
+    /// publisher wins, the losing unpublished dirty frame is discarded through
+    /// an explicit lifecycle transition that cannot be used for normal pages.
+    /// Logical page ID allocation remains an access-method/object-metadata
+    /// concern.
+    pub(crate) fn create_page(
+        &self,
+        key: PageKey,
+        image: &[u8],
+    ) -> Result<PageGuard<'_>, BufferError> {
+        if image.len() != self.page_size {
+            return Err(BufferError::PageSizeMismatch {
+                expected: self.page_size,
+                actual: image.len(),
+            });
+        }
+        self.metrics
+            .translation_lookups
+            .fetch_add(1, Ordering::Relaxed);
+        if self.translation.get(key)?.is_some() {
+            return Err(BufferError::PageAlreadyResident(key));
+        }
+
+        let (slot, incarnation) = self.reserve_for_load()?;
+        if let Err(error) = self.initialize_slot(slot, key, Some(image)) {
+            self.abort_loading(slot);
+            return Err(error);
+        }
+        let pin = match slot.meta.finish_load_pinned() {
+            Ok(pin) => pin,
+            Err(source) => {
+                self.abort_loading(slot);
+                return Err(self.frame_transition(slot.id, source));
+            }
+        };
+        let reference = FrameRef::new(slot.id, incarnation);
+
+        match pin.try_write() {
+            Ok(latch) => drop(latch),
+            Err(source) => {
+                drop(pin);
+                let _ = self.discard_unpublished(slot);
+                return Err(self.frame_transition(slot.id, source));
+            }
+        }
+
+        match self.translation.publish_if_absent(key, reference) {
+            Ok(PublishResult::Published) => {
+                self.metrics.new_pages.fetch_add(1, Ordering::Relaxed);
+                Ok(self.guard_from_pin(key, reference, pin))
+            }
+            Ok(PublishResult::Existing(_)) => {
+                drop(pin);
+                self.discard_unpublished(slot)?;
+                Err(BufferError::PageAlreadyResident(key))
+            }
+            Err(error) => {
+                drop(pin);
+                let _ = self.discard_unpublished(slot);
+                Err(BufferError::Translation(error))
             }
         }
     }
@@ -242,7 +341,8 @@ impl BufferPool {
         {
             return Ok(false);
         }
-        self.writeback(slot)
+        self.writeback(slot, WritebackTarget::Resident)?;
+        Ok(true)
     }
 
     /// Snapshot counters and frame occupancy without a global pool lock.
@@ -253,8 +353,10 @@ impl BufferPool {
             translation_lookups: self.metrics.translation_lookups.load(Ordering::Relaxed),
             translation_retries: self.metrics.translation_retries.load(Ordering::Relaxed),
             stale_translations: self.metrics.stale_translations.load(Ordering::Relaxed),
+            writeback_waits: self.metrics.writeback_waits.load(Ordering::Relaxed),
             loads: self.metrics.loads.load(Ordering::Relaxed),
             load_failures: self.metrics.load_failures.load(Ordering::Relaxed),
+            new_pages: self.metrics.new_pages.load(Ordering::Relaxed),
             duplicate_loads: self.metrics.duplicate_loads.load(Ordering::Relaxed),
             pins: self.metrics.pins.load(Ordering::Relaxed),
             latch_retries: self.metrics.latch_retries.load(Ordering::Relaxed),
@@ -315,68 +417,98 @@ impl BufferPool {
             .bytes_read
             .fetch_add(self.page_size as u64, Ordering::Relaxed);
 
-        match slot.page.write() {
-            Ok(mut page) => *page = Some(key),
-            Err(_) => {
+        if let Err(error) = self.set_page_identity(slot, key) {
+            self.abort_loading(slot);
+            return Err(error);
+        }
+        let pin = match slot.meta.finish_load_pinned() {
+            Ok(pin) => pin,
+            Err(source) => {
                 self.abort_loading(slot);
-                return Err(BufferError::Poisoned {
-                    frame: slot.id,
-                    component: "identity",
-                });
+                return Err(self.frame_transition(slot.id, source));
             }
-        }
-        if let Err(source) = slot.meta.finish_load() {
-            slot.installing.store(false, Ordering::Release);
-            return Err(self.frame_transition(slot.id, source));
-        }
-
+        };
         let reference = FrameRef::new(slot.id, incarnation);
-        match self.translation.publish_if_absent(key, reference)? {
-            PublishResult::Published => {
-                // `installing` prevents victim selection until our own pin is
-                // established. Translation readers may also pin immediately.
-                let guard = self.try_pin_reference(key, reference)?.ok_or_else(|| {
-                    self.frame_transition(
-                        slot.id,
-                        FrameTransitionError::WrongState {
-                            expected: FrameState::Resident,
-                            actual: slot.meta.state(),
-                        },
-                    )
-                })?;
-                slot.installing.store(false, Ordering::Release);
-                Ok(Some(guard))
-            }
-            PublishResult::Existing(_) => {
+
+        match self.translation.publish_if_absent(key, reference) {
+            Ok(PublishResult::Published) => Ok(Some(self.guard_from_pin(key, reference, pin))),
+            Ok(PublishResult::Existing(_)) => {
                 self.metrics.duplicate_loads.fetch_add(1, Ordering::Relaxed);
+                drop(pin);
                 self.discard_unpublished(slot)?;
                 Ok(None)
+            }
+            Err(error) => {
+                drop(pin);
+                let _ = self.discard_unpublished(slot);
+                Err(BufferError::Translation(error))
             }
         }
     }
 
-    fn try_pin_reference(
+    fn initialize_slot(
         &self,
+        slot: &FrameSlot,
+        key: PageKey,
+        image: Option<&[u8]>,
+    ) -> Result<(), BufferError> {
+        if let Some(image) = image {
+            let mut bytes = slot.bytes.write().map_err(|_| BufferError::Poisoned {
+                frame: slot.id,
+                component: "bytes",
+            })?;
+            bytes.copy_from_slice(image);
+        }
+        self.set_page_identity(slot, key)
+    }
+
+    fn set_page_identity(&self, slot: &FrameSlot, key: PageKey) -> Result<(), BufferError> {
+        let mut page = slot.page.write().map_err(|_| BufferError::Poisoned {
+            frame: slot.id,
+            component: "identity",
+        })?;
+        *page = Some(key);
+        Ok(())
+    }
+
+    fn guard_from_pin<'a>(
+        &'a self,
         key: PageKey,
         reference: FrameRef,
-    ) -> Result<Option<PageGuard<'_>>, BufferError> {
-        let slot = self.slot(reference.frame())?;
-        let Some(pin) = slot.meta.try_pin() else {
-            return Ok(None);
-        };
-        if pin.incarnation() != reference.incarnation() {
-            drop(pin);
-            return Ok(None);
-        }
+        pin: FramePin<'a>,
+    ) -> PageGuard<'a> {
+        let slot = &self.frames[reference.frame().index()];
         slot.referenced.store(true, Ordering::Release);
         self.metrics.pins.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(PageGuard {
+        PageGuard {
             pool: self,
             slot,
             pin,
             key,
             reference,
-        }))
+        }
+    }
+
+    fn try_pin_reference<'a>(&'a self, reference: FrameRef) -> Result<PinAttempt<'a>, BufferError> {
+        let slot = self.slot(reference.frame())?;
+        if slot.meta.incarnation() != Some(reference.incarnation()) {
+            return Ok(PinAttempt::Stale);
+        }
+        if let Some(pin) = slot.meta.try_pin() {
+            if pin.incarnation() == reference.incarnation() {
+                return Ok(PinAttempt::Pinned(pin));
+            }
+            drop(pin);
+            return Ok(PinAttempt::Stale);
+        }
+
+        if slot.meta.incarnation() != Some(reference.incarnation()) {
+            return Ok(PinAttempt::Stale);
+        }
+        match slot.meta.state() {
+            FrameState::Writeback | FrameState::Resident => Ok(PinAttempt::Busy),
+            FrameState::Free | FrameState::Loading | FrameState::Evicting => Ok(PinAttempt::Stale),
+        }
     }
 
     fn reserve_for_load(&self) -> Result<(&FrameSlot, FrameIncarnation), BufferError> {
@@ -384,34 +516,23 @@ impl BufferPool {
         for _ in 0..attempts {
             let index = self.clock.fetch_add(1, Ordering::Relaxed) % self.frames.len();
             let slot = &self.frames[index];
-            if slot
-                .installing
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
 
             match slot.meta.state() {
                 FrameState::Free => match slot.meta.begin_load() {
                     Ok(incarnation) => return Ok((slot, incarnation)),
-                    Err(_) => {
-                        slot.installing.store(false, Ordering::Release);
-                        continue;
-                    }
+                    Err(_) => continue,
                 },
                 FrameState::Resident => {
                     self.metrics
                         .eviction_attempts
                         .fetch_add(1, Ordering::Relaxed);
                     if slot.referenced.swap(false, Ordering::AcqRel) {
-                        slot.installing.store(false, Ordering::Release);
                         continue;
                     }
 
                     if slot.meta.is_dirty() {
-                        match self.writeback(slot) {
-                            Ok(true) | Ok(false) => {}
+                        match self.writeback(slot, WritebackTarget::Evicting) {
+                            Ok(()) => {}
                             Err(BufferError::FrameTransition {
                                 source: FrameTransitionError::Pinned,
                                 ..
@@ -419,59 +540,33 @@ impl BufferPool {
                                 self.metrics
                                     .eviction_refusals
                                     .fetch_add(1, Ordering::Relaxed);
-                                slot.installing.store(false, Ordering::Release);
                                 continue;
                             }
-                            Err(error) => {
-                                slot.installing.store(false, Ordering::Release);
-                                return Err(error);
+                            Err(BufferError::FrameTransition {
+                                source: FrameTransitionError::WrongState { .. },
+                                ..
+                            }) => continue,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        match slot.meta.try_begin_evict() {
+                            Ok(()) => {}
+                            Err(
+                                FrameTransitionError::Pinned
+                                | FrameTransitionError::WrongState { .. },
+                            ) => {
+                                self.metrics
+                                    .eviction_refusals
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
                             }
+                            Err(source) => return Err(self.frame_transition(slot.id, source)),
                         }
                     }
 
-                    match slot.meta.try_begin_evict() {
-                        Ok(()) => {}
-                        Err(
-                            FrameTransitionError::Pinned | FrameTransitionError::WrongState { .. },
-                        ) => {
-                            self.metrics
-                                .eviction_refusals
-                                .fetch_add(1, Ordering::Relaxed);
-                            slot.installing.store(false, Ordering::Release);
-                            continue;
-                        }
-                        Err(source) => {
-                            slot.installing.store(false, Ordering::Release);
-                            return Err(self.frame_transition(slot.id, source));
-                        }
-                    }
-
-                    let key = match slot.page.read() {
-                        Ok(page) => page.ok_or(BufferError::MissingIdentity { frame: slot.id })?,
-                        Err(_) => {
-                            slot.installing.store(false, Ordering::Release);
-                            return Err(BufferError::Poisoned {
-                                frame: slot.id,
-                                component: "identity",
-                            });
-                        }
-                    };
-                    let incarnation = slot
-                        .meta
-                        .incarnation()
-                        .ok_or(BufferError::MissingIdentity { frame: slot.id })?;
-                    let _ = self
-                        .translation
-                        .remove_if(key, FrameRef::new(slot.id, incarnation))?;
-                    match slot.page.write() {
-                        Ok(mut page) => *page = None,
-                        Err(_) => {
-                            slot.installing.store(false, Ordering::Release);
-                            return Err(BufferError::Poisoned {
-                                frame: slot.id,
-                                component: "identity",
-                            });
-                        }
+                    if let Err(error) = self.detach_evicted(slot) {
+                        let _ = slot.meta.abort_evict();
+                        return Err(error);
                     }
                     slot.meta
                         .finish_evict()
@@ -479,15 +574,10 @@ impl BufferPool {
                     self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
                     match slot.meta.begin_load() {
                         Ok(incarnation) => return Ok((slot, incarnation)),
-                        Err(source) => {
-                            slot.installing.store(false, Ordering::Release);
-                            return Err(self.frame_transition(slot.id, source));
-                        }
+                        Err(source) => return Err(self.frame_transition(slot.id, source)),
                     }
                 }
-                FrameState::Loading | FrameState::Writeback | FrameState::Evicting => {
-                    slot.installing.store(false, Ordering::Release);
-                }
+                FrameState::Loading | FrameState::Writeback | FrameState::Evicting => continue,
             }
         }
         self.metrics
@@ -496,10 +586,32 @@ impl BufferPool {
         Err(BufferError::NoVictim)
     }
 
-    fn writeback(&self, slot: &FrameSlot) -> Result<bool, BufferError> {
-        if !slot.meta.is_dirty() {
-            return Ok(false);
-        }
+    fn detach_evicted(&self, slot: &FrameSlot) -> Result<(), BufferError> {
+        let key = self.page_identity(slot)?;
+        let incarnation = slot
+            .meta
+            .incarnation()
+            .ok_or(BufferError::MissingIdentity { frame: slot.id })?;
+        let _ = self
+            .translation
+            .remove_if(key, FrameRef::new(slot.id, incarnation))?;
+        let mut page = slot.page.write().map_err(|_| BufferError::Poisoned {
+            frame: slot.id,
+            component: "identity",
+        })?;
+        *page = None;
+        Ok(())
+    }
+
+    fn page_identity(&self, slot: &FrameSlot) -> Result<PageKey, BufferError> {
+        let page = slot.page.read().map_err(|_| BufferError::Poisoned {
+            frame: slot.id,
+            component: "identity",
+        })?;
+        (*page).ok_or(BufferError::MissingIdentity { frame: slot.id })
+    }
+
+    fn writeback(&self, slot: &FrameSlot, target: WritebackTarget) -> Result<(), BufferError> {
         self.metrics
             .writeback_attempts
             .fetch_add(1, Ordering::Relaxed);
@@ -507,23 +619,13 @@ impl BufferPool {
             .try_begin_writeback()
             .map_err(|source| self.frame_transition(slot.id, source))?;
 
-        let key = match slot.page.read() {
-            Ok(page) => match *page {
-                Some(key) => key,
-                None => {
-                    let _ = slot.meta.abort_writeback();
-                    return Err(BufferError::MissingIdentity { frame: slot.id });
-                }
-            },
-            Err(_) => {
+        let key = match self.page_identity(slot) {
+            Ok(key) => key,
+            Err(error) => {
                 let _ = slot.meta.abort_writeback();
-                return Err(BufferError::Poisoned {
-                    frame: slot.id,
-                    component: "identity",
-                });
+                return Err(error);
             }
         };
-
         let result = match slot.bytes.read() {
             Ok(bytes) => self.io.write_page(key, &bytes),
             Err(_) => {
@@ -546,35 +648,31 @@ impl BufferPool {
             });
         }
 
-        slot.meta
-            .finish_writeback()
-            .map_err(|source| self.frame_transition(slot.id, source))?;
+        let transition = match target {
+            WritebackTarget::Resident => slot.meta.finish_writeback(),
+            WritebackTarget::Evicting => slot.meta.finish_writeback_for_evict(),
+        };
+        transition.map_err(|source| self.frame_transition(slot.id, source))?;
         self.metrics.writebacks.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_written
             .fetch_add(self.page_size as u64, Ordering::Relaxed);
-        Ok(true)
+        Ok(())
     }
 
     fn discard_unpublished(&self, slot: &FrameSlot) -> Result<(), BufferError> {
         slot.meta
-            .try_begin_evict()
+            .try_begin_unpublished_discard()
             .map_err(|source| self.frame_transition(slot.id, source))?;
-        match slot.page.write() {
-            Ok(mut page) => *page = None,
-            Err(_) => {
-                slot.installing.store(false, Ordering::Release);
-                return Err(BufferError::Poisoned {
-                    frame: slot.id,
-                    component: "identity",
-                });
-            }
-        }
+        let mut page = slot.page.write().map_err(|_| BufferError::Poisoned {
+            frame: slot.id,
+            component: "identity",
+        })?;
+        *page = None;
+        drop(page);
         slot.meta
             .finish_evict()
-            .map_err(|source| self.frame_transition(slot.id, source))?;
-        slot.installing.store(false, Ordering::Release);
-        Ok(())
+            .map_err(|source| self.frame_transition(slot.id, source))
     }
 
     fn abort_loading(&self, slot: &FrameSlot) {
@@ -582,7 +680,6 @@ impl BufferPool {
             *page = None;
         }
         let _ = slot.meta.abort_load();
-        slot.installing.store(false, Ordering::Release);
     }
 
     fn slot(&self, frame: FrameId) -> Result<&FrameSlot, BufferError> {
@@ -640,18 +737,18 @@ impl PageGuard<'_> {
             self.pool.frame_transition(self.slot.id, source)
         })?;
         Ok(PageWriteGuard {
-            _latch: latch,
             data,
+            _latch: latch,
         })
     }
 }
 
 /// Exclusive mutable view of one pinned page.
 pub struct PageWriteGuard<'a> {
-    // Dropping the optimistic latch first publishes an even version after all
-    // caller mutations have completed; the byte lock is then released.
-    _latch: FrameWriteLatch<'a>,
+    // Release the byte lock before publishing the next stable even version.
+    // This ordering matters once optimistic lock-free reads are introduced.
     data: RwLockWriteGuard<'a, Box<[u8]>>,
+    _latch: FrameWriteLatch<'a>,
 }
 
 impl Deref for PageWriteGuard<'_> {
@@ -673,7 +770,7 @@ mod tests {
     use super::*;
     use crate::vnext::{PageId, StorageObjectId};
     use std::collections::HashMap;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, Condvar, Mutex};
 
     const TEST_PAGE_SIZE: usize = 64;
 
@@ -758,6 +855,28 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_page_is_dirty_without_a_device_read() {
+        let device = Arc::new(MemoryPageIo::default());
+        let pool = BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
+        let image = vec![13u8; TEST_PAGE_SIZE];
+
+        let guard = pool
+            .create_page(key(7), &image)
+            .expect("new page installs");
+        assert_eq!(guard.read().expect("read latch")[0], 13);
+        drop(guard);
+
+        let stats = pool.stats().expect("stats");
+        assert_eq!(stats.new_pages, 1);
+        assert_eq!(stats.loads, 0);
+        assert_eq!(stats.bytes_read, 0);
+        assert_eq!(stats.dirty_frames, 1);
+        assert_eq!(device.reads.load(Ordering::Relaxed), 0);
+        assert!(pool.flush_page(key(7)).expect("new page flushes"));
+        assert_eq!(device.first_byte(key(7)), 13);
+    }
+
+    #[test]
     fn dirty_eviction_writes_before_reusing_single_frame() {
         let device = Arc::new(MemoryPageIo::default());
         device.insert(key(1), 1);
@@ -827,6 +946,96 @@ mod tests {
         assert_eq!(stats.duplicate_loads, 1);
         assert_eq!(stats.translation_entries, 1);
         assert_eq!(stats.resident_frames, 1);
+    }
+
+    struct BlockingWritePageIo {
+        inner: MemoryPageIo,
+        entered: (Mutex<bool>, Condvar),
+        release: (Mutex<bool>, Condvar),
+    }
+
+    impl BlockingWritePageIo {
+        fn wait_until_writeback(&self) {
+            let (lock, cv) = &self.entered;
+            let mut entered = lock.lock().expect("entered mutex");
+            while !*entered {
+                entered = cv.wait(entered).expect("entered wait");
+            }
+        }
+
+        fn release_writeback(&self) {
+            let (lock, cv) = &self.release;
+            *lock.lock().expect("release mutex") = true;
+            cv.notify_all();
+        }
+    }
+
+    impl PageIo for BlockingWritePageIo {
+        fn read_page(&self, key: PageKey, destination: &mut [u8]) -> io::Result<()> {
+            self.inner.read_page(key, destination)
+        }
+
+        fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
+            {
+                let (lock, cv) = &self.entered;
+                *lock.lock().map_err(|_| io::Error::other("entered mutex"))? = true;
+                cv.notify_all();
+            }
+            {
+                let (lock, cv) = &self.release;
+                let mut released = lock
+                    .lock()
+                    .map_err(|_| io::Error::other("release mutex"))?;
+                while !*released {
+                    released = cv
+                        .wait(released)
+                        .map_err(|_| io::Error::other("release wait"))?;
+                }
+            }
+            self.inner.write_page(key, source)
+        }
+    }
+
+    #[test]
+    fn lookup_during_writeback_waits_instead_of_reloading_stale_device_bytes() {
+        let inner = MemoryPageIo::default();
+        inner.insert(key(1), 1);
+        let device = Arc::new(BlockingWritePageIo {
+            inner,
+            entered: (Mutex::new(false), Condvar::new()),
+            release: (Mutex::new(false), Condvar::new()),
+        });
+        let pool =
+            Arc::new(BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates"));
+
+        {
+            let guard = pool.pin(key(1)).expect("page loads");
+            guard.write().expect("write latch")[0] = 9;
+        }
+
+        let flush_pool = Arc::clone(&pool);
+        let flusher = std::thread::spawn(move || {
+            assert!(flush_pool.flush_page(key(1)).expect("flush succeeds"));
+        });
+        device.wait_until_writeback();
+
+        let read_pool = Arc::clone(&pool);
+        let reader = std::thread::spawn(move || {
+            let guard = read_pool.pin(key(1)).expect("lookup survives writeback");
+            guard.read().expect("read latch")[0]
+        });
+
+        for _ in 0..100 {
+            if pool.stats().expect("stats").writeback_waits > 0 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        device.release_writeback();
+        flusher.join().expect("flusher completes");
+        assert_eq!(reader.join().expect("reader completes"), 9);
+        assert_eq!(device.inner.reads.load(Ordering::Relaxed), 1);
+        assert!(pool.stats().expect("stats").writeback_waits > 0);
     }
 
     #[test]
