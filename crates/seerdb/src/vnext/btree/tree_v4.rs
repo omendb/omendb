@@ -178,9 +178,8 @@ impl BTreeObject {
 
     /// Bounded materialized range helper over leaf right links.
     ///
-    /// The final API will expose a resumable guard-aware cursor. This helper
-    /// proves leaf-link ordering and split traversal before cursor lifetime
-    /// semantics are layered in.
+    /// The resumable cursor layer re-enters this helper by logical key rather
+    /// than retaining page/slot state across calls.
     pub fn range(
         &self,
         buffer: &BufferPool,
@@ -317,7 +316,7 @@ impl BTreeObject {
             drop(right_guard);
             drop(leaf_guard);
 
-            self.propagate_split(buffer, &mut path, leaf, separator, right_id)?;
+            self.propagate_split(buffer, &mut path, separator, right_id)?;
             return Ok(());
         }
     }
@@ -326,7 +325,6 @@ impl BTreeObject {
         &self,
         buffer: &BufferPool,
         path: &mut Vec<PageId>,
-        mut left_id: PageId,
         mut separator: Vec<u8>,
         mut right_id: PageId,
     ) -> Result<(), BTreeError> {
@@ -414,18 +412,24 @@ impl BTreeObject {
             drop(new_right_guard);
             drop(parent_guard);
 
-            left_id = parent_id;
             separator = promoted;
             right_id = new_right_id;
         }
 
+        // If an earlier root promotion failed after publishing a B-link split,
+        // `right_id` may be a sibling reached by following right from the
+        // current root rather than the root itself. The eventual promoted root
+        // must retain the full older chain on its left, not start at only the
+        // most recently split sibling.
+        let root_leftmost = self.root();
         let new_root = self.allocate_page()?;
         let entries = [InternalEntryOwned {
             key: separator,
             child: right_id,
         }];
-        let root_image = page_v4::build_internal(buffer.page_size(), None, None, left_id, &entries)
-            .map_err(|error| Self::map_build_error(new_root, error))?;
+        let root_image =
+            page_v4::build_internal(buffer.page_size(), None, None, root_leftmost, &entries)
+                .map_err(|error| Self::map_build_error(new_root, error))?;
         let guard = buffer.create_page(self.page_key(new_root), &root_image)?;
         drop(guard);
         self.root.store(new_root.get(), Ordering::Release);
