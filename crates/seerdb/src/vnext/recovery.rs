@@ -5,9 +5,7 @@
 //! must be contiguous and only a validated commit decision emits replayable
 //! state. Aborted or unterminated transactions never become visible.
 
-use super::{
-    mutation_digest, CommitPosition, CommitSeq, LogRecord, LoggedMutation, Lsn, TxnId,
-};
+use super::{CommitPosition, CommitSeq, LogRecord, LoggedMutation, Lsn, TxnId, mutation_digest};
 use std::collections::{HashMap, HashSet};
 
 /// One transaction proven committed by a valid durable decision.
@@ -143,8 +141,8 @@ impl RecoveryAssembler {
                         actual,
                     });
                 }
-                let digest = mutation_digest(&mutations)
-                    .map_err(|_| RecoveryError::MutationEncoding)?;
+                let digest =
+                    mutation_digest(&mutations).map_err(|_| RecoveryError::MutationEncoding)?;
                 if decision.mutation_digest() != digest {
                     return Err(RecoveryError::MutationDigest { txn });
                 }
@@ -201,18 +199,24 @@ mod tests {
         let second = vec![put(2, 0, 17, b"x")];
         let mut recovery = RecoveryAssembler::new();
 
-        assert!(recovery
-            .push(lsn(10), LogRecord::Mutation(first[0].clone()))
-            .expect("first mutation")
-            .is_none());
-        assert!(recovery
-            .push(lsn(20), LogRecord::Mutation(second[0].clone()))
-            .expect("second txn mutation")
-            .is_none());
-        assert!(recovery
-            .push(lsn(30), LogRecord::Mutation(first[1].clone()))
-            .expect("second first-txn mutation")
-            .is_none());
+        assert!(
+            recovery
+                .push(lsn(10), LogRecord::Mutation(first[0].clone()))
+                .expect("first mutation")
+                .is_none()
+        );
+        assert!(
+            recovery
+                .push(lsn(20), LogRecord::Mutation(second[0].clone()))
+                .expect("second txn mutation")
+                .is_none()
+        );
+        assert!(
+            recovery
+                .push(lsn(30), LogRecord::Mutation(first[1].clone()))
+                .expect("second first-txn mutation")
+                .is_none()
+        );
 
         let first_commit = CommitDecision::new(
             TxnId::new(1),
@@ -239,10 +243,12 @@ mod tests {
         recovery
             .push(lsn(10), LogRecord::Mutation(put(3, 0, 19, b"lost")))
             .expect("mutation stages");
-        assert!(recovery
-            .push(lsn(20), LogRecord::Abort(TxnId::new(3)))
-            .expect("abort validates")
-            .is_none());
+        assert!(
+            recovery
+                .push(lsn(20), LogRecord::Abort(TxnId::new(3)))
+                .expect("abort validates")
+                .is_none()
+        );
         recovery
             .push(lsn(30), LogRecord::Mutation(put(4, 0, 23, b"torn")))
             .expect("unterminated mutation stages");
