@@ -5,7 +5,9 @@
 //! metadata; page lifetime, translation, dirty state and I/O belong to the
 //! shared buffer/storage kernel.
 
+mod cursor_v4;
 mod page_v4;
 mod tree_v4;
 
+pub use cursor_v4::RangeCursor;
 pub use tree_v4::{BTreeError, BTreeLookup, BTreeObject};
