@@ -57,10 +57,7 @@ impl PreparedLogBatch {
     /// Encode a transaction already in `Prepared` state.
     pub fn from_transaction(transaction: &Transaction) -> Result<Self, PrepareLogBatchError> {
         let decision = transaction.commit_decision()?;
-        Ok(Self::from_decision(
-            decision,
-            transaction.mutations(),
-        )?)
+        Ok(Self::from_decision(decision, transaction.mutations())?)
     }
 
     /// Encode a candidate commit before changing transaction phase or touching
@@ -73,10 +70,7 @@ impl PreparedLogBatch {
     ) -> Result<Self, LogEncodeError> {
         let count = u32::try_from(mutations.len()).map_err(|_| LogEncodeError::RecordTooLarge)?;
         let digest = mutation_digest(mutations)?;
-        Self::from_decision(
-            CommitDecision::new(txn_id, csn, count, digest),
-            mutations,
-        )
+        Self::from_decision(CommitDecision::new(txn_id, csn, count, digest), mutations)
     }
 
     fn from_decision(
