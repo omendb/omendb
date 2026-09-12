@@ -11,9 +11,13 @@
 //! access method, but it does not dictate how canonical rows or future search
 //! and analytical structures must be laid out.
 
+mod frame;
 mod ids;
 mod object;
 
+pub use frame::{
+    FrameMeta, FramePin, FrameState, FrameTransitionError, FrameVersion, FrameWriteLatch,
+};
 pub use ids::{FrameId, PageId, StorageObjectId};
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 
