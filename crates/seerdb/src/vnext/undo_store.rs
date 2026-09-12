@@ -14,7 +14,7 @@ use super::{MvccCodecError, MvccRecord, VersionId};
 use durable_fs::{SyncClass, fsync_dir, fsync_dir_chain, sync_file_all, sync_file_data};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -134,14 +134,14 @@ impl UndoStore {
         let id = VersionId::new(raw_id);
         let frame = encode_frame(id, &payload)?;
         let frame_length = u64::try_from(frame.len()).map_err(|_| UndoStoreError::RecordTooLarge)?;
-        let end_offset = state
-            .end_offset
+        let offset = state.end_offset;
+        let end_offset = offset
             .checked_add(frame_length)
             .ok_or(UndoStoreError::FileOffsetExhausted)?;
 
         state
             .file
-            .seek(SeekFrom::Start(state.end_offset))
+            .seek(SeekFrom::Start(offset))
             .and_then(|_| state.file.write_all(&frame))
             .map_err(|source| {
                 self.fenced.store(true, Ordering::Release);
@@ -150,7 +150,6 @@ impl UndoStore {
                     source,
                 }
             })?;
-        let offset = state.end_offset;
         state.index.push(UndoFrame {
             offset,
             length: frame.len(),
@@ -178,7 +177,7 @@ impl UndoStore {
     /// latest indexed version rather than merely the requested ID.
     pub fn sync_through(&self, id: VersionId) -> Result<VersionId, UndoStoreError> {
         let requested = version_index(id)?;
-        let mut state = self.state.lock().map_err(|_| UndoStoreError::Poisoned)?;
+        let state = self.state.lock().map_err(|_| UndoStoreError::Poisoned)?;
         self.ensure_open()?;
         if requested >= state.index.len() {
             return Err(UndoStoreError::MissingVersion(id));
