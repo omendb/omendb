@@ -9,6 +9,7 @@ mod btree;
 mod buffer;
 mod frame;
 mod ids;
+mod log;
 mod object;
 mod translation;
 
@@ -20,6 +21,10 @@ pub use frame::{
     FrameMeta, FramePin, FrameState, FrameTransitionError, FrameVersion, FrameWriteLatch,
 };
 pub use ids::{FrameId, FrameIncarnation, FrameRef, PageId, PageKey, StorageObjectId};
+pub use log::{
+    CommitDecision, LogEncodeError, LogParseStatus, LogRecord, LoggedMutation, MutationKind,
+    mutation_digest, parse_log_prefix,
+};
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
 
