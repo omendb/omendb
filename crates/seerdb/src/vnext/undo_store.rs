@@ -74,6 +74,7 @@ impl UndoStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(path)
             .map_err(|source| UndoStoreError::Io {
                 operation: UndoIoOperation::Open,
