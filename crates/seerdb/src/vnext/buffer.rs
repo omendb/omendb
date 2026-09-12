@@ -985,7 +985,9 @@ mod tests {
             }
             {
                 let (lock, cv) = &self.release;
-                let mut released = lock.lock().map_err(|_| io::Error::other("release mutex"))?;
+                let mut released = lock
+                    .lock()
+                    .map_err(|_| io::Error::other("release mutex"))?;
                 while !*released {
                     released = cv
                         .wait(released)
