@@ -11,6 +11,7 @@ mod frame;
 mod ids;
 mod log;
 mod object;
+mod recovery;
 mod translation;
 mod txn;
 
@@ -27,6 +28,7 @@ pub use log::{
     LoggedMutation, MutationKind,
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
+pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
 pub use txn::{Transaction, TransactionError, TransactionPhase};
 
