@@ -99,7 +99,8 @@ fn failed_root_promotion_cannot_make_older_left_siblings_unreachable() {
     for number in 0..=failed_at {
         let key = format!("k-{number:04}");
         if matches!(
-            tree.lookup(&buffer, key.as_bytes()).expect("lookup after fault"),
+            tree.lookup(&buffer, key.as_bytes())
+                .expect("lookup after fault"),
             BTreeLookup::Found(_)
         ) {
             reachable.push(key);
