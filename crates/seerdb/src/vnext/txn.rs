@@ -369,7 +369,8 @@ mod tests {
         let lsn = Lsn::from_wal_position(0, 100).expect("lsn");
         txn.mark_wal_appended(lsn).expect("append records");
         assert!(txn.abort().is_err());
-        txn.mark_recovery_required().expect("outcome becomes uncertain");
+        txn.mark_recovery_required()
+            .expect("outcome becomes uncertain");
         assert_eq!(txn.phase(), TransactionPhase::RecoveryRequired);
         assert!(txn.abort().is_err());
         assert!(txn.release().is_err());
@@ -388,7 +389,8 @@ mod tests {
             Err(TransactionError::WalLsnMismatch { .. })
         ));
         assert_eq!(txn.phase(), TransactionPhase::WalAppended);
-        txn.mark_durable(appended).expect("correct barrier succeeds");
+        txn.mark_durable(appended)
+            .expect("correct barrier succeeds");
     }
 
     #[test]
