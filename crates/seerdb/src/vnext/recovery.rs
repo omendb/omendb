@@ -123,13 +123,14 @@ impl RecoveryAssembler {
                 if !self.terminal.insert(txn) {
                     return Err(RecoveryError::RecordAfterTerminal(txn));
                 }
-                if let Some(previous) = self.last_csn {
-                    if decision.csn() <= previous {
-                        return Err(RecoveryError::NonMonotonicCommitSeq {
-                            previous,
-                            actual: decision.csn(),
-                        });
-                    }
+                if let Some(previous) = self
+                    .last_csn
+                    .filter(|previous| decision.csn() <= *previous)
+                {
+                    return Err(RecoveryError::NonMonotonicCommitSeq {
+                        previous,
+                        actual: decision.csn(),
+                    });
                 }
 
                 let mutations = self.pending.remove(&txn).unwrap_or_default();
@@ -164,10 +165,8 @@ impl RecoveryAssembler {
     }
 
     fn advance_lsn(&mut self, actual: Lsn) -> Result<(), RecoveryError> {
-        if let Some(previous) = self.last_lsn {
-            if actual <= previous {
-                return Err(RecoveryError::NonMonotonicLsn { previous, actual });
-            }
+        if let Some(previous) = self.last_lsn.filter(|previous| actual <= *previous) {
+            return Err(RecoveryError::NonMonotonicLsn { previous, actual });
         }
         self.last_lsn = Some(actual);
         Ok(())
@@ -196,7 +195,7 @@ mod tests {
     #[test]
     fn interleaved_transactions_emit_only_after_valid_commit() {
         let first = vec![put(1, 0, 11, b"a"), put(1, 1, 13, b"b")];
-        let second = vec![put(2, 0, 17, b"x")];
+        let second = [put(2, 0, 17, b"x")];
         let mut recovery = RecoveryAssembler::new();
 
         assert!(
@@ -279,7 +278,7 @@ mod tests {
                     TxnId::new(8),
                     CommitSeq::new(1),
                     2,
-                    mutation_digest(&[mutation.clone()]).expect("digest")
+                    mutation_digest(std::slice::from_ref(&mutation)).expect("digest")
                 ))
             ),
             Err(RecoveryError::MutationCount { .. })
