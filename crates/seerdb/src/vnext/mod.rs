@@ -17,6 +17,7 @@ mod recovery;
 mod segment_log;
 mod translation;
 mod txn;
+mod visibility;
 
 pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
 pub use buffer::{
@@ -43,6 +44,7 @@ pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
 pub use txn::{Transaction, TransactionError, TransactionPhase};
+pub use visibility::{VisibilityError, VisibilityFrontier};
 
 // Keep the already-proven logical identity domains instead of manufacturing
 // vNext-specific duplicates.
