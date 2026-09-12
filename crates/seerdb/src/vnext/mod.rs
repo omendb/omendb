@@ -14,12 +14,14 @@
 mod frame;
 mod ids;
 mod object;
+mod translation;
 
 pub use frame::{
     FrameMeta, FramePin, FrameState, FrameTransitionError, FrameVersion, FrameWriteLatch,
 };
-pub use ids::{FrameId, PageId, StorageObjectId};
+pub use ids::{FrameId, PageId, PageKey, StorageObjectId};
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
+pub use translation::{DEFAULT_TRANSLATION_SHARDS, TranslationError, TranslationTable};
 
 // Preserve the ordering domains established by the current engine rather than
 // inventing vNext aliases that could accidentally diverge during migration.
