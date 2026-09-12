@@ -25,7 +25,7 @@ pub use frame::{
 pub use ids::{FrameId, FrameIncarnation, FrameRef, PageId, PageKey, StorageObjectId};
 pub use log::{
     CommitDecision, LogEncodeError, LogParseStatus, LogRecord, LoggedMutation, MutationKind,
-    mutation_digest, parse_log_prefix,
+    ParsedLogRecord, mutation_digest, parse_log_prefix, parse_log_prefix_frames,
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
