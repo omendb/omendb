@@ -165,11 +165,7 @@ mod tests {
         );
         assert_eq!(
             statuses
-                .visibility(
-                    RecordOwner::Transaction(txn),
-                    None,
-                    frontier.snapshot(),
-                )
+                .visibility(RecordOwner::Transaction(txn), None, frontier.snapshot(),)
                 .expect("new visibility"),
             RecordVisibility::Visible
         );
