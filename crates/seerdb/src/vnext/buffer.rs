@@ -298,13 +298,19 @@ impl BufferPool {
         };
         let reference = FrameRef::new(slot.id, incarnation);
 
-        match pin.try_write() {
-            Ok(latch) => drop(latch),
-            Err(source) => {
-                drop(pin);
-                let _ = self.discard_unpublished(slot);
-                return Err(self.frame_transition(slot.id, source));
+        let dirty_error = {
+            match pin.try_write() {
+                Ok(latch) => {
+                    drop(latch);
+                    None
+                }
+                Err(source) => Some(source),
             }
+        };
+        if let Some(source) = dirty_error {
+            drop(pin);
+            let _ = self.discard_unpublished(slot);
+            return Err(self.frame_transition(slot.id, source));
         }
 
         match self.translation.publish_if_absent(key, reference) {
