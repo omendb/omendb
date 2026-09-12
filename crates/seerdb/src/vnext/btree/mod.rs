@@ -10,6 +10,8 @@ mod page_v4;
 mod tree_v4;
 
 #[cfg(test)]
+mod failure_tests;
+#[cfg(test)]
 mod stress_tests;
 
 pub use cursor_v4::RangeCursor;
