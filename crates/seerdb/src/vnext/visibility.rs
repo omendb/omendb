@@ -6,7 +6,7 @@
 //! correct because a newly committed owner resolves as `NewerCommit` and follows
 //! its undo chain.
 
-use super::{CommitSeq, StatusTableError, TransactionStatus, TransactionStatusTable, TxnId};
+use super::{CommitSeq, StatusTableError, TransactionStatusTable, TxnId};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,7 +107,7 @@ pub enum VisibilityError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{RecordOwner, RecordVisibility};
+    use crate::vnext::{RecordOwner, RecordVisibility, TransactionStatus};
 
     #[test]
     fn out_of_order_status_publication_cannot_advance_snapshot_across_a_gap() {
