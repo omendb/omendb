@@ -45,9 +45,7 @@ impl TranslationShard {
     }
 
     fn write(&self) -> Result<RwLockWriteGuard<'_, HashMap<PageKey, FrameId>>, TranslationError> {
-        self.entries
-            .write()
-            .map_err(|_| TranslationError::Poisoned)
+        self.entries.write().map_err(|_| TranslationError::Poisoned)
     }
 }
 
@@ -112,11 +110,7 @@ impl TranslationTable {
     ///
     /// Conditional removal prevents a delayed eviction from deleting a newer
     /// frame that won a reload/replacement race for the same logical page.
-    pub fn remove_if(
-        &self,
-        key: PageKey,
-        expected: FrameId,
-    ) -> Result<bool, TranslationError> {
+    pub fn remove_if(&self, key: PageKey, expected: FrameId) -> Result<bool, TranslationError> {
         let mut entries = self.shard(key).write()?;
         if entries.get(&key).copied() != Some(expected) {
             return Ok(false);
@@ -209,14 +203,8 @@ mod tests {
         table
             .insert(key(2, 7), FrameId::new(9))
             .expect("insert second");
-        assert_eq!(
-            table.get(key(1, 7)).expect("lookup"),
-            Some(FrameId::new(3))
-        );
-        assert_eq!(
-            table.get(key(2, 7)).expect("lookup"),
-            Some(FrameId::new(9))
-        );
+        assert_eq!(table.get(key(1, 7)).expect("lookup"), Some(FrameId::new(3)));
+        assert_eq!(table.get(key(2, 7)).expect("lookup"), Some(FrameId::new(9)));
         assert_eq!(table.len().expect("length"), 2);
     }
 
@@ -224,22 +212,19 @@ mod tests {
     fn stale_conditional_remove_cannot_delete_newer_mapping() {
         let table = TranslationTable::with_shards(4).expect("translation table");
         let page = key(4, 12);
-        table
-            .insert(page, FrameId::new(1))
-            .expect("initial insert");
-        table
-            .insert(page, FrameId::new(2))
-            .expect("replacement");
-        assert!(!table
-            .remove_if(page, FrameId::new(1))
-            .expect("stale remove"));
-        assert_eq!(
-            table.get(page).expect("lookup"),
-            Some(FrameId::new(2))
+        table.insert(page, FrameId::new(1)).expect("initial insert");
+        table.insert(page, FrameId::new(2)).expect("replacement");
+        assert!(
+            !table
+                .remove_if(page, FrameId::new(1))
+                .expect("stale remove")
         );
-        assert!(table
-            .remove_if(page, FrameId::new(2))
-            .expect("current remove"));
+        assert_eq!(table.get(page).expect("lookup"), Some(FrameId::new(2)));
+        assert!(
+            table
+                .remove_if(page, FrameId::new(2))
+                .expect("current remove")
+        );
         assert!(table.is_empty().expect("empty"));
     }
 
@@ -252,9 +237,7 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 for page in 0..128u64 {
                     let frame = FrameId::new((worker as usize * 128) + page as usize);
-                    table
-                        .insert(key(worker + 1, page), frame)
-                        .expect("insert");
+                    table.insert(key(worker + 1, page), frame).expect("insert");
                 }
             }));
         }
