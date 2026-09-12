@@ -6,7 +6,7 @@
 //! but a transaction becomes replayable only after its commit decision validates
 //! the expected mutation count and digest.
 
-use super::{CommitSeq, StorageObjectId, TxnId};
+use super::{CommitSeq, Lsn, StorageObjectId, TxnId};
 
 const LOG_FORMAT_VERSION: u16 = 1;
 const RECORD_HEADER_SIZE: usize = 8; // length + version + kind + flags
@@ -169,6 +169,41 @@ pub enum LogRecord {
     Abort(TxnId),
 }
 
+/// One decoded record together with its end offset in the parsed byte slice.
+///
+/// The offset is relative to the supplied prefix. Recovery can combine it with
+/// a WAL segment and base offset to recover the record's exact durable LSN
+/// without reparsing framing bytes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ParsedLogRecord {
+    record: LogRecord,
+    end_offset: u64,
+}
+
+impl ParsedLogRecord {
+    #[must_use]
+    pub fn record(&self) -> &LogRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub fn into_record(self) -> LogRecord {
+        self.record
+    }
+
+    #[must_use]
+    pub const fn end_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    /// Resolve this relative end offset into the repository's packed LSN type.
+    #[must_use]
+    pub fn end_lsn(&self, segment: u64, base_offset: u64) -> Option<Lsn> {
+        let offset = base_offset.checked_add(self.end_offset)?;
+        Lsn::from_wal_position(segment, offset)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum LogEncodeError {
     #[error("vNext log record exceeds the u32 framing limit")]
@@ -222,8 +257,24 @@ pub fn mutation_digest(mutations: &[LoggedMutation]) -> Result<u32, LogEncodeErr
 }
 
 /// Parse every complete record in a prefix and classify the remaining suffix.
+///
+/// This convenience API discards record byte positions. Raw WAL recovery should
+/// prefer [`parse_log_prefix_frames`] so it can recover exact record end-LSNs.
 #[must_use]
 pub fn parse_log_prefix(bytes: &[u8]) -> (Vec<LogRecord>, LogParseStatus) {
+    let (frames, status) = parse_log_prefix_frames(bytes);
+    (
+        frames
+            .into_iter()
+            .map(ParsedLogRecord::into_record)
+            .collect(),
+        status,
+    )
+}
+
+/// Parse complete records while preserving each record's relative end offset.
+#[must_use]
+pub fn parse_log_prefix_frames(bytes: &[u8]) -> (Vec<ParsedLogRecord>, LogParseStatus) {
     let mut records = Vec::new();
     let mut offset = 0usize;
 
@@ -246,12 +297,20 @@ pub fn parse_log_prefix(bytes: &[u8]) -> (Vec<LogRecord>, LogParseStatus) {
         if bytes.len() - offset < total {
             return (records, LogParseStatus::Incomplete);
         }
-        let frame = &bytes[offset..offset + total];
+        let end = match offset.checked_add(total) {
+            Some(end) => end,
+            None => return (records, LogParseStatus::Corrupt),
+        };
+        let frame = &bytes[offset..end];
         let Some(record) = decode_complete_record(frame) else {
             return (records, LogParseStatus::Corrupt);
         };
-        records.push(record);
-        offset += total;
+        let end_offset = match u64::try_from(end) {
+            Ok(end) => end,
+            Err(_) => return (records, LogParseStatus::Corrupt),
+        };
+        records.push(ParsedLogRecord { record, end_offset });
+        offset = end;
     }
 
     (records, LogParseStatus::Complete)
@@ -421,6 +480,28 @@ mod tests {
     }
 
     #[test]
+    fn framed_parse_preserves_exact_record_boundaries() {
+        let first = LogRecord::Abort(TxnId::new(1))
+            .to_bytes()
+            .expect("first encodes");
+        let second = LogRecord::Abort(TxnId::new(2))
+            .to_bytes()
+            .expect("second encodes");
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&second);
+
+        let (frames, status) = parse_log_prefix_frames(&bytes);
+        assert_eq!(status, LogParseStatus::Complete);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].end_offset(), first.len() as u64);
+        assert_eq!(frames[1].end_offset(), bytes.len() as u64);
+        assert_eq!(
+            frames[1].end_lsn(3, 4096),
+            Lsn::from_wal_position(3, 4096 + bytes.len() as u64)
+        );
+    }
+
+    #[test]
     fn torn_suffix_keeps_complete_prefix() {
         let first = LogRecord::Abort(TxnId::new(1))
             .to_bytes()
@@ -433,6 +514,11 @@ mod tests {
         let (decoded, status) = parse_log_prefix(&bytes);
         assert_eq!(status, LogParseStatus::Incomplete);
         assert_eq!(decoded, vec![LogRecord::Abort(TxnId::new(1))]);
+
+        let (frames, framed_status) = parse_log_prefix_frames(&bytes);
+        assert_eq!(framed_status, LogParseStatus::Incomplete);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].end_offset(), first.len() as u64);
     }
 
     #[test]
