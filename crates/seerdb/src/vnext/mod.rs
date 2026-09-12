@@ -7,6 +7,7 @@
 
 mod btree;
 mod buffer;
+mod commit_append;
 mod frame;
 mod ids;
 mod log;
@@ -23,6 +24,7 @@ pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
 pub use buffer::{
     BufferError, BufferPool, BufferStats, PageGuard, PageIo, PageIoOperation, PageWriteGuard,
 };
+pub use commit_append::{CommitAppendError, CommitAppender};
 pub use frame::{
     FrameMeta, FramePin, FrameState, FrameTransitionError, FrameVersion, FrameWriteLatch,
 };
