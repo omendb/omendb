@@ -11,6 +11,7 @@ mod frame;
 mod ids;
 mod log;
 mod log_io;
+mod mvcc;
 mod object;
 mod recovery;
 mod segment_log;
@@ -33,6 +34,10 @@ pub use log_io::{
     AppendTicket, DurableLog, DurableLogError, LogDevice, LogIoOperation, PrepareLogBatchError,
     PreparedLogBatch,
 };
+pub use mvcc::{
+    MvccCodecError, MvccRecord, MvccValue, RecordOwner, RecordVisibility, StatusTableError,
+    TransactionStatus, TransactionStatusTable,
+};
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
@@ -41,4 +46,4 @@ pub use txn::{Transaction, TransactionError, TransactionPhase};
 
 // Keep the already-proven logical identity domains instead of manufacturing
 // vNext-specific duplicates.
-pub use crate::storage::format::{CommitPosition, CommitSeq, Lsn, TxnId};
+pub use crate::storage::format::{CommitPosition, CommitSeq, Lsn, TxnId, VersionId};
