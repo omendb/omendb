@@ -133,7 +133,8 @@ impl UndoStore {
         }
         let id = VersionId::new(raw_id);
         let frame = encode_frame(id, &payload)?;
-        let frame_length = u64::try_from(frame.len()).map_err(|_| UndoStoreError::RecordTooLarge)?;
+        let frame_length =
+            u64::try_from(frame.len()).map_err(|_| UndoStoreError::RecordTooLarge)?;
         let offset = state.end_offset;
         let end_offset = offset
             .checked_add(frame_length)
@@ -195,7 +196,8 @@ impl UndoStore {
                 source,
             }
         })?;
-        let latest = u64::try_from(state.index.len()).map_err(|_| UndoStoreError::VersionIdExhausted)?;
+        let latest =
+            u64::try_from(state.index.len()).map_err(|_| UndoStoreError::VersionIdExhausted)?;
         self.durable_version.store(latest, Ordering::Release);
         Ok(VersionId::new(latest))
     }
@@ -435,17 +437,20 @@ fn validate_complete_frame(
     validate_header(header)?;
     let raw_id = read_u64(header, 8).ok_or(UndoStoreError::Corruption("missing version ID"))?;
     if raw_id != expected_id.get() {
-        return Err(UndoStoreError::Corruption("undo frame ID disagrees with index"));
+        return Err(UndoStoreError::Corruption(
+            "undo frame ID disagrees with index",
+        ));
     }
-    let payload_len = read_u32(header, 16)
-        .ok_or(UndoStoreError::Corruption("missing payload length"))?
-        as usize;
+    let payload_len =
+        read_u32(header, 16).ok_or(UndoStoreError::Corruption("missing payload length"))? as usize;
     let expected_len = FRAME_HEADER_SIZE
         .checked_add(payload_len)
         .and_then(|length| length.checked_add(FRAME_CHECKSUM_SIZE))
         .ok_or(UndoStoreError::Corruption("undo frame length overflows"))?;
     if frame.len() != expected_len {
-        return Err(UndoStoreError::Corruption("undo frame length disagrees with header"));
+        return Err(UndoStoreError::Corruption(
+            "undo frame length disagrees with header",
+        ));
     }
     let checksum_offset = expected_len - FRAME_CHECKSUM_SIZE;
     let stored = u32::from_le_bytes(
@@ -489,14 +494,19 @@ mod tests {
         let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
         assert_eq!(store.durable_version(), None);
 
-        let first = store.append(&record(1, None, b"first")).expect("first appends");
+        let first = store
+            .append(&record(1, None, b"first"))
+            .expect("first appends");
         let second = store
             .append(&record(2, Some(first.get()), b"second"))
             .expect("second appends");
         assert_eq!(first, VersionId::new(1));
         assert_eq!(second, VersionId::new(2));
         assert_eq!(store.durable_version(), None);
-        assert_eq!(store.get(first).expect("first reads"), record(1, None, b"first"));
+        assert_eq!(
+            store.get(first).expect("first reads"),
+            record(1, None, b"first")
+        );
         assert_eq!(
             store.get(second).expect("second reads"),
             record(2, Some(1), b"second")
@@ -542,8 +552,12 @@ mod tests {
             store.sync_through(first).expect("sync");
             original_len = fs::metadata(&path).expect("metadata").len();
         }
-        let mut file = OpenOptions::new().append(true).open(&path).expect("raw append opens");
-        file.write_all(&FRAME_MAGIC[..2]).expect("partial tail writes");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("raw append opens");
+        file.write_all(&FRAME_MAGIC[..2])
+            .expect("partial tail writes");
         file.sync_all().expect("partial tail persists");
         drop(file);
 
