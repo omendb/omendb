@@ -1,41 +1,63 @@
-//! seerdb — High-performance ordered transactional storage for modern hardware
+//! seerdb — OmenDB's transaction and storage kernel for modern hardware
 //!
-//! SeerDB is OmenDB's ordered transactional KV engine. Its local implementation
-//! is currently an out-of-place B-tree engine for RAM + NVMe, while transaction,
-//! snapshot, CSN/LSN, and recovery semantics are deliberately independent of one
-//! durability transport or physical page policy.
+//! SeerDB is being redesigned as the shared kernel beneath OmenDB's physical
+//! access methods. It owns transaction ordering, durability, recovery, buffer
+//! residency, page/object lifetime, and physical storage services. An ordered
+//! transactional KV API remains an important standalone/compatibility facade,
+//! but `TreeId + key bytes + opaque value bytes` is no longer the universal
+//! internal boundary for canonical rows, search indexes, graph/analytical
+//! representations, or future access methods.
 //!
-//! The current local engine combines:
-//! - **Out-of-place writes** (LeanStore-inspired): pages are never updated in place
-//! - **KV separation** (WiscKey-inspired): large values are stored separately
+//! The current implementation remains available while the replacement is
+//! qualified. It combines:
+//! - **Out-of-place writes** (LeanStore-inspired): durable page images are not
+//!   overwritten in place
+//! - **KV separation** (WiscKey-inspired): large values can be stored separately
 //! - **SSD-aware layout**: append-oriented placement leaves room for FDP/ZNS
 //!   integration and lower device write amplification
 //! - **Fixed alpha page format**: the current implementation uses [`PAGE_SIZE`]
 //!   pages; page/node sizing remains benchmark-gated before format stability
-//! - **Logical MVCC**: fixed snapshots resolve current records through transaction
-//!   status and append-oriented before-images, independently of physical page
-//!   incarnations
+//! - **Logical MVCC**: fixed snapshots resolve current records through
+//!   transaction status and append-oriented before-images, independently of
+//!   physical page incarnations
 //! - **Explicit durability identities**: logical commit order (CSN) and durable
 //!   log position (LSN) remain distinct
 //!
-//! # Architecture
+//! # vNext architecture
 //!
-//! The local physical store currently uses an out-of-place B-tree where writes
-//! create new page versions instead of overwriting pages in place. A mapping
-//! layer tracks durable page locations, garbage collection reclaims superseded
-//! storage, and large values can live in append-oriented blob segments.
+//! The replacement architecture lives temporarily under [`vnext`] while the
+//! existing engine serves as a semantic, crash/fault, and performance oracle.
+//! vNext moves the narrow waist below ordered KV:
 //!
-//! [`TransactionDatabase`] provides multi-transaction logical semantics above
-//! that store and returns explicit `{CSN, LSN}` commit positions. The qualified
-//! commit implementation currently uses the group-publication lane from OmenDB
-//! ADR 0004. That lane is a baseline, not a permanent device policy: ADR 0006
-//! explicitly permits autonomous/parallel local-NVMe commit, quorum-replicated
-//! logging for HA, asynchronous page materialization, and object-storage-backed
-//! checkpoints/archive when measurements and fault qualification justify them.
+//! ```text
+//!                         OmenDB
+//!                           |
+//!                transaction/storage kernel
+//!             /        |        |          \
+//!        ordered     canonical  search/    analytical
+//!        B-tree       rows       graph     representations
+//!             \        |        |          /
+//!              +-------+--------+---------+
+//!                           |
+//!                 buffer / log / MVCC
+//! ```
 //!
-//! SeerDB is intentionally not an interchangeable RocksDB/LSM/backend wrapper.
-//! Deployment profiles may change durability, caching, and I/O mechanisms while
-//! retaining one transaction/storage contract.
+//! The first replacement slice is a shared buffered B-tree over guarded frames,
+//! followed by log-authoritative transactions and compact canonical row storage.
+//! Physical page materialization becomes asynchronous relative to a durable
+//! transaction decision. Specialized access methods then share the same
+//! transaction/log/buffer substrate instead of inventing sibling databases.
+//!
+//! The current group-publication lane and generation-COW storage remain a
+//! qualified baseline only. They are deleted after vNext passes the existing
+//! recovery/semantic gates and intended-workload performance gates.
+//!
+//! # Deployment policy
+//!
+//! One transaction/storage semantics may use different measured physical
+//! strategies: autonomous/adaptive local-NVMe logging, quorum logging for HA,
+//! async page materialization, and object-storage checkpoints/archive. SeerDB
+//! is intentionally not an interchangeable RocksDB/backend wrapper.
 //!
 //! # Example
 //!
@@ -51,12 +73,15 @@
 //!
 //! # References
 //!
-//! - LeanStore / Umbra: memory-efficient larger-than-memory B-tree engines
+//! - LeanStore / Umbra / CedarDB: integrated larger-than-memory transaction,
+//!   buffer, and physical-layout design
 //! - *B-Trees Are Back* (SIGMOD 2025): modern pageable B-tree node layouts
 //! - *Moving on From Group Commit* (SIGMOD 2025): autonomous commit on NVMe
 //! - *Predictive Translation* (SIGMOD 2026): low-overhead buffer translation
 //! - *How to Write to SSDs* (VLDB 2026): DB/SSD out-of-place co-optimization
 //! - BtrLog (VLDB 2026): quorum SSD logging plus object-store archival
+//! - FoundationDB: ordered transactional KV as a powerful external layering
+//!   interface rather than a requirement for every internal physical structure
 //! - WiscKey (FAST 2016): key/value separation
 
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
@@ -76,6 +101,7 @@ pub mod recovery;
 pub mod space;
 pub mod storage;
 pub mod transactional;
+pub mod vnext;
 
 // Re-export main types at crate root.
 pub use btree::PAGE_SIZE;
