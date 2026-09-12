@@ -728,18 +728,41 @@ impl PageGuard<'_> {
     }
 
     /// Acquire exclusive byte access and mark the page dirty.
+    ///
+    /// Writer contention is resolved at the guard boundary rather than exposed
+    /// to every access method. Claim the optimistic writer version before the
+    /// byte lock so a second writer waits here; the resulting guard still drops
+    /// the byte lock before publishing the next even version.
     pub fn write(&self) -> Result<PageWriteGuard<'_>, BufferError> {
-        let data = self.slot.bytes.write().map_err(|_| BufferError::Poisoned {
-            frame: self.slot.id,
-            component: "bytes",
-        })?;
-        let latch = self.pin.try_write().map_err(|source| {
-            self.pool
-                .metrics
-                .latch_retries
-                .fetch_add(1, Ordering::Relaxed);
-            self.pool.frame_transition(self.slot.id, source)
-        })?;
+        let latch = loop {
+            match self.pin.try_write() {
+                Ok(latch) => break latch,
+                Err(FrameTransitionError::WriteBusy) => {
+                    self.pool
+                        .metrics
+                        .latch_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+                Err(source) => {
+                    self.pool
+                        .metrics
+                        .latch_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(self.pool.frame_transition(self.slot.id, source));
+                }
+            }
+        };
+        let data = match self.slot.bytes.write() {
+            Ok(data) => data,
+            Err(_) => {
+                drop(latch);
+                return Err(BufferError::Poisoned {
+                    frame: self.slot.id,
+                    component: "bytes",
+                });
+            }
+        };
         Ok(PageWriteGuard {
             data,
             _latch: latch,
@@ -856,6 +879,35 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.translation_entries, 1);
+    }
+
+    #[test]
+    fn concurrent_page_writers_wait_inside_guard() {
+        let device = Arc::new(MemoryPageIo::default());
+        device.insert(key(1), 0);
+        let pool = Arc::new(BufferPool::new(2, TEST_PAGE_SIZE, device).expect("pool creates"));
+        {
+            let guard = pool.pin(key(1)).expect("page loads");
+            assert_eq!(guard.read().expect("read latch")[0], 0);
+        }
+        let start = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                let guard = pool.pin(key(1)).expect("page pins");
+                start.wait();
+                let mut bytes = guard.write().expect("writer waits internally");
+                bytes[0] = bytes[0].checked_add(1).expect("test counter fits");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("writer completes");
+        }
+        let guard = pool.pin(key(1)).expect("page remains resident");
+        assert_eq!(guard.read().expect("read latch")[0], 8);
+        assert!(pool.stats().expect("stats").latch_retries > 0);
     }
 
     #[test]
@@ -985,9 +1037,7 @@ mod tests {
             }
             {
                 let (lock, cv) = &self.release;
-                let mut released = lock
-                    .lock()
-                    .map_err(|_| io::Error::other("release mutex"))?;
+                let mut released = lock.lock().map_err(|_| io::Error::other("release mutex"))?;
                 while !*released {
                     released = cv
                         .wait(released)
