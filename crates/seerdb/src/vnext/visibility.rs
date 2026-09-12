@@ -8,8 +8,8 @@
 
 use super::{CommitSeq, StatusTableError, TransactionStatus, TransactionStatusTable, TxnId};
 use std::collections::BTreeSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Process-local visibility frontier rebuilt from durable commit decisions.
 pub struct VisibilityFrontier {
@@ -71,10 +71,7 @@ impl VisibilityFrontier {
             });
         }
 
-        let mut ready = self
-            .ready
-            .lock()
-            .map_err(|_| VisibilityError::Poisoned)?;
+        let mut ready = self.ready.lock().map_err(|_| VisibilityError::Poisoned)?;
         ready.insert(csn);
 
         let mut frontier = self.visible.load(Ordering::Acquire);
@@ -168,11 +165,7 @@ mod tests {
         );
         assert_eq!(
             statuses
-                .visibility(
-                    RecordOwner::Transaction(txn),
-                    None,
-                    frontier.snapshot()
-                )
+                .visibility(RecordOwner::Transaction(txn), None, frontier.snapshot())
                 .expect("new visibility"),
             RecordVisibility::Visible
         );
