@@ -12,6 +12,7 @@ mod ids;
 mod log;
 mod object;
 mod translation;
+mod txn;
 
 pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
 pub use buffer::{
@@ -22,12 +23,13 @@ pub use frame::{
 };
 pub use ids::{FrameId, FrameIncarnation, FrameRef, PageId, PageKey, StorageObjectId};
 pub use log::{
-    CommitDecision, LogEncodeError, LogParseStatus, LogRecord, LoggedMutation, MutationKind,
-    mutation_digest, parse_log_prefix,
+    mutation_digest, parse_log_prefix, CommitDecision, LogEncodeError, LogParseStatus, LogRecord,
+    LoggedMutation, MutationKind,
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
+pub use txn::{Transaction, TransactionError, TransactionPhase};
 
 // Keep the already-proven logical identity domains instead of manufacturing
 // vNext-specific duplicates.
-pub use crate::storage::format::{CommitSeq, Lsn, TxnId};
+pub use crate::storage::format::{CommitPosition, CommitSeq, Lsn, TxnId};
