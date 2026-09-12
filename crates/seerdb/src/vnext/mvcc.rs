@@ -236,7 +236,6 @@ impl TransactionStatusTable {
         self.recover(txn, TransactionStatus::Aborted)
     }
 
-    #[must_use]
     pub fn status(&self, txn: TxnId) -> Result<Option<TransactionStatus>, StatusTableError> {
         let shard = self.shard(txn);
         let entries = self.shards[shard]
