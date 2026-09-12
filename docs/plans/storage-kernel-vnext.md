@@ -35,7 +35,8 @@ Implemented on `storage-kernel-vnext`:
 - segmented local WAL device with whole-transaction segment rotation, durable-fs barriers, directory fsync, final torn-tail truncation, retained-segment gap detection and exact-LSN recovery scan;
 - ordered commit append lane coupling CSN assignment to physical WAL append order while leaving fsync, MVCC application and visibility publication outside the lane;
 - compact MVCC current/undo record envelope with owner `TxnId | frozen CSN`, a sharded transaction-status table and own-write/committed/active/aborted/newer-snapshot resolution;
-- contiguous visibility frontier so out-of-order completion cannot let a new snapshot cross an unpublished earlier CSN.
+- contiguous visibility frontier so out-of-order completion cannot let a new snapshot cross an unpublished earlier CSN;
+- append-only CRC-validated vNext undo store for complete `MvccRecord` before-images, with contiguous `VersionId`s, torn-final-frame repair, fail-closed retained corruption, fence-after-uncertain append/sync semantics and an explicit durable `VersionId` frontier.
 
 The temporary vNext v3 compatibility decoder has been removed. The old production tree/transaction engine remains available only as the correctness and recovery oracle until cutover.
 
@@ -46,7 +47,7 @@ Not implemented yet:
 - an optimized frame byte latch/read path replacing `std::sync::RwLock` if measurement justifies it;
 - background/asynchronous dirty queues and writeback scheduling;
 - the physical page-integrity/materialization envelope (checksum/page LSN/out-of-place physical mapping/checkpoint integration);
-- persistent or hybrid before-image/version-store integration for vNext MVCC;
+- current-record installation, snapshot traversal, freezing/GC and hybrid metadata policy over the new vNext undo store;
 - transaction write intents/conflict validation and visible snapshot reads over undo chains;
 - end-to-end log-authoritative application/recovery into authoritative access methods;
 - canonical row storage and OmenDB cutover.
@@ -77,7 +78,7 @@ Not implemented yet:
 
 ## Target module shape
 
-The implementation lives under temporary `seerdb::vnext` migration scaffolding while the old engine remains the oracle. The concrete module tree is allowed to grow only with real implementation seams; current vNext now includes IDs/object/frame/translation/buffer, native B-tree/cursor, logical WAL + physical segmented device, transaction/recovery, MVCC status/envelope and visibility-frontier modules.
+The implementation lives under temporary `seerdb::vnext` migration scaffolding while the old engine remains the oracle. The concrete module tree is allowed to grow only with real implementation seams; current vNext now includes IDs/object/frame/translation/buffer, native B-tree/cursor, logical WAL + physical segmented device, transaction/recovery, MVCC status/envelope, append-only undo storage and visibility-frontier modules.
 
 Do not create speculative plugin/trait hierarchies. Add a seam when a second real implementation or measurement target requires it.
 
@@ -185,7 +186,8 @@ Implemented foundations:
 - fence-after-uncertain-append/sync behavior;
 - local segmented WAL with whole-transaction rotation, directory durability and reopen/torn-tail repair;
 - short ordered append lane coupling CSN assignment to physical commit-decision order under concurrent committers;
-- `WalAppended`/`RecoveryRequired` transaction phases so a commit that may have entered the WAL cannot be incorrectly aborted in-process.
+- `WalAppended`/`RecoveryRequired` transaction phases so a commit that may have entered the WAL cannot be incorrectly aborted in-process;
+- standalone append-only complete-before-image storage with its own explicit durable `VersionId` frontier, ready for the materializer to enforce undo-before-data alongside WAL-before-data.
 
 Still required before D is complete:
 
@@ -193,15 +195,17 @@ Still required before D is complete:
 2. WAL-first/current-record application protocol with failpoints around every install/decision/status boundary.
 3. Conflict/write-intent validation before append.
 4. Recovery replay into access-method state plus process kill/reopen qualification.
-5. WAL-before-data/page-LSN eligibility in the out-of-place materialization layer.
-6. Checkpoint/replay-frontier integration and log retention.
+5. Materialization eligibility that enforces both WAL-before-data via real page LSN and undo-before-data for every referenced `VersionId`.
+6. Checkpoint/replay-frontier integration and log/undo retention.
 7. Group/autonomous/adaptive durability scheduling measurements above the same append/sync contract.
+
+Materialization invariant: a page containing a transaction-owned current MVCC record must not become durable unless the transaction WAL frontier covers that page's real LSN and every undo version referenced by the durable page image is at or below the undo store's durable `VersionId` frontier. The page/materialization layer owns this gate; frame version or a boolean dirty flag is not a substitute for either durability domain.
 
 The durable transaction decision, not page flush or root-generation publication, remains commit authority.
 
 ## Milestone E — MVCC/contention
 
-**Status: visibility ownership/status/frontier contract implemented; version-store/current-record integration remains.**
+**Status: visibility ownership/status/frontier plus standalone durable before-image storage implemented; current-record integration remains.**
 
 Implemented contract:
 
@@ -211,15 +215,17 @@ Implemented contract:
 - other readers resolve transaction-owned records as active/aborted/committed-at-CSN;
 - older snapshots see newer committed owners as `NewerCommit` and must follow undo;
 - one status publication changes visibility for every record owned by that transaction across objects;
-- a contiguous visibility frontier prevents new snapshots from crossing a gap when later commits finish status work before an earlier CSN.
+- a contiguous visibility frontier prevents new snapshots from crossing a gap when later commits finish status work before an earlier CSN;
+- the vNext `UndoStore` persists complete encoded `MvccRecord` before-images behind stable contiguous `VersionId`s, revalidates records on read, truncates only an incomplete final frame on reopen, fails closed on complete corruption, and exposes an explicit group-syncable durability frontier.
 
 Next E work:
 
-1. Integrate complete before-images/version chains with the vNext record path. Use the existing append-oriented version store as correctness/fallback baseline, but keep the layout replaceable and benchmark memory-resident metadata for short OLTP.
+1. Wire current-record replacement to the vNext `UndoStore`: preserve one complete prior visible state, install the new transaction-owned envelope atomically in the raw B-tree, and make repeated recovery application idempotent without allocating duplicate undo versions.
 2. Add write-intent/conflict ownership so concurrent writers cannot replace the same current record before validation.
 3. Add snapshot lookup/range traversal that follows undo until it finds a visible version or absence.
 4. Add status/version freezing and retention-aware GC once visibility is proven.
-5. Preserve serializable dependency certification as a layer above the fixed-snapshot MVCC core.
+5. Benchmark whether short-lived histories should remain in resident metadata before spilling to the durable undo store; the logical visibility contract must not depend on the chosen optimization.
+6. Preserve serializable dependency certification as a layer above the fixed-snapshot MVCC core.
 
 ## Milestone F — canonical rows and cross-object atomicity
 
@@ -269,11 +275,11 @@ Run hot/cached and larger-than-memory regimes. A design that wins only when ever
 
 ## Immediate sequence
 
-1. Keep the newly combined B-tree/WAL/MVCC/commit-order slice green under stable, MSRV, Clippy, PostgreSQL differential and perf smoke; fix surfaced invariants rather than relaxing tests.
+1. Keep the B-tree/WAL/MVCC/undo foundations green under stable, MSRV, Clippy, PostgreSQL differential and perf smoke; fix surfaced invariants rather than relaxing tests.
 2. Add atomic B-tree upsert/current-record replacement and prove idempotent put/delete replay across repeated recovery application.
-3. Integrate the MVCC record envelope with a complete-before-image version-store baseline and write-intent/conflict validation.
-4. Prove `install txn-owned records -> append/sync decision -> status publication -> contiguous visibility frontier` with multi-object tests and crash/fault injection at every boundary.
-5. Introduce the physical materialization/integrity envelope for checksum, real page LSN, out-of-place page placement, logical-to-physical mapping and checkpoint/replay frontier.
-6. Only then optimize durability batching, frame latching, translation, page compression/fence truncation and structural split coordination from end-to-end measurements.
+3. Wire the MVCC current-record path to the durable undo store, preserving one complete before-image per replacement and avoiding duplicate undo allocation on repeated recovery.
+4. Add canonical write-intent/conflict ownership, then prove `install txn-owned records -> append/sync decision -> status publication -> contiguous visibility frontier` with multi-object tests and crash/fault injection at every boundary.
+5. Introduce the physical materialization/integrity envelope for checksum, real page LSN, out-of-place page placement, logical-to-physical mapping and checkpoint/replay frontier, gating page durability on both WAL LSN and referenced undo `VersionId`.
+6. Only then optimize durability batching, frame latching, translation, page compression/fence truncation, version placement and structural split coordination from end-to-end measurements.
 
 This sequence keeps the rewrite measurable and reviewable while retaining freedom to replace any implementation choice that does not survive correctness or performance qualification.
