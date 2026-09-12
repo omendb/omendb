@@ -36,10 +36,7 @@ pub enum BTreeReadError {
     PageSize { expected: usize, actual: usize },
     /// A page failed checksum/layout/routing validation.
     #[error("B-tree page {page:?} is corrupt: {reason}")]
-    Corruption {
-        page: PageId,
-        reason: &'static str,
-    },
+    Corruption { page: PageId, reason: &'static str },
     /// A routing cycle or implausibly deep tree was encountered.
     #[error("B-tree routing exceeded the maximum supported depth")]
     RoutingDepthExceeded,
@@ -85,12 +82,11 @@ impl BTreeObject {
             let page_key = PageKey::new(self.descriptor.id(), current);
             let guard = buffer.pin(page_key)?;
             let bytes = guard.read()?;
-            let page = NodePage::parse(bytes.as_ref()).map_err(|error| {
-                BTreeReadError::Corruption {
+            let page =
+                NodePage::parse(bytes.as_ref()).map_err(|error| BTreeReadError::Corruption {
                     page: current,
                     reason: error.0,
-                }
-            })?;
+                })?;
 
             if page.is_leaf() {
                 return match page.search(key) {
@@ -256,7 +252,8 @@ mod tests {
             BTreeLookup::Found(b"left".to_vec())
         );
         assert_eq!(
-            tree.lookup(&buffer, b"m").expect("equal separator routes right"),
+            tree.lookup(&buffer, b"m")
+                .expect("equal separator routes right"),
             BTreeLookup::Found(b"middle".to_vec())
         );
         assert_eq!(

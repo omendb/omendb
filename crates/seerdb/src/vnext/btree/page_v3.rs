@@ -61,10 +61,9 @@ impl<'a> NodePage<'a> {
             Some(2) => PageType::Leaf,
             _ => return Err(PageDecodeError("invalid page type")),
         };
-        let count = read_u32(data, 12)
-            .ok_or(PageDecodeError("truncated page count"))? as usize;
-        let free_space = read_u32(data, 16)
-            .ok_or(PageDecodeError("truncated free-space field"))? as usize;
+        let count = read_u32(data, 12).ok_or(PageDecodeError("truncated page count"))? as usize;
+        let free_space =
+            read_u32(data, 16).ok_or(PageDecodeError("truncated free-space field"))? as usize;
         let checksum = read_u64(data, 20).ok_or(PageDecodeError("truncated checksum"))?;
         let leftmost_child =
             read_u64(data, 32).ok_or(PageDecodeError("truncated leftmost child"))?;
@@ -158,11 +157,8 @@ impl<'a> NodePage<'a> {
 
     fn validate_checksum(&self) -> Result<(), PageDecodeError> {
         let mut checksum = crc32c::crc32c(&self.data[..20]);
-        checksum = crc32c::crc32c_combine(
-            checksum,
-            crc32c::crc32c(&self.data[28..]),
-            PAGE_SIZE - 28,
-        );
+        checksum =
+            crc32c::crc32c_combine(checksum, crc32c::crc32c(&self.data[28..]), PAGE_SIZE - 28);
         if self.header.checksum != checksum as u64 {
             return Err(PageDecodeError("page checksum mismatch"));
         }

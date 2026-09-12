@@ -150,10 +150,8 @@ impl FrameMeta {
 
         let current = self.incarnation.load(Ordering::Relaxed);
         let Some(next) = current.checked_add(1).and_then(FrameIncarnation::new) else {
-            self.lifecycle.store(
-                lifecycle_word(FrameState::Free, 0),
-                Ordering::Release,
-            );
+            self.lifecycle
+                .store(lifecycle_word(FrameState::Free, 0), Ordering::Release);
             return Err(FrameTransitionError::IncarnationExhausted);
         };
         self.incarnation.store(next.get(), Ordering::Release);
