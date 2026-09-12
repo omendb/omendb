@@ -59,21 +59,14 @@ impl CommitAppender {
 
         // This is deliberately before `mark_prepared`: oversized/encoding
         // failures remain cleanly abortable and consume neither CSN nor WAL.
-        let batch = PreparedLogBatch::for_commit(
-            transaction.id(),
-            csn,
-            transaction.mutations(),
-        )?;
+        let batch = PreparedLogBatch::for_commit(transaction.id(), csn, transaction.mutations())?;
         transaction.mark_prepared(csn)?;
 
         let ticket = match self.log.append(&batch) {
             Ok(ticket) => ticket,
             Err(error @ DurableLogError::Io { .. }) => {
                 let state_error = transaction.mark_recovery_required().err();
-                return Err(CommitAppendError::OutcomeUncertain {
-                    error,
-                    state_error,
-                });
+                return Err(CommitAppendError::OutcomeUncertain { error, state_error });
             }
             Err(error @ (DurableLogError::Fenced | DurableLogError::Poisoned)) => {
                 // `DurableLog` did not enter this transaction's device append.
@@ -192,9 +185,7 @@ mod tests {
         transaction
             .stage_ordered_put(object(), key.clone(), key)
             .expect("mutation stages");
-        transaction
-            .begin_validation()
-            .expect("validation begins");
+        transaction.begin_validation().expect("validation begins");
         transaction
     }
 
@@ -242,10 +233,7 @@ mod tests {
                 recovered.push(transaction.position().csn);
             }
         }
-        assert_eq!(
-            recovered,
-            (1..=16).map(CommitSeq::new).collect::<Vec<_>>()
-        );
+        assert_eq!(recovered, (1..=16).map(CommitSeq::new).collect::<Vec<_>>());
     }
 
     #[test]
@@ -262,7 +250,10 @@ mod tests {
         ));
         assert_eq!(transaction.phase(), TransactionPhase::RecoveryRequired);
         assert!(log.is_fenced());
-        assert_eq!(appender.next_csn().expect("lane reads"), Some(CommitSeq::new(1)));
+        assert_eq!(
+            appender.next_csn().expect("lane reads"),
+            Some(CommitSeq::new(1))
+        );
     }
 
     #[test]
