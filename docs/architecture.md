@@ -2,14 +2,16 @@
 
 **Status:** accepted direction; implementation is incomplete and the current
 alpha line is not a release of this architecture. Physical formats, scheduling
-policies, commit mechanisms, and distribution protocols remain replaceable until
-measurement plus recovery qualification establishes them.
+policies, commit mechanisms, analytical representations, and distribution
+protocols remain replaceable until measurement plus recovery qualification
+establishes them.
 
-OmenDB is a **server-first PostgreSQL-class relational OLTP database written in
-Rust**. PostgreSQL compatibility belongs at deliberate external boundaries
-(wire protocol, SQL behavior, drivers, and tooling); OmenDB does not copy
-PostgreSQL's internal page layout, executor, WAL, or process-per-connection
-model.
+OmenDB is a **server-first PostgreSQL-class relational database written in
+Rust**, optimized first for demanding OLTP while allowing real-time analytical
+work on the same authoritative state. PostgreSQL compatibility belongs at
+deliberate external boundaries (wire protocol, SQL behavior, drivers, and
+tooling); OmenDB does not copy PostgreSQL's internal page layout, executor, WAL,
+or process-per-connection model.
 
 The direct Rust API remains a useful embedded and testing surface. It must use
 the same transaction and storage semantics as the server, not become a second
@@ -36,7 +38,7 @@ PostgreSQL clients / future native clients
                     |
  durable log + async physical materialization
                     |
-        RAM / NVMe / archive tiers
+ RAM / NVMe / analytical / archive tiers
 ```
 
 The first serious deployment target remains a single excellent node with strong
@@ -44,11 +46,14 @@ operational tooling. Regional HA follows from the same log/snapshot contracts.
 Distributed SQL is not a prerequisite for the first server architecture and
 must not impose a permanent coordination tax on local mode.
 
-OLTP and OLAP use separate physical engines. OmenDB exports a consistent
-snapshot plus an ordered committed-change stream to a future `omen-olap`
-consumer instead of making integrated HTAP storage a prerequisite. The OLTP
-batch executor may still use vectorized operators; “separate OLAP engine” means
-OmenDB does not force columnar analytical persistence into the OLTP write path.
+OmenDB no longer assumes that useful OLAP requires a separate physical database.
+The authoritative transaction/log state can feed in-engine compressed columnar
+or hybrid hot-row/cold-column representations for zero/low-lag analytics. The
+same atomic `snapshot CSN + restart LSN` contract can also bootstrap optional
+remote analytical workers or a future scale-out `omen-olap` deployment when
+workload isolation or analytical scale justifies it. Analytical physical layout
+is therefore a policy/cost choice, not a second source of truth. See
+[ADR 0011](adr/0011-htap-and-analytical-representations.md).
 
 ## Workspace and ownership
 
@@ -105,7 +110,8 @@ OmenDB owns:
   optional column-family placement;
 - primary and secondary index meaning and covering payloads;
 - constraints, DDL, optimizer, typed IR, and execution;
-- relational CDC interpretation and future distribution/placement metadata.
+- relational CDC interpretation, analytical representation metadata, and future
+  distribution/placement metadata.
 
 OmenDB encodes relational keys and row-family records into SeerDB's opaque byte
 boundary. SeerDB must not acquire SQL schema IDs, NULL bitmaps, column
@@ -153,11 +159,12 @@ snapshot CSN X + restart LSN Y
 ```
 
 A consumer copies snapshot X and then consumes committed changes after Y with
-no gap. This is the contract for backups, CDC, `omen-olap` bootstrap, and future
-live range movement.
+no gap. This is the contract for backups, CDC, analytical projection/bootstrap,
+and future live range movement.
 
-The durable commit **decision** is the visibility authority. Physical page
-materialization is not allowed to create or revoke logical commit state.
+The durable commit **decision** is the visibility authority. Physical page or
+analytical materialization is not allowed to create or revoke logical commit
+state.
 
 ## Runtime and server direction
 
@@ -175,13 +182,13 @@ Progress-critical work has protected capacity:
 ```text
 durability / recovery / essential reclaim   guaranteed progress
 foreground OLTP                              latency priority
-scans / index builds / non-urgent work      elastic and preemptible
+scans / index builds / analytical work       elastic and preemptible
 ```
 
-Unused reserve can be borrowed, but foreground load cannot indefinitely starve
-WAL/log completion or reclamation required for continued service. Admission
-evolves from one abstract scalar cost to concrete memory, spill/storage, I/O,
-and CPU reservations.
+Unused reserve can be borrowed, but foreground or analytical load cannot
+indefinitely starve WAL/log completion or reclamation required for continued
+service. Admission evolves from one abstract scalar cost to concrete memory,
+spill/storage, I/O, and CPU reservations.
 
 The current pgwire `Arc<RwLock<RelationalDatabase>>`, 1 ms lock polling, and
 Tokio `spawn_blocking` per operation are correctness scaffolding, not the target
@@ -202,9 +209,9 @@ execution paths:
 - **OLTP micro-plans** for prepared point/range lookups, constraint probes,
   simple DML, and short transactions. These use compact specialized operations,
   borrowed row views, and avoid generic `Vec<Row>`/`Vec<Value>` hot paths.
-- **Batch pipelines** for scans, joins, aggregates, sorts, windows, and index
-  builds. These consume resumable storage cursors and use typed vectors,
-  selection representations, bounded work, and cancellation.
+- **Batch pipelines** for scans, joins, aggregates, sorts, windows, index
+  builds, and analytical queries. These consume resumable storage cursors and
+  use typed vectors, selection representations, bounded work, and cancellation.
 
 A database-specific typed IR permits several execution tiers: direct micro-plan
 execution, vectorized pipelines, and optional very-low-overhead JIT for hot
@@ -272,6 +279,31 @@ pointer-swizzling/virtual-memory techniques, buffered vs direct I/O, and Linux
 `io_uring` are all benchmark-gated before format stability. See
 [ADR 0009](adr/0009-buffered-btree-and-materialization.md).
 
+## HTAP and analytical representations
+
+OmenDB is OLTP-first but does not require an ETL-fed second database for every
+analytical workload. The initial safe architecture treats analytical state as a
+**derived, rebuildable representation** of the authoritative transactional
+snapshot/log. Candidates include workload-selected column stores, compressed
+cold chunks, materialized expressions, vector/search projections, and skipping
+metadata.
+
+Each representation names the CSN/catalog frontier it covers. The planner uses
+it only when it is valid for the requested snapshot or when a bounded delta
+merge can bridge to that snapshot. Missing/corrupt derived state can be rebuilt
+instead of making the primary unavailable.
+
+A later single-copy hybrid row/column store is explicitly allowed if mixed-
+workload benchmarks show that it beats the simpler row-source + columnar-
+projection architecture. CedarDB/Colibri demonstrates that hot row data and
+cold compressed column chunks can coexist efficiently on modern SSD/object
+storage; OmenDB will measure rather than assume the same answer for its MVCC and
+storage design.
+
+Heavy analytics can also execute on remote workers/`omen-olap` bootstrapped by
+the same snapshot/change stream, preserving strict OLTP resource isolation when
+needed. See [ADR 0011](adr/0011-htap-and-analytical-representations.md).
+
 ## Deployment and durability profiles
 
 One transaction/storage semantics supports several first-class physical
@@ -292,10 +324,10 @@ commit authority while page/materialization services may lag and rebuild from
 checkpoint + log.
 
 Object storage is a designed immutable tier for checkpoints, archived log,
-backups, cold version history, large immutable artifacts, and replica bootstrap.
-It is **not** the default fine-grained random-write OLTP device. A future
-cost-first object-native physical materializer remains possible when separately
-measured; it must not force an LSM layout on local NVMe mode.
+backups, cold version history, large immutable artifacts, analytical chunks,
+and replica bootstrap. It is **not** the default fine-grained random-write OLTP
+device. A future cost-first object-native physical materializer remains possible
+when separately measured; it must not force an LSM layout on local NVMe mode.
 
 See [ADR 0006](adr/0006-deployment-storage-and-durability.md).
 
@@ -405,13 +437,17 @@ The dependency-ordered roadmap is now:
 5. **Make planning semantic.** Introduce binder-owned result/parameter/effect
    metadata, typed IR, micro-plans and resumable typed batch pipelines; remove
    text-prefix statement classification and Describe execution probes.
-6. **Measure modern hardware policies.** Benchmark autonomous vs group/adaptive
+6. **Add rebuildable analytical acceleration.** Use the batch path and committed
+   frontier to prototype workload-selected columnar/cold representations under
+   ADR 0011; compare against a single-copy hybrid layout before making either a
+   stable physical-format commitment.
+7. **Measure modern hardware policies.** Benchmark autonomous vs group/adaptive
    commit, page/node layouts, translation, allocation arenas, buffered/direct
    async I/O, hot-key waiting, RAM-heavy and larger-than-memory workloads on
    x86-64 and AArch64.
-7. **Regional durability/replication.** Add quorum log replication and replica
+8. **Regional durability/replication.** Add quorum log replication and replica
    materialization/bootstrap using the same local transaction semantics.
-8. **Distribution only after the local engine earns it.** Add range ownership,
+9. **Distribution only after the local engine earns it.** Add range ownership,
    placement groups, online split/move and cross-range transactions under ADR
    0008; preserve the single-range/local fast path.
 
