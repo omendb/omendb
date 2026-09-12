@@ -194,9 +194,10 @@ impl TransactionStatusTable {
         let mut entries = self.shards[shard]
             .write()
             .map_err(|_| StatusTableError::Poisoned(shard))?;
-        if entries.insert(txn, TransactionStatus::Active).is_some() {
+        if entries.contains_key(&txn) {
             return Err(StatusTableError::DuplicateTxn(txn));
         }
+        entries.insert(txn, TransactionStatus::Active);
         Ok(())
     }
 
@@ -284,7 +285,9 @@ impl TransactionStatusTable {
         let mut entries = self.shards[shard]
             .write()
             .map_err(|_| StatusTableError::Poisoned(shard))?;
-        let status = entries.get_mut(&txn).ok_or(StatusTableError::UnknownTxn(txn))?;
+        let status = entries
+            .get_mut(&txn)
+            .ok_or(StatusTableError::UnknownTxn(txn))?;
         if *status != TransactionStatus::Active {
             return Err(StatusTableError::InvalidTransition {
                 txn,
@@ -376,7 +379,10 @@ mod tests {
         ];
         for record in records {
             let encoded = record.to_bytes().expect("record encodes");
-            assert_eq!(MvccRecord::from_bytes(&encoded).expect("record decodes"), record);
+            assert_eq!(
+                MvccRecord::from_bytes(&encoded).expect("record decodes"),
+                record
+            );
         }
     }
 
@@ -409,6 +415,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_begin_does_not_overwrite_terminal_status() {
+        let statuses = TransactionStatusTable::new();
+        let txn = TxnId::new(11);
+        statuses.begin(txn).expect("transaction begins");
+        statuses
+            .commit(txn, CommitSeq::new(5))
+            .expect("transaction commits");
+        assert!(matches!(
+            statuses.begin(txn),
+            Err(StatusTableError::DuplicateTxn(id)) if id == txn
+        ));
+        assert_eq!(
+            statuses.status(txn).expect("status"),
+            Some(TransactionStatus::Committed(CommitSeq::new(5)))
+        );
+    }
+
+    #[test]
     fn one_status_publication_makes_multi_object_records_visible_together() {
         let statuses = TransactionStatusTable::new();
         let txn = TxnId::new(17);
@@ -418,15 +442,21 @@ mod tests {
         let snapshot = CommitSeq::new(20);
 
         assert_eq!(
-            statuses.visibility(row, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(row, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Active
         );
         assert_eq!(
-            statuses.visibility(index, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(index, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Active
         );
         assert_eq!(
-            statuses.visibility(row, Some(txn), CommitSeq::new(1)).expect("own write"),
+            statuses
+                .visibility(row, Some(txn), CommitSeq::new(1))
+                .expect("own write"),
             RecordVisibility::Visible
         );
 
@@ -434,11 +464,15 @@ mod tests {
             .commit(txn, CommitSeq::new(19))
             .expect("commit publishes");
         assert_eq!(
-            statuses.visibility(row, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(row, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Visible
         );
         assert_eq!(
-            statuses.visibility(index, None, snapshot).expect("visibility"),
+            statuses
+                .visibility(index, None, snapshot)
+                .expect("visibility"),
             RecordVisibility::Visible
         );
     }
