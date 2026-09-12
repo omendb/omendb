@@ -3,17 +3,25 @@
 //! Prepared transactions are encoded into contiguous batches whose final record
 //! is their durable commit decision. Appending establishes a physical log order
 //! and returns the decision end-LSN; `sync_through` establishes durability. The
-//! two operations are deliberately separate so autonomous sync, group commit,
-//! and future parallel/reservation-based append devices share one contract.
+//! two operations are deliberately separate so autonomous sync and group commit
+//! share one contract.
+//!
+//! The baseline wrapper serializes physical append/sync operations so a failing
+//! operation cannot race a later success across the fence. This is a WAL-device
+//! coordination lock only, not a database/transaction lock. A measured future
+//! implementation may replace it with explicit in-flight epochs/reservations.
 //!
 //! Any append or sync I/O failure is outcome-uncertain and fences this handle
 //! until reopen. Callers may retry only failures that happen while building a
 //! batch before the device is touched.
 
-use super::{CommitSeq, LogEncodeError, LogRecord, Lsn, Transaction, TxnId};
+use super::{
+    CommitDecision, CommitSeq, LogEncodeError, LogRecord, LoggedMutation, Lsn, Transaction, TxnId,
+    mutation_digest,
+};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Physical log operations that may make a commit outcome uncertain.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -25,13 +33,13 @@ pub enum LogIoOperation {
 /// Device contract below commit scheduling.
 ///
 /// `append` must place the supplied bytes contiguously in one total log order
-/// and return the LSN immediately after the final byte. It may internally use a
-/// mutex, atomic reservation plus pwrite, a userspace ring, a remote quorum, or
-/// another implementation. Returning success does not imply durability.
+/// and return the LSN immediately after the final byte. Returning success does
+/// not imply durability. The baseline `DurableLog` serializes calls into this
+/// device; a future wrapper may expose safe parallel reservations without
+/// changing transaction records or recovery.
 ///
 /// If either method returns an I/O error, the caller must assume the requested
-/// operation may have partially or fully happened; `DurableLog` enforces that
-/// by fencing itself until recovery/reopen.
+/// operation may have partially or fully happened.
 pub trait LogDevice: Send + Sync {
     fn append(&self, bytes: &[u8]) -> io::Result<Lsn>;
     fn sync_through(&self, lsn: Lsn) -> io::Result<()>;
@@ -46,13 +54,36 @@ pub struct PreparedLogBatch {
 }
 
 impl PreparedLogBatch {
-    /// Encode a prepared transaction without touching durable storage.
+    /// Encode a transaction already in `Prepared` state.
     pub fn from_transaction(transaction: &Transaction) -> Result<Self, PrepareLogBatchError> {
         let decision = transaction.commit_decision()?;
-        let mut encoded = Vec::with_capacity(transaction.mutations().len() + 1);
+        Ok(Self::from_decision(decision, transaction.mutations())?)
+    }
+
+    /// Encode a candidate commit before changing transaction phase or touching
+    /// the WAL. The append-order sequencer uses this to keep encode failures
+    /// cleanly retryable while assigning CSN and WAL order in one lane.
+    pub(crate) fn for_commit(
+        txn_id: TxnId,
+        csn: CommitSeq,
+        mutations: &[LoggedMutation],
+    ) -> Result<Self, LogEncodeError> {
+        let count = u32::try_from(mutations.len()).map_err(|_| LogEncodeError::RecordTooLarge)?;
+        let digest = mutation_digest(mutations)?;
+        Self::from_decision(
+            CommitDecision::new(txn_id, csn, count, digest),
+            mutations,
+        )
+    }
+
+    fn from_decision(
+        decision: CommitDecision,
+        mutations: &[LoggedMutation],
+    ) -> Result<Self, LogEncodeError> {
+        let mut encoded = Vec::with_capacity(mutations.len() + 1);
         let mut total = 0usize;
 
-        for mutation in transaction.mutations() {
+        for mutation in mutations {
             let bytes = LogRecord::Mutation(mutation.clone()).to_bytes()?;
             total = total
                 .checked_add(bytes.len())
@@ -131,6 +162,8 @@ impl AppendTicket {
 pub enum DurableLogError {
     #[error("vNext transaction log is fenced until recovery/reopen")]
     Fenced,
+    #[error("vNext transaction log operation lock is poisoned")]
+    Poisoned,
     #[error("transaction log {operation:?} failed and fenced the handle: {source}")]
     Io {
         operation: LogIoOperation,
@@ -142,6 +175,7 @@ pub enum DurableLogError {
 /// Fencing wrapper around a scheduler/device-specific append implementation.
 pub struct DurableLog {
     device: Arc<dyn LogDevice>,
+    operations: Mutex<()>,
     fenced: AtomicBool,
     durable_lsn: AtomicU64,
 }
@@ -151,6 +185,7 @@ impl DurableLog {
     pub fn new(device: Arc<dyn LogDevice>) -> Self {
         Self {
             device,
+            operations: Mutex::new(()),
             fenced: AtomicBool::new(false),
             durable_lsn: AtomicU64::new(0),
         }
@@ -158,6 +193,7 @@ impl DurableLog {
 
     /// Append one already-prepared transaction without forcing durability.
     pub fn append(&self, batch: &PreparedLogBatch) -> Result<AppendTicket, DurableLogError> {
+        let _operation = self.lock_operation()?;
         self.ensure_open()?;
         let decision_lsn = self.device.append(batch.as_bytes()).map_err(|source| {
             self.fenced.store(true, Ordering::Release);
@@ -175,6 +211,7 @@ impl DurableLog {
 
     /// Make every append through the requested LSN durable.
     pub fn sync_through(&self, lsn: Lsn) -> Result<(), DurableLogError> {
+        let _operation = self.lock_operation()?;
         self.ensure_open()?;
         self.device.sync_through(lsn).map_err(|source| {
             self.fenced.store(true, Ordering::Release);
@@ -197,6 +234,13 @@ impl DurableLog {
     pub fn durable_lsn(&self) -> Option<Lsn> {
         let raw = self.durable_lsn.load(Ordering::Acquire);
         (raw != 0).then_some(Lsn::new(raw))
+    }
+
+    fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, DurableLogError> {
+        self.operations.lock().map_err(|_| {
+            self.fenced.store(true, Ordering::Release);
+            DurableLogError::Poisoned
+        })
     }
 
     fn ensure_open(&self) -> Result<(), DurableLogError> {
