@@ -9,5 +9,8 @@ mod cursor_v4;
 mod page_v4;
 mod tree_v4;
 
+#[cfg(test)]
+mod stress_tests;
+
 pub use cursor_v4::RangeCursor;
 pub use tree_v4::{BTreeError, BTreeLookup, BTreeObject};
