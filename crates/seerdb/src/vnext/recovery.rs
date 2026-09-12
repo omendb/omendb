@@ -6,7 +6,7 @@
 //! state. Aborted or unterminated transactions never become visible.
 
 use super::{
-    CommitPosition, CommitSeq, LogRecord, LoggedMutation, Lsn, TxnId, mutation_digest,
+    mutation_digest, CommitPosition, CommitSeq, LogRecord, LoggedMutation, Lsn, TxnId,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -225,7 +225,10 @@ mod tests {
             .expect("commit validates")
             .expect("transaction emits");
         assert_eq!(committed.txn_id(), TxnId::new(1));
-        assert_eq!(committed.position(), CommitPosition::new(CommitSeq::new(5), lsn(40)));
+        assert_eq!(
+            committed.position(),
+            CommitPosition::new(CommitSeq::new(5), lsn(40))
+        );
         assert_eq!(committed.mutations(), first.as_slice());
         assert_eq!(recovery.pending_transactions(), 1);
     }
@@ -299,7 +302,7 @@ mod tests {
             .expect("abort terminal");
         assert!(matches!(
             terminal.push(lsn(20), LogRecord::Mutation(put(9, 0, 37, b"late"))),
-            Err(RecoveryError::RecordAfterTerminal(TxnId::new(9)))
+            Err(RecoveryError::RecordAfterTerminal(txn)) if txn == TxnId::new(9)
         ));
     }
 
