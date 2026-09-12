@@ -60,17 +60,16 @@ mod tests {
 
     #[test]
     fn authoritative_objects_require_transaction_recovery_coverage() {
-        let object = StorageObjectDescriptor::new(
-            StorageObjectId::new(7),
-            ObjectAuthority::Authoritative,
-        );
+        let object =
+            StorageObjectDescriptor::new(StorageObjectId::new(7), ObjectAuthority::Authoritative);
         assert_eq!(object.id(), StorageObjectId::new(7));
         assert!(object.authority().requires_commit_recovery());
     }
 
     #[test]
     fn derived_objects_do_not_define_commit_durability() {
-        let object = StorageObjectDescriptor::new(StorageObjectId::new(9), ObjectAuthority::Derived);
+        let object =
+            StorageObjectDescriptor::new(StorageObjectId::new(9), ObjectAuthority::Derived);
         assert!(!object.authority().requires_commit_recovery());
     }
 }
