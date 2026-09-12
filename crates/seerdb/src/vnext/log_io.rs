@@ -309,7 +309,13 @@ mod tests {
         let second_batch = PreparedLogBatch::from_transaction(&second).expect("second encodes");
 
         let first_ticket = log.append(&first_batch).expect("first appends");
+        first
+            .mark_wal_appended(first_ticket.decision_lsn())
+            .expect("first records append");
         let second_ticket = log.append(&second_batch).expect("second appends");
+        second
+            .mark_wal_appended(second_ticket.decision_lsn())
+            .expect("second records append");
         assert!(first_ticket.decision_lsn() < second_ticket.decision_lsn());
         assert_eq!(device.durable_offset(), 0);
         assert_eq!(log.durable_lsn(), None);
@@ -352,10 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_append_fences_and_recovers_no_commit_decision() {
+    fn partial_append_fences_and_requires_recovery_resolution() {
         let device = Arc::new(MemoryLogDevice::default());
         let log = DurableLog::new(device.clone());
-        let txn = prepared(3, 0, 3, b"partial");
+        let mut txn = prepared(3, 0, 3, b"partial");
         let batch = PreparedLogBatch::from_transaction(&txn).expect("batch encodes");
         device.fail_next_append_after(batch.as_bytes().len() / 2);
 
@@ -366,6 +372,10 @@ mod tests {
                 ..
             })
         ));
+        txn.mark_recovery_required()
+            .expect("uncertain append requires recovery");
+        assert_eq!(txn.phase(), TransactionPhase::RecoveryRequired);
+        assert!(txn.abort().is_err());
         assert!(log.is_fenced());
         assert!(matches!(log.append(&batch), Err(DurableLogError::Fenced)));
 
@@ -386,9 +396,11 @@ mod tests {
     fn sync_failure_fences_an_uncertain_commit() {
         let device = Arc::new(MemoryLogDevice::default());
         let log = DurableLog::new(device.clone());
-        let txn = prepared(5, 0, 5, b"sync");
+        let mut txn = prepared(5, 0, 5, b"sync");
         let batch = PreparedLogBatch::from_transaction(&txn).expect("batch encodes");
         let ticket = log.append(&batch).expect("append succeeds");
+        txn.mark_wal_appended(ticket.decision_lsn())
+            .expect("append records");
         device.fail_next_sync();
 
         assert!(matches!(
@@ -398,6 +410,10 @@ mod tests {
                 ..
             })
         ));
+        txn.mark_recovery_required()
+            .expect("sync uncertainty requires recovery");
+        assert_eq!(txn.phase(), TransactionPhase::RecoveryRequired);
+        assert!(txn.abort().is_err());
         assert!(log.is_fenced());
         assert_eq!(log.durable_lsn(), None);
         assert!(matches!(
