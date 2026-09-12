@@ -429,7 +429,10 @@ mod tests {
         let first = meta.try_pin().expect("first pin");
         let second = meta.try_pin().expect("second pin");
         let writer = first.try_write().expect("first writer");
-        assert!(matches!(second.try_write(), Err(FrameTransitionError::WriteBusy)));
+        assert!(matches!(
+            second.try_write(),
+            Err(FrameTransitionError::WriteBusy)
+        ));
         drop(writer);
         second.try_write().expect("writer after release");
     }
