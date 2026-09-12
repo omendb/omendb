@@ -7,8 +7,8 @@
 //! only an incomplete suffix on the final segment; complete corruption fails
 //! closed.
 
-use super::{parse_log_prefix_frames, LogDevice, LogParseStatus, LogRecord, Lsn};
-use durable_fs::{fsync_dir, fsync_dir_chain, sync_file_all, sync_file_data, SyncClass};
+use super::{LogDevice, LogParseStatus, LogRecord, Lsn, parse_log_prefix_frames};
+use durable_fs::{SyncClass, fsync_dir, fsync_dir_chain, sync_file_all, sync_file_data};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -59,10 +59,7 @@ pub struct SegmentedFileLogDevice {
 
 impl SegmentedFileLogDevice {
     /// Open or create a segmented WAL directory and repair a torn final suffix.
-    pub fn open(
-        directory: impl AsRef<Path>,
-        config: SegmentedLogConfig,
-    ) -> io::Result<Self> {
+    pub fn open(directory: impl AsRef<Path>, config: SegmentedLogConfig) -> io::Result<Self> {
         validate_config(config)?;
         let directory = directory.as_ref().to_path_buf();
         let existed = directory.exists();
@@ -73,7 +70,7 @@ impl SegmentedFileLogDevice {
 
         let segments = list_segments(&directory)?;
         validate_segment_sequence(&segments)?;
-        let (segment, mut file, offset, directory_dirty) = if let Some(&segment) = segments.last() {
+        let (segment, file, offset, directory_dirty) = if let Some(&segment) = segments.last() {
             let path = segment_path(&directory, segment);
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let metadata_len = file.metadata()?.len();
@@ -194,9 +191,8 @@ impl LogDevice for SegmentedFileLogDevice {
         state.offset = end;
         let segment = state.segment;
         state.dirty_segments.insert(segment);
-        Lsn::from_wal_position(segment, end).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::StorageFull, "WAL LSN domain exhausted")
-        })
+        Lsn::from_wal_position(segment, end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::StorageFull, "WAL LSN domain exhausted"))
     }
 
     fn sync_through(&self, lsn: Lsn) -> io::Result<()> {
@@ -284,9 +280,8 @@ fn list_segments(directory: &Path) -> io::Result<Vec<u64>> {
                 "malformed WAL segment filename",
             ));
         }
-        let segment = u64::from_str_radix(encoded, 16).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "malformed WAL segment ID")
-        })?;
+        let segment = u64::from_str_radix(encoded, 16)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed WAL segment ID"))?;
         segments.push(segment);
     }
     segments.sort_unstable();
@@ -361,16 +356,18 @@ mod tests {
             segment_bytes: 160,
             sync_class: SyncClass::KernelBarrier,
         };
-        let device = Arc::new(
-            SegmentedFileLogDevice::open(directory.path(), config).expect("device opens"),
-        );
+        let device =
+            Arc::new(SegmentedFileLogDevice::open(directory.path(), config).expect("device opens"));
         let log = DurableLog::new(device.clone());
         let first = batch(1, 1, b"alpha");
         let second = batch(2, 2, b"beta");
         let first_ticket = log.append(&first).expect("first appends");
         let second_ticket = log.append(&second).expect("second appends");
         assert!(second_ticket.decision_lsn().segment() >= first_ticket.decision_lsn().segment());
-        assert!(second_ticket.decision_lsn().segment() > 0, "test must rotate");
+        assert!(
+            second_ticket.decision_lsn().segment() > 0,
+            "test must rotate"
+        );
         log.sync_through(second_ticket.decision_lsn())
             .expect("group durability succeeds");
         drop(log);
@@ -419,7 +416,10 @@ mod tests {
         drop(file);
 
         let reopened = SegmentedFileLogDevice::open(directory.path(), config).expect("reopens");
-        assert_eq!(fs::metadata(&active).expect("metadata").len(), first.len() as u64);
+        assert_eq!(
+            fs::metadata(&active).expect("metadata").len(),
+            first.len() as u64
+        );
         assert_eq!(
             reopened.recover_records().expect("records recover"),
             vec![(first_lsn, LogRecord::Abort(TxnId::new(1)))]
