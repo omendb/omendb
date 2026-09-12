@@ -12,8 +12,8 @@ use super::page_v4::{
     PageValue, RemoveResult,
 };
 use crate::btree::BlobPointer;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_ROUTING_DEPTH: usize = 128;
 const RESERVED_PAGE_ID: u64 = u64::MAX;
@@ -33,10 +33,7 @@ pub enum BTreeError {
     #[error(transparent)]
     Buffer(#[from] BufferError),
     #[error("B-tree page {page:?} is corrupt: {reason}")]
-    Corruption {
-        page: PageId,
-        reason: &'static str,
-    },
+    Corruption { page: PageId, reason: &'static str },
     #[error("B-tree routing exceeded the maximum supported depth")]
     RoutingDepthExceeded,
     #[error("duplicate key")]
@@ -117,8 +114,8 @@ impl BTreeObject {
         for _ in 0..MAX_ROUTING_DEPTH {
             let guard = buffer.pin(self.page_key(current))?;
             let bytes = guard.read()?;
-            let page = PageRef::parse(bytes.as_ref())
-                .map_err(|error| Self::page_error(current, error))?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(current, error))?;
             if let Some(right) = page
                 .follow_right(key)
                 .map_err(|error| Self::page_error(current, error))?
@@ -199,8 +196,8 @@ impl BTreeObject {
         for _ in 0..MAX_ROUTING_DEPTH.saturating_mul(1024) {
             let guard = buffer.pin(self.page_key(current))?;
             let bytes = guard.read()?;
-            let page = PageRef::parse(bytes.as_ref())
-                .map_err(|error| Self::page_error(current, error))?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(current, error))?;
             if !page.is_leaf() {
                 return Err(Self::page_error(
                     current,
@@ -273,8 +270,8 @@ impl BTreeObject {
                 InsertResult::Full => {}
             }
 
-            let page = PageRef::parse(bytes.as_ref())
-                .map_err(|error| Self::page_error(leaf, error))?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(leaf, error))?;
             let old_high = page
                 .high_fence()
                 .map_err(|error| Self::page_error(leaf, error))?
@@ -386,10 +383,12 @@ impl BTreeObject {
             );
             let split = page_v4::choose_internal_split(&entries)
                 .map_err(|error| Self::page_error(parent_id, error))?;
-            let promoted = entries[split].key.clone();
-            let right_leftmost = entries[split].child;
             let right_entries = entries.split_off(split + 1);
-            entries.pop(); // promoted separator moves to the parent
+            let promoted_entry = entries.pop().ok_or_else(|| {
+                Self::page_error(parent_id, PageError("internal split lost promoted entry"))
+            })?;
+            let promoted = promoted_entry.key;
+            let right_leftmost = promoted_entry.child;
 
             let new_right_id = self.allocate_page()?;
             let left_image = page_v4::build_internal(
@@ -425,14 +424,8 @@ impl BTreeObject {
             key: separator,
             child: right_id,
         }];
-        let root_image = page_v4::build_internal(
-            buffer.page_size(),
-            None,
-            None,
-            left_id,
-            &entries,
-        )
-        .map_err(|error| Self::map_build_error(new_root, error))?;
+        let root_image = page_v4::build_internal(buffer.page_size(), None, None, left_id, &entries)
+            .map_err(|error| Self::map_build_error(new_root, error))?;
         let guard = buffer.create_page(self.page_key(new_root), &root_image)?;
         drop(guard);
         self.root.store(new_root.get(), Ordering::Release);
@@ -449,8 +442,8 @@ impl BTreeObject {
         for _ in 0..MAX_ROUTING_DEPTH {
             let guard = buffer.pin(self.page_key(current))?;
             let bytes = guard.read()?;
-            let page = PageRef::parse(bytes.as_ref())
-                .map_err(|error| Self::page_error(current, error))?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(current, error))?;
             if let Some(right) = page
                 .follow_right(key)
                 .map_err(|error| Self::page_error(current, error))?
@@ -491,9 +484,7 @@ impl BTreeObject {
             if observed == RESERVED_PAGE_ID {
                 return Err(BTreeError::PageIdExhausted);
             }
-            let next = observed
-                .checked_add(1)
-                .ok_or(BTreeError::PageIdExhausted)?;
+            let next = observed.checked_add(1).ok_or(BTreeError::PageIdExhausted)?;
             match self.next_page.compare_exchange_weak(
                 observed,
                 next,
@@ -550,7 +541,10 @@ mod tests {
                 .get(&key)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing page"))?;
             if page.len() != destination.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "page size mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "page size mismatch",
+                ));
             }
             destination.copy_from_slice(page);
             Ok(())
@@ -594,8 +588,7 @@ mod tests {
                 other => panic!("unexpected reference result: {other:?}"),
             };
             assert_eq!(
-                tree.lookup(&buffer, key.as_bytes())
-                    .expect("vNext lookup"),
+                tree.lookup(&buffer, key.as_bytes()).expect("vNext lookup"),
                 expected
             );
         }
