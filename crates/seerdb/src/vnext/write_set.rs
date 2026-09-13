@@ -145,7 +145,10 @@ mod tests {
         let effects = normalize_final_effects(TxnId::new(7), &mutations).expect("normalizes");
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].ordinal(), 3);
-        assert_eq!(effects[0].install_identity(), InstallIdentity::new(TxnId::new(7), 3));
+        assert_eq!(
+            effects[0].install_identity(),
+            InstallIdentity::new(TxnId::new(7), 3)
+        );
         assert_eq!(effects[0].kind(), MutationKind::OrderedPut);
         assert_eq!(effects[0].value(), b"c");
     }
