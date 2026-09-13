@@ -9,10 +9,10 @@
 use super::{
     BTreeError, BTreeObject, BufferPool, CommitSeq, FinalEffect, FinalWriteSetError,
     InstallContext, Lsn, MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError,
-    OrderedMvccInstaller, PageDependencyTable, PrepareEffectResult, RecoveredTransaction,
-    StatusTableError, StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore,
-    UndoStoreError, VersionId, VisibilityError, VisibilityFrontier, WriteIntentError,
-    WriteIntentTable,
+    OrderedMvccInstaller, PageDependencyTable, PageMaterialization, PrepareEffectResult,
+    RecoveredTransaction, StatusTableError, StorageObjectId, TransactionStatus,
+    TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, VisibilityError,
+    VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -194,8 +194,7 @@ impl<'a> OrderedRecoveryApplier<'a> {
                     buffer,
                     &intent_guard,
                     prepared,
-                    dependencies,
-                    position.lsn,
+                    PageMaterialization::new(dependencies, position.lsn),
                 )
             } else {
                 installer.apply_prepared(tree, buffer, &intent_guard, prepared)

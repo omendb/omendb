@@ -10,6 +10,9 @@ use super::{
     UndoStore, UndoStoreError, VersionId,
 };
 
+/// Ordered logical key/value batch produced by a visible MVCC range read.
+pub type OrderedKeyValueBatch = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Logical result of one MVCC point lookup at a fixed snapshot.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MvccLookup {
@@ -48,7 +51,7 @@ impl OrderedMvccRangeCursor {
         tree: &BTreeObject,
         buffer: &BufferPool,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OrderedMvccReadError> {
+    ) -> Result<OrderedKeyValueBatch, OrderedMvccReadError> {
         if limit == 0 || self.raw.is_done() {
             return Ok(Vec::new());
         }
@@ -156,10 +159,10 @@ impl<'a> OrderedMvccReader<'a> {
                     let Some(next) = record.undo_head() else {
                         return Ok(MvccLookup::NotFound);
                     };
-                    if let Some(current) = containing_undo {
-                        if next.get() >= current.get() {
-                            return Err(OrderedMvccReadError::NonDecreasingUndo { current, next });
-                        }
+                    if let Some(current) = containing_undo
+                        && next.get() >= current.get()
+                    {
+                        return Err(OrderedMvccReadError::NonDecreasingUndo { current, next });
                     }
                     record = self.undo.get(next)?;
                     containing_undo = Some(next);

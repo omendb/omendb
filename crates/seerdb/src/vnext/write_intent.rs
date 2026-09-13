@@ -85,8 +85,7 @@ impl WriteIntentTable {
             keys.push(key);
         }
 
-        let mut acquired = 0usize;
-        for key in &keys {
+        for (acquired, key) in keys.iter().enumerate() {
             let shard = self.shard(key);
             let mut entries = match self.shards[shard].lock() {
                 Ok(entries) => entries,
@@ -124,7 +123,6 @@ impl WriteIntentTable {
                     });
                 }
             }
-            acquired += 1;
         }
 
         Ok(WriteIntentGuard {

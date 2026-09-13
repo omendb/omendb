@@ -159,13 +159,13 @@ impl MvccRecord {
                 if identity.txn_id.get() == 0 {
                     return Err(MvccCodecError::ReservedInstallTransaction);
                 }
-                if let RecordOwner::Transaction(owner) = self.owner {
-                    if owner != identity.txn_id {
-                        return Err(MvccCodecError::InstallOwnerMismatch {
-                            owner,
-                            install: identity.txn_id,
-                        });
-                    }
+                if let RecordOwner::Transaction(owner) = self.owner
+                    && owner != identity.txn_id
+                {
+                    return Err(MvccCodecError::InstallOwnerMismatch {
+                        owner,
+                        install: identity.txn_id,
+                    });
                 }
                 (identity.txn_id.get(), identity.ordinal)
             }
@@ -225,13 +225,13 @@ impl MvccRecord {
                 install_ordinal,
             ))
         };
-        if let (RecordOwner::Transaction(owner_txn), Some(identity)) = (owner, install_identity) {
-            if owner_txn != identity.txn_id {
-                return Err(MvccCodecError::InstallOwnerMismatch {
-                    owner: owner_txn,
-                    install: identity.txn_id,
-                });
-            }
+        if let (RecordOwner::Transaction(owner_txn), Some(identity)) = (owner, install_identity)
+            && owner_txn != identity.txn_id
+        {
+            return Err(MvccCodecError::InstallOwnerMismatch {
+                owner: owner_txn,
+                install: identity.txn_id,
+            });
         }
         let value_len = read_u32(bytes, 36).ok_or(MvccCodecError::Malformed)? as usize;
         let expected = RECORD_HEADER_SIZE

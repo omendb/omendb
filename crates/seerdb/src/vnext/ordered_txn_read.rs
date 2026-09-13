@@ -1,8 +1,9 @@
 //! Ordered MVCC reads with a transaction-private staged overlay.
 
 use super::{
-    BTreeObject, BufferPool, MutationKind, MvccLookup, OrderedMvccRangeCursor,
-    OrderedMvccReadError, OrderedMvccReader, StagedOrderedLookup, Transaction,
+    BTreeObject, BufferPool, MutationKind, MvccLookup, OrderedKeyValueBatch,
+    OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader, StagedOrderedLookup,
+    Transaction,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -38,7 +39,7 @@ impl OrderedTransactionRangeCursor {
         tree: &BTreeObject,
         buffer: &BufferPool,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OrderedMvccReadError> {
+    ) -> Result<OrderedKeyValueBatch, OrderedMvccReadError> {
         if limit == 0 || self.is_done() {
             return Ok(Vec::new());
         }
@@ -79,7 +80,7 @@ impl OrderedTransactionRangeCursor {
         Ok(rows)
     }
 
-    fn consume_staged(&mut self, output: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    fn consume_staged(&mut self, output: &mut OrderedKeyValueBatch) {
         let Some((key, value)) = self.staged.get(self.staged_index) else {
             return;
         };

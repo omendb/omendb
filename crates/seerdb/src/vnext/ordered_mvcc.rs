@@ -9,8 +9,8 @@
 //! standalone qualification.
 
 use super::{
-    BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, FinalEffect, Lsn, MvccCodecError,
-    MvccRecord, MvccValue, PageDependencies, PageDependencyTable, RecordOwner, StatusTableError,
+    BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, FinalEffect, MvccCodecError,
+    MvccRecord, MvccValue, PageDependencies, PageMaterialization, RecordOwner, StatusTableError,
     StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
     VersionId, WriteIntentGuard,
 };
@@ -82,9 +82,12 @@ impl PreparedOrderedMvccEffect {
 }
 
 /// Outcome of the non-page-mutating preparation phase.
+///
+/// The prepared plan is boxed so the common `AlreadyInstalled` retry outcome
+/// does not carry an entire predecessor/value plan by value.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PrepareEffectResult {
-    Prepared(PreparedOrderedMvccEffect),
+    Prepared(Box<PreparedOrderedMvccEffect>),
     AlreadyInstalled { undo_head: Option<VersionId> },
 }
 
@@ -184,13 +187,20 @@ impl<'a> OrderedMvccInstaller<'a> {
             }
         };
 
-        Ok(PrepareEffectResult::Prepared(PreparedOrderedMvccEffect {
-            effect: effect.clone(),
-            context,
-            predecessor,
-            current: MvccRecord::installed(effect.txn_id(), effect.ordinal(), undo_head, intended),
-            appended_undo,
-        }))
+        Ok(PrepareEffectResult::Prepared(Box::new(
+            PreparedOrderedMvccEffect {
+                effect: effect.clone(),
+                context,
+                predecessor,
+                current: MvccRecord::installed(
+                    effect.txn_id(),
+                    effect.ordinal(),
+                    undo_head,
+                    intended,
+                ),
+                appended_undo,
+            },
+        )))
     }
 
     /// Apply one prepared effect without page dependency attachment.
@@ -212,16 +222,9 @@ impl<'a> OrderedMvccInstaller<'a> {
         buffer: &BufferPool,
         intents: &WriteIntentGuard<'_>,
         prepared: &PreparedOrderedMvccEffect,
-        dependencies: &PageDependencyTable,
-        required_wal: Lsn,
+        materialization: PageMaterialization<'_>,
     ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
-        self.apply_prepared_inner(
-            tree,
-            buffer,
-            intents,
-            prepared,
-            Some((dependencies, required_wal)),
-        )
+        self.apply_prepared_inner(tree, buffer, intents, prepared, Some(materialization))
     }
 
     /// Convenience transient install. This preserves the original standalone
@@ -257,29 +260,27 @@ impl<'a> OrderedMvccInstaller<'a> {
         intents: &WriteIntentGuard<'_>,
         effect: &FinalEffect,
         context: InstallContext,
-        dependencies: &PageDependencyTable,
-        required_wal: Lsn,
+        materialization: PageMaterialization<'_>,
     ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
         match self.prepare(tree, buffer, intents, effect, context)? {
             PrepareEffectResult::AlreadyInstalled { undo_head } => {
                 if let Some(version) = undo_head {
                     let durable = self.undo.sync_through(version)?;
-                    dependencies.advance_undo(durable);
+                    materialization.dependencies().advance_undo(durable);
                 }
                 Ok(InstallEffectResult::AlreadyInstalled { undo_head })
             }
             PrepareEffectResult::Prepared(prepared) => {
                 if let Some(version) = prepared.required_undo() {
                     let durable = self.undo.sync_through(version)?;
-                    dependencies.advance_undo(durable);
+                    materialization.dependencies().advance_undo(durable);
                 }
                 self.apply_prepared_with_dependencies(
                     tree,
                     buffer,
                     intents,
                     &prepared,
-                    dependencies,
-                    required_wal,
+                    materialization,
                 )
             }
         }
@@ -291,7 +292,7 @@ impl<'a> OrderedMvccInstaller<'a> {
         buffer: &BufferPool,
         intents: &WriteIntentGuard<'_>,
         prepared: &PreparedOrderedMvccEffect,
-        dependency: Option<(&PageDependencyTable, Lsn)>,
+        dependency: Option<PageMaterialization<'_>>,
     ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
         self.validate_call(tree, intents, &prepared.effect, prepared.context)?;
 
@@ -300,13 +301,13 @@ impl<'a> OrderedMvccInstaller<'a> {
         }
 
         let encoded = prepared.current.to_bytes()?;
-        if let Some((dependencies, required_wal)) = dependency {
+        if let Some(materialization) = dependency {
             tree.upsert_with_dependencies(
                 buffer,
                 prepared.effect.key(),
                 &encoded,
-                dependencies,
-                PageDependencies::new(required_wal, prepared.current.undo_head()),
+                materialization.dependencies(),
+                PageDependencies::new(materialization.required_wal(), prepared.current.undo_head()),
             )?;
         } else {
             tree.upsert(buffer, prepared.effect.key(), &encoded)?;
@@ -487,8 +488,8 @@ pub enum OrderedMvccInstallError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        LoggedMutation, ObjectAuthority, PageId, PageIo, PageKey, StorageObjectDescriptor,
-        WriteIntentTable, normalize_final_effects,
+        LoggedMutation, Lsn, ObjectAuthority, PageDependencyTable, PageId, PageIo, PageKey,
+        StorageObjectDescriptor, WriteIntentTable, normalize_final_effects,
     };
     use durable_fs::SyncClass;
     use std::collections::HashMap;
@@ -704,8 +705,7 @@ mod tests {
                 InstallContext::Live {
                     snapshot: CommitSeq::new(2),
                 },
-                &dependencies,
-                wal,
+                PageMaterialization::new(&dependencies, wal),
             )
             .expect("tracked install");
         assert_eq!(

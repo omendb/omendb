@@ -58,12 +58,14 @@ pub use ordered_mvcc::{
     PrepareEffectResult, PreparedOrderedMvccEffect,
 };
 pub use ordered_mvcc_read::{
-    MvccLookup, OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader,
+    MvccLookup, OrderedKeyValueBatch, OrderedMvccRangeCursor, OrderedMvccReadError,
+    OrderedMvccReader,
 };
 pub use ordered_recovery::{OrderedRecoveryApplier, OrderedRecoveryError, RecoveryApplyResult};
 pub use ordered_txn_read::OrderedTransactionRangeCursor;
 pub use page_dependency::{
     DependencyCheckedPageIo, PageDependencies, PageDependencyError, PageDependencyTable,
+    PageMaterialization,
 };
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};

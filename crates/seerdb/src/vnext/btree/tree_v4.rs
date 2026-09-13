@@ -935,7 +935,7 @@ mod tests {
             .merge(tree.page_key(PageId::new(0)), inherited)
             .expect("seed inherited requirement");
         let operation = PageDependencies::new(Lsn::new(50), None);
-        tree.upsert_with_dependencies(&buffer, b"b", &vec![b'l'; 180], &dependencies, operation)
+        tree.upsert_with_dependencies(&buffer, b"b", &[b'l'; 180], &dependencies, operation)
             .expect("tracked replacement splits");
 
         let combined = PageDependencies::new(Lsn::new(50), Some(VersionId::new(9)));

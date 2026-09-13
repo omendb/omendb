@@ -13,10 +13,10 @@ use super::{
     BTreeError, BTreeObject, BufferError, BufferPool, CommitAppendError, CommitAppender,
     CommitPosition, DurableLogError, FinalEffect, FinalWriteSetError, InstallContext,
     MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
-    PageDependencyTable, PrepareEffectResult, StatusTableError, StorageObjectId, Transaction,
-    TransactionError, TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId,
-    UndoStore, UndoStoreError, VersionId, VisibilityError, VisibilityFrontier, WriteIntentError,
-    WriteIntentTable,
+    PageDependencyTable, PageMaterialization, PrepareEffectResult, StatusTableError,
+    StorageObjectId, Transaction, TransactionError, TransactionPhase, TransactionStatus,
+    TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, VisibilityError,
+    VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,8 +221,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
                     buffer,
                     &intent_guard,
                     prepared,
-                    dependencies,
-                    ticket.decision_lsn(),
+                    PageMaterialization::new(dependencies, ticket.decision_lsn()),
                 )
             } else {
                 installer.apply_prepared(tree, buffer, &intent_guard, prepared)
@@ -311,11 +310,11 @@ impl<'a> OrderedCommitCoordinator<'a> {
             self.fenced.store(true, Ordering::Release);
             return Err(OrderedCommitError::Status(error));
         }
-        if transaction.phase() != TransactionPhase::Aborted {
-            if let Err(error) = transaction.abort() {
-                self.fenced.store(true, Ordering::Release);
-                return Err(OrderedCommitError::Transaction(error));
-            }
+        if transaction.phase() != TransactionPhase::Aborted
+            && let Err(error) = transaction.abort()
+        {
+            self.fenced.store(true, Ordering::Release);
+            return Err(OrderedCommitError::Transaction(error));
         }
         Ok(())
     }

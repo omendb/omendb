@@ -82,6 +82,37 @@ impl PageDependencies {
     }
 }
 
+/// Durability requirements attached to one prepared page mutation.
+///
+/// Grouping the exact dependency table with the decision LSN keeps install
+/// entry points concrete and makes it impossible to materialize an image
+/// against a frontier belonging to a different attempt.
+#[derive(Clone, Copy)]
+pub struct PageMaterialization<'a> {
+    dependencies: &'a PageDependencyTable,
+    required_wal: Lsn,
+}
+
+impl<'a> PageMaterialization<'a> {
+    #[must_use]
+    pub const fn new(dependencies: &'a PageDependencyTable, required_wal: Lsn) -> Self {
+        Self {
+            dependencies,
+            required_wal,
+        }
+    }
+
+    #[must_use]
+    pub const fn dependencies(self) -> &'a PageDependencyTable {
+        self.dependencies
+    }
+
+    #[must_use]
+    pub const fn required_wal(self) -> Lsn {
+        self.required_wal
+    }
+}
+
 /// Sharded logical-page requirements plus monotonic runtime durability frontiers.
 pub struct PageDependencyTable {
     shards: [RwLock<HashMap<PageKey, PageDependencies>>; DEPENDENCY_SHARDS],
