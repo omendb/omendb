@@ -195,13 +195,7 @@ mod tests {
         StorageObjectDescriptor::new(StorageObjectId::new(id), ObjectAuthority::Authoritative)
     }
 
-    fn seed(
-        tree: &BTreeObject,
-        buffer: &BufferPool,
-        key: &[u8],
-        value: &[u8],
-        csn: u64,
-    ) {
+    fn seed(tree: &BTreeObject, buffer: &BufferPool, key: &[u8], value: &[u8], csn: u64) {
         let record = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(csn)),
             None,
@@ -334,8 +328,7 @@ mod tests {
             .stage_ordered_delete(descriptor(1), b"k6".to_vec())
             .expect("delete k6");
 
-        let mut cursor =
-            reader.range_cursor_transaction(&tree, &transaction, b"k0", b"k9");
+        let mut cursor = reader.range_cursor_transaction(&tree, &transaction, b"k0", b"k9");
         assert_eq!(
             cursor
                 .next_batch(&reader, &tree, &buffer, 2)
