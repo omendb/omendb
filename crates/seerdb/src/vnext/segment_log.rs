@@ -424,7 +424,14 @@ mod tests {
             assert!(!state.directory_dirty);
         }
         reopened.sync_through(second_lsn).expect("second barrier");
-        assert!(reopened.state.lock().expect("state").dirty_segments.is_empty());
+        assert!(
+            reopened
+                .state
+                .lock()
+                .expect("state")
+                .dirty_segments
+                .is_empty()
+        );
         assert_eq!(reopened.recover_records().expect("recover").len(), 2);
     }
 
