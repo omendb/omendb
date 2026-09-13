@@ -15,6 +15,7 @@ mod log_io;
 mod mvcc;
 mod object;
 mod ordered_mvcc;
+mod ordered_mvcc_read;
 mod recovery;
 mod segment_log;
 mod translation;
@@ -49,6 +50,7 @@ pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use ordered_mvcc::{
     InstallContext, InstallEffectResult, OrderedMvccInstallError, OrderedMvccInstaller,
 };
+pub use ordered_mvcc_read::{MvccLookup, OrderedMvccReadError, OrderedMvccReader};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
