@@ -67,11 +67,9 @@ impl SegmentedFileLogDevice {
     pub fn open(directory: impl AsRef<Path>, config: SegmentedLogConfig) -> io::Result<Self> {
         validate_config(config)?;
         let directory = directory.as_ref().to_path_buf();
-        let existed = directory.exists();
         fs::create_dir_all(&directory)?;
-        if !existed {
-            fsync_dir_chain(&directory)?;
-        }
+        // A prior process may have died between mkdir and its directory barrier.
+        fsync_dir_chain(&directory)?;
 
         let segments = list_segments(&directory)?;
         validate_segment_sequence(&segments)?;

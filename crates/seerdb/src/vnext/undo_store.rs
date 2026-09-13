@@ -11,7 +11,7 @@
 //! complete corruption. Retained undo links must point strictly backwards.
 
 use super::{MvccCodecError, MvccRecord, VersionId};
-use durable_fs::{SyncClass, fsync_dir, fsync_dir_chain, sync_file_all, sync_file_data};
+use durable_fs::{SyncClass, fsync_dir_chain, sync_file_all, sync_file_data};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -54,25 +54,18 @@ pub struct UndoStore {
 impl UndoStore {
     /// Open or create an undo file and repair an incomplete final frame.
     ///
-    /// Existing complete frames are synchronized before the store is returned,
-    /// so `durable_version` is immediately meaningful after recovery. Scanning
-    /// retains only one frame's payload at a time plus the version-offset index.
+    /// Existing complete frames and their directory entries are synchronized
+    /// before returning: existence after a process restart does not prove that
+    /// an earlier creation barrier finished. Scanning retains only one frame's
+    /// payload at a time plus the version-offset index.
     pub fn open(path: impl AsRef<Path>, sync_class: SyncClass) -> Result<Self, UndoStoreError> {
         let path = path.as_ref();
         let parent = publication_parent(path);
-        let parent_existed = parent.exists();
         fs::create_dir_all(parent).map_err(|source| UndoStoreError::Io {
             operation: UndoIoOperation::Open,
             source,
         })?;
-        if !parent_existed {
-            fsync_dir_chain(parent).map_err(|source| UndoStoreError::Io {
-                operation: UndoIoOperation::Open,
-                source,
-            })?;
-        }
 
-        let file_existed = path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -83,12 +76,10 @@ impl UndoStore {
                 operation: UndoIoOperation::Open,
                 source,
             })?;
-        if !file_existed {
-            fsync_dir(parent).map_err(|source| UndoStoreError::Io {
-                operation: UndoIoOperation::Open,
-                source,
-            })?;
-        }
+        fsync_dir_chain(parent).map_err(|source| UndoStoreError::Io {
+            operation: UndoIoOperation::Open,
+            source,
+        })?;
 
         let (index, end_offset) = scan_and_repair(&mut file, sync_class)?;
         sync_file_all(&file, sync_class).map_err(|source| UndoStoreError::Io {
