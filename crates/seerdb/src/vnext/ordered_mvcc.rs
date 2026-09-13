@@ -123,12 +123,7 @@ impl<'a> OrderedMvccInstaller<'a> {
             }
         };
 
-        let current = MvccRecord::installed(
-            effect.txn_id(),
-            effect.ordinal(),
-            undo_head,
-            intended,
-        );
+        let current = MvccRecord::installed(effect.txn_id(), effect.ordinal(), undo_head, intended);
         let encoded = current.to_bytes()?;
         tree.upsert(buffer, effect.key(), &encoded)?;
         Ok(InstallEffectResult::Installed {
@@ -150,9 +145,7 @@ impl<'a> OrderedMvccInstaller<'a> {
                 effect: effect.object(),
             });
         }
-        if intents.txn_id() != effect.txn_id()
-            || !intents.owns(effect.object(), effect.key())
-        {
+        if intents.txn_id() != effect.txn_id() || !intents.owns(effect.object(), effect.key()) {
             return Err(OrderedMvccInstallError::IntentNotHeld {
                 txn: effect.txn_id(),
                 object: effect.object(),
@@ -162,10 +155,11 @@ impl<'a> OrderedMvccInstaller<'a> {
         let actual = self.statuses.status(effect.txn_id())?;
         match (context, actual) {
             (InstallContext::Live { .. }, Some(TransactionStatus::Active)) => Ok(()),
-            (
-                InstallContext::Recovery { commit },
-                Some(TransactionStatus::Committed(actual)),
-            ) if commit.get() != 0 && actual == commit => Ok(()),
+            (InstallContext::Recovery { commit }, Some(TransactionStatus::Committed(actual)))
+                if commit.get() != 0 && actual == commit =>
+            {
+                Ok(())
+            }
             (InstallContext::Recovery { commit }, _) if commit.get() == 0 => {
                 Err(OrderedMvccInstallError::ReservedCommitSeq)
             }
@@ -222,10 +216,7 @@ pub enum OrderedMvccInstallError {
         effect: StorageObjectId,
     },
     #[error("transaction {txn:?} does not hold the required write intent for object {object:?}")]
-    IntentNotHeld {
-        txn: TxnId,
-        object: StorageObjectId,
-    },
+    IntentNotHeld { txn: TxnId, object: StorageObjectId },
     #[error("transaction {txn:?} has invalid installer status {actual:?}")]
     WriterStatus {
         txn: TxnId,
@@ -248,9 +239,7 @@ pub enum OrderedMvccInstallError {
         predecessor: CommitSeq,
         snapshot: CommitSeq,
     },
-    #[error(
-        "recovery replay at {replay:?} encountered non-older current commit {predecessor:?}"
-    )]
+    #[error("recovery replay at {replay:?} encountered non-older current commit {predecessor:?}")]
     ReplayOrderConflict {
         predecessor: CommitSeq,
         replay: CommitSeq,
@@ -347,8 +336,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, device).expect("buffer");
         let tree = BTreeObject::create(descriptor(object), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
-            .expect("undo");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
         (
             buffer,
             tree,
@@ -414,7 +403,9 @@ mod tests {
         statuses.begin(TxnId::new(7)).expect("writer begins");
         let effect = make_effect(7, 2, b"key", Some(b"new"));
         let effects = [effect.clone()];
-        let guard = intents.try_acquire(TxnId::new(7), &effects).expect("intent");
+        let guard = intents
+            .try_acquire(TxnId::new(7), &effects)
+            .expect("intent");
 
         assert_eq!(
             installer
@@ -479,7 +470,9 @@ mod tests {
         statuses.begin(TxnId::new(5)).expect("writer begins");
         let effect = make_effect(5, 3, b"key", Some(b"replacement"));
         let effects = [effect.clone()];
-        let guard = intents.try_acquire(TxnId::new(5), &effects).expect("intent");
+        let guard = intents
+            .try_acquire(TxnId::new(5), &effects)
+            .expect("intent");
 
         assert_eq!(
             installer
@@ -521,7 +514,9 @@ mod tests {
         statuses.begin(TxnId::new(11)).expect("writer begins");
         let effect = make_effect(11, 4, b"key", Some(b"new"));
         let effects = [effect.clone()];
-        let guard = intents.try_acquire(TxnId::new(11), &effects).expect("intent");
+        let guard = intents
+            .try_acquire(TxnId::new(11), &effects)
+            .expect("intent");
         assert!(matches!(
             installer.install(
                 &tree,
@@ -594,7 +589,7 @@ mod tests {
         drop(first_guard);
 
         let newer = MvccRecord::new(
-            RecordOwner::Frozen(CommitSeq::new(8)),
+            RecordOwner::Frozen(CommitSeq::new(9)),
             None,
             MvccValue::Inline(b"newer".to_vec()),
         );
