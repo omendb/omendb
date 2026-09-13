@@ -265,8 +265,8 @@ pub enum OrderedMvccInstallError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        LoggedMutation, ObjectAuthority, PageIo, StorageObjectDescriptor, WriteIntentTable,
-        normalize_final_effects,
+        LoggedMutation, ObjectAuthority, PageIo, PageKey, StorageObjectDescriptor,
+        WriteIntentTable, normalize_final_effects,
     };
     use durable_fs::SyncClass;
     use std::collections::HashMap;
@@ -275,15 +275,11 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryPageIo {
-        pages: RwLock<HashMap<super::super::PageKey, Vec<u8>>>,
+        pages: RwLock<HashMap<PageKey, Vec<u8>>>,
     }
 
     impl PageIo for MemoryPageIo {
-        fn read_page(
-            &self,
-            key: super::super::PageKey,
-            destination: &mut [u8],
-        ) -> io::Result<()> {
+        fn read_page(&self, key: PageKey, destination: &mut [u8]) -> io::Result<()> {
             let pages = self
                 .pages
                 .read()
@@ -295,7 +291,7 @@ mod tests {
             Ok(())
         }
 
-        fn write_page(&self, key: super::super::PageKey, source: &[u8]) -> io::Result<()> {
+        fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
             self.pages
                 .write()
                 .map_err(|_| io::Error::other("page map poisoned"))?
@@ -308,7 +304,7 @@ mod tests {
         StorageObjectDescriptor::new(StorageObjectId::new(id), ObjectAuthority::Authoritative)
     }
 
-    fn effect(txn: u64, object: u64, key: &[u8], value: Option<&[u8]>) -> FinalEffect {
+    fn make_effect(txn: u64, object: u64, key: &[u8], value: Option<&[u8]>) -> FinalEffect {
         let mutation = match value {
             Some(value) => LoggedMutation::ordered_put(
                 TxnId::new(txn),
@@ -330,32 +326,50 @@ mod tests {
             .expect("one effect")
     }
 
-    fn decode_current(
-        tree: &BTreeObject,
-        buffer: &BufferPool,
-        key: &[u8],
-    ) -> MvccRecord {
+    fn decode_current(tree: &BTreeObject, buffer: &BufferPool, key: &[u8]) -> MvccRecord {
         let BTreeLookup::Found(bytes) = tree.lookup(buffer, key).expect("lookup") else {
             panic!("expected encoded current record");
         };
         MvccRecord::from_bytes(&bytes).expect("current decodes")
     }
 
-    #[test]
-    fn installs_absent_put_and_delete_with_final_effect_identity() {
+    fn setup(
+        object: u64,
+    ) -> (
+        BufferPool,
+        BTreeObject,
+        tempfile::TempDir,
+        UndoStore,
+        TransactionStatusTable,
+        WriteIntentTable,
+    ) {
         let device = Arc::new(MemoryPageIo::default());
         let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        let tree = BTreeObject::create(descriptor(object), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
         let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
             .expect("undo");
-        let statuses = TransactionStatusTable::new();
-        let intents = WriteIntentTable::new();
+        (
+            buffer,
+            tree,
+            directory,
+            undo,
+            TransactionStatusTable::new(),
+            WriteIntentTable::new(),
+        )
+    }
+
+    #[test]
+    fn installs_absent_put_and_delete_with_final_effect_identity() {
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(1);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
 
-        for (txn, key, value) in [(1, b"put".as_slice(), Some(b"value".as_slice())), (2, b"delete".as_slice(), None)] {
+        for (txn, key, value) in [
+            (1, b"put".as_slice(), Some(b"value".as_slice())),
+            (2, b"delete".as_slice(), None),
+        ] {
             statuses.begin(TxnId::new(txn)).expect("writer begins");
-            let effect = effect(txn, 1, key, value);
+            let effect = make_effect(txn, 1, key, value);
             let effects = [effect.clone()];
             let guard = intents
                 .try_acquire(TxnId::new(txn), &effects)
@@ -379,25 +393,17 @@ mod tests {
             );
             let current = decode_current(&tree, &buffer, key);
             assert_eq!(current.install_identity(), Some(effect.install_identity()));
-            assert_eq!(
-                current.value(),
-                &value.map_or(MvccValue::Tombstone, |value| MvccValue::Inline(value.to_vec()))
-            );
+            let expected = value.map_or(MvccValue::Tombstone, |bytes| {
+                MvccValue::Inline(bytes.to_vec())
+            });
+            assert_eq!(current.value(), &expected);
         }
     }
 
     #[test]
     fn replacement_appends_one_before_image_and_repeat_is_allocation_free() {
-        let device = Arc::new(MemoryPageIo::default());
-        let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(2), &buffer).expect("tree");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
-            .expect("undo");
-        let statuses = TransactionStatusTable::new();
-        let intents = WriteIntentTable::new();
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(2);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
-
         let prior = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(3)),
             None,
@@ -406,7 +412,7 @@ mod tests {
         tree.insert(&buffer, b"key", &prior.to_bytes().expect("encode"))
             .expect("seed");
         statuses.begin(TxnId::new(7)).expect("writer begins");
-        let effect = effect(7, 2, b"key", Some(b"new"));
+        let effect = make_effect(7, 2, b"key", Some(b"new"));
         let effects = [effect.clone()];
         let guard = intents.try_acquire(TxnId::new(7), &effects).expect("intent");
 
@@ -428,7 +434,6 @@ mod tests {
             }
         );
         assert_eq!(undo.get(VersionId::new(1)).expect("undo reads"), prior);
-
         assert_eq!(
             installer
                 .install(
@@ -447,23 +452,14 @@ mod tests {
         );
         assert_eq!(
             undo.sync_through(VersionId::new(1)).expect("sync"),
-            VersionId::new(1),
-            "repeat install must not append a second predecessor"
+            VersionId::new(1)
         );
     }
 
     #[test]
     fn aborted_current_is_bypassed_without_becoming_history() {
-        let device = Arc::new(MemoryPageIo::default());
-        let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(3), &buffer).expect("tree");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
-            .expect("undo");
-        let statuses = TransactionStatusTable::new();
-        let intents = WriteIntentTable::new();
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(3);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
-
         let prior = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(2)),
             None,
@@ -481,7 +477,7 @@ mod tests {
         statuses.begin(TxnId::new(4)).expect("aborted begins");
         statuses.abort(TxnId::new(4)).expect("aborts");
         statuses.begin(TxnId::new(5)).expect("writer begins");
-        let effect = effect(5, 3, b"key", Some(b"replacement"));
+        let effect = make_effect(5, 3, b"key", Some(b"replacement"));
         let effects = [effect.clone()];
         let guard = intents.try_acquire(TxnId::new(5), &effects).expect("intent");
 
@@ -502,26 +498,17 @@ mod tests {
                 appended_undo: None,
             }
         );
-        assert_eq!(decode_current(&tree, &buffer, b"key").undo_head(), Some(version));
         assert_eq!(
-            undo.sync_through(version).expect("sync"),
-            version,
-            "aborted current must not be appended as history"
+            decode_current(&tree, &buffer, b"key").undo_head(),
+            Some(version)
         );
+        assert_eq!(undo.sync_through(version).expect("sync"), version);
     }
 
     #[test]
     fn active_and_newer_committed_predecessors_fail_before_undo_allocation() {
-        let device = Arc::new(MemoryPageIo::default());
-        let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(4), &buffer).expect("tree");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
-            .expect("undo");
-        let statuses = TransactionStatusTable::new();
-        let intents = WriteIntentTable::new();
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(4);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
-
         statuses.begin(TxnId::new(10)).expect("owner begins");
         let active = MvccRecord::installed(
             TxnId::new(10),
@@ -532,7 +519,7 @@ mod tests {
         tree.insert(&buffer, b"key", &active.to_bytes().expect("encode"))
             .expect("seed");
         statuses.begin(TxnId::new(11)).expect("writer begins");
-        let effect = effect(11, 4, b"key", Some(b"new"));
+        let effect = make_effect(11, 4, b"key", Some(b"new"));
         let effects = [effect.clone()];
         let guard = intents.try_acquire(TxnId::new(11), &effects).expect("intent");
         assert!(matches!(
@@ -576,16 +563,8 @@ mod tests {
 
     #[test]
     fn recovery_requires_matching_writer_status_and_strict_commit_order() {
-        let device = Arc::new(MemoryPageIo::default());
-        let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(5), &buffer).expect("tree");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let undo = UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier)
-            .expect("undo");
-        let statuses = TransactionStatusTable::new();
-        let intents = WriteIntentTable::new();
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(5);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
-
         let prior = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(6)),
             None,
@@ -596,20 +575,23 @@ mod tests {
         statuses
             .recover_committed(TxnId::new(20), CommitSeq::new(7))
             .expect("writer recovered");
-        let effect = effect(20, 5, b"key", Some(b"replayed"));
-        let effects = [effect.clone()];
-        let guard = intents.try_acquire(TxnId::new(20), &effects).expect("intent");
+        let first_effect = make_effect(20, 5, b"key", Some(b"replayed"));
+        let first_effects = [first_effect.clone()];
+        let first_guard = intents
+            .try_acquire(TxnId::new(20), &first_effects)
+            .expect("intent");
         installer
             .install(
                 &tree,
                 &buffer,
-                &guard,
-                &effect,
+                &first_guard,
+                &first_effect,
                 InstallContext::Recovery {
                     commit: CommitSeq::new(7),
                 },
             )
             .expect("ordered recovery install");
+        drop(first_guard);
 
         let newer = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(8)),
@@ -619,19 +601,33 @@ mod tests {
         tree.upsert(&buffer, b"other", &newer.to_bytes().expect("encode"))
             .expect("seed newer");
         statuses
-            .recover_committed(TxnId::new(21), CommitSeq::new(7))
+            .recover_committed(TxnId::new(21), CommitSeq::new(9))
             .expect("second writer recovered");
-        let effect = effect(21, 5, b"other", Some(b"bad-order"));
-        let effects = [effect.clone()];
-        let guard = intents.try_acquire(TxnId::new(21), &effects).expect("intent");
+        let second_effect = make_effect(21, 5, b"other", Some(b"bad-order"));
+        let second_effects = [second_effect.clone()];
+        let second_guard = intents
+            .try_acquire(TxnId::new(21), &second_effects)
+            .expect("intent");
         assert!(matches!(
             installer.install(
                 &tree,
                 &buffer,
-                &guard,
-                &effect,
+                &second_guard,
+                &second_effect,
                 InstallContext::Recovery {
-                    commit: CommitSeq::new(7),
+                    commit: CommitSeq::new(8),
+                },
+            ),
+            Err(OrderedMvccInstallError::WriterStatus { .. })
+        ));
+        assert!(matches!(
+            installer.install(
+                &tree,
+                &buffer,
+                &second_guard,
+                &second_effect,
+                InstallContext::Recovery {
+                    commit: CommitSeq::new(9),
                 },
             ),
             Err(OrderedMvccInstallError::ReplayOrderConflict { .. })
