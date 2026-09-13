@@ -9,9 +9,9 @@ use super::{
     BTreeError, BTreeObject, BufferPool, CommitAppendError, CommitAppender, CommitPosition,
     DurableLogError, FinalEffect, FinalWriteSetError, InstallContext, InstallEffectResult,
     MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
-    StatusTableError, StorageObjectId, Transaction, TransactionError, TransactionPhase,
-    TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId,
-    VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    PageDependencyTable, StatusTableError, StorageObjectId, Transaction, TransactionError,
+    TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
+    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,10 +28,13 @@ pub struct OrderedCommitCoordinator<'a> {
     frontier: &'a VisibilityFrontier,
     intents: &'a WriteIntentTable,
     undo: &'a UndoStore,
+    page_dependencies: Option<&'a PageDependencyTable>,
     fenced: AtomicBool,
 }
 
 impl<'a> OrderedCommitCoordinator<'a> {
+    /// Construct the transient coordinator without page-materialization
+    /// dependency attachment.
     #[must_use]
     pub const fn new(
         appender: &'a CommitAppender,
@@ -46,6 +49,36 @@ impl<'a> OrderedCommitCoordinator<'a> {
             frontier,
             intents,
             undo,
+            page_dependencies: None,
+            fenced: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct a coordinator that attaches exact WAL/undo requirements to
+    /// mutated B-tree pages and advances the same table only after successful
+    /// durability barriers.
+    #[must_use]
+    pub fn with_page_dependencies(
+        appender: &'a CommitAppender,
+        statuses: &'a TransactionStatusTable,
+        frontier: &'a VisibilityFrontier,
+        intents: &'a WriteIntentTable,
+        undo: &'a UndoStore,
+        page_dependencies: &'a PageDependencyTable,
+    ) -> Self {
+        if let Some(lsn) = appender.durable_lsn() {
+            page_dependencies.advance_wal(lsn);
+        }
+        if let Some(version) = undo.durable_version() {
+            page_dependencies.advance_undo(version);
+        }
+        Self {
+            appender,
+            statuses,
+            frontier,
+            intents,
+            undo,
+            page_dependencies: Some(page_dependencies),
             fenced: AtomicBool::new(false),
         }
     }
@@ -116,6 +149,9 @@ impl<'a> OrderedCommitCoordinator<'a> {
             self.fence_after_wal(transaction);
             return Err(OrderedCommitError::Log(error));
         }
+        if let Some(dependencies) = self.page_dependencies {
+            dependencies.advance_wal(ticket.decision_lsn());
+        }
         let position = match transaction.mark_durable(ticket.decision_lsn()) {
             Ok(position) => position,
             Err(error) => {
@@ -131,15 +167,30 @@ impl<'a> OrderedCommitCoordinator<'a> {
                 self.fence_after_wal(transaction);
                 return Err(OrderedCommitError::MissingObject(effect.object()));
             };
-            match installer.install(
-                tree,
-                buffer,
-                &intent_guard,
-                effect,
-                InstallContext::Live {
-                    snapshot: transaction.snapshot(),
-                },
-            ) {
+            let installed = if let Some(dependencies) = self.page_dependencies {
+                installer.install_with_dependencies(
+                    tree,
+                    buffer,
+                    &intent_guard,
+                    effect,
+                    InstallContext::Live {
+                        snapshot: transaction.snapshot(),
+                    },
+                    dependencies,
+                    ticket.decision_lsn(),
+                )
+            } else {
+                installer.install(
+                    tree,
+                    buffer,
+                    &intent_guard,
+                    effect,
+                    InstallContext::Live {
+                        snapshot: transaction.snapshot(),
+                    },
+                )
+            };
+            match installed {
                 Ok(InstallEffectResult::Installed { appended_undo, .. }) => {
                     if let Some(version) = appended_undo {
                         max_undo = Some(max_version(max_undo, version));
@@ -157,6 +208,9 @@ impl<'a> OrderedCommitCoordinator<'a> {
             if let Err(error) = self.undo.sync_through(version) {
                 self.fence_after_wal(transaction);
                 return Err(OrderedCommitError::Undo(error));
+            }
+            if let Some(dependencies) = self.page_dependencies {
+                dependencies.advance_undo(version);
             }
         }
 
@@ -314,8 +368,8 @@ pub enum OrderedCommitError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        BTreeLookup, DurableLog, LogDevice, LogIoOperation, ObjectAuthority, OrderedMvccReader,
-        PageIo, PageKey, StorageObjectDescriptor,
+        BTreeLookup, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
+        ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, StorageObjectDescriptor,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -467,6 +521,64 @@ mod tests {
                 .expect("new index"),
             super::super::MvccLookup::Found(b"idx-v2".to_vec())
         );
+    }
+
+    #[test]
+    fn dependency_aware_commit_advances_both_materialization_frontiers() {
+        let physical = Arc::new(MemoryPageIo::default());
+        let page_dependencies = Arc::new(PageDependencyTable::new());
+        let checked = Arc::new(DependencyCheckedPageIo::new(
+            physical,
+            Arc::clone(&page_dependencies),
+        ));
+        let buffer = BufferPool::new(8, 512, checked).expect("buffer");
+        let tree = BTreeObject::create(descriptor(9), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let coordinator = OrderedCommitCoordinator::with_page_dependencies(
+            &appender,
+            &statuses,
+            &frontier,
+            &intents,
+            &undo,
+            page_dependencies.as_ref(),
+        );
+
+        let mut first = coordinator.begin_write(TxnId::new(90)).expect("first begins");
+        first
+            .stage_ordered_put(descriptor(9), b"key".to_vec(), b"v1".to_vec())
+            .expect("first stages");
+        coordinator
+            .commit(&mut first, &buffer, &[&tree])
+            .expect("first commits");
+
+        let mut second = coordinator
+            .begin_write(TxnId::new(91))
+            .expect("second begins");
+        second
+            .stage_ordered_put(descriptor(9), b"key".to_vec(), b"v2".to_vec())
+            .expect("second stages");
+        let position = coordinator
+            .commit(&mut second, &buffer, &[&tree])
+            .expect("second commits");
+
+        let page = PageKey::new(tree.descriptor().id(), PageId::new(0));
+        let required = page_dependencies
+            .requirements(page)
+            .expect("requirements read");
+        assert_eq!(required.required_wal(), position.lsn);
+        assert_eq!(required.required_undo(), Some(VersionId::new(1)));
+        assert_eq!(page_dependencies.durable_wal(), position.lsn);
+        assert_eq!(page_dependencies.durable_undo(), Some(VersionId::new(1)));
+        assert!(page_dependencies.is_eligible(page).expect("page eligible"));
+        buffer.flush_page(page).expect("eligible page flushes");
     }
 
     #[test]
