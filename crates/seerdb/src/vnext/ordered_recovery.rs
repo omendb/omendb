@@ -8,10 +8,11 @@
 
 use super::{
     BTreeError, BTreeObject, BufferPool, CommitSeq, FinalEffect, FinalWriteSetError,
-    InstallContext, InstallEffectResult, MvccCodecError, MvccRecord, MvccValue,
-    OrderedMvccInstallError, OrderedMvccInstaller, RecoveredTransaction, StatusTableError,
-    StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
-    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    InstallContext, InstallEffectResult, Lsn, MvccCodecError, MvccRecord, MvccValue,
+    OrderedMvccInstallError, OrderedMvccInstaller, PageDependencyTable, RecoveredTransaction,
+    StatusTableError, StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore,
+    UndoStoreError, VersionId, VisibilityError, VisibilityFrontier, WriteIntentError,
+    WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +30,7 @@ pub struct OrderedRecoveryApplier<'a> {
     frontier: &'a VisibilityFrontier,
     intents: &'a WriteIntentTable,
     undo: &'a UndoStore,
+    page_dependencies: Option<&'a PageDependencyTable>,
     lane: Mutex<()>,
     fenced: AtomicBool,
 }
@@ -46,6 +48,33 @@ impl<'a> OrderedRecoveryApplier<'a> {
             frontier,
             intents,
             undo,
+            page_dependencies: None,
+            lane: Mutex::new(()),
+            fenced: AtomicBool::new(false),
+        }
+    }
+
+    /// Construct dependency-aware recovery. The caller must advance the table's
+    /// WAL frontier only after the retained WAL has been successfully
+    /// synchronized through the replay transaction's decision LSN. Existing
+    /// durable undo is seeded immediately because `UndoStore` owns that barrier.
+    #[must_use]
+    pub fn with_page_dependencies(
+        statuses: &'a TransactionStatusTable,
+        frontier: &'a VisibilityFrontier,
+        intents: &'a WriteIntentTable,
+        undo: &'a UndoStore,
+        page_dependencies: &'a PageDependencyTable,
+    ) -> Self {
+        if let Some(version) = undo.durable_version() {
+            page_dependencies.advance_undo(version);
+        }
+        Self {
+            statuses,
+            frontier,
+            intents,
+            undo,
+            page_dependencies: Some(page_dependencies),
             lane: Mutex::new(()),
             fenced: AtomicBool::new(false),
         }
@@ -69,7 +98,8 @@ impl<'a> OrderedRecoveryApplier<'a> {
         self.ensure_open()?;
 
         let txn = recovered.txn_id();
-        let csn = recovered.position().csn;
+        let position = recovered.position();
+        let csn = position.csn;
         let visible = self.frontier.snapshot();
         if csn <= visible {
             let actual = self.statuses.status(txn)?;
@@ -96,6 +126,15 @@ impl<'a> OrderedRecoveryApplier<'a> {
                 actual: csn,
             });
         }
+        if let Some(dependencies) = self.page_dependencies {
+            let durable = dependencies.durable_wal();
+            if durable < position.lsn {
+                return self.fail(OrderedRecoveryError::WalFrontierBehind {
+                    required: position.lsn,
+                    durable,
+                });
+            }
+        }
 
         let effects = match recovered.final_effects() {
             Ok(effects) => effects,
@@ -119,13 +158,26 @@ impl<'a> OrderedRecoveryApplier<'a> {
             let Some(tree) = objects.get(&effect.object()).copied() else {
                 return self.fail(OrderedRecoveryError::MissingObject(effect.object()));
             };
-            match installer.install(
-                tree,
-                buffer,
-                &intent_guard,
-                effect,
-                InstallContext::Recovery { commit: csn },
-            ) {
+            let installed = if let Some(dependencies) = self.page_dependencies {
+                installer.install_with_dependencies(
+                    tree,
+                    buffer,
+                    &intent_guard,
+                    effect,
+                    InstallContext::Recovery { commit: csn },
+                    dependencies,
+                    position.lsn,
+                )
+            } else {
+                installer.install(
+                    tree,
+                    buffer,
+                    &intent_guard,
+                    effect,
+                    InstallContext::Recovery { commit: csn },
+                )
+            };
+            match installed {
                 Ok(InstallEffectResult::Installed { appended_undo, .. }) => {
                     if let Some(version) = appended_undo {
                         max_undo = Some(max_version(max_undo, version));
@@ -139,6 +191,9 @@ impl<'a> OrderedRecoveryApplier<'a> {
         if let Some(version) = max_undo {
             if let Err(error) = self.undo.sync_through(version) {
                 return self.fail(OrderedRecoveryError::Undo(error));
+            }
+            if let Some(dependencies) = self.page_dependencies {
+                dependencies.advance_undo(version);
             }
         }
         if let Err(error) = self.frontier.publish_recovered(self.statuses, txn, csn) {
@@ -231,6 +286,8 @@ pub enum OrderedRecoveryError {
         requested: CommitSeq,
         actual: Option<TransactionStatus>,
     },
+    #[error("retained WAL durability {durable:?} is behind recovered decision {required:?}")]
+    WalFrontierBehind { required: Lsn, durable: Lsn },
     #[error("ordered recovery object set contains duplicate object {0:?}")]
     DuplicateObject(StorageObjectId),
     #[error("ordered recovery is missing authoritative object {0:?}")]
@@ -260,8 +317,9 @@ mod tests {
     use super::*;
     use crate::storage::format::Lsn;
     use crate::vnext::{
-        BTreeLookup, CommitDecision, LogRecord, LoggedMutation, ObjectAuthority, OrderedMvccReader,
-        PageIo, PageKey, RecoveryAssembler, StorageObjectDescriptor, mutation_digest,
+        BTreeLookup, CommitDecision, DependencyCheckedPageIo, LogRecord, LoggedMutation,
+        ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecoveryAssembler,
+        StorageObjectDescriptor, mutation_digest,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -387,6 +445,70 @@ mod tests {
             RecoveryApplyResult::AlreadyApplied
         );
         assert_eq!(undo.durable_version(), Some(VersionId::new(1)));
+    }
+
+    #[test]
+    fn dependency_aware_recovery_requires_wal_barrier_and_advances_undo() {
+        let physical = Arc::new(MemoryPageIo::default());
+        let page_dependencies = Arc::new(PageDependencyTable::new());
+        let checked = Arc::new(DependencyCheckedPageIo::new(
+            physical,
+            Arc::clone(&page_dependencies),
+        ));
+        let buffer = BufferPool::new(8, 512, checked).expect("buffer");
+        let tree = BTreeObject::create(descriptor(8), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let first = recovered(80, 1, &[(8, b"key", b"v1")]);
+
+        let blocked = OrderedRecoveryApplier::with_page_dependencies(
+            &statuses,
+            &frontier,
+            &intents,
+            &undo,
+            page_dependencies.as_ref(),
+        );
+        assert!(matches!(
+            blocked.apply(&first, &buffer, &[&tree]),
+            Err(OrderedRecoveryError::WalFrontierBehind { required, .. })
+                if required == first.position().lsn
+        ));
+        assert_eq!(frontier.snapshot(), CommitSeq::new(0));
+        assert_eq!(
+            tree.lookup(&buffer, b"key").expect("lookup"),
+            BTreeLookup::NotFound
+        );
+
+        page_dependencies.advance_wal(first.position().lsn);
+        let applier = OrderedRecoveryApplier::with_page_dependencies(
+            &statuses,
+            &frontier,
+            &intents,
+            &undo,
+            page_dependencies.as_ref(),
+        );
+        applier
+            .apply(&first, &buffer, &[&tree])
+            .expect("first applies after WAL barrier");
+
+        let second = recovered(81, 2, &[(8, b"key", b"v2")]);
+        page_dependencies.advance_wal(second.position().lsn);
+        applier
+            .apply(&second, &buffer, &[&tree])
+            .expect("second applies");
+        let page = PageKey::new(tree.descriptor().id(), PageId::new(0));
+        let required = page_dependencies
+            .requirements(page)
+            .expect("requirements read");
+        assert_eq!(required.required_wal(), second.position().lsn);
+        assert_eq!(required.required_undo(), Some(VersionId::new(1)));
+        assert_eq!(page_dependencies.durable_undo(), Some(VersionId::new(1)));
+        assert!(page_dependencies.is_eligible(page).expect("page eligible"));
+        buffer.flush_page(page).expect("eligible page flushes");
     }
 
     #[test]
