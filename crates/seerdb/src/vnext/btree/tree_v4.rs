@@ -143,6 +143,7 @@ impl BTreeObject {
     /// write guard; the structural mutex is entered only after a full page is
     /// observed and is revalidated under the mutex.
     pub fn insert(&self, buffer: &BufferPool, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
+        Self::validate_inline_entry(key, value)?;
         loop {
             let (leaf, _) = self.find_leaf_path(buffer, key)?;
             let guard = buffer.pin(self.page_key(leaf))?;
@@ -157,6 +158,54 @@ impl BTreeObject {
             }
         }
         self.insert_with_split(buffer, key, value)
+    }
+
+    /// Insert or atomically replace one inline key/value.
+    ///
+    /// The complete candidate leaf is built off to the side while holding the
+    /// page write guard and is copied into the frame only after validation. A
+    /// replacement therefore never exposes a delete-then-insert gap. If growth
+    /// requires a split, structural coordination is entered and the operation
+    /// is revalidated before publishing the B-link split.
+    pub fn upsert(&self, buffer: &BufferPool, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
+        Self::validate_inline_entry(key, value)?;
+        loop {
+            let (leaf, _) = self.find_leaf_path(buffer, key)?;
+            let guard = buffer.pin(self.page_key(leaf))?;
+            let mut bytes = guard.write()?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(leaf, error))?;
+            if page
+                .follow_right(key)
+                .map_err(|error| Self::page_error(leaf, error))?
+                .is_some()
+            {
+                continue;
+            }
+            let old_high = page
+                .high_fence()
+                .map_err(|error| Self::page_error(leaf, error))?
+                .map(ToOwned::to_owned);
+            let old_right = page.right_sibling();
+            let mut entries = page
+                .leaf_entries_owned()
+                .map_err(|error| Self::page_error(leaf, error))?;
+            Self::upsert_leaf_entry(&mut entries, key, value);
+            match page_v4::build_leaf(
+                buffer.page_size(),
+                old_high.as_deref(),
+                old_right,
+                &entries,
+            ) {
+                Ok(candidate) => {
+                    bytes.copy_from_slice(&candidate);
+                    return Ok(());
+                }
+                Err(error) if Self::leaf_capacity_error(error) => break,
+                Err(error) => return Err(Self::map_build_error(leaf, error)),
+            }
+        }
+        self.upsert_with_split(buffer, key, value)
     }
 
     /// Remove one key without eager merge/rebalance. Empty/underfull leaves are
@@ -290,6 +339,88 @@ impl BTreeObject {
                     value: LeafValueOwned::Inline(value.to_vec()),
                 },
             );
+            let split = page_v4::choose_leaf_split(&entries)
+                .map_err(|error| Self::page_error(leaf, error))?;
+            let separator = entries[split].key.clone();
+            let right_entries = entries.split_off(split);
+            let right_id = self.allocate_page()?;
+            let left_image = page_v4::build_leaf(
+                buffer.page_size(),
+                Some(&separator),
+                Some(right_id),
+                &entries,
+            )
+            .map_err(|error| Self::map_build_error(leaf, error))?;
+            let right_image = page_v4::build_leaf(
+                buffer.page_size(),
+                old_high.as_deref(),
+                old_right,
+                &right_entries,
+            )
+            .map_err(|error| Self::map_build_error(right_id, error))?;
+
+            let right_guard = buffer.create_page(self.page_key(right_id), &right_image)?;
+            bytes.copy_from_slice(&left_image);
+            drop(bytes);
+            drop(right_guard);
+            drop(leaf_guard);
+
+            self.propagate_split(buffer, &mut path, separator, right_id)?;
+            return Ok(());
+        }
+    }
+
+    fn upsert_with_split(
+        &self,
+        buffer: &BufferPool,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), BTreeError> {
+        let _structural = self
+            .structural
+            .lock()
+            .map_err(|_| BTreeError::StructuralLockPoisoned)?;
+
+        loop {
+            let (leaf, mut path) = self.find_leaf_path(buffer, key)?;
+            let leaf_guard = buffer.pin(self.page_key(leaf))?;
+            let mut bytes = leaf_guard.write()?;
+            let page =
+                PageRef::parse(bytes.as_ref()).map_err(|error| Self::page_error(leaf, error))?;
+            if page
+                .follow_right(key)
+                .map_err(|error| Self::page_error(leaf, error))?
+                .is_some()
+            {
+                continue;
+            }
+            let old_high = page
+                .high_fence()
+                .map_err(|error| Self::page_error(leaf, error))?
+                .map(ToOwned::to_owned);
+            let old_right = page.right_sibling();
+            let mut entries = page
+                .leaf_entries_owned()
+                .map_err(|error| Self::page_error(leaf, error))?;
+            Self::upsert_leaf_entry(&mut entries, key, value);
+
+            match page_v4::build_leaf(
+                buffer.page_size(),
+                old_high.as_deref(),
+                old_right,
+                &entries,
+            ) {
+                Ok(candidate) => {
+                    bytes.copy_from_slice(&candidate);
+                    return Ok(());
+                }
+                Err(error) if Self::leaf_capacity_error(error) => {}
+                Err(error) => return Err(Self::map_build_error(leaf, error)),
+            }
+
+            if entries.len() < 2 {
+                return Err(BTreeError::EntryTooLarge);
+            }
             let split = page_v4::choose_leaf_split(&entries)
                 .map_err(|error| Self::page_error(leaf, error))?;
             let separator = entries[split].key.clone();
@@ -482,6 +613,37 @@ impl BTreeObject {
         }
     }
 
+    fn upsert_leaf_entry(entries: &mut Vec<LeafEntryOwned>, key: &[u8], value: &[u8]) {
+        let replacement = LeafValueOwned::Inline(value.to_vec());
+        match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+            Ok(index) => entries[index].value = replacement,
+            Err(index) => entries.insert(
+                index,
+                LeafEntryOwned {
+                    key: key.to_vec(),
+                    value: replacement,
+                },
+            ),
+        }
+    }
+
+    fn validate_inline_entry(key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
+        if key.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
+            Err(BTreeError::EntryTooLarge)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn leaf_capacity_error(error: PageError) -> bool {
+        matches!(
+            error.0,
+            "slot array does not fit page"
+                | "entry heap does not fit page"
+                | "page does not fit encoded entries"
+        )
+    }
+
     fn allocate_page(&self) -> Result<PageId, BTreeError> {
         let mut observed = self.next_page.load(Ordering::Acquire);
         loop {
@@ -525,8 +687,10 @@ impl BTreeObject {
 mod tests {
     use super::*;
     use crate::btree::{BTree, LookupResult};
-    use crate::vnext::{ObjectAuthority, PageIo, StorageObjectId};
-    use std::collections::HashMap;
+    use crate::vnext::{
+        LoggedMutation, MutationKind, ObjectAuthority, PageIo, StorageObjectId, TxnId,
+    };
+    use std::collections::{BTreeMap, HashMap};
     use std::io;
     use std::sync::{Arc, RwLock};
 
@@ -567,6 +731,24 @@ mod tests {
         StorageObjectDescriptor::new(StorageObjectId::new(id), ObjectAuthority::Authoritative)
     }
 
+    fn apply_raw_mutations(
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        mutations: &[LoggedMutation],
+    ) -> Result<(), BTreeError> {
+        for mutation in mutations {
+            match mutation.kind() {
+                MutationKind::OrderedPut => {
+                    tree.upsert(buffer, mutation.key(), mutation.value())?;
+                }
+                MutationKind::OrderedDelete => {
+                    tree.delete(buffer, mutation.key())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_tree_matches_reference_for_split_heavy_inserts() {
         let device = Arc::new(MemoryPageIo::default());
@@ -596,6 +778,79 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn upsert_inserts_and_replaces_without_disturbing_neighbors() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(16, 512, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(42), &buffer).expect("tree creates");
+
+        tree.upsert(&buffer, b"alpha", b"one").expect("insert");
+        tree.upsert(&buffer, b"beta", b"two").expect("insert");
+        tree.upsert(&buffer, b"gamma", b"three").expect("insert");
+        tree.upsert(&buffer, b"beta", b"a substantially longer replacement")
+            .expect("grow replacement");
+        assert_eq!(
+            tree.lookup(&buffer, b"beta").expect("lookup"),
+            BTreeLookup::Found(b"a substantially longer replacement".to_vec())
+        );
+        tree.upsert(&buffer, b"beta", b"x")
+            .expect("shrink replacement");
+        tree.upsert(&buffer, b"beta", b"x")
+            .expect("same-value replacement");
+
+        assert_eq!(
+            tree.range(&buffer, b"a", b"z", 10).expect("range"),
+            vec![
+                (b"alpha".to_vec(), BTreeLookup::Found(b"one".to_vec())),
+                (b"beta".to_vec(), BTreeLookup::Found(b"x".to_vec())),
+                (b"gamma".to_vec(), BTreeLookup::Found(b"three".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn growing_replacement_can_split_without_losing_old_neighbors() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(16, 384, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(44), &buffer).expect("tree creates");
+        for key in [b"a", b"b", b"c", b"d"] {
+            tree.insert(&buffer, key, &[b's'; 40]).expect("insert");
+        }
+        assert_eq!(tree.root(), PageId::new(0));
+
+        let replacement = vec![b'l'; 180];
+        tree.upsert(&buffer, b"b", &replacement)
+            .expect("replacement splits");
+        assert_ne!(tree.root(), PageId::new(0));
+        assert_eq!(
+            tree.lookup(&buffer, b"b").expect("lookup replacement"),
+            BTreeLookup::Found(replacement)
+        );
+        for key in [b"a", b"c", b"d"] {
+            assert_eq!(
+                tree.lookup(&buffer, key).expect("neighbor lookup"),
+                BTreeLookup::Found(vec![b's'; 40])
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_replacement_leaves_existing_value_unchanged() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 384, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(45), &buffer).expect("tree creates");
+        tree.insert(&buffer, b"alpha", b"stable").expect("insert");
+
+        assert!(matches!(
+            tree.upsert(&buffer, b"alpha", &vec![b'x'; 400]),
+            Err(BTreeError::EntryTooLarge)
+        ));
+        assert_eq!(
+            tree.lookup(&buffer, b"alpha").expect("lookup"),
+            BTreeLookup::Found(b"stable".to_vec())
+        );
     }
 
     #[test]
@@ -633,6 +888,79 @@ mod tests {
             tree.lookup(&buffer, b"beta").expect("lookup"),
             BTreeLookup::Found(b"two".to_vec())
         );
+    }
+
+    #[test]
+    fn raw_logical_replay_is_idempotent_under_splits_and_eviction() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(6, 384, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(49), &buffer).expect("tree creates");
+        let object = tree.descriptor().id();
+        let txn = TxnId::new(77);
+        let mut ordinal = 0u32;
+        let mut mutations = Vec::new();
+
+        for number in 0..80u32 {
+            let key = format!("key-{number:04}").into_bytes();
+            mutations.push(LoggedMutation::ordered_put(
+                txn,
+                ordinal,
+                object,
+                key,
+                vec![b'i'; 20],
+            ));
+            ordinal += 1;
+        }
+        for number in (0..80u32).step_by(3) {
+            let key = format!("key-{number:04}").into_bytes();
+            mutations.push(LoggedMutation::ordered_put(
+                txn,
+                ordinal,
+                object,
+                key,
+                vec![b'u'; 140],
+            ));
+            ordinal += 1;
+        }
+        for number in (0..80u32).step_by(5) {
+            let key = format!("key-{number:04}").into_bytes();
+            mutations.push(LoggedMutation::ordered_delete(txn, ordinal, object, key));
+            ordinal += 1;
+        }
+        mutations.push(LoggedMutation::ordered_delete(
+            txn,
+            ordinal,
+            object,
+            b"key-0010".to_vec(),
+        ));
+
+        let mut expected = BTreeMap::new();
+        for mutation in &mutations {
+            match mutation.kind() {
+                MutationKind::OrderedPut => {
+                    expected.insert(mutation.key().to_vec(), mutation.value().to_vec());
+                }
+                MutationKind::OrderedDelete => {
+                    expected.remove(mutation.key());
+                }
+            }
+        }
+        let expected_rows: Vec<_> = expected
+            .into_iter()
+            .map(|(key, value)| (key, BTreeLookup::Found(value)))
+            .collect();
+
+        apply_raw_mutations(&tree, &buffer, &mutations).expect("first replay");
+        let first = tree
+            .range(&buffer, b"", b"\xff", usize::MAX)
+            .expect("first range");
+        assert_eq!(first, expected_rows);
+        apply_raw_mutations(&tree, &buffer, &mutations).expect("second replay");
+        let second = tree
+            .range(&buffer, b"", b"\xff", usize::MAX)
+            .expect("second range");
+        assert_eq!(second, first);
+        assert!(buffer.stats().expect("stats").evictions > 0);
     }
 
     #[test]
