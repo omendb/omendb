@@ -406,13 +406,7 @@ mod tests {
         );
         assert_eq!(
             reader
-                .lookup(
-                    &tree,
-                    &buffer,
-                    b"without-history",
-                    None,
-                    CommitSeq::new(10),
-                )
+                .lookup(&tree, &buffer, b"without-history", None, CommitSeq::new(10),)
                 .expect("active lookup"),
             MvccLookup::NotFound
         );
