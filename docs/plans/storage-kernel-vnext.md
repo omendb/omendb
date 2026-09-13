@@ -25,18 +25,19 @@ This plan owns milestone order and unfinished vNext work. ADR 0014 owns the
 installation/recovery contract; repository agent guidance and skills link here
 rather than maintain separate roadmaps.
 
-The 2026-09-13 source review at `90b016a` identified a blocking correctness defect:
-`OrderedCommitCoordinator::commit` ignores the frontier returned by
-`VisibilityFrontier::publish_commit`. A later CSN can return success while an
-earlier unfinished CSN prevents new snapshots from seeing it. Fix this before
-Milestone F: separate ready publication from completion, wait for frontier
-coverage, and wake pending committers with recovery-required semantics on an
-unresolved earlier failure. Add coordinator-level out-of-order completion and
-failure tests, not only frontier unit tests. This is a source-review finding,
-not a newly executed test result; do not mark it closed until qualified.
+The 2026-09-13 source review at `90b016a` found that
+`OrderedCommitCoordinator::commit` ignored the frontier returned by
+`VisibilityFrontier::publish_commit`, so a later CSN could return success while
+an earlier unfinished CSN prevented new snapshots from seeing it. That defect is
+fixed at `9fbde17`: readiness publication and synchronous completion are
+separate, a commit waits for contiguous frontier coverage, and an unresolved
+earlier decision wakes waiters with recovery-required semantics. Coordinator
+completion and frontier wakeup tests cover both outcomes. Runtime-wide admission
+and drain authority for reads, snapshots, checkpoint cuts and already-admitted
+writers remains open below.
 
-Clear the existing Clippy failures and keep the full CI matrix green before
-stacking persistence changes. The architecture remains a correctness baseline,
+Keep the full CI matrix green before stacking persistence changes. The
+architecture remains a correctness baseline,
 not demonstrated state-of-the-art performance. Performance qualification must
 precede product cutover; research informs experiments, not unconditional
 algorithm replacements.
@@ -144,7 +145,6 @@ algorithm replacements.
 - full deterministic/bounded admission for arbitrary buffer and allocation
   pressure. The transaction's own undo-dependency cycle is fixed, but an
   undersized pool or externally pinned frames may still produce `NoVictim`;
-- synchronous commit completion waiting for contiguous frontier coverage;
 - runtime-wide failure fencing for reads, snapshots, checkpoint admission and
   pending/already-admitted committers; current fencing is write-admission scope
   only. These are persistent-runtime gates, not post-checkpoint polish;
@@ -268,7 +268,7 @@ private staged writes
      attaching decision LSN + actual resulting undo head to mutated page images
   -> publish transaction status
   -> mark CSN ready / advance contiguous visibility
-  -> wait until the frontier covers this CSN (required fix; not implemented)
+  -> wait until the frontier covers this CSN before returning success
   -> release transaction state and intents
 ```
 
@@ -294,12 +294,11 @@ Still required before D is persistent-runtime complete:
 1. Define deterministic admission/resource bounds for remaining dynamic failures
    such as arbitrary pin pressure, minimum usable buffer capacity, allocation
    exhaustion and whole-transaction WAL-segment limits.
-2. Fix synchronous completion across frontier gaps and add runtime-wide
-   snapshot/read/checkpoint admission fencing or an explicitly proven safe-prior
-   read boundary. Define drain/stop behavior for already-admitted writers and
-   wake pending completion waits on failure. The current coordinator fences new
-   writes only. Qualify this lifecycle within Milestone F, before persistent
-   exposure.
+2. Extend runtime-wide snapshot/read/checkpoint admission fencing, or an
+   explicitly proven safe-prior read boundary, and define drain/stop behavior for
+   already-admitted writers. Completion waiting across frontier gaps and its
+   failure wakeup are implemented; the lifecycle around them is not. Qualify
+   this within Milestone F, before persistent exposure.
 3. Qualify injected failures at every prepare/undo/apply/status/frontier boundary
    with dependency-aware pages and persistent checkpoint authority.
 4. Only after milestone F's checkpoint work may persistent current-record pages
@@ -500,9 +499,10 @@ retention/streaming/indexing policy before large-history qualification.
 
 ## Immediate sequence
 
-1. Clear Clippy and fix synchronous commit completion across frontier gaps.
+1. Keep the completed visibility-completion fix, the Clippy-clean tree and the
+   stable/MSRV/all-features suites green, and clear Clippy on any new work.
    Qualify out-of-order installers, earlier-decision failure and pending-waiter
-   wakeup. Keep stable, MSRV, Clippy, PostgreSQL differential and perf smoke green.
+   wakeup as the surrounding runtime lifecycle lands.
 2. Define the shared runtime admission/drain/failure lifecycle. Implement
    checksummed out-of-place pages, persistent page map and complete checkpoint
    publication with exclusive writable ownership and store-incarnation binding.

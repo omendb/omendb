@@ -77,6 +77,10 @@ Implemented and integrated:
 - sharded in-process per-page WAL/undo dependency tracking and a checked `PageIo`
   gate that refuses physical writeback until both durability frontiers cover the
   exact page requirements;
+- synchronous completion: `VisibilityFrontier` distinguishes readiness
+  publication from completion, waits for contiguous coverage, and reports
+  recovery-required instead of blocking or acknowledging when an earlier durable
+  decision cannot complete;
 - dependency-aware B-tree upsert that attaches requirements while the exact page
   remains pinned and conservatively inherits source requirements through leaf
   splits, internal splits and root replacement;
@@ -87,10 +91,6 @@ Implemented and integrated:
 
 Still incomplete:
 
-- synchronous completion waiting for the contiguous frontier to cover its CSN:
-  source review at `90b016a` found that the coordinator ignores the frontier
-  returned by `publish_commit` and can acknowledge a later, not-yet-visible
-  transaction. Ready publication is implemented; completion waiting is not;
 - checksummed persistent page envelope and out-of-place physical page map;
 - structurally complete checkpoint/manifest publication retaining roots, object
   metadata, allocation high-water marks, page map, owner outcomes and retention;
@@ -146,7 +146,7 @@ For a writing transaction:
 9. Wait until the contiguous frontier covers this transaction's CSN before
    returning synchronous success; marking a CSN ready is not completion. Release
    intents and the ordinary transaction snapshot on completion. An unresolved
-   earlier decision must wake pending completion waits with recovery-required
+   earlier decision wakes pending completion waits with recovery-required
    semantics rather than allowing success or an indefinite wait.
 
 Pre-WAL snapshot/write conflicts are ordinary clean refusals: they create no WAL
