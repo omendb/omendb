@@ -19,6 +19,7 @@ mod ordered_mvcc;
 mod ordered_mvcc_read;
 mod ordered_recovery;
 mod ordered_txn_read;
+mod page_dependency;
 mod recovery;
 mod segment_log;
 mod translation;
@@ -60,6 +61,9 @@ pub use ordered_mvcc_read::{
 };
 pub use ordered_recovery::{OrderedRecoveryApplier, OrderedRecoveryError, RecoveryApplyResult};
 pub use ordered_txn_read::OrderedTransactionRangeCursor;
+pub use page_dependency::{
+    DependencyCheckedPageIo, PageDependencies, PageDependencyError, PageDependencyTable,
+};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
