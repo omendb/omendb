@@ -55,6 +55,7 @@ pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use ordered_commit::{OrderedCommitCoordinator, OrderedCommitError};
 pub use ordered_mvcc::{
     InstallContext, InstallEffectResult, OrderedMvccInstallError, OrderedMvccInstaller,
+    PrepareEffectResult, PreparedOrderedMvccEffect,
 };
 pub use ordered_mvcc_read::{
     MvccLookup, OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader,
