@@ -1,15 +1,16 @@
-//! Durable-WAL-first commit orchestration for transient ordered MVCC objects.
+//! Durable-WAL-first commit orchestration for ordered MVCC objects.
 //!
-//! This is the first executable integration of ADR 0014's transaction order.
-//! It deliberately does not make buffered pages persistent recovery authority:
-//! callers must still use transient/non-authoritative page I/O until page
-//! dependency capture and structurally complete checkpoints land.
+//! The coordinator integrates ADR 0014's transaction order. Shared page
+//! mutation starts only after the decision WAL is durable and every required
+//! predecessor before-image has been prepared and group-synchronized. Page
+//! persistence still does not become recovery authority until structurally
+//! complete checkpoint publication lands.
 
 use super::{
     BTreeError, BTreeObject, BufferPool, CommitAppendError, CommitAppender, CommitPosition,
-    DurableLogError, FinalEffect, FinalWriteSetError, InstallContext, InstallEffectResult,
-    MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
-    PageDependencyTable, StatusTableError, StorageObjectId, Transaction, TransactionError,
+    DurableLogError, FinalEffect, FinalWriteSetError, InstallContext, MvccCodecError, MvccRecord,
+    MvccValue, OrderedMvccInstallError, OrderedMvccInstaller, PageDependencyTable,
+    PrepareEffectResult, StatusTableError, StorageObjectId, Transaction, TransactionError,
     TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
     VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
@@ -113,9 +114,10 @@ impl<'a> OrderedCommitCoordinator<'a> {
     ///
     /// Deterministic object/record representability checks happen before the
     /// transaction enters `Validating`, so those failures leave it active and
-    /// retryable. Once WAL append may have happened, every uncertain or
-    /// post-decision failure fences this coordinator before the intent guard is
-    /// dropped and moves the transaction to `RecoveryRequired` where possible.
+    /// retryable. After the WAL decision becomes durable, all predecessor
+    /// records are prepared and one undo barrier completes before the first
+    /// shared page mutation. Any failure after WAL append may have consumed
+    /// durable transaction authority and therefore fences this coordinator.
     pub fn commit(
         &self,
         transaction: &mut Transaction,
@@ -161,56 +163,65 @@ impl<'a> OrderedCommitCoordinator<'a> {
         };
 
         let installer = OrderedMvccInstaller::new(self.statuses, self.undo);
-        let mut max_undo = None;
+        let mut prepared_effects = Vec::with_capacity(effects.len());
+        let mut max_required_undo = None;
         for effect in &effects {
             let Some(tree) = objects.get(&effect.object()).copied() else {
                 self.fence_after_wal(transaction);
                 return Err(OrderedCommitError::MissingObject(effect.object()));
             };
-            let installed = if let Some(dependencies) = self.page_dependencies {
-                installer.install_with_dependencies(
-                    tree,
-                    buffer,
-                    &intent_guard,
-                    effect,
-                    InstallContext::Live {
-                        snapshot: transaction.snapshot(),
-                    },
-                    dependencies,
-                    ticket.decision_lsn(),
-                )
-            } else {
-                installer.install(
-                    tree,
-                    buffer,
-                    &intent_guard,
-                    effect,
-                    InstallContext::Live {
-                        snapshot: transaction.snapshot(),
-                    },
-                )
-            };
-            match installed {
-                Ok(InstallEffectResult::Installed { appended_undo, .. }) => {
-                    if let Some(version) = appended_undo {
-                        max_undo = Some(max_version(max_undo, version));
-                    }
-                }
-                Ok(InstallEffectResult::AlreadyInstalled { .. }) => {}
+            let prepared = match installer.prepare(
+                tree,
+                buffer,
+                &intent_guard,
+                effect,
+                InstallContext::Live {
+                    snapshot: transaction.snapshot(),
+                },
+            ) {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     self.fence_after_wal(transaction);
                     return Err(OrderedCommitError::Install(error));
                 }
+            };
+            if let Some(version) = prepared.required_undo() {
+                max_required_undo = Some(max_version(max_required_undo, version));
+            }
+            if let PrepareEffectResult::Prepared(prepared) = prepared {
+                prepared_effects.push((tree, prepared));
             }
         }
 
-        if let Some(version) = max_undo {
-            if let Err(error) = self.undo.sync_through(version) {
-                self.fence_after_wal(transaction);
-                return Err(OrderedCommitError::Undo(error));
-            }
+        if let Some(version) = max_required_undo {
+            let durable = match self.undo.sync_through(version) {
+                Ok(durable) => durable,
+                Err(error) => {
+                    self.fence_after_wal(transaction);
+                    return Err(OrderedCommitError::Undo(error));
+                }
+            };
             if let Some(dependencies) = self.page_dependencies {
-                dependencies.advance_undo(version);
+                dependencies.advance_undo(durable);
+            }
+        }
+
+        for (tree, prepared) in &prepared_effects {
+            let installed = if let Some(dependencies) = self.page_dependencies {
+                installer.apply_prepared_with_dependencies(
+                    tree,
+                    buffer,
+                    &intent_guard,
+                    prepared,
+                    dependencies,
+                    ticket.decision_lsn(),
+                )
+            } else {
+                installer.apply_prepared(tree, buffer, &intent_guard, prepared)
+            };
+            if let Err(error) = installed {
+                self.fence_after_wal(transaction);
+                return Err(OrderedCommitError::Install(error));
             }
         }
 
