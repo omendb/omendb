@@ -19,6 +19,28 @@ Do not build speculative plugin hierarchies. The kernel owns common transaction,
 log, buffer, durability and lifetime services; access methods remain concrete
 until a second implementation demonstrates the seam that is actually needed.
 
+## Review gates and ownership
+
+This plan owns milestone order and unfinished vNext work. ADR 0014 owns the
+installation/recovery contract; repository agent guidance and skills link here
+rather than maintain separate roadmaps.
+
+The 2026-09-13 source review at `90b016a` identified a blocking correctness defect:
+`OrderedCommitCoordinator::commit` ignores the frontier returned by
+`VisibilityFrontier::publish_commit`. A later CSN can return success while an
+earlier unfinished CSN prevents new snapshots from seeing it. Fix this before
+Milestone F: separate ready publication from completion, wait for frontier
+coverage, and wake pending committers with recovery-required semantics on an
+unresolved earlier failure. Add coordinator-level out-of-order completion and
+failure tests, not only frontier unit tests. This is a source-review finding,
+not a newly executed test result; do not mark it closed until qualified.
+
+Clear the existing Clippy failures and keep the full CI matrix green before
+stacking persistence changes. The architecture remains a correctness baseline,
+not demonstrated state-of-the-art performance. Performance qualification must
+precede product cutover; research informs experiments, not unconditional
+algorithm replacements.
+
 ## Current implementation status
 
 ### Implemented foundations
@@ -122,13 +144,16 @@ until a second implementation demonstrates the seam that is actually needed.
 - full deterministic/bounded admission for arbitrary buffer and allocation
   pressure. The transaction's own undo-dependency cycle is fixed, but an
   undersized pool or externally pinned frames may still produce `NoVictim`;
-- runtime-wide read/snapshot admission fencing after a post-decision failure;
-  current coordinator fencing is write-admission scope only;
+- synchronous commit completion waiting for contiguous frontier coverage;
+- runtime-wide failure fencing for reads, snapshots, checkpoint admission and
+  pending/already-admitted committers; current fencing is write-admission scope
+  only. These are persistent-runtime gates, not post-checkpoint polish;
 - complete failpoint/crash matrix across dependency-aware prepare, undo barrier,
   page application, status/frontier publication, checkpoint publication and two
   consecutive reopens;
 - owner freezing, retention-aware WAL/undo reclamation and physical GC;
-- cross-process exclusive writable directory ownership/store-incarnation binding;
+- cross-process exclusive writable directory ownership and store-incarnation
+  binding across WAL, undo, pages and manifests, required within Milestone F;
 - canonical row storage and OmenDB cutover;
 - optimized background writeback, durability batching, custom latches,
   translation fast paths or finer-grained SMO coordination.
@@ -221,7 +246,8 @@ because the B-tree is the first access method.
 implemented; checkpoint authority and broader progress/fault qualification
 remain.**
 
-The implemented live write path is:
+The live write path below includes the required completion fix explicitly marked
+as not yet implemented:
 
 ```text
 private staged writes
@@ -242,6 +268,7 @@ private staged writes
      attaching decision LSN + actual resulting undo head to mutated page images
   -> publish transaction status
   -> mark CSN ready / advance contiguous visibility
+  -> wait until the frontier covers this CSN (required fix; not implemented)
   -> release transaction state and intents
 ```
 
@@ -267,9 +294,12 @@ Still required before D is persistent-runtime complete:
 1. Define deterministic admission/resource bounds for remaining dynamic failures
    such as arbitrary pin pressure, minimum usable buffer capacity, allocation
    exhaustion and whole-transaction WAL-segment limits.
-2. Add runtime-wide snapshot/read admission fencing or an explicit safe-prior
-   read boundary for post-decision failures; the current coordinator fences new
-   writes only.
+2. Fix synchronous completion across frontier gaps and add runtime-wide
+   snapshot/read/checkpoint admission fencing or an explicitly proven safe-prior
+   read boundary. Define drain/stop behavior for already-admitted writers and
+   wake pending completion waits on failure. The current coordinator fences new
+   writes only. Qualify this lifecycle within Milestone F, before persistent
+   exposure.
 3. Qualify injected failures at every prepare/undo/apply/status/frontier boundary
    with dependency-aware pages and persistent checkpoint authority.
 4. Only after milestone F's checkpoint work may persistent current-record pages
@@ -345,9 +375,13 @@ finish out of LSN order and splits move logical effects between pages.
 The next major implementation milestone is a structurally complete checkpoint:
 
 1. define a checksummed page image/envelope and out-of-place physical page map;
-2. briefly quiesce install/structural/GC mutation for the first correctness
-   baseline;
-3. drain a completely installed contiguous visible frontier;
+2. acquire exclusive writable-store ownership and validate common store
+   incarnation across retained components;
+3. close admission to new committing mutations, allow admitted work to finish
+   installation/publication, then establish the exact `(CSN, decision LSN)` cut.
+   Keep install/structural/GC and allocation metadata mutation quiescent during
+   graph capture; do not stop installers needed by the drain. A failed drain
+   enters recovery-required state rather than publishing a partial checkpoint;
 4. capture every reachable authoritative page plus roots, object metadata,
    logical-to-physical mapping, allocation high-water marks, retained owner
    outcomes and retention metadata;
@@ -366,9 +400,15 @@ step 7, including contiguous ordering, exact transaction identity, grouped undo
 before page mutation and dependency-aware replay. It remains transient until a
 checkpoint/page-map authority exists.
 
-After this blocking baseline is proven, measure a coherent nonblocking checkpoint
-epoch or structural/physiological logging alternative. Do not retain checkpoint
-pauses by inertia.
+A blocking checkpoint is not assumed to be brief. Capture and materialization
+can hold mutation admission closed through graph traversal and I/O. Reuse
+unchanged immutable images where valid, retain prior-authority dependencies,
+and measure pause time versus database size and dirty fraction.
+
+After this baseline is crash-qualified, measure a coherent nonblocking checkpoint
+epoch or structural/physiological logging alternative before cutover if pause
+budgets require it. Do not retain checkpoint pauses by inertia. Runtime failure
+fencing and pending-commit wakeup are part of this milestone's acceptance gate.
 
 ## Milestone G — canonical rows and OmenDB cutover
 
@@ -420,6 +460,21 @@ frontier derived from retained bytes.
 
 ## Performance gates
 
+Qualify the actual vNext transaction/storage path before cutover. The existing
+product perf smoke is a regression tripwire, not a vNext benchmark. Before
+claiming a performance gate passed, record target hardware, durability/isolation
+settings, datasets, concurrency, explicit throughput/latency/memory/recovery
+budgets, and the accepted comparison tolerance. Budgets are not yet established
+by this plan; do not invent passing thresholds after observing results.
+
+Prioritize architectural costs after checkpoint crash qualification and before
+cutover: serial WAL/undo barriers, undo read/write/sync contention, frontier
+head-of-line waiting, history metadata footprint, checkpoint pauses and recovery
+memory. Measure resident short-history alternatives, adaptive durability
+batching and autonomous commit only with an explicit correctness proof for any
+changed ordering. Preserve the replaceable translation seam; adopt predictive
+translation, custom latches or finer SMO coordination only from measured need.
+
 Every serious design choice records, where meaningful:
 
 - throughput and p50/p95/p99;
@@ -428,11 +483,15 @@ Every serious design choice records, where meaningful:
 - buffer occupancy, hit/miss/translation/latch/conflict/retry/wait metrics;
 - logical WAL bytes, host writes and device/flash write amplification;
 - recovery time versus checkpoint/log distance;
-- database/checkpoint size and checkpoint pause/overhead.
+- database/checkpoint size and checkpoint pause/overhead;
+- WAL and undo barrier latency/count per transaction, history-read contention,
+  append-lane wait and ready-to-visible frontier wait.
 
-Run both hot/cached and larger-than-memory regimes. Do not optimize SSD throughput
-by imposing large cached-hit overhead, or declare an in-memory winner without
-measuring spill/recovery behavior.
+Run both hot/cached and larger-than-memory regimes, with 1/4/16+ committers,
+uniform and skewed keys, long snapshots, and concurrent checkpoint activity.
+Include canonical rows plus secondary/constraint indexes before product cutover.
+Do not optimize SSD throughput by imposing large cached-hit overhead, or declare
+an in-memory winner without measuring spill/recovery behavior.
 
 Current recovery is not fully bounded-memory: undo payload scanning is bounded
 to one frame, but its version-offset index, WAL recovery output and pending/
@@ -441,20 +500,27 @@ retention/streaming/indexing policy before large-history qualification.
 
 ## Immediate sequence
 
-1. Keep pre-WAL predecessor/conflict validation, prepared MVCC apply,
-   dependency-aware commit/recovery, private point/range reads, WAL/undo framing,
-   B-tree split propagation and buffer suites green under stable, MSRV, Clippy,
-   PostgreSQL differential and perf smoke.
-2. Implement checksummed out-of-place page images plus the logical-to-physical
-   page map and structurally complete checkpoint/manifest baseline.
+1. Clear Clippy and fix synchronous commit completion across frontier gaps.
+   Qualify out-of-order installers, earlier-decision failure and pending-waiter
+   wakeup. Keep stable, MSRV, Clippy, PostgreSQL differential and perf smoke green.
+2. Define the shared runtime admission/drain/failure lifecycle. Implement
+   checksummed out-of-place pages, persistent page map and complete checkpoint
+   publication with exclusive writable ownership and store-incarnation binding.
 3. Recover checkpoint + synchronized retained WAL suffix through the existing
-   ordered recovery applicator, and run the two-reopen crash matrix before any
-   vNext working page becomes restart authority.
-4. Add deterministic resource/admission bounds and dependency-aware failpoints,
-   including arbitrary pin pressure and post-decision read/snapshot fencing.
-5. Add owner freezing/retention reclamation only once checkpointed owner outcomes
-   and all reader/CDC/replica/backup horizons are explicit.
-6. Add canonical rows/cross-object relational qualification and cut OmenDB over.
-7. Only then optimize batching, latches, translation, checkpoint concurrency,
-   compression/fence truncation, version placement and SMO coordination from
-   end-to-end measurement.
+   applicator. Qualify runtime read/snapshot fencing, already-admitted writers,
+   checkpoint cuts and two consecutive reopens before persistent exposure.
+4. Complete deterministic resource/admission bounds and dependency-aware
+   failpoints, including arbitrary pin pressure. Add freezing/reclamation only
+   with checkpointed outcomes and explicit reader/CDC/replica/backup horizons.
+5. Benchmark the actual vNext path and address measured architectural costs,
+   especially commit/history I/O, frontier waits, checkpoint pauses and bounded
+   recovery. Do not postpone necessary performance work until after cutover.
+6. Add canonical rows and cross-object relational qualification. Compare
+   clustered rows against heap + primary index, and pass the product oracle and
+   agreed performance budgets on the intended regimes.
+7. Cut OmenDB over only after those gates pass, then delete the legacy engine.
+   Continue measured tuning without preserving obsolete paths by inertia.
+
+Update milestone status only with source/test/benchmark evidence. This order
+supersedes execution sequences in older handoffs; it does not authorize a merge,
+release or deployment.

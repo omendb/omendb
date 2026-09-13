@@ -2,7 +2,7 @@
 
 - **Status:** accepted target architecture; implementation begins on `storage-kernel-vnext`
 - **Scope:** SeerDB/OmenDB physical boundary, transaction/storage kernel, access methods, recovery participation, and multimodal derived state
-- **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md), [ADR 0003](0003-seerdb-commit-recovery-state-machine.md), [ADR 0006](0006-deployment-storage-and-durability.md), [ADR 0009](0009-buffered-btree-and-materialization.md), [ADR 0011](0011-htap-and-analytical-representations.md), and [ADR 0012](0012-unified-data-modalities-and-rewrite-policy.md)
+- **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md), [ADR 0003](0003-seerdb-commit-recovery-state-machine.md), [ADR 0006](0006-deployment-storage-and-durability.md), [ADR 0009](0009-buffered-btree-and-materialization.md), [ADR 0011](0011-htap-and-analytical-representations.md), and [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md)
 - **Revises:** the earlier assumption that `TreeId + ordered key bytes + opaque value bytes` is the only OmenDB↔SeerDB narrow waist
 
 ## Context

@@ -87,6 +87,10 @@ Implemented and integrated:
 
 Still incomplete:
 
+- synchronous completion waiting for the contiguous frontier to cover its CSN:
+  source review at `90b016a` found that the coordinator ignores the frontier
+  returned by `publish_commit` and can acknowledge a later, not-yet-visible
+  transaction. Ready publication is implemented; completion waiting is not;
 - checksummed persistent page envelope and out-of-place physical page map;
 - structurally complete checkpoint/manifest publication retaining roots, object
   metadata, allocation high-water marks, page map, owner outcomes and retention;
@@ -94,8 +98,9 @@ Still incomplete:
   into authoritative vNext access methods;
 - deterministic/bounded resource admission for arbitrary pin/buffer/allocation
   pressure and whole-transaction WAL bounds;
-- runtime-wide read/snapshot admission fencing after unresolved post-decision
-  failures; current coordinator fencing is write-admission scope;
+- runtime-wide read/snapshot/checkpoint admission fencing and pending-commit
+  wakeup after unresolved post-decision failures, including defined handling for
+  already-admitted writers; current fencing is write-admission scope;
 - complete failpoint/crash matrix and two consecutive reopens across transaction,
   dependency, structural and checkpoint boundaries;
 - freezing, owner-status retention, undo/WAL reclamation and physical GC;
@@ -138,8 +143,11 @@ For a writing transaction:
    Finish every authoritative object before publication.
 8. Publish committed transaction status and mark its CSN ready. Advance new
    snapshots only through the contiguous ready frontier.
-9. Complete the synchronous API only after durability and frontier visibility;
-   release intents and the ordinary transaction snapshot on completion.
+9. Wait until the contiguous frontier covers this transaction's CSN before
+   returning synchronous success; marking a CSN ready is not completion. Release
+   intents and the ordinary transaction snapshot on completion. An unresolved
+   earlier decision must wake pending completion waits with recovery-required
+   semantics rather than allowing success or an indefinite wait.
 
 Pre-WAL snapshot/write conflicts are ordinary clean refusals: they create no WAL
 decision and leave the transaction active for caller-directed abort/retry.
@@ -260,9 +268,12 @@ logical transaction before a replay boundary is represented.
 The first recovery model is therefore one structurally complete checkpoint plus
 the committed logical WAL suffix:
 
-1. Quiesce new commit installation and structural/GC mutation long enough to
-   drain a fully installed contiguous visible frontier and capture its decision
-   LSN.
+1. Close admission to new committing mutations, while allowing admitted work
+   to finish installation/publication. After draining, establish the exact
+   `(visible CSN, decision LSN)` cut. Hold install/structural/GC and allocation
+   metadata mutation quiescent during graph capture. Do not park installers
+   needed by the drain or include partially installed transactions above the
+   checkpoint prefix. Failed drains require recovery, not partial publication.
 2. Materialize the complete reachable authoritative graph and checkpoint
    metadata: roots, logical-to-physical map, allocation high-water marks,
    retained owner outcomes and retention state. Enforce WAL/undo barriers and
@@ -280,9 +291,12 @@ advance recovery authority. After a crash they can be ignored unless a later
 protocol explicitly proves them part of a coherent checkpoint epoch.
 
 Checkpoint quiescence is a correctness baseline, not a desired permanent
-latency strategy. A nonblocking coherent epoch or crash-qualified structural
+latency strategy or a promise of a brief pause. Graph traversal and materializing
+dirty images can hold admission closed through substantial I/O. Reuse unchanged
+immutable images where valid and measure pause cost against database size and
+dirty fraction. A nonblocking coherent epoch or crash-qualified structural
 logging may replace it only after proving reference closure, replay completeness
-and retention.
+and retention. Meet checkpoint latency budgets before product cutover.
 
 ## 6. Owner status, identity and retention are checkpoint state
 
@@ -299,10 +313,17 @@ ad-hoc GC mechanism.
 
 Checkpoint/object metadata must recover allocation high-water marks and prevent
 reuse of live transaction, object or page identities. WAL, undo and page-map
-components must eventually be bound to the same database/store incarnation so
-numeric IDs cannot accidentally validate a foreign component. The owning
+components must be bound to the same database/store incarnation in the first
+persistent runtime so numeric IDs cannot accidentally validate a foreign
+component. The owning
 runtime also needs exclusive writable directory ownership; per-handle mutexes do
-not provide a cross-process writer lock.
+not provide a cross-process writer lock. Both store binding and exclusive
+writable ownership are Milestone F acceptance requirements, not deferred GC work.
+
+The runtime lifecycle must also govern snapshot/read/checkpoint admission and
+pending commit completion after failure. Already-admitted writers need explicit
+drain/stop behavior; an entry-only fence is insufficient. Either fence reads or
+prove an explicit safe-prior read boundary before exposing a persistent runtime.
 
 ## 7. Format and resource qualification
 
@@ -339,6 +360,10 @@ Before persistent cutover, tests must cover at least:
 - failure after decision WAL sync, after grouped undo sync and after subsets of
   current-record installation;
 - failure around status publication and frontier advancement;
+- a later installed CSN cannot acknowledge success while an earlier CSN leaves a
+  frontier gap; completing the gap releases waiters, and unresolved failure wakes
+  them with recovery-required semantics;
+- already-admitted writers and checkpoint drains racing runtime failure;
 - runtime fencing before unresolved intent release;
 - out-of-order installers on different keys of one page;
 - page dependency inheritance through split sibling/parent/root publication;
@@ -350,22 +375,10 @@ Before persistent cutover, tests must cover at least:
 - small-buffer progress, allocation refusal and oversized deterministic
   precommit rejection.
 
-## Next implementation order
+## Implementation roadmap
 
-1. Keep canonical effects/intents, pre-WAL predecessor validation, prepared MVCC
-   apply, dependency-aware commit/recovery, snapshot/RYW reads, WAL/undo framing,
-   B-tree split propagation and buffer suites green under stable, MSRV, Clippy,
-   PostgreSQL differential and perf smoke.
-2. Add checksummed out-of-place page images plus the logical-to-physical page map
-   and structurally complete checkpoint/manifest authority.
-3. Recover checkpoint + synchronized retained WAL suffix through the existing
-   ordered recovery applicator and run the two-reopen crash matrix before any
-   vNext working page becomes restart authority.
-4. Add deterministic resource/admission bounds and dependency-aware failpoints,
-   including arbitrary pin pressure and post-decision read/snapshot fencing.
-5. Add owner freezing/retention reclamation only once checkpointed owner outcomes
-   and all reader/CDC/replica/backup horizons are explicit.
-6. Add canonical rows/cross-object relational qualification and cut OmenDB over.
-7. Only then optimize durability batching, latches, translation, checkpoint
-   concurrency, compression/fence truncation, version placement and structural
-   coordination from end-to-end measurement.
+The [vNext plan](../plans/storage-kernel-vnext.md#immediate-sequence) owns the
+implementation sequence and open gates. Fix visibility completion first;
+qualify runtime lifecycle and store identity with checkpoint authority; then
+address measured architectural performance costs before canonical-row/product
+cutover. This ADR owns the protocol, not a second execution backlog.
