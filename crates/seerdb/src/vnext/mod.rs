@@ -50,7 +50,9 @@ pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use ordered_mvcc::{
     InstallContext, InstallEffectResult, OrderedMvccInstallError, OrderedMvccInstaller,
 };
-pub use ordered_mvcc_read::{MvccLookup, OrderedMvccReadError, OrderedMvccReader};
+pub use ordered_mvcc_read::{
+    MvccLookup, OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader,
+};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
