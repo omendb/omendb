@@ -1,14 +1,14 @@
 //! Minimal ordered append lane for vNext commit decisions.
 //!
 //! The lane couples commit-sequence assignment to physical WAL append order.
-//! It does not perform durability barriers, install MVCC records, publish status,
-//! or hold any database-wide execution lock. This is the smallest baseline that
-//! makes recovery's strictly increasing CSN contract true under concurrent
-//! committers. A future reservation-based WAL may replace the mutex if it can
-//! preserve the same order invariant measurably better.
+//! It does not hold the lane across durability barriers, install MVCC records,
+//! publish status, or hold any database-wide execution lock. The appender owns
+//! the durable log handle so higher orchestration cannot append to one WAL and
+//! accidentally synchronize another. A future reservation-based WAL may replace
+//! the mutex if it preserves the same order invariant measurably better.
 
 use super::{
-    AppendTicket, CommitSeq, DurableLog, DurableLogError, FinalWriteSetError, LogEncodeError,
+    AppendTicket, CommitSeq, DurableLog, DurableLogError, FinalWriteSetError, LogEncodeError, Lsn,
     PreparedLogBatch, Transaction, TransactionError, TransactionPhase,
 };
 use std::sync::{Arc, Mutex};
@@ -96,6 +96,24 @@ impl CommitAppender {
             });
         }
         Ok(ticket)
+    }
+
+    /// Synchronize the same durable log that receives `append_validated`.
+    /// This does not acquire or retain the CSN append lane.
+    pub fn sync_through(&self, lsn: Lsn) -> Result<(), DurableLogError> {
+        self.log.sync_through(lsn)
+    }
+
+    /// Highest LSN synchronized on the log owned by this appender.
+    #[must_use]
+    pub fn durable_lsn(&self) -> Option<Lsn> {
+        self.log.durable_lsn()
+    }
+
+    /// Whether the underlying log has fenced further append/sync operations.
+    #[must_use]
+    pub fn is_log_fenced(&self) -> bool {
+        self.log.is_fenced()
     }
 
     /// CSN that the next successful append would receive, or `None` when the
@@ -259,11 +277,28 @@ mod tests {
             Err(CommitAppendError::OutcomeUncertain { .. })
         ));
         assert_eq!(transaction.phase(), TransactionPhase::RecoveryRequired);
+        assert!(appender.is_log_fenced());
         assert!(log.is_fenced());
         assert_eq!(
             appender.next_csn().expect("lane reads"),
             Some(CommitSeq::new(1))
         );
+    }
+
+    #[test]
+    fn appender_owns_the_log_used_for_durability() {
+        let device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(device));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let mut transaction = validating(2);
+        let ticket = appender
+            .append_validated(&mut transaction)
+            .expect("append succeeds");
+        assert_eq!(appender.durable_lsn(), None);
+        appender
+            .sync_through(ticket.decision_lsn())
+            .expect("same log syncs");
+        assert_eq!(appender.durable_lsn(), Some(ticket.decision_lsn()));
     }
 
     #[test]
