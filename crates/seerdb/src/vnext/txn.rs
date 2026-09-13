@@ -6,8 +6,8 @@
 //! does not recreate the old monolithic runtime/publication lock.
 
 use super::{
-    CommitDecision, CommitPosition, CommitSeq, LogEncodeError, LoggedMutation, Lsn,
-    StorageObjectDescriptor, TxnId, mutation_digest,
+    CommitDecision, CommitPosition, CommitSeq, FinalEffect, FinalWriteSetError, LogEncodeError,
+    LoggedMutation, Lsn, StorageObjectDescriptor, TxnId, mutation_digest, normalize_final_effects,
 };
 
 /// Logical phase of one vNext transaction.
@@ -86,6 +86,13 @@ impl Transaction {
     #[must_use]
     pub fn mutations(&self) -> &[LoggedMutation] {
         &self.mutations
+    }
+
+    /// Return the canonical one-effect-per-key physical view of the currently
+    /// staged mutation stream. Commit callers freeze writes before consuming
+    /// this view for intents or installation.
+    pub fn final_effects(&self) -> Result<Vec<FinalEffect>, FinalWriteSetError> {
+        normalize_final_effects(self.id, &self.mutations)
     }
 
     #[must_use]
@@ -288,7 +295,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{ObjectAuthority, StorageObjectId};
+    use crate::vnext::{MutationKind, ObjectAuthority, StorageObjectId};
 
     fn object(id: u64, authority: ObjectAuthority) -> StorageObjectDescriptor {
         StorageObjectDescriptor::new(StorageObjectId::new(id), authority)
@@ -311,6 +318,25 @@ mod tests {
         assert_eq!(txn.mutations()[0].object(), StorageObjectId::new(11));
         assert_eq!(txn.mutations()[1].ordinal(), 1);
         assert_eq!(txn.mutations()[1].object(), StorageObjectId::new(13));
+    }
+
+    #[test]
+    fn live_transaction_uses_shared_final_effect_normalization() {
+        let mut txn = Transaction::new(TxnId::new(8), CommitSeq::new(3));
+        let object = object(11, ObjectAuthority::Authoritative);
+        txn.stage_ordered_put(object, b"key".to_vec(), b"first".to_vec())
+            .expect("first put");
+        txn.stage_ordered_delete(object, b"key".to_vec())
+            .expect("delete");
+        txn.stage_ordered_put(object, b"key".to_vec(), b"final".to_vec())
+            .expect("final put");
+        txn.begin_validation().expect("freezes writes");
+
+        let effects = txn.final_effects().expect("normalizes");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].ordinal(), 2);
+        assert_eq!(effects[0].kind(), MutationKind::OrderedPut);
+        assert_eq!(effects[0].value(), b"final");
     }
 
     #[test]

@@ -5,7 +5,10 @@
 //! must be contiguous and only a validated commit decision emits replayable
 //! state. Aborted or unterminated transactions never become visible.
 
-use super::{CommitPosition, CommitSeq, LogRecord, LoggedMutation, Lsn, TxnId, mutation_digest};
+use super::{
+    CommitPosition, CommitSeq, FinalEffect, FinalWriteSetError, LogRecord, LoggedMutation, Lsn,
+    TxnId, mutation_digest, normalize_final_effects,
+};
 use std::collections::{HashMap, HashSet};
 
 /// One transaction proven committed by a valid durable decision.
@@ -30,6 +33,11 @@ impl RecoveredTransaction {
     #[must_use]
     pub fn mutations(&self) -> &[LoggedMutation] {
         &self.mutations
+    }
+
+    /// Return the same canonical physical write-set view used by live commit.
+    pub fn final_effects(&self) -> Result<Vec<FinalEffect>, FinalWriteSetError> {
+        normalize_final_effects(self.txn_id, &self.mutations)
     }
 
     #[must_use]
@@ -174,7 +182,7 @@ impl RecoveryAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{CommitDecision, StorageObjectId};
+    use crate::vnext::{CommitDecision, MutationKind, StorageObjectId};
 
     fn lsn(offset: u64) -> Lsn {
         Lsn::from_wal_position(0, offset).expect("test LSN fits")
@@ -232,6 +240,47 @@ mod tests {
         );
         assert_eq!(committed.mutations(), first.as_slice());
         assert_eq!(recovery.pending_transactions(), 1);
+    }
+
+    #[test]
+    fn recovered_transaction_uses_shared_final_effect_normalization() {
+        let mutations = vec![
+            LoggedMutation::ordered_put(
+                TxnId::new(3),
+                0,
+                StorageObjectId::new(9),
+                b"same".to_vec(),
+                b"first".to_vec(),
+            ),
+            LoggedMutation::ordered_delete(
+                TxnId::new(3),
+                1,
+                StorageObjectId::new(9),
+                b"same".to_vec(),
+            ),
+        ];
+        let decision = CommitDecision::new(
+            TxnId::new(3),
+            CommitSeq::new(1),
+            2,
+            mutation_digest(&mutations).expect("digest"),
+        );
+        let mut recovery = RecoveryAssembler::new();
+        recovery
+            .push(lsn(10), LogRecord::Mutation(mutations[0].clone()))
+            .expect("first mutation");
+        recovery
+            .push(lsn(20), LogRecord::Mutation(mutations[1].clone()))
+            .expect("second mutation");
+        let recovered = recovery
+            .push(lsn(30), LogRecord::Commit(decision))
+            .expect("commit validates")
+            .expect("transaction emits");
+
+        let effects = recovered.final_effects().expect("normalizes");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].ordinal(), 1);
+        assert_eq!(effects[0].kind(), MutationKind::OrderedDelete);
     }
 
     #[test]
