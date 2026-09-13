@@ -20,6 +20,9 @@ mod ordered_mvcc_read;
 mod ordered_recovery;
 mod ordered_txn_read;
 mod page_dependency;
+mod page_image;
+mod page_map;
+mod page_store;
 mod recovery;
 mod segment_log;
 mod translation;
@@ -38,7 +41,9 @@ pub use commit_append::{CommitAppendError, CommitAppender};
 pub use frame::{
     FrameMeta, FramePin, FrameState, FrameTransitionError, FrameVersion, FrameWriteLatch,
 };
-pub use ids::{FrameId, FrameIncarnation, FrameRef, PageId, PageKey, StorageObjectId};
+pub use ids::{
+    FrameId, FrameIncarnation, FrameRef, PageId, PageKey, StorageObjectId, StoreIncarnation,
+};
 pub use log::{
     CommitDecision, LogEncodeError, LogParseStatus, LogRecord, LoggedMutation, MutationKind,
     ParsedLogRecord, mutation_digest, parse_log_prefix, parse_log_prefix_frames,
@@ -67,6 +72,9 @@ pub use page_dependency::{
     DependencyCheckedPageIo, PageDependencies, PageDependencyError, PageDependencyTable,
     PageMaterialization,
 };
+pub use page_image::{ImageLocation, PageImageMetadata};
+pub use page_map::{PageMap, PageMapEntry, PageMapId, PageMapRef};
+pub use page_store::{PageStoreError, PageStoreOperation, PersistentPageIo};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};

@@ -119,6 +119,44 @@ impl FrameIncarnation {
     }
 }
 
+/// Durable identity of one physical store incarnation.
+///
+/// Unlike [`FrameIncarnation`], this identity is persisted. It binds page
+/// images, page maps and later WAL/undo/manifest components to the same store so
+/// numeric offsets cannot accidentally validate a foreign component. All-zero
+/// bytes are not a valid incarnation.
+#[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StoreIncarnation([u8; 16]);
+
+impl StoreIncarnation {
+    /// Construct an incarnation from its persisted bytes, rejecting all zeroes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                return Some(Self(bytes));
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Return the persisted incarnation bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Construct a deterministic nonzero incarnation for tests.
+#[cfg(test)]
+pub(crate) fn test_incarnation(tag: u64) -> StoreIncarnation {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&tag.to_le_bytes());
+    StoreIncarnation::from_bytes(bytes).expect("test incarnation is nonzero")
+}
+
 /// Stale-safe process-local reference to one resident frame incarnation.
 ///
 /// Translation tables and long-lived diagnostics must use this pair rather

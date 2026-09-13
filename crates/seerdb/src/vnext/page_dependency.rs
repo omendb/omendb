@@ -169,6 +169,42 @@ impl PageDependencyTable {
         Ok(entries.get(&key).copied().unwrap_or_default())
     }
 
+    /// Whether the current durable frontiers cover these exact requirements.
+    #[must_use]
+    pub(crate) fn frontiers_cover(&self, required: PageDependencies) -> bool {
+        required.is_satisfied_by(
+            self.durable_wal(),
+            self.durable_undo.load(Ordering::Acquire),
+        )
+    }
+
+    /// Capture one page's conservative requirements, refusing the write when
+    /// either durable frontier does not cover them.
+    ///
+    /// The returned value is the exact requirement that was checked, so a
+    /// persistent backend can encode the captured requirement instead of
+    /// repeating the lookup and risking a different answer.
+    pub(crate) fn checked_requirements(&self, key: PageKey) -> io::Result<PageDependencies> {
+        let required = self
+            .requirements(key)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let durable_wal = self.durable_wal();
+        let durable_undo = self.durable_undo.load(Ordering::Acquire);
+        if !required.is_satisfied_by(durable_wal, durable_undo) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "page {key:?} requires WAL {:?} and undo {:?}; durable frontiers are {:?} and {:?}",
+                    required.required_wal(),
+                    required.required_undo(),
+                    durable_wal,
+                    self.durable_undo(),
+                ),
+            ));
+        }
+        Ok(required)
+    }
+
     /// Advance the durable WAL frontier after a successful barrier.
     pub fn advance_wal(&self, durable: Lsn) {
         self.durable_wal.fetch_max(durable.get(), Ordering::AcqRel);
@@ -239,24 +275,7 @@ impl PageIo for DependencyCheckedPageIo {
     }
 
     fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
-        let required = self
-            .dependencies
-            .requirements(key)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let durable_wal = self.dependencies.durable_wal();
-        let durable_undo = self.dependencies.durable_undo.load(Ordering::Acquire);
-        if !required.is_satisfied_by(durable_wal, durable_undo) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "page {key:?} requires WAL {:?} and undo {:?}; durable frontiers are {:?} and {:?}",
-                    required.required_wal(),
-                    required.required_undo(),
-                    durable_wal,
-                    self.dependencies.durable_undo(),
-                ),
-            ));
-        }
+        self.dependencies.checked_requirements(key)?;
         self.inner.write_page(key, source)
     }
 }
