@@ -5,13 +5,17 @@
 //! a durable commit decision. Recovery may see interleaved transaction records,
 //! but a transaction becomes replayable only after its commit decision validates
 //! the expected mutation count and digest.
+//!
+//! The fixed header has its own checksum, including the length. Recovery must
+//! validate it before using the length to classify an incomplete final append.
 
 use super::{CommitSeq, Lsn, StorageObjectId, TxnId};
 
-const LOG_FORMAT_VERSION: u16 = 1;
-const RECORD_HEADER_SIZE: usize = 8; // length + version + kind + flags
-const RECORD_TRAILER_SIZE: usize = 4; // crc32c
-const MIN_RECORD_LENGTH: usize = 2 + 1 + 1 + RECORD_TRAILER_SIZE;
+const LOG_FORMAT_VERSION: u16 = 2;
+const HEADER_CHECKSUM_OFFSET: usize = 8;
+const RECORD_HEADER_SIZE: usize = 12; // length + version + kind + flags + header CRC
+const RECORD_TRAILER_SIZE: usize = 4; // whole-record CRC32C
+const MIN_RECORD_LENGTH: usize = RECORD_HEADER_SIZE - 4 + RECORD_TRAILER_SIZE;
 const MUTATION_FIXED_PAYLOAD: usize = 8 + 4 + 8 + 1 + 4 + 4;
 
 /// Classification of the suffix after parsing a vNext log prefix.
@@ -19,9 +23,9 @@ const MUTATION_FIXED_PAYLOAD: usize = 8 + 4 + 8 + 1 + 4 + 4;
 pub enum LogParseStatus {
     /// Every input byte belongs to a complete valid record.
     Complete,
-    /// The final record is truncated and may be a torn append.
+    /// The final header or a record with a validated header is truncated.
     Incomplete,
-    /// A complete record has invalid framing, checksum, version, or semantics.
+    /// A complete header or record has invalid framing, checksum, or semantics.
     Corrupt,
 }
 
@@ -211,7 +215,7 @@ pub enum LogEncodeError {
 }
 
 impl LogRecord {
-    /// Serialize one record as length + version/kind/flags + payload + CRC32C.
+    /// Serialize a checksummed fixed header, payload, and whole-record CRC32C.
     pub fn to_bytes(&self) -> Result<Vec<u8>, LogEncodeError> {
         let (kind, payload) = match self {
             Self::Mutation(mutation) => (1u8, encode_mutation_payload(mutation)?),
@@ -219,10 +223,8 @@ impl LogRecord {
             Self::Abort(txn_id) => (3u8, txn_id.get().to_le_bytes().to_vec()),
         };
 
-        let length = 2usize
-            .checked_add(1)
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| value.checked_add(payload.len()))
+        let length = (RECORD_HEADER_SIZE - 4)
+            .checked_add(payload.len())
             .and_then(|value| value.checked_add(RECORD_TRAILER_SIZE))
             .ok_or(LogEncodeError::RecordTooLarge)?;
         let length_u32 = u32::try_from(length).map_err(|_| LogEncodeError::RecordTooLarge)?;
@@ -235,8 +237,10 @@ impl LogRecord {
         bytes.extend_from_slice(&LOG_FORMAT_VERSION.to_le_bytes());
         bytes.push(kind);
         bytes.push(0); // reserved flags; unknown flags fail closed on decode.
+        let header_checksum = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&header_checksum.to_le_bytes());
         bytes.extend_from_slice(&payload);
-        let checksum = crc32c::crc32c(&bytes[4..]);
+        let checksum = crc32c::crc32c(&bytes);
         bytes.extend_from_slice(&checksum.to_le_bytes());
         Ok(bytes)
     }
@@ -279,14 +283,15 @@ pub fn parse_log_prefix_frames(bytes: &[u8]) -> (Vec<ParsedLogRecord>, LogParseS
     let mut offset = 0usize;
 
     while offset < bytes.len() {
-        if bytes.len() - offset < 4 {
+        if bytes.len() - offset < RECORD_HEADER_SIZE {
             return (records, LogParseStatus::Incomplete);
         }
+        let header = &bytes[offset..offset + RECORD_HEADER_SIZE];
+        if !valid_record_header(header) {
+            return (records, LogParseStatus::Corrupt);
+        }
         let length = u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
+            header[0], header[1], header[2], header[3],
         ]) as usize;
         if length < MIN_RECORD_LENGTH {
             return (records, LogParseStatus::Corrupt);
@@ -314,6 +319,21 @@ pub fn parse_log_prefix_frames(bytes: &[u8]) -> (Vec<ParsedLogRecord>, LogParseS
     }
 
     (records, LogParseStatus::Complete)
+}
+
+fn valid_record_header(header: &[u8]) -> bool {
+    if header.len() != RECORD_HEADER_SIZE {
+        return false;
+    }
+    let Some(version) = read_u32(header, 4) else {
+        return false;
+    };
+    // Read version separately from kind/flags; all four bytes are checksummed.
+    if version as u16 != LOG_FORMAT_VERSION || header[7] != 0 || !matches!(header[6], 1..=3) {
+        return false;
+    }
+    read_u32(header, HEADER_CHECKSUM_OFFSET)
+        == Some(crc32c::crc32c(&header[..HEADER_CHECKSUM_OFFSET]))
 }
 
 fn encode_mutation_payload(mutation: &LoggedMutation) -> Result<Vec<u8>, LogEncodeError> {
@@ -350,7 +370,9 @@ fn encode_commit_payload(decision: CommitDecision) -> Vec<u8> {
 }
 
 fn decode_complete_record(frame: &[u8]) -> Option<LogRecord> {
-    if frame.len() < RECORD_HEADER_SIZE + RECORD_TRAILER_SIZE {
+    if frame.len() < RECORD_HEADER_SIZE + RECORD_TRAILER_SIZE
+        || !valid_record_header(&frame[..RECORD_HEADER_SIZE])
+    {
         return None;
     }
     let length = u32::from_le_bytes(frame[0..4].try_into().ok()?) as usize;
@@ -359,14 +381,10 @@ fn decode_complete_record(frame: &[u8]) -> Option<LogRecord> {
     }
     let payload_end = frame.len().checked_sub(RECORD_TRAILER_SIZE)?;
     let stored_checksum = u32::from_le_bytes(frame[payload_end..].try_into().ok()?);
-    if stored_checksum != crc32c::crc32c(&frame[4..payload_end]) {
+    if stored_checksum != crc32c::crc32c(&frame[..payload_end]) {
         return None;
     }
-    let version = u16::from_le_bytes(frame[4..6].try_into().ok()?);
-    if version != LOG_FORMAT_VERSION || frame[7] != 0 {
-        return None;
-    }
-    let payload = &frame[8..payload_end];
+    let payload = &frame[RECORD_HEADER_SIZE..payload_end];
     match frame[6] {
         1 => decode_mutation_payload(payload).map(LogRecord::Mutation),
         2 => decode_commit_payload(payload).map(LogRecord::Commit),
@@ -522,28 +540,62 @@ mod tests {
     }
 
     #[test]
+    fn every_truncation_preserves_the_valid_prefix() {
+        let first = LogRecord::Abort(TxnId::new(1)).to_bytes().expect("encode");
+        let second = LogRecord::Mutation(mutations()[0].clone())
+            .to_bytes()
+            .expect("encode");
+        for cut in 1..second.len() {
+            let mut bytes = first.clone();
+            bytes.extend_from_slice(&second[..cut]);
+            let (records, status) = parse_log_prefix(&bytes);
+            assert_eq!(status, LogParseStatus::Incomplete, "cut {cut}");
+            assert_eq!(records, vec![LogRecord::Abort(TxnId::new(1))]);
+        }
+    }
+
+    #[test]
+    fn corrupt_length_is_not_a_repairable_torn_tail() {
+        let first = LogRecord::Abort(TxnId::new(1)).to_bytes().expect("encode");
+        let second = LogRecord::Abort(TxnId::new(2)).to_bytes().expect("encode");
+        for byte in 0..4 {
+            for bit in 0..8 {
+                let mut bytes = first.clone();
+                bytes.extend_from_slice(&second);
+                bytes[first.len() + byte] ^= 1 << bit;
+                let (frames, status) = parse_log_prefix_frames(&bytes);
+                assert_eq!(status, LogParseStatus::Corrupt, "byte {byte}, bit {bit}");
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].end_offset(), first.len() as u64);
+            }
+        }
+    }
+
+    #[test]
     fn checksum_unknown_kind_version_and_flags_fail_closed() {
         let record = LogRecord::Abort(TxnId::new(9))
             .to_bytes()
             .expect("record encodes");
 
         let mut checksum = record.clone();
-        checksum[8] ^= 0x80;
+        checksum[RECORD_HEADER_SIZE] ^= 0x80;
         assert_eq!(parse_log_prefix(&checksum).1, LogParseStatus::Corrupt);
 
         let mut kind = record.clone();
         kind[6] = 0xff;
-        rewrite_checksum(&mut kind);
+        rewrite_checksums(&mut kind);
         assert_eq!(parse_log_prefix(&kind).1, LogParseStatus::Corrupt);
 
-        let mut version = record.clone();
-        version[4..6].copy_from_slice(&2u16.to_le_bytes());
-        rewrite_checksum(&mut version);
-        assert_eq!(parse_log_prefix(&version).1, LogParseStatus::Corrupt);
+        for unsupported in [1u16, LOG_FORMAT_VERSION + 1] {
+            let mut version = record.clone();
+            version[4..6].copy_from_slice(&unsupported.to_le_bytes());
+            rewrite_checksums(&mut version);
+            assert_eq!(parse_log_prefix(&version).1, LogParseStatus::Corrupt);
+        }
 
         let mut flags = record;
         flags[7] = 1;
-        rewrite_checksum(&mut flags);
+        rewrite_checksums(&mut flags);
         assert_eq!(parse_log_prefix(&flags).1, LogParseStatus::Corrupt);
     }
 
@@ -562,9 +614,12 @@ mod tests {
         );
     }
 
-    fn rewrite_checksum(bytes: &mut [u8]) {
+    fn rewrite_checksums(bytes: &mut [u8]) {
+        let header_checksum = crc32c::crc32c(&bytes[..HEADER_CHECKSUM_OFFSET]);
+        bytes[HEADER_CHECKSUM_OFFSET..RECORD_HEADER_SIZE]
+            .copy_from_slice(&header_checksum.to_le_bytes());
         let end = bytes.len() - RECORD_TRAILER_SIZE;
-        let checksum = crc32c::crc32c(&bytes[4..end]);
+        let checksum = crc32c::crc32c(&bytes[..end]);
         bytes[end..].copy_from_slice(&checksum.to_le_bytes());
     }
 }

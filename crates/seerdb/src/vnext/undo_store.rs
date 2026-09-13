@@ -6,9 +6,9 @@
 //! an undo version until both the transaction WAL and this store's durability
 //! frontier cover the dependency.
 //!
-//! Recovery truncates only an incomplete final frame. A complete frame with an
-//! unknown format, non-contiguous ID, bad checksum, or malformed MVCC payload is
-//! corruption and fails closed.
+//! Recovery validates a checksummed fixed header before trusting its length.
+//! It truncates only an incomplete final header or frame, and fails closed on
+//! complete corruption. Retained undo links must point strictly backwards.
 
 use super::{MvccCodecError, MvccRecord, VersionId};
 use durable_fs::{SyncClass, fsync_dir, fsync_dir_chain, sync_file_all, sync_file_data};
@@ -19,8 +19,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const FRAME_MAGIC: [u8; 4] = *b"OMU1";
-const FRAME_VERSION: u8 = 1;
-const FRAME_HEADER_SIZE: usize = 20;
+const FRAME_VERSION: u8 = 2;
+const HEADER_CHECKSUM_OFFSET: usize = 20;
+const FRAME_HEADER_SIZE: usize = 24;
 const FRAME_CHECKSUM_SIZE: usize = 4;
 const MAX_UNDO_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
@@ -42,6 +43,7 @@ struct UndoState {
 /// A failed append or sync fences further mutation until reopen because the
 /// physical outcome may be uncertain. Indexed reads remain available while
 /// fenced because a partial failed append is never published into the index.
+/// The database owner must exclude other handles/processes for this path.
 pub struct UndoStore {
     sync_class: SyncClass,
     state: Mutex<UndoState>,
@@ -53,7 +55,8 @@ impl UndoStore {
     /// Open or create an undo file and repair an incomplete final frame.
     ///
     /// Existing complete frames are synchronized before the store is returned,
-    /// so `durable_version` is immediately meaningful after recovery.
+    /// so `durable_version` is immediately meaningful after recovery. Scanning
+    /// retains only one frame's payload at a time plus the version-offset index.
     pub fn open(path: impl AsRef<Path>, sync_class: SyncClass) -> Result<Self, UndoStoreError> {
         let path = path.as_ref();
         let parent = publication_parent(path);
@@ -113,8 +116,8 @@ impl UndoStore {
 
     /// Append one complete logical before-image and return its stable ID.
     ///
-    /// Encoding and size validation happen before file I/O. Once file I/O has
-    /// started, any error fences the store until reopen.
+    /// Encoding, size and predecessor validation happen before file I/O. Once
+    /// file I/O has started, any error fences the store until reopen.
     pub fn append(&self, record: &MvccRecord) -> Result<VersionId, UndoStoreError> {
         let payload = record.to_bytes()?;
         if payload.len() > MAX_UNDO_RECORD_BYTES {
@@ -133,6 +136,7 @@ impl UndoStore {
             return Err(UndoStoreError::VersionIdExhausted);
         }
         let id = VersionId::new(raw_id);
+        validate_predecessor(record, id)?;
         let frame = encode_frame(id, &payload)?;
         let frame_length =
             u64::try_from(frame.len()).map_err(|_| UndoStoreError::RecordTooLarge)?;
@@ -252,6 +256,14 @@ pub enum UndoStoreError {
     /// The requested version does not exist in this store.
     #[error("undo version {0:?} is not present")]
     MissingVersion(VersionId),
+    /// A before-image must link only to an already appended, nonzero version.
+    #[error("undo version {version:?} has invalid predecessor {previous:?}")]
+    InvalidPredecessor {
+        /// Version containing the link.
+        version: VersionId,
+        /// Reserved, self-referential or forward link.
+        previous: VersionId,
+    },
     /// The logical version ID domain has been exhausted.
     #[error("undo version ID space is exhausted")]
     VersionIdExhausted,
@@ -295,6 +307,15 @@ fn version_index(id: VersionId) -> Result<usize, UndoStoreError> {
     usize::try_from(raw - 1).map_err(|_| UndoStoreError::MissingVersion(id))
 }
 
+fn validate_predecessor(record: &MvccRecord, version: VersionId) -> Result<(), UndoStoreError> {
+    if let Some(previous) = record.undo_head() {
+        if previous.get() == 0 || previous.get() >= version.get() {
+            return Err(UndoStoreError::InvalidPredecessor { version, previous });
+        }
+    }
+    Ok(())
+}
+
 fn encode_frame(id: VersionId, payload: &[u8]) -> Result<Vec<u8>, UndoStoreError> {
     if payload.len() > MAX_UNDO_RECORD_BYTES {
         return Err(UndoStoreError::RecordTooLarge);
@@ -311,6 +332,8 @@ fn encode_frame(id: VersionId, payload: &[u8]) -> Result<Vec<u8>, UndoStoreError
     frame.extend_from_slice(&0u16.to_le_bytes());
     frame.extend_from_slice(&id.get().to_le_bytes());
     frame.extend_from_slice(&payload_len.to_le_bytes());
+    let header_checksum = crc32c::crc32c(&frame);
+    frame.extend_from_slice(&header_checksum.to_le_bytes());
     frame.extend_from_slice(payload);
     let checksum = crc32c::crc32c(&frame);
     frame.extend_from_slice(&checksum.to_le_bytes());
@@ -321,28 +344,20 @@ fn scan_and_repair(
     file: &mut File,
     sync_class: SyncClass,
 ) -> Result<(Vec<UndoFrame>, u64), UndoStoreError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| UndoStoreError::Io {
-            operation: UndoIoOperation::Open,
-            source,
-        })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| UndoStoreError::Io {
-            operation: UndoIoOperation::Open,
-            source,
-        })?;
-
+    let length = file.metadata().map_err(open_error)?.len();
+    file.seek(SeekFrom::Start(0)).map_err(open_error)?;
     let mut index = Vec::new();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let remaining = bytes.len() - offset;
-        if remaining < FRAME_HEADER_SIZE {
-            return repair_tail(file, &index, offset, sync_class);
+    let mut offset = 0u64;
+    let mut header = [0u8; FRAME_HEADER_SIZE];
+
+    while offset < length {
+        let remaining = length - offset;
+        if remaining < FRAME_HEADER_SIZE as u64 {
+            return repair_tail(file, index, offset, sync_class);
         }
-        let header = &bytes[offset..offset + FRAME_HEADER_SIZE];
-        validate_header(header)?;
-        let raw_id = read_u64(header, 8).ok_or(UndoStoreError::Corruption("missing version ID"))?;
+        file.read_exact(&mut header).map_err(open_error)?;
+        validate_header(&header)?;
+        let raw_id = read_u64(&header, 8).ok_or(UndoStoreError::Corruption("missing version ID"))?;
         let expected_id = u64::try_from(index.len())
             .map_err(|_| UndoStoreError::VersionIdExhausted)?
             .checked_add(1)
@@ -352,7 +367,7 @@ fn scan_and_repair(
                 "retained undo version IDs are not contiguous",
             ));
         }
-        let payload_len = read_u32(header, 16)
+        let payload_len = read_u32(&header, 16)
             .ok_or(UndoStoreError::Corruption("missing payload length"))?
             as usize;
         if payload_len > MAX_UNDO_RECORD_BYTES {
@@ -364,32 +379,40 @@ fn scan_and_repair(
             .checked_add(payload_len)
             .and_then(|length| length.checked_add(FRAME_CHECKSUM_SIZE))
             .ok_or(UndoStoreError::Corruption("undo frame length overflows"))?;
-        if remaining < frame_len {
-            return repair_tail(file, &index, offset, sync_class);
+        let frame_length =
+            u64::try_from(frame_len).map_err(|_| UndoStoreError::FileOffsetExhausted)?;
+        if remaining < frame_length {
+            return repair_tail(file, index, offset, sync_class);
         }
-        let frame = &bytes[offset..offset + frame_len];
-        validate_complete_frame(frame, VersionId::new(raw_id))?;
+        let mut frame = vec![0u8; frame_len];
+        frame[..FRAME_HEADER_SIZE].copy_from_slice(&header);
+        file.read_exact(&mut frame[FRAME_HEADER_SIZE..])
+            .map_err(open_error)?;
+        validate_complete_frame(&frame, VersionId::new(raw_id))?;
         index.push(UndoFrame {
-            offset: u64::try_from(offset).map_err(|_| UndoStoreError::FileOffsetExhausted)?,
+            offset,
             length: frame_len,
         });
-        offset += frame_len;
+        offset += frame_length;
     }
 
-    Ok((
-        index,
-        u64::try_from(offset).map_err(|_| UndoStoreError::FileOffsetExhausted)?,
-    ))
+    Ok((index, offset))
+}
+
+fn open_error(source: io::Error) -> UndoStoreError {
+    UndoStoreError::Io {
+        operation: UndoIoOperation::Open,
+        source,
+    }
 }
 
 fn repair_tail(
     file: &mut File,
-    index: &[UndoFrame],
-    valid_len: usize,
+    index: Vec<UndoFrame>,
+    valid_len: u64,
     sync_class: SyncClass,
 ) -> Result<(Vec<UndoFrame>, u64), UndoStoreError> {
-    let valid = u64::try_from(valid_len).map_err(|_| UndoStoreError::FileOffsetExhausted)?;
-    file.set_len(valid).map_err(|source| UndoStoreError::Io {
+    file.set_len(valid_len).map_err(|source| UndoStoreError::Io {
         operation: UndoIoOperation::Repair,
         source,
     })?;
@@ -397,7 +420,7 @@ fn repair_tail(
         operation: UndoIoOperation::Repair,
         source,
     })?;
-    Ok((index.to_vec(), valid))
+    Ok((index, valid_len))
 }
 
 fn read_frame(
@@ -423,6 +446,11 @@ fn validate_header(header: &[u8]) -> Result<(), UndoStoreError> {
         return Err(UndoStoreError::Corruption(
             "unsupported undo frame version or flags",
         ));
+    }
+    if read_u32(header, HEADER_CHECKSUM_OFFSET)
+        != Some(crc32c::crc32c(&header[..HEADER_CHECKSUM_OFFSET]))
+    {
+        return Err(UndoStoreError::Corruption("undo header checksum mismatch"));
     }
     Ok(())
 }
@@ -462,7 +490,9 @@ fn validate_complete_frame(
     if crc32c::crc32c(&frame[..checksum_offset]) != stored {
         return Err(UndoStoreError::Corruption("undo frame checksum mismatch"));
     }
-    MvccRecord::from_bytes(&frame[FRAME_HEADER_SIZE..checksum_offset]).map_err(Into::into)
+    let record = MvccRecord::from_bytes(&frame[FRAME_HEADER_SIZE..checksum_offset])?;
+    validate_predecessor(&record, expected_id)?;
+    Ok(record)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
@@ -568,6 +598,90 @@ mod tests {
             store.get(VersionId::new(1)).expect("version survives"),
             record(5, None, b"stable")
         );
+    }
+
+    #[test]
+    fn every_truncation_preserves_complete_undo_versions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("undo.log");
+        let first = encode_frame(
+            VersionId::new(1),
+            &record(1, None, b"first").to_bytes().expect("payload"),
+        )
+        .expect("frame");
+        let second = encode_frame(
+            VersionId::new(2),
+            &record(2, Some(1), b"second").to_bytes().expect("payload"),
+        )
+        .expect("frame");
+        for cut in 1..second.len() {
+            let mut bytes = first.clone();
+            bytes.extend_from_slice(&second[..cut]);
+            fs::write(&path, bytes).expect("write partial file");
+            let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("repair");
+            assert_eq!(store.durable_version(), Some(VersionId::new(1)), "cut {cut}");
+            assert_eq!(fs::read(&path).expect("read repaired file"), first);
+            assert_eq!(store.get(VersionId::new(1)).expect("read"), record(1, None, b"first"));
+        }
+    }
+
+    #[test]
+    fn corrupt_lengths_fail_without_truncating_the_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("undo.log");
+        let frame = encode_frame(
+            VersionId::new(1),
+            &record(1, None, b"stable").to_bytes().expect("payload"),
+        )
+        .expect("frame");
+        for byte in 16..20 {
+            for bit in 0..8 {
+                let mut corrupt = frame.clone();
+                corrupt[byte] ^= 1 << bit;
+                fs::write(&path, &corrupt).expect("write corruption");
+                assert!(matches!(
+                    UndoStore::open(&path, SyncClass::KernelBarrier),
+                    Err(UndoStoreError::Corruption("undo header checksum mismatch"))
+                ));
+                assert_eq!(fs::read(&path).expect("read unchanged file"), corrupt);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_predecessors_do_not_append_or_fence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("undo.log");
+        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("open");
+        for previous in [0, 1, 9] {
+            assert!(matches!(
+                store.append(&record(1, Some(previous), b"invalid")),
+                Err(UndoStoreError::InvalidPredecessor { .. })
+            ));
+        }
+        assert_eq!(fs::metadata(&path).expect("metadata").len(), 0);
+        assert_eq!(store.durable_version(), None);
+        assert!(!store.is_fenced());
+        assert_eq!(store.append(&record(1, None, b"valid")).expect("append"), VersionId::new(1));
+    }
+
+    #[test]
+    fn checksummed_self_and_forward_links_fail_closed_on_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("undo.log");
+        for previous in [1, 2] {
+            let frame = encode_frame(
+                VersionId::new(1),
+                &record(1, Some(previous), b"invalid").to_bytes().expect("payload"),
+            )
+            .expect("frame");
+            fs::write(&path, &frame).expect("write invalid link");
+            assert!(matches!(
+                UndoStore::open(&path, SyncClass::KernelBarrier),
+                Err(UndoStoreError::InvalidPredecessor { .. })
+            ));
+            assert_eq!(fs::read(&path).expect("read unchanged file"), frame);
+        }
     }
 
     #[test]
