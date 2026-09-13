@@ -265,7 +265,9 @@ pub enum MvccCodecError {
     ReservedOwner,
     #[error("MVCC install identity uses reserved transaction ID zero")]
     ReservedInstallTransaction,
-    #[error("transaction-owned MVCC record owner {owner:?} disagrees with install identity {install:?}")]
+    #[error(
+        "transaction-owned MVCC record owner {owner:?} disagrees with install identity {install:?}"
+    )]
     InstallOwnerMismatch { owner: TxnId, install: TxnId },
     #[error("MVCC inline value exceeds the envelope length domain")]
     ValueTooLarge,
@@ -551,12 +553,8 @@ mod tests {
 
     #[test]
     fn malformed_and_unknown_record_envelopes_fail_closed() {
-        let record = MvccRecord::installed(
-            TxnId::new(3),
-            9,
-            None,
-            MvccValue::Inline(b"x".to_vec()),
-        );
+        let record =
+            MvccRecord::installed(TxnId::new(3), 9, None, MvccValue::Inline(b"x".to_vec()));
         let encoded = record.to_bytes().expect("record encodes");
         assert!(matches!(
             MvccRecord::from_bytes(&encoded[..encoded.len() - 1]),
