@@ -51,6 +51,7 @@ struct SegmentState {
 /// not for transaction validation or page installation. The `LogDevice` seam
 /// permits replacing this with atomic reservation plus positional writes or a
 /// remote ordered log without changing transaction/recovery code.
+/// The database owner must exclude other handles/processes for this directory.
 pub struct SegmentedFileLogDevice {
     directory: PathBuf,
     config: SegmentedLogConfig,
@@ -59,6 +60,10 @@ pub struct SegmentedFileLogDevice {
 
 impl SegmentedFileLogDevice {
     /// Open or create a segmented WAL directory and repair a torn final suffix.
+    ///
+    /// Complete recovered bytes may still be in the operating system's cache.
+    /// Retained segments and directory entries therefore need a new barrier
+    /// before a recovered prefix can be published as confirmed durable.
     pub fn open(directory: impl AsRef<Path>, config: SegmentedLogConfig) -> io::Result<Self> {
         validate_config(config)?;
         let directory = directory.as_ref().to_path_buf();
@@ -70,7 +75,7 @@ impl SegmentedFileLogDevice {
 
         let segments = list_segments(&directory)?;
         validate_segment_sequence(&segments)?;
-        let (segment, file, offset, directory_dirty) = if let Some(&segment) = segments.last() {
+        let (segment, file, offset) = if let Some(&segment) = segments.last() {
             let path = segment_path(&directory, segment);
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let metadata_len = file.metadata()?.len();
@@ -82,11 +87,11 @@ impl SegmentedFileLogDevice {
             }
             let valid_len = repair_final_segment(&mut file, metadata_len, config.sync_class)?;
             file.seek(SeekFrom::Start(valid_len))?;
-            (segment, file, valid_len, false)
+            (segment, file, valid_len)
         } else {
             let segment = 0;
             let file = create_segment(&directory, segment)?;
-            (segment, file, 0, true)
+            (segment, file, 0)
         };
 
         Ok(Self {
@@ -96,8 +101,8 @@ impl SegmentedFileLogDevice {
                 segment,
                 offset,
                 file,
-                dirty_segments: BTreeSet::new(),
-                directory_dirty,
+                dirty_segments: segments.into_iter().collect(),
+                directory_dirty: true,
             }),
         })
     }
@@ -106,7 +111,9 @@ impl SegmentedFileLogDevice {
     ///
     /// This is a recovery baseline, not the eventual streaming replay path.
     /// Every retained segment must be fully framed because `open` has already
-    /// truncated any incomplete suffix from the final segment.
+    /// truncated any incomplete suffix from the final segment. Parsing alone
+    /// does not establish a durability barrier: the recovery coordinator must
+    /// synchronize the recovered prefix before publishing its durable frontier.
     pub fn recover_records(&self) -> io::Result<Vec<(Lsn, LogRecord)>> {
         let segments = list_segments(&self.directory)?;
         validate_segment_sequence(&segments)?;
@@ -388,6 +395,40 @@ mod tests {
     }
 
     #[test]
+    fn recovered_segments_require_new_durability_barriers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = SegmentedLogConfig {
+            segment_bytes: 32,
+            sync_class: SyncClass::KernelBarrier,
+        };
+        let device = SegmentedFileLogDevice::open(directory.path(), config).expect("open");
+        let first = LogRecord::Abort(TxnId::new(1)).to_bytes().expect("encode");
+        let second = LogRecord::Abort(TxnId::new(2)).to_bytes().expect("encode");
+        let first_lsn = device.append(&first).expect("append first");
+        let second_lsn = device.append(&second).expect("append second");
+        assert_eq!(first_lsn.segment(), 0);
+        assert_eq!(second_lsn.segment(), 1);
+        // Simulate process restart without making either append durable first.
+        drop(device);
+
+        let reopened = SegmentedFileLogDevice::open(directory.path(), config).expect("reopen");
+        {
+            let state = reopened.state.lock().expect("state");
+            assert_eq!(state.dirty_segments, BTreeSet::from([0, 1]));
+            assert!(state.directory_dirty);
+        }
+        reopened.sync_through(first_lsn).expect("first barrier");
+        {
+            let state = reopened.state.lock().expect("state");
+            assert_eq!(state.dirty_segments, BTreeSet::from([1]));
+            assert!(!state.directory_dirty);
+        }
+        reopened.sync_through(second_lsn).expect("second barrier");
+        assert!(reopened.state.lock().expect("state").dirty_segments.is_empty());
+        assert_eq!(reopened.recover_records().expect("recover").len(), 2);
+    }
+
+    #[test]
     fn reopen_truncates_only_incomplete_final_record() {
         let directory = tempfile::tempdir().expect("tempdir");
         let config = SegmentedLogConfig {
@@ -424,6 +465,30 @@ mod tests {
             reopened.recover_records().expect("records recover"),
             vec![(first_lsn, LogRecord::Abort(TxnId::new(1)))]
         );
+    }
+
+    #[test]
+    fn corrupt_length_is_not_truncated_on_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = SegmentedLogConfig {
+            segment_bytes: 4096,
+            sync_class: SyncClass::KernelBarrier,
+        };
+        let device = SegmentedFileLogDevice::open(directory.path(), config).expect("open");
+        let record = LogRecord::Abort(TxnId::new(7)).to_bytes().expect("encode");
+        let lsn = device.append(&record).expect("append");
+        device.sync_through(lsn).expect("sync");
+        drop(device);
+
+        let active = segment_path(directory.path(), 0);
+        let mut corrupt = fs::read(&active).expect("read");
+        corrupt[0] ^= 0x80;
+        fs::write(&active, &corrupt).expect("write corruption");
+        assert!(matches!(
+            SegmentedFileLogDevice::open(directory.path(), config),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(fs::read(&active).expect("read unchanged file"), corrupt);
     }
 
     #[test]

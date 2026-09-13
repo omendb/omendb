@@ -290,9 +290,7 @@ pub fn parse_log_prefix_frames(bytes: &[u8]) -> (Vec<ParsedLogRecord>, LogParseS
         if !valid_record_header(header) {
             return (records, LogParseStatus::Corrupt);
         }
-        let length = u32::from_le_bytes([
-            header[0], header[1], header[2], header[3],
-        ]) as usize;
+        let length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
         if length < MIN_RECORD_LENGTH {
             return (records, LogParseStatus::Corrupt);
         }
@@ -325,11 +323,8 @@ fn valid_record_header(header: &[u8]) -> bool {
     if header.len() != RECORD_HEADER_SIZE {
         return false;
     }
-    let Some(version) = read_u32(header, 4) else {
-        return false;
-    };
-    // Read version separately from kind/flags; all four bytes are checksummed.
-    if version as u16 != LOG_FORMAT_VERSION || header[7] != 0 || !matches!(header[6], 1..=3) {
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != LOG_FORMAT_VERSION || header[7] != 0 || !matches!(header[6], 1..=3) {
         return false;
     }
     read_u32(header, HEADER_CHECKSUM_OFFSET)

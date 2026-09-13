@@ -308,10 +308,11 @@ fn version_index(id: VersionId) -> Result<usize, UndoStoreError> {
 }
 
 fn validate_predecessor(record: &MvccRecord, version: VersionId) -> Result<(), UndoStoreError> {
-    if let Some(previous) = record.undo_head() {
-        if previous.get() == 0 || previous.get() >= version.get() {
-            return Err(UndoStoreError::InvalidPredecessor { version, previous });
-        }
+    if let Some(previous) = record
+        .undo_head()
+        .filter(|previous| previous.get() == 0 || previous.get() >= version.get())
+    {
+        return Err(UndoStoreError::InvalidPredecessor { version, previous });
     }
     Ok(())
 }
@@ -357,7 +358,8 @@ fn scan_and_repair(
         }
         file.read_exact(&mut header).map_err(open_error)?;
         validate_header(&header)?;
-        let raw_id = read_u64(&header, 8).ok_or(UndoStoreError::Corruption("missing version ID"))?;
+        let raw_id =
+            read_u64(&header, 8).ok_or(UndoStoreError::Corruption("missing version ID"))?;
         let expected_id = u64::try_from(index.len())
             .map_err(|_| UndoStoreError::VersionIdExhausted)?
             .checked_add(1)
@@ -412,10 +414,11 @@ fn repair_tail(
     valid_len: u64,
     sync_class: SyncClass,
 ) -> Result<(Vec<UndoFrame>, u64), UndoStoreError> {
-    file.set_len(valid_len).map_err(|source| UndoStoreError::Io {
-        operation: UndoIoOperation::Repair,
-        source,
-    })?;
+    file.set_len(valid_len)
+        .map_err(|source| UndoStoreError::Io {
+            operation: UndoIoOperation::Repair,
+            source,
+        })?;
     sync_file_all(file, sync_class).map_err(|source| UndoStoreError::Io {
         operation: UndoIoOperation::Repair,
         source,
@@ -619,9 +622,16 @@ mod tests {
             bytes.extend_from_slice(&second[..cut]);
             fs::write(&path, bytes).expect("write partial file");
             let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("repair");
-            assert_eq!(store.durable_version(), Some(VersionId::new(1)), "cut {cut}");
+            assert_eq!(
+                store.durable_version(),
+                Some(VersionId::new(1)),
+                "cut {cut}"
+            );
             assert_eq!(fs::read(&path).expect("read repaired file"), first);
-            assert_eq!(store.get(VersionId::new(1)).expect("read"), record(1, None, b"first"));
+            assert_eq!(
+                store.get(VersionId::new(1)).expect("read"),
+                record(1, None, b"first")
+            );
         }
     }
 
@@ -662,7 +672,10 @@ mod tests {
         assert_eq!(fs::metadata(&path).expect("metadata").len(), 0);
         assert_eq!(store.durable_version(), None);
         assert!(!store.is_fenced());
-        assert_eq!(store.append(&record(1, None, b"valid")).expect("append"), VersionId::new(1));
+        assert_eq!(
+            store.append(&record(1, None, b"valid")).expect("append"),
+            VersionId::new(1)
+        );
     }
 
     #[test]
@@ -672,7 +685,9 @@ mod tests {
         for previous in [1, 2] {
             let frame = encode_frame(
                 VersionId::new(1),
-                &record(1, Some(previous), b"invalid").to_bytes().expect("payload"),
+                &record(1, Some(previous), b"invalid")
+                    .to_bytes()
+                    .expect("payload"),
             )
             .expect("frame");
             fs::write(&path, &frame).expect("write invalid link");
