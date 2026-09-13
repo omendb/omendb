@@ -4,9 +4,9 @@
 //! configured page size before a durable decision is appended. This module
 //! exercises the real v4 leaf builder without touching tree state.
 
+use super::super::BufferPool;
 use super::page_v4::{self, LeafEntryOwned, LeafValueOwned};
 use super::tree_v4::{BTreeError, BTreeObject};
-use super::super::BufferPool;
 
 impl BTreeObject {
     /// Validate that one inline key/value can fit by itself in a leaf for this
