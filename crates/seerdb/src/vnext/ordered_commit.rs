@@ -1,18 +1,22 @@
 //! Durable-WAL-first commit orchestration for ordered MVCC objects.
 //!
-//! The coordinator integrates ADR 0014's transaction order. Shared page
-//! mutation starts only after the decision WAL is durable and every required
-//! predecessor before-image has been prepared and group-synchronized. Page
-//! persistence still does not become recovery authority until structurally
-//! complete checkpoint publication lands.
+//! The coordinator integrates ADR 0014's transaction order. Write intents are
+//! acquired before predecessor validation, so write conflicts and current-record
+//! corruption are discovered before commit authority enters the WAL. Required
+//! before-images may be appended during this pre-WAL validation phase but remain
+//! unreachable garbage on a clean abort. Shared page mutation begins only after
+//! the decision WAL and all referenced undo are durable. Page persistence still
+//! does not become recovery authority until structurally complete checkpoint
+//! publication lands.
 
 use super::{
-    BTreeError, BTreeObject, BufferPool, CommitAppendError, CommitAppender, CommitPosition,
-    DurableLogError, FinalEffect, FinalWriteSetError, InstallContext, MvccCodecError, MvccRecord,
-    MvccValue, OrderedMvccInstallError, OrderedMvccInstaller, PageDependencyTable,
-    PrepareEffectResult, StatusTableError, StorageObjectId, Transaction, TransactionError,
-    TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
-    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    BTreeError, BTreeObject, BufferError, BufferPool, CommitAppendError, CommitAppender,
+    CommitPosition, DurableLogError, FinalEffect, FinalWriteSetError, InstallContext,
+    MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
+    PageDependencyTable, PrepareEffectResult, StatusTableError, StorageObjectId, Transaction,
+    TransactionError, TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId,
+    UndoStore, UndoStoreError, VersionId, VisibilityError, VisibilityFrontier, WriteIntentError,
+    WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// One coordinator is intended to represent one runtime's write-admission
 /// fence. The lower WAL/undo components have their own I/O fences; this higher
-/// fence prevents a post-decision failure from releasing logical key ownership
-/// back to a still-running writer population.
+/// fence prevents an unresolved failure from returning control to an ordinary
+/// writer population when recovery/reopen is required.
 pub struct OrderedCommitCoordinator<'a> {
     appender: &'a CommitAppender,
     statuses: &'a TransactionStatusTable,
@@ -94,7 +98,8 @@ impl<'a> OrderedCommitCoordinator<'a> {
     }
 
     /// Cleanly abort a transaction whose commit decision cannot have reached
-    /// the WAL.
+    /// the WAL. This remains available after the coordinator is fenced so a
+    /// caller can discard an active transaction before reopening the runtime.
     pub fn abort(&self, transaction: &mut Transaction) -> Result<(), OrderedCommitError> {
         match transaction.phase() {
             TransactionPhase::Active
@@ -112,12 +117,13 @@ impl<'a> OrderedCommitCoordinator<'a> {
 
     /// Commit one transaction across one or more authoritative ordered objects.
     ///
-    /// Deterministic object/record representability checks happen before the
-    /// transaction enters `Validating`, so those failures leave it active and
-    /// retryable. After the WAL decision becomes durable, all predecessor
-    /// records are prepared and one undo barrier completes before the first
-    /// shared page mutation. Any failure after WAL append may have consumed
-    /// durable transaction authority and therefore fences this coordinator.
+    /// Intents, deterministic representability checks and predecessor conflict
+    /// validation all happen before `begin_validation`/WAL append. Preparing a
+    /// predecessor may append an unreachable undo before-image, but no page can
+    /// reference it and no commit decision exists yet. Once WAL append may have
+    /// happened, every uncertain or post-decision failure fences this
+    /// coordinator. After decision durability, one grouped undo barrier covers
+    /// all prepared effects before the first shared page mutation.
     pub fn commit(
         &self,
         transaction: &mut Transaction,
@@ -133,6 +139,39 @@ impl<'a> OrderedCommitCoordinator<'a> {
         let intent_guard = self.intents.try_acquire(transaction.id(), &effects)?;
         let objects = self.preflight(transaction, buffer, trees, &effects)?;
         self.require_active_status(transaction.id())?;
+
+        let installer = OrderedMvccInstaller::new(self.statuses, self.undo);
+        let mut prepared_effects = Vec::with_capacity(effects.len());
+        let mut max_required_undo = None;
+        for effect in &effects {
+            let tree = objects
+                .get(&effect.object())
+                .copied()
+                .ok_or(OrderedCommitError::MissingObject(effect.object()))?;
+            let prepared = match installer.prepare(
+                tree,
+                buffer,
+                &intent_guard,
+                effect,
+                InstallContext::Live {
+                    snapshot: transaction.snapshot(),
+                },
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if prepare_failure_requires_fence(&error) {
+                        self.fenced.store(true, Ordering::Release);
+                    }
+                    return Err(OrderedCommitError::Install(error));
+                }
+            };
+            if let Some(version) = prepared.required_undo() {
+                max_required_undo = Some(max_version(max_required_undo, version));
+            }
+            if let PrepareEffectResult::Prepared(prepared) = prepared {
+                prepared_effects.push((tree, prepared));
+            }
+        }
 
         transaction.begin_validation()?;
         let ticket = match self.appender.append_validated(transaction) {
@@ -161,37 +200,6 @@ impl<'a> OrderedCommitCoordinator<'a> {
                 return Err(OrderedCommitError::Transaction(error));
             }
         };
-
-        let installer = OrderedMvccInstaller::new(self.statuses, self.undo);
-        let mut prepared_effects = Vec::with_capacity(effects.len());
-        let mut max_required_undo = None;
-        for effect in &effects {
-            let Some(tree) = objects.get(&effect.object()).copied() else {
-                self.fence_after_wal(transaction);
-                return Err(OrderedCommitError::MissingObject(effect.object()));
-            };
-            let prepared = match installer.prepare(
-                tree,
-                buffer,
-                &intent_guard,
-                effect,
-                InstallContext::Live {
-                    snapshot: transaction.snapshot(),
-                },
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.fence_after_wal(transaction);
-                    return Err(OrderedCommitError::Install(error));
-                }
-            };
-            if let Some(version) = prepared.required_undo() {
-                max_required_undo = Some(max_version(max_required_undo, version));
-            }
-            if let PrepareEffectResult::Prepared(prepared) = prepared {
-                prepared_effects.push((tree, prepared));
-            }
-        }
 
         if let Some(version) = max_required_undo {
             let durable = match self.undo.sync_through(version) {
@@ -245,7 +253,8 @@ impl<'a> OrderedCommitCoordinator<'a> {
         Ok(position)
     }
 
-    /// Whether a post-WAL ambiguity has stopped further write admission.
+    /// Whether an unresolved runtime failure has stopped further write
+    /// admission until recovery/reopen.
     #[must_use]
     pub fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::Acquire)
@@ -334,6 +343,15 @@ fn max_version(current: Option<VersionId>, candidate: VersionId) -> VersionId {
     }
 }
 
+fn prepare_failure_requires_fence(error: &OrderedMvccInstallError) -> bool {
+    !matches!(
+        error,
+        OrderedMvccInstallError::SnapshotConflict { .. }
+            | OrderedMvccInstallError::ActiveWriterConflict(_)
+            | OrderedMvccInstallError::BTree(BTreeError::Buffer(BufferError::NoVictim))
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OrderedCommitError {
     #[error("ordered commit coordinator is fenced until recovery/reopen")]
@@ -380,7 +398,8 @@ mod tests {
     use super::*;
     use crate::vnext::{
         BTreeLookup, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
-        ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, StorageObjectDescriptor,
+        ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecordOwner,
+        StorageObjectDescriptor,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -595,6 +614,89 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_conflict_is_rejected_before_wal_decision() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(12), &buffer).expect("tree");
+        let newer = MvccRecord::new(
+            RecordOwner::Frozen(super::super::CommitSeq::new(2)),
+            None,
+            MvccValue::Inline(b"newer".to_vec()),
+        );
+        tree.insert(&buffer, b"key", &newer.to_bytes().expect("encode"))
+            .expect("seed newer predecessor");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(120))
+            .expect("transaction begins at snapshot zero");
+        transaction
+            .stage_ordered_put(descriptor(12), b"key".to_vec(), b"mine".to_vec())
+            .expect("stages");
+
+        assert!(matches!(
+            coordinator.commit(&mut transaction, &buffer, &[&tree]),
+            Err(OrderedCommitError::Install(
+                OrderedMvccInstallError::SnapshotConflict { .. }
+            ))
+        ));
+        assert_eq!(transaction.phase(), TransactionPhase::Active);
+        assert!(log_device.bytes().is_empty());
+        assert!(!coordinator.is_fenced());
+        assert_eq!(tree.lookup(&buffer, b"key").expect("lookup"), BTreeLookup::Found(newer.to_bytes().expect("encode")));
+        coordinator.abort(&mut transaction).expect("conflict aborts cleanly");
+    }
+
+    #[test]
+    fn corrupt_current_is_rejected_before_wal_and_fences_runtime() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        tree.insert(&buffer, b"key", b"not-an-mvcc-record")
+            .expect("corrupt logical seed");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(30))
+            .expect("transaction begins");
+        transaction
+            .stage_ordered_put(descriptor(1), b"key".to_vec(), b"value".to_vec())
+            .expect("stages");
+
+        assert!(matches!(
+            coordinator.commit(&mut transaction, &buffer, &[&tree]),
+            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(_)))
+        ));
+        assert!(coordinator.is_fenced());
+        assert_eq!(transaction.phase(), TransactionPhase::Active);
+        assert!(log_device.bytes().is_empty());
+        assert_eq!(frontier.snapshot(), super::super::CommitSeq::new(0));
+        coordinator.abort(&mut transaction).expect("active transaction aborts");
+        assert!(matches!(
+            coordinator.begin_write(TxnId::new(31)),
+            Err(OrderedCommitError::Fenced)
+        ));
+    }
+
+    #[test]
     fn oversized_value_is_refused_before_wal_and_remains_retryable() {
         let page_device = Arc::new(MemoryPageIo::default());
         let buffer = BufferPool::new(4, 384, page_device).expect("buffer");
@@ -665,56 +767,5 @@ mod tests {
             tree.lookup(&buffer, b"key").expect("lookup"),
             BTreeLookup::NotFound
         );
-    }
-
-    #[test]
-    fn post_decision_install_failure_fences_before_intent_release() {
-        let page_device = Arc::new(MemoryPageIo::default());
-        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
-        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
-        tree.insert(&buffer, b"key", b"not-an-mvcc-record")
-            .expect("corrupt logical seed");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
-        let log_device = Arc::new(MemoryLogDevice::default());
-        let log = Arc::new(DurableLog::new(log_device));
-        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
-        let statuses = TransactionStatusTable::new();
-        let frontier = VisibilityFrontier::default();
-        let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
-        let mut transaction = coordinator
-            .begin_write(TxnId::new(30))
-            .expect("transaction begins");
-        transaction
-            .stage_ordered_put(descriptor(1), b"key".to_vec(), b"value".to_vec())
-            .expect("stages");
-
-        assert!(matches!(
-            coordinator.commit(&mut transaction, &buffer, &[&tree]),
-            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(
-                _
-            )))
-        ));
-        assert!(coordinator.is_fenced());
-        assert_eq!(transaction.phase(), TransactionPhase::RecoveryRequired);
-        assert_eq!(frontier.snapshot(), super::super::CommitSeq::new(0));
-        assert_eq!(
-            statuses.status(TxnId::new(30)).expect("status"),
-            Some(TransactionStatus::Active)
-        );
-        assert_eq!(
-            intents
-                .owner(StorageObjectId::new(1), b"key")
-                .expect("intent owner"),
-            None,
-            "intent may release only after the runtime fence is established"
-        );
-        assert!(matches!(
-            coordinator.begin_write(TxnId::new(31)),
-            Err(OrderedCommitError::Fenced)
-        ));
     }
 }
