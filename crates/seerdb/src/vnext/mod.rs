@@ -57,6 +57,7 @@ pub use ordered_mvcc::{
 pub use ordered_mvcc_read::{
     MvccLookup, OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader,
 };
+pub use ordered_txn_read::OrderedTransactionRangeCursor;
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
