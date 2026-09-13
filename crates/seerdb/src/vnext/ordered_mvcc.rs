@@ -188,12 +188,7 @@ impl<'a> OrderedMvccInstaller<'a> {
             effect: effect.clone(),
             context,
             predecessor,
-            current: MvccRecord::installed(
-                effect.txn_id(),
-                effect.ordinal(),
-                undo_head,
-                intended,
-            ),
+            current: MvccRecord::installed(effect.txn_id(), effect.ordinal(), undo_head, intended),
             appended_undo,
         }))
     }
@@ -298,12 +293,7 @@ impl<'a> OrderedMvccInstaller<'a> {
         prepared: &PreparedOrderedMvccEffect,
         dependency: Option<(&PageDependencyTable, Lsn)>,
     ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
-        self.validate_call(
-            tree,
-            intents,
-            &prepared.effect,
-            prepared.context,
-        )?;
+        self.validate_call(tree, intents, &prepared.effect, prepared.context)?;
 
         if let Some(result) = self.validate_prepared_predecessor(tree, buffer, prepared)? {
             return Ok(result);
@@ -364,10 +354,7 @@ impl<'a> OrderedMvccInstaller<'a> {
         }
     }
 
-    fn predecessor_changed(
-        &self,
-        prepared: &PreparedOrderedMvccEffect,
-    ) -> OrderedMvccInstallError {
+    fn predecessor_changed(&self, prepared: &PreparedOrderedMvccEffect) -> OrderedMvccInstallError {
         OrderedMvccInstallError::PreparedPredecessorChanged {
             txn: prepared.effect.txn_id(),
             object: prepared.effect.object(),
@@ -476,11 +463,10 @@ pub enum OrderedMvccInstallError {
         "install identity ({txn:?}, {ordinal}) matches the current record but its logical value differs"
     )]
     IdentityContentMismatch { txn: TxnId, ordinal: u32 },
-    #[error("prepared predecessor changed before transaction {txn:?} could install object {object:?}")]
-    PreparedPredecessorChanged {
-        txn: TxnId,
-        object: StorageObjectId,
-    },
+    #[error(
+        "prepared predecessor changed before transaction {txn:?} could install object {object:?}"
+    )]
+    PreparedPredecessorChanged { txn: TxnId, object: StorageObjectId },
     #[error("current record commit {predecessor:?} is newer than writer snapshot {snapshot:?}")]
     SnapshotConflict {
         predecessor: CommitSeq,
@@ -683,7 +669,10 @@ mod tests {
                 appended_undo: Some(VersionId::new(1)),
             }
         );
-        assert_eq!(decode_current(&tree, &buffer, b"key").value(), &MvccValue::Inline(b"new".to_vec()));
+        assert_eq!(
+            decode_current(&tree, &buffer, b"key").value(),
+            &MvccValue::Inline(b"new".to_vec())
+        );
     }
 
     #[test]
