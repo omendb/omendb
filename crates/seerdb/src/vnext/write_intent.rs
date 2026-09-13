@@ -208,6 +208,19 @@ impl WriteIntentGuard<'_> {
         self.keys.is_empty()
     }
 
+    /// Whether this guard owns the addressed logical key for its transaction.
+    #[must_use]
+    pub fn owns(&self, object: StorageObjectId, key: &[u8]) -> bool {
+        self.keys
+            .binary_search_by(|candidate| {
+                candidate
+                    .object
+                    .cmp(&object)
+                    .then_with(|| candidate.key.as_slice().cmp(key))
+            })
+            .is_ok()
+    }
+
     /// Release this ownership batch before the guard's lexical drop point.
     pub fn release(mut self) {
         self.release_all();
@@ -283,6 +296,8 @@ mod tests {
         let writes = effects(1, &[(1, b"a"), (1, b"b"), (2, b"a")]);
         let guard = table.try_acquire(TxnId::new(1), &writes).expect("acquires");
         assert_eq!(guard.len(), 3);
+        assert!(guard.owns(StorageObjectId::new(1), b"a"));
+        assert!(!guard.owns(StorageObjectId::new(1), b"missing"));
         assert_eq!(
             table.owner(StorageObjectId::new(1), b"a").expect("owner"),
             Some(TxnId::new(1))
