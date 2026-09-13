@@ -130,10 +130,10 @@ impl<'a> OrderedCommitCoordinator<'a> {
         let installer = OrderedMvccInstaller::new(self.statuses, self.undo);
         let mut max_undo = None;
         for effect in &effects {
-            let tree = objects
-                .get(&effect.object())
-                .copied()
-                .ok_or(OrderedCommitError::MissingObject(effect.object()))?;
+            let Some(tree) = objects.get(&effect.object()).copied() else {
+                self.fence_after_wal(transaction);
+                return Err(OrderedCommitError::MissingObject(effect.object()));
+            };
             match installer.install(
                 tree,
                 buffer,
@@ -163,9 +163,9 @@ impl<'a> OrderedCommitCoordinator<'a> {
             }
         }
 
-        if let Err(error) = self
-            .frontier
-            .publish_commit(self.statuses, transaction.id(), ticket.csn())
+        if let Err(error) =
+            self.frontier
+                .publish_commit(self.statuses, transaction.id(), ticket.csn())
         {
             self.fence_after_wal(transaction);
             return Err(OrderedCommitError::Visibility(error));
@@ -216,13 +216,8 @@ impl<'a> OrderedCommitCoordinator<'a> {
                 super::MutationKind::OrderedPut => MvccValue::Inline(effect.value().to_vec()),
                 super::MutationKind::OrderedDelete => MvccValue::Tombstone,
             };
-            let encoded = MvccRecord::installed(
-                transaction.id(),
-                effect.ordinal(),
-                None,
-                value,
-            )
-            .to_bytes()?;
+            let encoded = MvccRecord::installed(transaction.id(), effect.ordinal(), None, value)
+                .to_bytes()?;
             tree.preflight_inline_upsert(buffer, effect.key(), &encoded)?;
         }
         Ok(objects)
@@ -241,12 +236,15 @@ impl<'a> OrderedCommitCoordinator<'a> {
         &self,
         transaction: &mut Transaction,
     ) -> Result<(), OrderedCommitError> {
-        if transaction.phase() != TransactionPhase::Aborted {
-            transaction.abort()?;
-        }
         if let Err(error) = self.statuses.abort(transaction.id()) {
             self.fenced.store(true, Ordering::Release);
             return Err(OrderedCommitError::Status(error));
+        }
+        if transaction.phase() != TransactionPhase::Aborted {
+            if let Err(error) = transaction.abort() {
+                self.fenced.store(true, Ordering::Release);
+                return Err(OrderedCommitError::Transaction(error));
+            }
         }
         Ok(())
     }
@@ -448,7 +446,10 @@ mod tests {
             .commit(&mut second, &buffer, &[&rows, &index])
             .expect("second commits");
         assert_eq!(second_position.csn.get(), first_position.csn.get() + 1);
-        assert!(undo.durable_version().is_some_and(|version| version.get() >= 2));
+        assert!(
+            undo.durable_version()
+                .is_some_and(|version| version.get() >= 2)
+        );
 
         let reader = OrderedMvccReader::new(&statuses, &undo);
         assert_eq!(
@@ -595,7 +596,9 @@ mod tests {
 
         assert!(matches!(
             coordinator.commit(&mut transaction, &buffer, &[&tree]),
-            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(_)))
+            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(
+                _
+            )))
         ));
         assert!(coordinator.is_fenced());
         assert_eq!(transaction.phase(), TransactionPhase::RecoveryRequired);
@@ -605,7 +608,9 @@ mod tests {
             Some(TransactionStatus::Active)
         );
         assert_eq!(
-            intents.owner(StorageObjectId::new(1), b"key").expect("intent owner"),
+            intents
+                .owner(StorageObjectId::new(1), b"key")
+                .expect("intent owner"),
             None,
             "intent may release only after the runtime fence is established"
         );
