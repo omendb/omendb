@@ -1,6 +1,6 @@
 # ADR 0014: vNext installation, replay and checkpoint boundaries
 
-- **Status:** accepted integration contract; upsert/write-set/intent/install primitives implemented, persistent runtime/materializer pending
+- **Status:** accepted integration contract; transaction/MVCC/dependency-aware materialization baseline implemented, persistent checkpoint authority pending
 - **Scope:** storage-kernel vNext, not the legacy production engine
 - **Depends on:** [ADR 0013](0013-storage-kernel-and-access-methods.md)
 - **Refines:** [ADR 0003](0003-seerdb-commit-recovery-state-machine.md) and
@@ -17,8 +17,12 @@ several integration hazards that are easy to miss when the pieces are reviewed
 in isolation:
 
 - shared-record installation and WAL ordering had been described inconsistently;
+- write-conflict/predecessor validation must complete before an irrevocable
+  commit decision is created;
 - a dirty page could otherwise reach `PageIo` before the WAL and referenced undo
   state were durable;
+- a transaction could otherwise install a page referencing its own unsynced undo
+  and then need that ineligible page as an eviction victim to finish commit;
 - a page's maximum WAL dependency does not prove that every older logical effect
   has actually been installed;
 - independently durable page images do not by themselves form a structurally
@@ -38,7 +42,7 @@ vNext branch.
 
 ## Current implementation boundary
 
-Implemented and qualified as independent primitives:
+Implemented and integrated:
 
 - atomic B-tree `upsert` separate from duplicate-rejecting `insert`, including
   replacement growth that can split and unchanged-on-oversize behavior;
@@ -50,68 +54,107 @@ Implemented and qualified as independent primitives:
 - MVCC record envelope version 2 with optional install identity
   `(TxnId, final mutation ordinal)`; newly installed transaction-owned current
   records carry it and freezing may preserve it;
-- an access-method-specific ordered MVCC installer for transient/non-authoritative
-  page I/O, with exact-install no-op detection, before-image allocation, aborted
-  owner bypass, live snapshot conflict checks and ordered recovery checks;
+- ordered MVCC prepare/apply: predecessor visibility/order is validated and any
+  complete before-image is appended without page mutation, required undo is
+  group-synchronized, then the exact predecessor is revalidated before install;
+- live predecessor/write-conflict validation under retained intents before WAL
+  append, including clean snapshot/active-writer rejection with no commit
+  decision; pre-WAL before-images may remain unreachable GC work on clean abort;
+- durable-WAL-first multi-object commit coordination, exact WAL sync on the same
+  owned log, grouped undo durability, authoritative page installation, status
+  publication and contiguous visibility;
+- private point/range read-your-writes and point/range fixed-snapshot traversal
+  through the shared current/undo visibility resolver;
+- sequential ordered recovery using the same canonical effects, intents,
+  prepared predecessor state, grouped undo barrier, installer and visibility
+  frontier as live commit;
 - standalone durable undo storage with strictly backward predecessor links;
 - outer WAL and undo framing version 2 with checksummed fixed headers validated
   before length-based torn-tail repair;
 - reopen durability barriers for retained WAL/undo directory state;
 - frame-by-frame undo scanning, while the retained version-offset index still
-  grows with retained history.
+  grows with retained history;
+- sharded in-process per-page WAL/undo dependency tracking and a checked `PageIo`
+  gate that refuses physical writeback until both durability frontiers cover the
+  exact page requirements;
+- dependency-aware B-tree upsert that attaches requirements while the exact page
+  remains pinned and conservatively inherits source requirements through leaf
+  splits, internal splits and root replacement;
+- live commit/recovery page dependency frontier wiring: decision WAL is covered
+  before page mutation, referenced undo is group-synchronized before page
+  mutation, and each resulting page image records decision LSN plus actual
+  resulting undo head.
 
 Still incomplete:
 
-- the full durable-WAL-first transaction coordinator across all authoritative
-  objects;
-- grouped undo synchronization and status/frontier publication around the
-  installer;
-- same-image page dependency capture, materialization eligibility and checksums;
-- out-of-place page mapping and structurally complete checkpoint publication;
-- process-restart replay into the integrated persistent B-tree;
-- snapshot lookup/range traversal through undo chains;
+- checksummed persistent page envelope and out-of-place physical page map;
+- structurally complete checkpoint/manifest publication retaining roots, object
+  metadata, allocation high-water marks, page map, owner outcomes and retention;
+- process-restart recovery from checkpoint plus synchronized retained WAL suffix
+  into authoritative vNext access methods;
+- deterministic/bounded resource admission for arbitrary pin/buffer/allocation
+  pressure and whole-transaction WAL bounds;
+- runtime-wide read/snapshot admission fencing after unresolved post-decision
+  failures; current coordinator fencing is write-admission scope;
+- complete failpoint/crash matrix and two consecutive reopens across transaction,
+  dependency, structural and checkpoint boundaries;
 - freezing, owner-status retention, undo/WAL reclamation and physical GC;
 - canonical row storage and OmenDB cutover.
 
-The transient ordered installer is deliberately **not** proof of crash-safe
-persistent current-record integration. Until page dependencies and checkpoint
-publication exist, tests must use page I/O whose persisted bytes are not treated
-as recovery authority.
+The in-process dependency-aware page path is deliberately **not** proof of
+restart-safe persistent current-record integration. Until a complete checkpoint
+and page-map authority exists, durable working spill pages are not recovery
+authority after a crash.
 
 ## 1. Durable-WAL-first shared installation
 
-The first integrated runtime uses private staged writes until a complete
-transaction decision is durable. Read-your-writes comes from that private
-transaction view; it does not require speculative replacement in shared pages.
+The integrated runtime uses private staged writes until a complete transaction
+decision is durable. Read-your-writes comes from that private transaction view;
+it does not require speculative replacement in shared pages.
 
 For a writing transaction:
 
 1. Validate the original mutation sequence and compute canonical final effects.
 2. Acquire logical write intents for the unique `(StorageObjectId, key)` set in
-   canonical order. Resolve write/write conflicts, snapshot/isolation rules,
-   constraints and configured dependency certification while ownership is held.
-3. Preflight deterministic failures: reserved identities, object availability,
-   record/undo size limits, access-method representability, allocation progress
-   and whole-transaction WAL segment limits. A value recovery cannot install
-   must be refused before the durable decision.
-4. Assign CSN and append the complete mutation/decision batch in the ordered
-   append lane. Keep validation, page work and fsync outside that lane.
+   canonical order.
+3. Preflight deterministic representability/object failures and, while intents
+   remain held, inspect each actual predecessor. Resolve write/write and snapshot
+   conflicts, reject corrupt/unknown current owners, and prepare the resulting
+   current record. If a visible predecessor must become history, append its
+   complete before-image to undo **without mutating shared pages**. A clean
+   pre-WAL refusal may leave such an unreferenced undo record as GC work.
+4. Enter transaction validation, assign CSN and append the complete
+   mutation/decision batch in the ordered append lane. Keep predecessor analysis,
+   page work and fsync outside that lane.
 5. Synchronize through the decision LSN. The durable decision is irrevocable
-   commit authority even if installation has not finished.
-6. Under the retained intents, obtain each actual predecessor, append any
-   required before-image and atomically install the canonical transaction-owned
-   current record. Attach the decision/page and undo dependencies to the same
-   guarded page mutation once that facility exists. Finish every authoritative
-   object before publication.
-7. Publish committed transaction status and mark its CSN ready. Advance new
+   commit authority even if installation has not finished. Only after this
+   barrier may the in-process page WAL frontier advance.
+6. Group-synchronize undo through the highest `VersionId` referenced by any
+   prepared effect. Only after this barrier may the page undo frontier advance.
+7. Under the retained intents, revalidate each exact prepared predecessor and
+   atomically install the canonical transaction-owned current record. Attach the
+   decision LSN and actual resulting undo head to the same guarded page mutation.
+   Split siblings/parents/roots conservatively inherit copied-state dependencies.
+   Finish every authoritative object before publication.
+8. Publish committed transaction status and mark its CSN ready. Advance new
    snapshots only through the contiguous ready frontier.
-8. Complete the synchronous API only after durability and frontier visibility;
+9. Complete the synchronous API only after durability and frontier visibility;
    release intents and the ordinary transaction snapshot on completion.
 
-An ordinary pre-I/O validation/refusal can abort. Any uncertain WAL operation,
-post-decision installation failure or poisoned critical state fences runtime
-write admission and requires recovery, not a fabricated abort. The runtime fence
-must be established before unresolved writer ownership is released.
+Pre-WAL snapshot/write conflicts are ordinary clean refusals: they create no WAL
+decision and leave the transaction active for caller-directed abort/retry.
+Corrupt current state, uncertain undo I/O or poisoned critical state fails closed
+and may fence the runtime even before WAL because continuing could make later
+transactions depend on untrustworthy storage state. Any uncertain WAL operation
+or post-decision failure fences runtime write admission and requires recovery,
+not a fabricated abort. The runtime fence must be established before unresolved
+writer ownership is released.
+
+Preparing undo before WAL is safe because no shared page references those bytes
+until after both the WAL decision and required undo are durable. The trade-off is
+that a clean pre-WAL abort may leave unreachable undo allocation. Avoiding that
+space leak would require a more elaborate reservation/deduplication protocol and
+is not part of the correctness baseline.
 
 This baseline intentionally forgoes speculative shared installation while WAL is
 syncing. A future measured alternative needs its own abort, eviction and recovery
@@ -150,17 +193,17 @@ Required semantics:
 - missing owner status fails closed unless recovery has explicitly established
   the outcome.
 
-A crash after undo append but before current replacement can leave an
-unreferenced undo record. Install identity in the new current record cannot
-prevent that orphan. The baseline therefore requires logical/history idempotence
-and allocation-free repeats of a retained completed install, while permitting
-unreachable allocation to become GC work. Stronger allocation deduplication
-would require a separate durable installation ledger and is not currently
-justified.
+A crash or clean refusal after undo append but before current replacement can
+leave an unreferenced undo record. Install identity in a later current record
+cannot prevent that orphan. The baseline therefore requires logical/history
+idempotence and allocation-free repeats of a retained completed install, while
+permitting unreachable allocation to become GC work. Stronger allocation
+deduplication would require a separate durable installation ledger and is not
+currently justified.
 
 ## 3. Atomic upsert is an access-method primitive, not a persistence protocol
 
-The ordered B-tree now has a distinct atomic `upsert` path. It builds a complete
+The ordered B-tree has a distinct atomic `upsert` path. It builds a complete
 candidate leaf off to the side while holding the page write guard and publishes
 it only after validation. Ordinary `insert` remains duplicate-rejecting. Growth
 that requires a split enters structural coordination and revalidates before the
@@ -174,27 +217,28 @@ the final ordered state to a `BTreeMap` oracle.
 This does **not** make B-tree persistence crash safe. A B-link right sibling
 keeps concurrent traversal correct, but arbitrary independently materialized
 old/new sibling, parent and root images need not form a valid recovery graph.
-All same-key transactional replacement paths must also retain logical intent
-ownership for the entire read-before-image-upsert sequence.
+All same-key transactional replacement paths retain logical intent ownership for
+the entire prepare-before-image-revalidate-upsert sequence.
 
 ## 4. Page dependencies and logical replay completion are different
 
-For every captured page image, the materialization layer must retain at least:
+For every captured page image, the materialization layer retains at least:
 
 ```text
 required WAL LSN  = highest WAL durability dependency of that exact image
 required undo ID  = highest referenced undo VersionId, if any
 ```
 
-The page bytes and dependencies must be captured under the same page guard or
-validated version. A post-hoc metadata update is insufficient because writeback
-could observe the new bytes first. Split siblings must inherit every dependency
-of copied state as well as dependencies introduced by the mutation causing the
-split.
+The page bytes and dependencies are attached while the exact page remains pinned
+and writer-owned. A post-hoc metadata update is insufficient because writeback
+could observe the new bytes first. Split siblings inherit every conservative
+dependency of copied state as well as dependencies introduced by the mutation
+causing the split; structural parents/new roots inherit the relevant maxima.
 
-Before an image can reach durable page storage, require both frontiers to cover
-its dependencies. The generic materialization envelope owns this authority; a
-frame version, dirty bit, root generation or transaction CSN is not a substitute.
+Before an image can reach physical working-page storage, require both frontiers
+to cover its dependencies. The generic materialization envelope owns this
+authority; a frame version, dirty bit, root generation or transaction CSN is not
+a substitute.
 
 A maximum page WAL LSN is **not** a logical-redo skip watermark. Example: two
 independent keys share a page, and installation for decision LSN 200 completes
@@ -202,6 +246,10 @@ before installation for LSN 100. An image requiring WAL 200 can still lack the
 effect at 100. Splits can then move records to different pages. Logical replay
 may be skipped only using a complete checkpoint prefix or explicit validated
 per-effect replay evidence.
+
+The current dependency table is process-local. It makes in-process spill obey
+write-ahead ordering, but its loss on crash is exactly why written working pages
+are not yet restart authority.
 
 ## 5. Structurally complete checkpoints precede persistent cutover
 
@@ -273,7 +321,7 @@ append. Unknown formats and complete checksum/payload corruption fail closed;
 only an incomplete final header/frame is repairable under the append/torn-write
 failure model.
 
-Undo payload scanning is now bounded to one frame, but the offset index, WAL
+Undo payload scanning is bounded to one frame, but the offset index, WAL
 recovery vectors and pending/terminal transaction bookkeeping still grow with
 retained history. Explicit retention and streaming/indexing policy remain
 required before claiming bounded-memory large-history recovery.
@@ -284,11 +332,13 @@ Before persistent cutover, tests must cover at least:
 
 - same-key writers and multi-object decisions with intents retained through
   publication;
+- pre-WAL snapshot/active-writer conflict rejection with no decision bytes;
 - canonical repeated writes and exact install-identity replay;
 - active, aborted, frozen and committed predecessor classification;
-- failure after undo append, after undo sync and after subsets of current-record
-  installation;
-- failure around WAL append/sync, status publication and frontier advancement;
+- clean refusal/failure after unreachable pre-WAL undo append;
+- failure after decision WAL sync, after grouped undo sync and after subsets of
+  current-record installation;
+- failure around status publication and frontier advancement;
 - runtime fencing before unresolved intent release;
 - out-of-order installers on different keys of one page;
 - page dependency inheritance through split sibling/parent/root publication;
@@ -302,19 +352,20 @@ Before persistent cutover, tests must cover at least:
 
 ## Next implementation order
 
-1. Finish qualification of the transient ordered MVCC installer and keep all
-   stable/MSRV/Clippy/oracle gates green.
-2. Add the durable-WAL-first transaction coordinator around canonical effects,
-   intents, preflight, WAL append/sync, grouped undo durability, installation,
-   status publication and contiguous visibility. Keep its page I/O transient
-   until step 4.
-3. Add point snapshot resolution through current/undo chains, then range/cursor
-   traversal using the same visibility resolver.
-4. Add same-image page dependency metadata, durability gating, integrity,
-   out-of-place working placement and a structurally complete checkpoint/page
-   map.
-5. Qualify process crash/reopen twice at every transaction and structural
-   boundary before allowing persistent vNext current-record pages.
-6. Only then optimize durability batching, frame latching/translation,
-   nonblocking checkpoints, compression/fence truncation, version placement and
-   structural coordination from end-to-end measurements.
+1. Keep canonical effects/intents, pre-WAL predecessor validation, prepared MVCC
+   apply, dependency-aware commit/recovery, snapshot/RYW reads, WAL/undo framing,
+   B-tree split propagation and buffer suites green under stable, MSRV, Clippy,
+   PostgreSQL differential and perf smoke.
+2. Add checksummed out-of-place page images plus the logical-to-physical page map
+   and structurally complete checkpoint/manifest authority.
+3. Recover checkpoint + synchronized retained WAL suffix through the existing
+   ordered recovery applicator and run the two-reopen crash matrix before any
+   vNext working page becomes restart authority.
+4. Add deterministic resource/admission bounds and dependency-aware failpoints,
+   including arbitrary pin pressure and post-decision read/snapshot fencing.
+5. Add owner freezing/retention reclamation only once checkpointed owner outcomes
+   and all reader/CDC/replica/backup horizons are explicit.
+6. Add canonical rows/cross-object relational qualification and cut OmenDB over.
+7. Only then optimize durability batching, latches, translation, checkpoint
+   concurrency, compression/fence truncation, version placement and structural
+   coordination from end-to-end measurement.
