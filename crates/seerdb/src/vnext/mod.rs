@@ -41,8 +41,8 @@ pub use log_io::{
     PreparedLogBatch,
 };
 pub use mvcc::{
-    MvccCodecError, MvccRecord, MvccValue, RecordOwner, RecordVisibility, StatusTableError,
-    TransactionStatus, TransactionStatusTable,
+    InstallIdentity, MvccCodecError, MvccRecord, MvccValue, RecordOwner, RecordVisibility,
+    StatusTableError, TransactionStatus, TransactionStatusTable,
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
