@@ -191,12 +191,8 @@ impl BTreeObject {
                 .leaf_entries_owned()
                 .map_err(|error| Self::page_error(leaf, error))?;
             Self::upsert_leaf_entry(&mut entries, key, value);
-            match page_v4::build_leaf(
-                buffer.page_size(),
-                old_high.as_deref(),
-                old_right,
-                &entries,
-            ) {
+            match page_v4::build_leaf(buffer.page_size(), old_high.as_deref(), old_right, &entries)
+            {
                 Ok(candidate) => {
                     bytes.copy_from_slice(&candidate);
                     return Ok(());
@@ -404,12 +400,8 @@ impl BTreeObject {
                 .map_err(|error| Self::page_error(leaf, error))?;
             Self::upsert_leaf_entry(&mut entries, key, value);
 
-            match page_v4::build_leaf(
-                buffer.page_size(),
-                old_high.as_deref(),
-                old_right,
-                &entries,
-            ) {
+            match page_v4::build_leaf(buffer.page_size(), old_high.as_deref(), old_right, &entries)
+            {
                 Ok(candidate) => {
                     bytes.copy_from_slice(&candidate);
                     return Ok(());
