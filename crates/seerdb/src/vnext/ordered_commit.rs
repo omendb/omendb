@@ -7,11 +7,11 @@
 
 use super::{
     BTreeError, BTreeObject, BufferPool, CommitAppendError, CommitAppender, CommitPosition,
-    DurableLog, DurableLogError, FinalEffect, FinalWriteSetError, InstallContext,
-    InstallEffectResult, MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError,
-    OrderedMvccInstaller, StatusTableError, StorageObjectId, Transaction, TransactionError,
-    TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
-    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    DurableLogError, FinalEffect, FinalWriteSetError, InstallContext, InstallEffectResult,
+    MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
+    StatusTableError, StorageObjectId, Transaction, TransactionError, TransactionPhase,
+    TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId,
+    VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// back to a still-running writer population.
 pub struct OrderedCommitCoordinator<'a> {
     appender: &'a CommitAppender,
-    log: &'a DurableLog,
     statuses: &'a TransactionStatusTable,
     frontier: &'a VisibilityFrontier,
     intents: &'a WriteIntentTable,
@@ -36,7 +35,6 @@ impl<'a> OrderedCommitCoordinator<'a> {
     #[must_use]
     pub const fn new(
         appender: &'a CommitAppender,
-        log: &'a DurableLog,
         statuses: &'a TransactionStatusTable,
         frontier: &'a VisibilityFrontier,
         intents: &'a WriteIntentTable,
@@ -44,7 +42,6 @@ impl<'a> OrderedCommitCoordinator<'a> {
     ) -> Self {
         Self {
             appender,
-            log,
             statuses,
             frontier,
             intents,
@@ -115,7 +112,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             }
         };
 
-        if let Err(error) = self.log.sync_through(ticket.decision_lsn()) {
+        if let Err(error) = self.appender.sync_through(ticket.decision_lsn()) {
             self.fence_after_wal(transaction);
             return Err(OrderedCommitError::Log(error));
         }
@@ -317,8 +314,8 @@ pub enum OrderedCommitError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        BTreeLookup, LogDevice, LogIoOperation, ObjectAuthority, OrderedMvccReader, PageIo,
-        PageKey, StorageObjectDescriptor,
+        BTreeLookup, DurableLog, LogDevice, LogIoOperation, ObjectAuthority, OrderedMvccReader,
+        PageIo, PageKey, StorageObjectDescriptor,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -403,18 +400,12 @@ mod tests {
             UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
-        let appender = CommitAppender::new(log.clone(), super::super::CommitSeq::new(0));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator = OrderedCommitCoordinator::new(
-            &appender,
-            log.as_ref(),
-            &statuses,
-            &frontier,
-            &intents,
-            &undo,
-        );
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
 
         let mut first = coordinator
             .begin_write(TxnId::new(1))
@@ -430,7 +421,7 @@ mod tests {
             .expect("first commits");
         assert_eq!(first.phase(), TransactionPhase::Released);
         assert_eq!(frontier.snapshot(), first_position.csn);
-        assert_eq!(log.durable_lsn(), Some(first_position.lsn));
+        assert_eq!(appender.durable_lsn(), Some(first_position.lsn));
 
         let old_snapshot = frontier.snapshot();
         let mut second = coordinator
@@ -488,18 +479,12 @@ mod tests {
             UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
-        let appender = CommitAppender::new(log.clone(), super::super::CommitSeq::new(0));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator = OrderedCommitCoordinator::new(
-            &appender,
-            log.as_ref(),
-            &statuses,
-            &frontier,
-            &intents,
-            &undo,
-        );
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
         let mut transaction = coordinator
             .begin_write(TxnId::new(10))
             .expect("transaction begins");
@@ -527,18 +512,12 @@ mod tests {
             UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
-        let appender = CommitAppender::new(log.clone(), super::super::CommitSeq::new(0));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator = OrderedCommitCoordinator::new(
-            &appender,
-            log.as_ref(),
-            &statuses,
-            &frontier,
-            &intents,
-            &undo,
-        );
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
         let mut transaction = coordinator
             .begin_write(TxnId::new(20))
             .expect("transaction begins");
@@ -575,18 +554,12 @@ mod tests {
             UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
-        let appender = CommitAppender::new(log.clone(), super::super::CommitSeq::new(0));
+        let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator = OrderedCommitCoordinator::new(
-            &appender,
-            log.as_ref(),
-            &statuses,
-            &frontier,
-            &intents,
-            &undo,
-        );
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
         let mut transaction = coordinator
             .begin_write(TxnId::new(30))
             .expect("transaction begins");
