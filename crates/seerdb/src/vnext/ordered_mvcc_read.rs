@@ -1,13 +1,13 @@
-//! Point snapshot resolution for ordered-access-method MVCC records.
+//! Snapshot resolution for ordered-access-method MVCC records.
 //!
 //! Visibility is resolved from transaction status and complete undo records,
-//! never from physical page/frame versions. Range/cursor reads must reuse this
-//! resolver rather than inventing a second visibility policy.
+//! never from physical page/frame versions. Point and range reads share one
+//! resolver so cursor filtering cannot diverge from point lookup semantics.
 
 use super::{
     BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, MvccCodecError, MvccRecord,
-    MvccValue, RecordVisibility, StatusTableError, TransactionStatusTable, TxnId, UndoStore,
-    UndoStoreError, VersionId,
+    MvccValue, RangeCursor, RecordVisibility, StatusTableError, TransactionStatusTable, TxnId,
+    UndoStore, UndoStoreError, VersionId,
 };
 
 /// Logical result of one MVCC point lookup at a fixed snapshot.
@@ -18,7 +18,61 @@ pub enum MvccLookup {
     NotFound,
 }
 
-/// Ordered point-reader over the shared status and undo services.
+/// Snapshot-stable logical range cursor over ordered MVCC records.
+///
+/// The underlying B-tree cursor still restarts by logical key after every raw
+/// batch. This wrapper fixes reader/snapshot identity and counts only visible
+/// values toward caller limits; tombstones and versions absent at the snapshot
+/// do not prematurely shorten a logical batch.
+pub struct OrderedMvccRangeCursor {
+    raw: RangeCursor,
+    reader: Option<TxnId>,
+    snapshot: CommitSeq,
+}
+
+impl OrderedMvccRangeCursor {
+    /// Whether the underlying ordered range is exhausted.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.raw.is_done()
+    }
+
+    /// Return up to `limit` visible logical rows.
+    ///
+    /// Raw batches never exceed the number of still-needed visible rows. Since
+    /// one raw slot can produce at most one visible row, the cursor cannot skip
+    /// an unreturned visible row when it reaches the requested logical limit.
+    pub fn next_batch(
+        &mut self,
+        resolver: &OrderedMvccReader<'_>,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, OrderedMvccReadError> {
+        if limit == 0 || self.raw.is_done() {
+            return Ok(Vec::new());
+        }
+
+        let mut visible = Vec::with_capacity(limit);
+        while visible.len() < limit && !self.raw.is_done() {
+            let remaining = limit - visible.len();
+            let rows = self.raw.next_batch(tree, buffer, remaining)?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, lookup) in rows {
+                if let MvccLookup::Found(value) =
+                    resolver.resolve_lookup(lookup, self.reader, self.snapshot)?
+                {
+                    visible.push((key, value));
+                }
+            }
+        }
+        Ok(visible)
+    }
+}
+
+/// Ordered reader over the shared status and undo services.
 pub struct OrderedMvccReader<'a> {
     statuses: &'a TransactionStatusTable,
     undo: &'a UndoStore,
@@ -44,7 +98,33 @@ impl<'a> OrderedMvccReader<'a> {
         reader: Option<TxnId>,
         snapshot: CommitSeq,
     ) -> Result<MvccLookup, OrderedMvccReadError> {
-        let current = match tree.lookup(buffer, key)? {
+        self.resolve_lookup(tree.lookup(buffer, key)?, reader, snapshot)
+    }
+
+    /// Create a resumable `[start, end)` cursor at one fixed logical snapshot.
+    #[must_use]
+    pub fn range_cursor(
+        &self,
+        tree: &BTreeObject,
+        start: &[u8],
+        end: &[u8],
+        reader: Option<TxnId>,
+        snapshot: CommitSeq,
+    ) -> OrderedMvccRangeCursor {
+        OrderedMvccRangeCursor {
+            raw: tree.range_cursor(start, end),
+            reader,
+            snapshot,
+        }
+    }
+
+    fn resolve_lookup(
+        &self,
+        lookup: BTreeLookup,
+        reader: Option<TxnId>,
+        snapshot: CommitSeq,
+    ) -> Result<MvccLookup, OrderedMvccReadError> {
+        let current = match lookup {
             BTreeLookup::NotFound => return Ok(MvccLookup::NotFound),
             BTreeLookup::Found(bytes) => MvccRecord::from_bytes(&bytes)?,
             BTreeLookup::Blob(_) => return Err(OrderedMvccReadError::UnexpectedBlobCurrent),
@@ -377,6 +457,103 @@ mod tests {
                 .expect("lookup"),
             MvccLookup::Found(b"v5".to_vec())
         );
+    }
+
+    #[test]
+    fn range_cursor_counts_visible_rows_instead_of_physical_slots() {
+        let (buffer, tree, _directory, undo, statuses) = setup();
+        seed(
+            &tree,
+            &buffer,
+            b"k0",
+            &MvccRecord::new(
+                RecordOwner::Frozen(CommitSeq::new(2)),
+                None,
+                MvccValue::Inline(b"v0".to_vec()),
+            ),
+        );
+        seed(
+            &tree,
+            &buffer,
+            b"k1",
+            &MvccRecord::new(
+                RecordOwner::Frozen(CommitSeq::new(2)),
+                None,
+                MvccValue::Tombstone,
+            ),
+        );
+
+        let active = TxnId::new(40);
+        statuses.begin(active).expect("active writer");
+        seed(
+            &tree,
+            &buffer,
+            b"k2",
+            &MvccRecord::installed(active, 0, None, MvccValue::Inline(b"hidden".to_vec())),
+        );
+        seed(
+            &tree,
+            &buffer,
+            b"k3",
+            &MvccRecord::new(
+                RecordOwner::Frozen(CommitSeq::new(2)),
+                None,
+                MvccValue::Inline(b"v3".to_vec()),
+            ),
+        );
+
+        let older = MvccRecord::new(
+            RecordOwner::Frozen(CommitSeq::new(2)),
+            None,
+            MvccValue::Inline(b"old4".to_vec()),
+        );
+        let older_id = undo.append(&older).expect("older undo");
+        let committed = TxnId::new(41);
+        statuses
+            .recover_committed(committed, CommitSeq::new(8))
+            .expect("committed writer");
+        seed(
+            &tree,
+            &buffer,
+            b"k4",
+            &MvccRecord::installed(
+                committed,
+                0,
+                Some(older_id),
+                MvccValue::Inline(b"new4".to_vec()),
+            ),
+        );
+        seed(
+            &tree,
+            &buffer,
+            b"k5",
+            &MvccRecord::new(
+                RecordOwner::Frozen(CommitSeq::new(2)),
+                None,
+                MvccValue::Inline(b"v5".to_vec()),
+            ),
+        );
+
+        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let mut cursor = reader.range_cursor(&tree, b"k0", b"k9", None, CommitSeq::new(3));
+        let first = cursor
+            .next_batch(&reader, &tree, &buffer, 3)
+            .expect("first visible batch");
+        assert_eq!(
+            first,
+            vec![
+                (b"k0".to_vec(), b"v0".to_vec()),
+                (b"k3".to_vec(), b"v3".to_vec()),
+                (b"k4".to_vec(), b"old4".to_vec()),
+            ]
+        );
+        assert!(!cursor.is_done());
+
+        let second = cursor
+            .next_batch(&reader, &tree, &buffer, 3)
+            .expect("second visible batch");
+        assert_eq!(second, vec![(b"k5".to_vec(), b"v5".to_vec())]);
+        assert!(cursor.is_done());
     }
 
     #[test]
