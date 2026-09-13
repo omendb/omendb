@@ -61,6 +61,8 @@ impl FinalEffect {
 /// Rejection while validating and normalizing one transaction's mutation list.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum FinalWriteSetError {
+    #[error("transaction ID zero is reserved")]
+    ReservedTransaction,
     #[error("mutation ordinal {ordinal} belongs to transaction {actual:?}, expected {expected:?}")]
     WrongTransaction {
         expected: TxnId,
@@ -82,6 +84,9 @@ pub fn normalize_final_effects(
     txn_id: TxnId,
     mutations: &[LoggedMutation],
 ) -> Result<Vec<FinalEffect>, FinalWriteSetError> {
+    if txn_id.get() == 0 {
+        return Err(FinalWriteSetError::ReservedTransaction);
+    }
     let mut final_by_key: BTreeMap<(StorageObjectId, Vec<u8>), LoggedMutation> = BTreeMap::new();
 
     for (index, mutation) in mutations.iter().enumerate() {
@@ -194,6 +199,11 @@ mod tests {
 
     #[test]
     fn malformed_original_stream_is_rejected_before_reduction() {
+        assert!(matches!(
+            normalize_final_effects(TxnId::new(0), &[]),
+            Err(FinalWriteSetError::ReservedTransaction)
+        ));
+
         let gap = [put(1, 0, 1, b"a", b"a"), put(1, 2, 1, b"a", b"b")];
         assert!(matches!(
             normalize_final_effects(TxnId::new(1), &gap),
