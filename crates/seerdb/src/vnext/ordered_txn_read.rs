@@ -154,11 +154,11 @@ impl OrderedMvccReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::format::CommitSeq;
     use crate::vnext::{
         MvccRecord, MvccValue, ObjectAuthority, PageIo, PageKey, RecordOwner,
         StorageObjectDescriptor, StorageObjectId, TransactionStatusTable, TxnId, UndoStore,
     };
-    use crate::storage::format::CommitSeq;
     use durable_fs::SyncClass;
     use std::collections::HashMap;
     use std::io;
