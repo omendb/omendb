@@ -7,6 +7,7 @@
 
 mod cursor_v4;
 mod page_v4;
+mod preflight;
 mod tree_v4;
 
 #[cfg(test)]
