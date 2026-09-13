@@ -41,8 +41,8 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{ObjectAuthority, StorageObjectDescriptor, TxnId};
     use crate::storage::format::CommitSeq;
+    use crate::vnext::{ObjectAuthority, StorageObjectDescriptor, TxnId};
 
     fn object(id: u64) -> StorageObjectDescriptor {
         StorageObjectDescriptor::new(StorageObjectId::new(id), ObjectAuthority::Authoritative)
