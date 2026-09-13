@@ -1,16 +1,17 @@
 //! Ordered-access-method MVCC current-record installation for vNext.
 //!
 //! This is the first B-tree consumer of the shared transaction/status/undo
-//! primitives. It deliberately does not own commit scheduling, status
-//! publication, or page persistence. Callers must hold the addressed logical
-//! write intent. Until page dependency capture and checkpoint publication land,
-//! use this installer only with non-authoritative/transient page I/O; a dirty
-//! page containing an undo reference is not yet safe to persist independently.
+//! primitives. It deliberately does not own commit scheduling or status
+//! publication. Callers must hold the addressed logical write intent. The
+//! dependency-aware entry point attaches the durable decision LSN and actual
+//! resulting undo head to the exact B-tree page mutation; the plain entry point
+//! remains available for transient standalone qualification.
 
 use super::{
-    BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, FinalEffect, MvccCodecError,
-    MvccRecord, MvccValue, RecordOwner, StatusTableError, StorageObjectId, TransactionStatus,
-    TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, WriteIntentGuard,
+    BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, FinalEffect, Lsn, MvccCodecError,
+    MvccRecord, MvccValue, PageDependencies, PageDependencyTable, RecordOwner, StatusTableError,
+    StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
+    VersionId, WriteIntentGuard,
 };
 
 /// Ordering context used to classify the predecessor occupying a current slot.
@@ -52,13 +53,8 @@ impl<'a> OrderedMvccInstaller<'a> {
         Self { statuses, undo }
     }
 
-    /// Install one canonical final effect into an ordered B-tree current slot.
-    ///
-    /// The caller must retain an intent guard covering this `(object,key)` for
-    /// the complete read-before-image-replace sequence. A successful undo append
-    /// is intentionally not synchronized here so a transaction can group the
-    /// undo barrier across effects. If replacement fails after append, that undo
-    /// entry is unreachable allocation/GC work; retry must not invent an abort.
+    /// Install one canonical final effect without page dependency attachment.
+    /// This remains useful for transient access-method qualification.
     pub fn install(
         &self,
         tree: &BTreeObject,
@@ -66,6 +62,45 @@ impl<'a> OrderedMvccInstaller<'a> {
         intents: &WriteIntentGuard<'_>,
         effect: &FinalEffect,
         context: InstallContext,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        self.install_inner(tree, buffer, intents, effect, context, None)
+    }
+
+    /// Install one canonical final effect and attach the exact durable WAL/undo
+    /// requirements to every B-tree page image changed by the operation.
+    pub fn install_with_dependencies(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        effect: &FinalEffect,
+        context: InstallContext,
+        dependencies: &PageDependencyTable,
+        required_wal: Lsn,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        self.install_inner(
+            tree,
+            buffer,
+            intents,
+            effect,
+            context,
+            Some((dependencies, required_wal)),
+        )
+    }
+
+    /// The caller must retain an intent guard covering this `(object,key)` for
+    /// the complete read-before-image-replace sequence. A successful undo append
+    /// is intentionally not synchronized here so a transaction can group the
+    /// undo barrier across effects. If replacement fails after append, that undo
+    /// entry is unreachable allocation/GC work; retry must not invent an abort.
+    fn install_inner(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        effect: &FinalEffect,
+        context: InstallContext,
+        dependency: Option<(&PageDependencyTable, Lsn)>,
     ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
         self.validate_call(tree, intents, effect, context)?;
         let intended = intended_value(effect);
@@ -125,7 +160,17 @@ impl<'a> OrderedMvccInstaller<'a> {
 
         let current = MvccRecord::installed(effect.txn_id(), effect.ordinal(), undo_head, intended);
         let encoded = current.to_bytes()?;
-        tree.upsert(buffer, effect.key(), &encoded)?;
+        if let Some((dependencies, required_wal)) = dependency {
+            tree.upsert_with_dependencies(
+                buffer,
+                effect.key(),
+                &encoded,
+                dependencies,
+                PageDependencies::new(required_wal, undo_head),
+            )?;
+        } else {
+            tree.upsert(buffer, effect.key(), &encoded)?;
+        }
         Ok(InstallEffectResult::Installed {
             undo_head,
             appended_undo,
@@ -254,7 +299,7 @@ pub enum OrderedMvccInstallError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        LoggedMutation, ObjectAuthority, PageIo, PageKey, StorageObjectDescriptor,
+        LoggedMutation, ObjectAuthority, PageId, PageIo, PageKey, StorageObjectDescriptor,
         WriteIntentTable, normalize_final_effects,
     };
     use durable_fs::SyncClass;
@@ -387,6 +432,54 @@ mod tests {
             });
             assert_eq!(current.value(), &expected);
         }
+    }
+
+    #[test]
+    fn dependency_aware_install_attaches_decision_and_actual_undo_head() {
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(6);
+        let installer = OrderedMvccInstaller::new(&statuses, &undo);
+        let prior = MvccRecord::new(
+            RecordOwner::Frozen(CommitSeq::new(2)),
+            None,
+            MvccValue::Inline(b"old".to_vec()),
+        );
+        tree.insert(&buffer, b"key", &prior.to_bytes().expect("encode"))
+            .expect("seed");
+        statuses.begin(TxnId::new(60)).expect("writer begins");
+        let effect = make_effect(60, 6, b"key", Some(b"new"));
+        let effects = [effect.clone()];
+        let guard = intents
+            .try_acquire(TxnId::new(60), &effects)
+            .expect("intent");
+        let dependencies = PageDependencyTable::new();
+        let wal = Lsn::new(500);
+
+        let result = installer
+            .install_with_dependencies(
+                &tree,
+                &buffer,
+                &guard,
+                &effect,
+                InstallContext::Live {
+                    snapshot: CommitSeq::new(2),
+                },
+                &dependencies,
+                wal,
+            )
+            .expect("tracked install");
+        assert_eq!(
+            result,
+            InstallEffectResult::Installed {
+                undo_head: Some(VersionId::new(1)),
+                appended_undo: Some(VersionId::new(1)),
+            }
+        );
+        assert_eq!(
+            dependencies
+                .requirements(PageKey::new(tree.descriptor().id(), PageId::new(0)))
+                .expect("page requirements"),
+            PageDependencies::new(wal, Some(VersionId::new(1)))
+        );
     }
 
     #[test]
