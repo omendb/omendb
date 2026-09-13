@@ -178,7 +178,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             Ok(ticket) => ticket,
             Err(error) => {
                 if transaction.phase() == TransactionPhase::RecoveryRequired {
-                    self.fenced.store(true, Ordering::Release);
+                    self.fence_after_wal(transaction);
                 } else {
                     self.cleanup_clean_append_failure(transaction)?;
                 }
@@ -232,9 +232,12 @@ impl<'a> OrderedCommitCoordinator<'a> {
             }
         }
 
+        // Readiness publication is not completion: a synchronous commit is only
+        // acknowledged once the contiguous frontier covers this CSN, so a
+        // snapshot taken after the acknowledgement must observe the effect.
         if let Err(error) =
             self.frontier
-                .publish_commit(self.statuses, transaction.id(), ticket.csn())
+                .complete_commit(self.statuses, transaction.id(), ticket.csn())
         {
             self.fence_after_wal(transaction);
             return Err(OrderedCommitError::Visibility(error));
@@ -244,7 +247,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             return Err(OrderedCommitError::Transaction(error));
         }
         if let Err(error) = transaction.release() {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_after_wal(transaction);
             return Err(OrderedCommitError::Transaction(error));
         }
 
@@ -319,11 +322,17 @@ impl<'a> OrderedCommitCoordinator<'a> {
         Ok(())
     }
 
+    /// Establish the unresolved-failure fence.
+    ///
+    /// Every post-decision failure path routes through here so completion
+    /// waiters are woken with recovery-required semantics instead of blocking on
+    /// a frontier that cannot advance until recovery.
     fn fence_after_wal(&self, transaction: &mut Transaction) {
         self.fenced.store(true, Ordering::Release);
         if transaction.phase() != TransactionPhase::RecoveryRequired {
             let _ = transaction.mark_recovery_required();
         }
+        self.frontier.require_recovery();
     }
 
     fn ensure_open(&self) -> Result<(), OrderedCommitError> {
@@ -396,14 +405,16 @@ pub enum OrderedCommitError {
 mod tests {
     use super::*;
     use crate::vnext::{
-        BTreeLookup, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
+        BTreeLookup, CommitSeq, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
         ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecordOwner,
         StorageObjectDescriptor,
     };
     use durable_fs::SyncClass;
     use std::io;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
     use std::sync::{Arc, Mutex, RwLock};
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct MemoryPageIo {
@@ -775,5 +786,214 @@ mod tests {
             tree.lookup(&buffer, b"key").expect("lookup"),
             BTreeLookup::NotFound
         );
+    }
+
+    /// Block until `txn` has published `csn` as committed, or give up.
+    ///
+    /// Readiness publication happens inside completion, so observing it is how a
+    /// test waits for the exact state where a frontier gap can withhold
+    /// acknowledgement.
+    fn wait_until_committed(statuses: &TransactionStatusTable, txn: TxnId, csn: CommitSeq) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if statuses.status(txn).expect("status") == Some(TransactionStatus::Committed(csn)) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    /// A later commit must not be acknowledged while an earlier admitted CSN is
+    /// published ready but not visible; closing the gap completes it.
+    #[test]
+    fn later_commit_waits_for_the_earlier_csn_visibility_gap_to_close() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+
+        let mut first = coordinator
+            .begin_write(TxnId::new(31))
+            .expect("first begins");
+        first
+            .stage_ordered_put(descriptor(1), b"a".to_vec(), b"a-v1".to_vec())
+            .expect("stages");
+        let first_position = coordinator
+            .commit(&mut first, &buffer, &[&tree])
+            .expect("first commits");
+        assert_eq!(first_position.csn, CommitSeq::new(1));
+        assert_eq!(frontier.snapshot(), CommitSeq::new(1));
+
+        // An admitted writer that appended CSN 2 and then stalled before
+        // readiness publication. Its intents stay retained, as in the runtime.
+        let mut stalled = coordinator
+            .begin_write(TxnId::new(32))
+            .expect("stalled begins");
+        stalled
+            .stage_ordered_put(descriptor(1), b"b".to_vec(), b"b-v1".to_vec())
+            .expect("stages");
+        let stalled_effects = stalled.final_effects().expect("canonical effects");
+        let stalled_intents = intents
+            .try_acquire(stalled.id(), &stalled_effects)
+            .expect("stalled intents");
+        stalled.begin_validation().expect("stalled validates");
+        assert_eq!(
+            appender
+                .append_validated(&mut stalled)
+                .expect("stalled appends")
+                .csn(),
+            CommitSeq::new(2)
+        );
+
+        let mut later = coordinator
+            .begin_write(TxnId::new(33))
+            .expect("later begins");
+        later
+            .stage_ordered_put(descriptor(1), b"c".to_vec(), b"c-v1".to_vec())
+            .expect("stages");
+        let later_id = later.id();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("signal start");
+                let result = coordinator.commit(&mut later, &buffer, &[&tree]);
+                result_tx.send(result).expect("send result");
+            });
+            started_rx.recv().expect("commit starts");
+
+            assert!(
+                wait_until_committed(&statuses, later_id, CommitSeq::new(3)),
+                "later commit never published readiness"
+            );
+            assert_eq!(
+                frontier.snapshot(),
+                CommitSeq::new(1),
+                "readiness must not advance the visible frontier across the gap"
+            );
+            assert!(
+                matches!(result_rx.try_recv(), Err(TryRecvError::Empty)),
+                "later commit was acknowledged before its CSN was visible"
+            );
+
+            frontier
+                .publish_commit(&statuses, stalled.id(), CommitSeq::new(2))
+                .expect("stalled publishes");
+            let position = result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("later commit returns once the gap closes")
+                .expect("later commit succeeds");
+            assert_eq!(position.csn, CommitSeq::new(3));
+            assert_eq!(frontier.snapshot(), CommitSeq::new(3));
+        });
+
+        drop(stalled_intents);
+        let reader = OrderedMvccReader::new(&statuses, &undo);
+        assert_eq!(
+            reader
+                .lookup(&tree, &buffer, b"c", None, frontier.snapshot())
+                .expect("later row"),
+            super::super::MvccLookup::Found(b"c-v1".to_vec())
+        );
+    }
+
+    /// An unresolved earlier durable decision must wake waiting commits with a
+    /// recovery-required outcome instead of acknowledging them or blocking
+    /// forever.
+    #[test]
+    fn unresolved_earlier_decision_fails_waiting_commit_with_recovery_required() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+
+        let mut first = coordinator
+            .begin_write(TxnId::new(41))
+            .expect("first begins");
+        first
+            .stage_ordered_put(descriptor(1), b"a".to_vec(), b"a-v1".to_vec())
+            .expect("stages");
+        coordinator
+            .commit(&mut first, &buffer, &[&tree])
+            .expect("first commits");
+
+        let mut stalled = coordinator
+            .begin_write(TxnId::new(42))
+            .expect("stalled begins");
+        stalled
+            .stage_ordered_put(descriptor(1), b"b".to_vec(), b"b-v1".to_vec())
+            .expect("stages");
+        stalled.begin_validation().expect("stalled validates");
+        appender
+            .append_validated(&mut stalled)
+            .expect("stalled appends");
+
+        let mut later = coordinator
+            .begin_write(TxnId::new(43))
+            .expect("later begins");
+        later
+            .stage_ordered_put(descriptor(1), b"c".to_vec(), b"c-v1".to_vec())
+            .expect("stages");
+        let later_id = later.id();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("signal start");
+                let result = coordinator.commit(&mut later, &buffer, &[&tree]);
+                result_tx.send(result).expect("send result");
+            });
+            started_rx.recv().expect("commit starts");
+            assert!(
+                wait_until_committed(&statuses, later_id, CommitSeq::new(3)),
+                "later commit never published readiness"
+            );
+            assert!(
+                matches!(
+                    result_rx.recv_timeout(Duration::from_millis(500)),
+                    Err(RecvTimeoutError::Timeout)
+                ),
+                "later commit must not be acknowledged while CSN 2 is unpublished"
+            );
+
+            // The stalled transaction fails after its durable decision existed.
+            coordinator.fence_after_wal(&mut stalled);
+            let result = result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("waiting commit wakes");
+            assert!(
+                matches!(
+                    result,
+                    Err(OrderedCommitError::Visibility(
+                        VisibilityError::RecoveryRequired { .. }
+                    ))
+                ),
+                "waiting commit must report recovery, not success: {result:?}"
+            );
+            assert!(coordinator.is_fenced());
+        });
     }
 }
