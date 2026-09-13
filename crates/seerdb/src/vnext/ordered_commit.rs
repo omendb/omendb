@@ -652,8 +652,13 @@ mod tests {
         assert_eq!(transaction.phase(), TransactionPhase::Active);
         assert!(log_device.bytes().is_empty());
         assert!(!coordinator.is_fenced());
-        assert_eq!(tree.lookup(&buffer, b"key").expect("lookup"), BTreeLookup::Found(newer.to_bytes().expect("encode")));
-        coordinator.abort(&mut transaction).expect("conflict aborts cleanly");
+        assert_eq!(
+            tree.lookup(&buffer, b"key").expect("lookup"),
+            BTreeLookup::Found(newer.to_bytes().expect("encode"))
+        );
+        coordinator
+            .abort(&mut transaction)
+            .expect("conflict aborts cleanly");
     }
 
     #[test]
@@ -683,13 +688,17 @@ mod tests {
 
         assert!(matches!(
             coordinator.commit(&mut transaction, &buffer, &[&tree]),
-            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(_)))
+            Err(OrderedCommitError::Install(OrderedMvccInstallError::Codec(
+                _
+            )))
         ));
         assert!(coordinator.is_fenced());
         assert_eq!(transaction.phase(), TransactionPhase::Active);
         assert!(log_device.bytes().is_empty());
         assert_eq!(frontier.snapshot(), super::super::CommitSeq::new(0));
-        coordinator.abort(&mut transaction).expect("active transaction aborts");
+        coordinator
+            .abort(&mut transaction)
+            .expect("active transaction aborts");
         assert!(matches!(
             coordinator.begin_write(TxnId::new(31)),
             Err(OrderedCommitError::Fenced)
