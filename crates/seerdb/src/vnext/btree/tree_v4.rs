@@ -6,6 +6,7 @@
 //! so this coarse structural baseline can later be replaced by page-local SMO
 //! coordination without changing the page/search contract.
 
+use super::super::page_dependency::{PageDependencies, PageDependencyError, PageDependencyTable};
 use super::super::{BufferError, BufferPool, PageId, PageKey, StorageObjectDescriptor};
 use super::page_v4::{
     self, InsertResult, InternalEntryOwned, LeafEntryOwned, LeafValueOwned, PageError, PageRef,
@@ -17,6 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_ROUTING_DEPTH: usize = 128;
 const RESERVED_PAGE_ID: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct DependencyMutation<'a> {
+    table: &'a PageDependencyTable,
+    required: PageDependencies,
+}
 
 /// Result of a point lookup through the native vNext B-tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +39,8 @@ pub enum BTreeLookup {
 pub enum BTreeError {
     #[error(transparent)]
     Buffer(#[from] BufferError),
+    #[error(transparent)]
+    PageDependency(#[from] PageDependencyError),
     #[error("B-tree page {page:?} is corrupt: {reason}")]
     Corruption { page: PageId, reason: &'static str },
     #[error("B-tree routing exceeded the maximum supported depth")]
@@ -168,6 +177,39 @@ impl BTreeObject {
     /// requires a split, structural coordination is entered and the operation
     /// is revalidated before publishing the B-link split.
     pub fn upsert(&self, buffer: &BufferPool, key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
+        self.upsert_inner(buffer, key, value, None)
+    }
+
+    /// Upsert while attaching conservative WAL/undo requirements to every page
+    /// image mutated by this operation. Requirements are merged while the
+    /// affected logical page is still pinned; split siblings inherit the source
+    /// page requirements before either split pin is released.
+    pub fn upsert_with_dependencies(
+        &self,
+        buffer: &BufferPool,
+        key: &[u8],
+        value: &[u8],
+        dependencies: &PageDependencyTable,
+        required: PageDependencies,
+    ) -> Result<(), BTreeError> {
+        self.upsert_inner(
+            buffer,
+            key,
+            value,
+            Some(DependencyMutation {
+                table: dependencies,
+                required,
+            }),
+        )
+    }
+
+    fn upsert_inner(
+        &self,
+        buffer: &BufferPool,
+        key: &[u8],
+        value: &[u8],
+        dependency: Option<DependencyMutation<'_>>,
+    ) -> Result<(), BTreeError> {
         Self::validate_inline_entry(key, value)?;
         loop {
             let (leaf, _) = self.find_leaf_path(buffer, key)?;
@@ -194,6 +236,7 @@ impl BTreeObject {
             match page_v4::build_leaf(buffer.page_size(), old_high.as_deref(), old_right, &entries)
             {
                 Ok(candidate) => {
+                    self.attach_operation_dependency(dependency, leaf)?;
                     bytes.copy_from_slice(&candidate);
                     return Ok(());
                 }
@@ -201,7 +244,7 @@ impl BTreeObject {
                 Err(error) => return Err(Self::map_build_error(leaf, error)),
             }
         }
-        self.upsert_with_split(buffer, key, value)
+        self.upsert_with_split(buffer, key, value, dependency)
     }
 
     /// Remove one key without eager merge/rebalance. Empty/underfull leaves are
@@ -361,7 +404,7 @@ impl BTreeObject {
             drop(right_guard);
             drop(leaf_guard);
 
-            self.propagate_split(buffer, &mut path, separator, right_id)?;
+            self.propagate_split(buffer, &mut path, separator, right_id, None)?;
             return Ok(());
         }
     }
@@ -371,6 +414,7 @@ impl BTreeObject {
         buffer: &BufferPool,
         key: &[u8],
         value: &[u8],
+        dependency: Option<DependencyMutation<'_>>,
     ) -> Result<(), BTreeError> {
         let _structural = self
             .structural
@@ -403,6 +447,7 @@ impl BTreeObject {
             match page_v4::build_leaf(buffer.page_size(), old_high.as_deref(), old_right, &entries)
             {
                 Ok(candidate) => {
+                    self.attach_operation_dependency(dependency, leaf)?;
                     bytes.copy_from_slice(&candidate);
                     return Ok(());
                 }
@@ -433,13 +478,23 @@ impl BTreeObject {
             )
             .map_err(|error| Self::map_build_error(right_id, error))?;
 
+            if let Some(dependency) = dependency {
+                let inherited = dependency.table.requirements(self.page_key(leaf))?;
+                let split_required = inherited.merged(dependency.required);
+                dependency
+                    .table
+                    .merge(self.page_key(leaf), split_required)?;
+                dependency
+                    .table
+                    .merge(self.page_key(right_id), split_required)?;
+            }
             let right_guard = buffer.create_page(self.page_key(right_id), &right_image)?;
             bytes.copy_from_slice(&left_image);
             drop(bytes);
             drop(right_guard);
             drop(leaf_guard);
 
-            self.propagate_split(buffer, &mut path, separator, right_id)?;
+            self.propagate_split(buffer, &mut path, separator, right_id, dependency)?;
             return Ok(());
         }
     }
@@ -450,10 +505,12 @@ impl BTreeObject {
         path: &mut Vec<PageId>,
         mut separator: Vec<u8>,
         mut right_id: PageId,
+        dependency: Option<DependencyMutation<'_>>,
     ) -> Result<(), BTreeError> {
         while let Some(parent_id) = path.pop() {
             let parent_guard = buffer.pin(self.page_key(parent_id))?;
             let mut bytes = parent_guard.write()?;
+            let parent_required = self.attach_operation_dependency(dependency, parent_id)?;
             match page_v4::try_insert_internal(&mut bytes, &separator, right_id)
                 .map_err(|error| Self::page_error(parent_id, error))?
             {
@@ -529,6 +586,11 @@ impl BTreeObject {
             )
             .map_err(|error| Self::map_build_error(new_right_id, error))?;
 
+            if let (Some(dependency), Some(parent_required)) = (dependency, parent_required) {
+                dependency
+                    .table
+                    .merge(self.page_key(new_right_id), parent_required)?;
+            }
             let new_right_guard = buffer.create_page(self.page_key(new_right_id), &right_image)?;
             bytes.copy_from_slice(&left_image);
             drop(bytes);
@@ -553,6 +615,15 @@ impl BTreeObject {
         let root_image =
             page_v4::build_internal(buffer.page_size(), None, None, root_leftmost, &entries)
                 .map_err(|error| Self::map_build_error(new_root, error))?;
+        if let Some(dependency) = dependency {
+            let root_required = dependency
+                .required
+                .merged(dependency.table.requirements(self.page_key(root_leftmost))?)
+                .merged(dependency.table.requirements(self.page_key(right_id))?);
+            dependency
+                .table
+                .merge(self.page_key(new_root), root_required)?;
+        }
         let guard = buffer.create_page(self.page_key(new_root), &root_image)?;
         drop(guard);
         self.root.store(new_root.get(), Ordering::Release);
@@ -619,6 +690,21 @@ impl BTreeObject {
         }
     }
 
+    fn attach_operation_dependency(
+        &self,
+        dependency: Option<DependencyMutation<'_>>,
+        page: PageId,
+    ) -> Result<Option<PageDependencies>, BTreeError> {
+        let Some(dependency) = dependency else {
+            return Ok(None);
+        };
+        Ok(Some(
+            dependency
+                .table
+                .merge(self.page_key(page), dependency.required)?,
+        ))
+    }
+
     fn validate_inline_entry(key: &[u8], value: &[u8]) -> Result<(), BTreeError> {
         if key.len() > u16::MAX as usize || value.len() > u16::MAX as usize {
             Err(BTreeError::EntryTooLarge)
@@ -680,7 +766,8 @@ mod tests {
     use super::*;
     use crate::btree::{BTree, LookupResult};
     use crate::vnext::{
-        LoggedMutation, MutationKind, ObjectAuthority, PageIo, StorageObjectId, TxnId,
+        LoggedMutation, Lsn, MutationKind, ObjectAuthority, PageDependencies, PageDependencyTable,
+        PageIo, StorageObjectId, TxnId, VersionId,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::io;
@@ -826,6 +913,47 @@ mod tests {
                 BTreeLookup::Found(vec![b's'; 40])
             );
         }
+    }
+
+    #[test]
+    fn dependency_aware_upsert_inherits_requirements_through_split_and_root() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(16, 384, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(46), &buffer).expect("tree creates");
+        for key in [b"a", b"b", b"c", b"d"] {
+            tree.insert(&buffer, key, &[b's'; 40]).expect("insert");
+        }
+        assert_eq!(tree.root(), PageId::new(0));
+
+        let dependencies = PageDependencyTable::new();
+        let inherited = PageDependencies::new(Lsn::new(40), Some(VersionId::new(9)));
+        dependencies
+            .merge(tree.page_key(PageId::new(0)), inherited)
+            .expect("seed inherited requirement");
+        let operation = PageDependencies::new(Lsn::new(50), None);
+        tree.upsert_with_dependencies(&buffer, b"b", &vec![b'l'; 180], &dependencies, operation)
+            .expect("tracked replacement splits");
+
+        let combined = PageDependencies::new(Lsn::new(50), Some(VersionId::new(9)));
+        assert_ne!(tree.root(), PageId::new(0));
+        assert_eq!(
+            dependencies
+                .requirements(tree.page_key(PageId::new(0)))
+                .expect("left requirements"),
+            combined
+        );
+        assert_eq!(
+            dependencies
+                .requirements(tree.page_key(PageId::new(1)))
+                .expect("right requirements"),
+            combined
+        );
+        assert_eq!(
+            dependencies
+                .requirements(tree.page_key(tree.root()))
+                .expect("root requirements"),
+            combined
+        );
     }
 
     #[test]
