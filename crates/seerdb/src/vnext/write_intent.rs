@@ -281,9 +281,7 @@ mod tests {
     fn guard_holds_and_releases_a_canonical_batch() {
         let table = WriteIntentTable::new();
         let writes = effects(1, &[(1, b"a"), (1, b"b"), (2, b"a")]);
-        let guard = table
-            .try_acquire(TxnId::new(1), &writes)
-            .expect("acquires");
+        let guard = table.try_acquire(TxnId::new(1), &writes).expect("acquires");
         assert_eq!(guard.len(), 3);
         assert_eq!(
             table.owner(StorageObjectId::new(1), b"a").expect("owner"),

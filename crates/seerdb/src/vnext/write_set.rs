@@ -56,9 +56,7 @@ impl FinalEffect {
 /// Rejection while validating and normalizing one transaction's mutation list.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum FinalWriteSetError {
-    #[error(
-        "mutation ordinal {ordinal} belongs to transaction {actual:?}, expected {expected:?}"
-    )]
+    #[error("mutation ordinal {ordinal} belongs to transaction {actual:?}, expected {expected:?}")]
     WrongTransaction {
         expected: TxnId,
         actual: TxnId,
