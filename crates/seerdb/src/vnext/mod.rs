@@ -14,6 +14,7 @@ mod log;
 mod log_io;
 mod mvcc;
 mod object;
+mod ordered_commit;
 mod ordered_mvcc;
 mod ordered_mvcc_read;
 mod recovery;
@@ -47,6 +48,7 @@ pub use mvcc::{
     StatusTableError, TransactionStatus, TransactionStatusTable,
 };
 pub use object::{ObjectAuthority, StorageObjectDescriptor};
+pub use ordered_commit::{OrderedCommitCoordinator, OrderedCommitError};
 pub use ordered_mvcc::{
     InstallContext, InstallEffectResult, OrderedMvccInstallError, OrderedMvccInstaller,
 };
