@@ -17,6 +17,7 @@ mod object;
 mod ordered_commit;
 mod ordered_mvcc;
 mod ordered_mvcc_read;
+mod ordered_recovery;
 mod ordered_txn_read;
 mod recovery;
 mod segment_log;
@@ -57,6 +58,7 @@ pub use ordered_mvcc::{
 pub use ordered_mvcc_read::{
     MvccLookup, OrderedMvccRangeCursor, OrderedMvccReadError, OrderedMvccReader,
 };
+pub use ordered_recovery::{OrderedRecoveryApplier, OrderedRecoveryError, RecoveryApplyResult};
 pub use ordered_txn_read::OrderedTransactionRangeCursor;
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
