@@ -72,9 +72,13 @@ until a second implementation demonstrates the seam that is actually needed.
   that synchronizes the referenced undo head before mutating a persistable page;
 - durable-WAL-first ordered commit coordination:
   canonical effects -> intents -> deterministic record/object preflight ->
-  ordered append -> exact WAL sync -> prepare every predecessor/undo record ->
-  one grouped undo sync -> apply every prepared authoritative effect -> status
-  publication -> contiguous visibility -> release;
+  predecessor/write-conflict validation + before-image preparation (no page
+  mutation) -> ordered append -> exact WAL sync -> one grouped undo sync ->
+  revalidate/apply every prepared authoritative effect -> status publication ->
+  contiguous visibility -> release;
+- clean live snapshot/active-writer conflicts are rejected before commit
+  authority and produce no WAL decision; a pre-WAL prepared before-image may
+  remain unreachable garbage on later clean abort;
 - post-WAL runtime write fencing before unresolved intents can drop, with clean
   deterministic refusal kept before the durable decision where currently known;
 - point MVCC snapshot resolution through transaction status and multi-hop undo,
@@ -95,9 +99,9 @@ until a second implementation demonstrates the seam that is actually needed.
 - dependency-aware B-tree upsert that merges the current operation requirement
   while the exact page pin/write guard is held and conservatively inherits source
   requirements through leaf splits, internal splits and root replacement;
-- live commit advances the page WAL frontier only after decision sync, prepares
-  and synchronizes all required undo before any page mutation, then attaches the
-  decision LSN plus resulting actual undo head to every mutated page image;
+- live commit advances the page WAL frontier only after decision sync,
+  synchronizes all required prepared undo before any page mutation, then attaches
+  the decision LSN plus resulting actual undo head to every mutated page image;
 - dependency-aware recovery requires the retained WAL frontier through the
   decision LSN before replay, group-synchronizes required undo before page
   mutation, and attaches the same exact WAL/undo requirements during replay;
@@ -224,12 +228,15 @@ private staged writes
   -> validate original stream / canonical final effects
   -> acquire canonical write intents
   -> deterministic object/current-record page-fit preflight
+  -> inspect every actual predecessor under intents, reject write/snapshot
+     conflicts and corrupt/unknown state, append any required complete
+     before-image without mutating shared pages
+  -> begin transaction validation
   -> ordered CSN assignment + complete WAL append
   -> sync exact durable decision on the same owned WAL
   -> advance in-process page WAL frontier
-  -> prepare every effect: validate predecessor + append required complete undo
-     (no shared page mutation)
-  -> group-sync through the highest undo VersionId referenced by any result
+  -> group-sync through the highest undo VersionId referenced by any prepared
+     result
   -> advance in-process page undo frontier
   -> revalidate each prepared predecessor and install every authoritative effect,
      attaching decision LSN + actual resulting undo head to mutated page images
@@ -239,14 +246,21 @@ private staged writes
 ```
 
 The durable transaction decision is commit authority. A failure after that
-boundary is recovery work, not an abort. The coordinator establishes its write
-admission fence before an unresolved post-WAL path can return control to ordinary
-writers.
+boundary is recovery work, not an abort. Snapshot/write-conflict rejection now
+happens before that boundary and creates no WAL decision. Preparing a complete
+before-image may allocate an undo record before WAL, but no page can reference it
+until after both WAL and undo durability; a later clean abort can leave only
+unreachable GC work.
 
-Preparing and synchronizing undo before the first page mutation is deliberate.
-It preserves one grouped undo barrier while preventing a transaction from
-creating pages that depend on its own unsynchronized undo and then requiring
-those ineligible pages as eviction victims to finish the same commit.
+The coordinator establishes its write admission fence before an unresolved
+post-WAL path can return control to ordinary writers. Corrupt current state or
+uncertain/poisoned storage state may also fence fail-closed before WAL rather
+than allowing later transactions to build on an untrustworthy predecessor.
+
+Synchronizing undo before the first page mutation is deliberate. It preserves
+one grouped undo barrier while preventing a transaction from creating pages that
+depend on its own unsynchronized undo and then requiring those ineligible pages
+as eviction victims to finish the same commit.
 
 Still required before D is persistent-runtime complete:
 
@@ -274,8 +288,9 @@ The current logical path proves:
 - preparation can append history while leaving the shared page unchanged;
 - prepared application revalidates the exact predecessor before mutation;
 - aborted current ownership is bypassed by inheriting its undo head;
-- active other owners conflict;
-- committed predecessors newer than a live writer snapshot conflict;
+- active other owners conflict before the WAL decision in live commit;
+- committed predecessors newer than a live writer snapshot conflict before the
+  WAL decision;
 - recovery requires the writer's recovered committed status and an older
   predecessor commit;
 - MVCC delete is a transaction-owned tombstone, not raw tree deletion;
@@ -426,9 +441,10 @@ retention/streaming/indexing policy before large-history qualification.
 
 ## Immediate sequence
 
-1. Keep prepared MVCC install, dependency-aware commit/recovery, private
-   point/range reads, WAL/undo framing, B-tree split propagation and buffer suites
-   green under stable, MSRV, Clippy, PostgreSQL differential and perf smoke.
+1. Keep pre-WAL predecessor/conflict validation, prepared MVCC apply,
+   dependency-aware commit/recovery, private point/range reads, WAL/undo framing,
+   B-tree split propagation and buffer suites green under stable, MSRV, Clippy,
+   PostgreSQL differential and perf smoke.
 2. Implement checksummed out-of-place page images plus the logical-to-physical
    page map and structurally complete checkpoint/manifest baseline.
 3. Recover checkpoint + synchronized retained WAL suffix through the existing
