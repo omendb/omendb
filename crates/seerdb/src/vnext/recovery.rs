@@ -51,6 +51,10 @@ impl RecoveredTransaction {
 pub enum RecoveryError {
     #[error("log record LSN {actual:?} does not advance beyond {previous:?}")]
     NonMonotonicLsn { previous: Lsn, actual: Lsn },
+    #[error("transaction ID zero is reserved")]
+    ReservedTxn,
+    #[error("commit sequence zero is reserved")]
+    ReservedCommitSeq,
     #[error("transaction {txn:?} received mutation ordinal {actual}, expected {expected}")]
     MutationOrdinal {
         txn: TxnId,
@@ -104,6 +108,9 @@ impl RecoveryAssembler {
         match record {
             LogRecord::Mutation(mutation) => {
                 let txn = mutation.txn_id();
+                if txn.get() == 0 {
+                    return Err(RecoveryError::ReservedTxn);
+                }
                 if self.terminal.contains(&txn) {
                     return Err(RecoveryError::RecordAfterTerminal(txn));
                 }
@@ -120,6 +127,9 @@ impl RecoveryAssembler {
                 Ok(None)
             }
             LogRecord::Abort(txn) => {
+                if txn.get() == 0 {
+                    return Err(RecoveryError::ReservedTxn);
+                }
                 if !self.terminal.insert(txn) {
                     return Err(RecoveryError::RecordAfterTerminal(txn));
                 }
@@ -128,6 +138,12 @@ impl RecoveryAssembler {
             }
             LogRecord::Commit(decision) => {
                 let txn = decision.txn_id();
+                if txn.get() == 0 {
+                    return Err(RecoveryError::ReservedTxn);
+                }
+                if decision.csn().get() == 0 {
+                    return Err(RecoveryError::ReservedCommitSeq);
+                }
                 if !self.terminal.insert(txn) {
                     return Err(RecoveryError::RecordAfterTerminal(txn));
                 }
@@ -281,6 +297,35 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].ordinal(), 1);
         assert_eq!(effects[0].kind(), MutationKind::OrderedDelete);
+    }
+
+    #[test]
+    fn reserved_transaction_and_commit_identities_fail_closed() {
+        let mut recovery = RecoveryAssembler::new();
+        assert!(matches!(
+            recovery.push(lsn(10), LogRecord::Mutation(put(0, 0, 1, b"zero"))),
+            Err(RecoveryError::ReservedTxn)
+        ));
+
+        let mut recovery = RecoveryAssembler::new();
+        assert!(matches!(
+            recovery.push(lsn(10), LogRecord::Abort(TxnId::new(0))),
+            Err(RecoveryError::ReservedTxn)
+        ));
+
+        let mut recovery = RecoveryAssembler::new();
+        assert!(matches!(
+            recovery.push(
+                lsn(10),
+                LogRecord::Commit(CommitDecision::new(
+                    TxnId::new(1),
+                    CommitSeq::new(0),
+                    0,
+                    mutation_digest(&[]).expect("digest"),
+                ))
+            ),
+            Err(RecoveryError::ReservedCommitSeq)
+        ));
     }
 
     #[test]
