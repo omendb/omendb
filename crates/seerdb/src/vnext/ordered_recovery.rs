@@ -1,15 +1,15 @@
 //! Ordered-access-method application of validated recovered transactions.
 //!
-//! Recovery uses the same canonical final effects, write intents, MVCC install
-//! identity, current-record installer, undo barrier, and visibility frontier as
-//! live commit. The baseline is intentionally sequential in CSN order. The WAL
-//! scanner/caller must establish the retained WAL durability barrier before
-//! passing validated transactions here.
+//! Recovery uses the same canonical final effects, write intents, prepared MVCC
+//! predecessor state, grouped undo barrier, current-record installer, and
+//! visibility frontier as live commit. The baseline is intentionally sequential
+//! in CSN order. The WAL scanner/caller must establish the retained WAL
+//! durability barrier before passing validated transactions here.
 
 use super::{
     BTreeError, BTreeObject, BufferPool, CommitSeq, FinalEffect, FinalWriteSetError,
-    InstallContext, InstallEffectResult, Lsn, MvccCodecError, MvccRecord, MvccValue,
-    OrderedMvccInstallError, OrderedMvccInstaller, PageDependencyTable, RecoveredTransaction,
+    InstallContext, Lsn, MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError,
+    OrderedMvccInstaller, PageDependencyTable, PrepareEffectResult, RecoveredTransaction,
     StatusTableError, StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore,
     UndoStoreError, VersionId, VisibilityError, VisibilityFrontier, WriteIntentError,
     WriteIntentTable,
@@ -153,49 +153,58 @@ impl<'a> OrderedRecoveryApplier<'a> {
         }
 
         let installer = OrderedMvccInstaller::new(self.statuses, self.undo);
-        let mut max_undo = None;
+        let mut prepared_effects = Vec::with_capacity(effects.len());
+        let mut max_required_undo = None;
         for effect in &effects {
             let Some(tree) = objects.get(&effect.object()).copied() else {
                 return self.fail(OrderedRecoveryError::MissingObject(effect.object()));
             };
+            let prepared = match installer.prepare(
+                tree,
+                buffer,
+                &intent_guard,
+                effect,
+                InstallContext::Recovery { commit: csn },
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => return self.fail(OrderedRecoveryError::Install(error)),
+            };
+            if let Some(version) = prepared.required_undo() {
+                max_required_undo = Some(max_version(max_required_undo, version));
+            }
+            if let PrepareEffectResult::Prepared(prepared) = prepared {
+                prepared_effects.push((tree, prepared));
+            }
+        }
+
+        if let Some(version) = max_required_undo {
+            let durable = match self.undo.sync_through(version) {
+                Ok(durable) => durable,
+                Err(error) => return self.fail(OrderedRecoveryError::Undo(error)),
+            };
+            if let Some(dependencies) = self.page_dependencies {
+                dependencies.advance_undo(durable);
+            }
+        }
+
+        for (tree, prepared) in &prepared_effects {
             let installed = if let Some(dependencies) = self.page_dependencies {
-                installer.install_with_dependencies(
+                installer.apply_prepared_with_dependencies(
                     tree,
                     buffer,
                     &intent_guard,
-                    effect,
-                    InstallContext::Recovery { commit: csn },
+                    prepared,
                     dependencies,
                     position.lsn,
                 )
             } else {
-                installer.install(
-                    tree,
-                    buffer,
-                    &intent_guard,
-                    effect,
-                    InstallContext::Recovery { commit: csn },
-                )
+                installer.apply_prepared(tree, buffer, &intent_guard, prepared)
             };
-            match installed {
-                Ok(InstallEffectResult::Installed { appended_undo, .. }) => {
-                    if let Some(version) = appended_undo {
-                        max_undo = Some(max_version(max_undo, version));
-                    }
-                }
-                Ok(InstallEffectResult::AlreadyInstalled { .. }) => {}
-                Err(error) => return self.fail(OrderedRecoveryError::Install(error)),
+            if let Err(error) = installed {
+                return self.fail(OrderedRecoveryError::Install(error));
             }
         }
 
-        if let Some(version) = max_undo {
-            if let Err(error) = self.undo.sync_through(version) {
-                return self.fail(OrderedRecoveryError::Undo(error));
-            }
-            if let Some(dependencies) = self.page_dependencies {
-                dependencies.advance_undo(version);
-            }
-        }
         if let Err(error) = self.frontier.publish_recovered(self.statuses, txn, csn) {
             return self.fail(OrderedRecoveryError::Visibility(error));
         }
