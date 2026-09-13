@@ -8,8 +8,8 @@
 //! preserve the same order invariant measurably better.
 
 use super::{
-    AppendTicket, CommitSeq, DurableLog, DurableLogError, LogEncodeError, PreparedLogBatch,
-    Transaction, TransactionError, TransactionPhase,
+    AppendTicket, CommitSeq, DurableLog, DurableLogError, FinalWriteSetError, LogEncodeError,
+    PreparedLogBatch, Transaction, TransactionError, TransactionPhase,
 };
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +38,10 @@ impl CommitAppender {
     /// Assign a CSN and append one validated transaction's complete logical
     /// commit batch. The transaction must already be in `Validating` phase.
     ///
-    /// Encoding happens before changing transaction phase or touching the WAL.
+    /// The original mutation stream is validated through the shared canonical
+    /// final-effect reducer before entering the append lane. Encoding also
+    /// happens before changing transaction phase or touching the WAL. These
+    /// failures remain cleanly abortable and consume neither CSN nor WAL bytes.
     /// A clean pre-existing fence aborts this transaction. An I/O error from the
     /// current append makes its outcome uncertain and moves it to
     /// `RecoveryRequired`.
@@ -49,6 +52,11 @@ impl CommitAppender {
         if transaction.phase() != TransactionPhase::Validating {
             return Err(CommitAppendError::WrongPhase(transaction.phase()));
         }
+
+        // The integrated coordinator consumes this same normalized view for
+        // intents and installation. The append primitive validates it here too
+        // so standalone use cannot write a WAL stream recovery must reject.
+        let _ = transaction.final_effects()?;
 
         let mut lane = self
             .lane
@@ -109,6 +117,8 @@ pub enum CommitAppendError {
     AppendLanePoisoned,
     #[error("commit sequence space is exhausted")]
     CommitSeqExhausted,
+    #[error(transparent)]
+    WriteSet(#[from] FinalWriteSetError),
     #[error(transparent)]
     Encoding(#[from] LogEncodeError),
     #[error(transparent)]
@@ -250,6 +260,27 @@ mod tests {
         ));
         assert_eq!(transaction.phase(), TransactionPhase::RecoveryRequired);
         assert!(log.is_fenced());
+        assert_eq!(
+            appender.next_csn().expect("lane reads"),
+            Some(CommitSeq::new(1))
+        );
+    }
+
+    #[test]
+    fn reserved_transaction_is_rejected_before_csn_or_wal() {
+        let device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(device.clone()));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let mut transaction = validating(0);
+
+        assert!(matches!(
+            appender.append_validated(&mut transaction),
+            Err(CommitAppendError::WriteSet(
+                FinalWriteSetError::ReservedTransaction
+            ))
+        ));
+        assert_eq!(transaction.phase(), TransactionPhase::Validating);
+        assert!(device.bytes().is_empty());
         assert_eq!(
             appender.next_csn().expect("lane reads"),
             Some(CommitSeq::new(1))
