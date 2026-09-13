@@ -578,6 +578,7 @@ impl BufferPool {
                     self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
                     match slot.meta.begin_load() {
                         Ok(incarnation) => return Ok((slot, incarnation)),
+                        Err(FrameTransitionError::WrongState { .. }) => continue,
                         Err(source) => return Err(self.frame_transition(slot.id, source)),
                     }
                 }
