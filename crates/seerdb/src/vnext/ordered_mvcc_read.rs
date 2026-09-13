@@ -78,10 +78,7 @@ impl<'a> OrderedMvccReader<'a> {
                     };
                     if let Some(current) = containing_undo {
                         if next.get() >= current.get() {
-                            return Err(OrderedMvccReadError::NonDecreasingUndo {
-                                current,
-                                next,
-                            });
+                            return Err(OrderedMvccReadError::NonDecreasingUndo { current, next });
                         }
                     }
                     record = self.undo.get(next)?;
@@ -157,21 +154,13 @@ mod tests {
     ) {
         let device = Arc::new(MemoryPageIo::default());
         let buffer = BufferPool::new(8, 512, device).expect("buffer");
-        let descriptor = StorageObjectDescriptor::new(
-            StorageObjectId::new(1),
-            ObjectAuthority::Authoritative,
-        );
+        let descriptor =
+            StorageObjectDescriptor::new(StorageObjectId::new(1), ObjectAuthority::Authoritative);
         let tree = BTreeObject::create(descriptor, &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
         let undo =
             UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
-        (
-            buffer,
-            tree,
-            directory,
-            undo,
-            TransactionStatusTable::new(),
-        )
+        (buffer, tree, directory, undo, TransactionStatusTable::new())
     }
 
     fn seed(tree: &BTreeObject, buffer: &BufferPool, key: &[u8], record: &MvccRecord) {
@@ -325,24 +314,13 @@ mod tests {
             &tree,
             &buffer,
             b"without-history",
-            &MvccRecord::installed(
-                absent,
-                0,
-                None,
-                MvccValue::Inline(b"uncommitted".to_vec()),
-            ),
+            &MvccRecord::installed(absent, 0, None, MvccValue::Inline(b"uncommitted".to_vec())),
         );
 
         let reader = OrderedMvccReader::new(&statuses, &undo);
         assert_eq!(
             reader
-                .lookup(
-                    &tree,
-                    &buffer,
-                    b"with-history",
-                    None,
-                    CommitSeq::new(10),
-                )
+                .lookup(&tree, &buffer, b"with-history", None, CommitSeq::new(10))
                 .expect("aborted lookup"),
             MvccLookup::Found(b"prior".to_vec())
         );
