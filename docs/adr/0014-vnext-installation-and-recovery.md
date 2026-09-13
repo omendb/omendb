@@ -77,6 +77,14 @@ Implemented and integrated:
 - sharded in-process per-page WAL/undo dependency tracking and a checked `PageIo`
   gate that refuses physical writeback until both durability frontiers cover the
   exact page requirements;
+- a checksummed out-of-place page store below logical `PageKey`: a versioned
+  image arena bound to a persisted store incarnation, an immutable
+  caller-selected placement map, and a `PageIo` implementation. Requirements are
+  captured from the dependency table once per image, references fail closed for
+  missing, dangling, duplicate, foreign or mismatched images, and only an
+  unreferenced incomplete final append is repaired. This is placement authority
+  only: no map is discovered or selected automatically, and no uncheckpointed
+  image becomes restart authority;
 - synchronous completion: `VisibilityFrontier` distinguishes readiness
   publication from completion, waits for contiguous coverage, and reports
   recovery-required instead of blocking or acknowledging when an earlier durable
@@ -91,9 +99,10 @@ Implemented and integrated:
 
 Still incomplete:
 
-- checksummed persistent page envelope and out-of-place physical page map;
 - structurally complete checkpoint/manifest publication retaining roots, object
-  metadata, allocation high-water marks, page map, owner outcomes and retention;
+  metadata, allocation high-water marks, page map, owner outcomes and retention
+  (the page-image envelope and out-of-place placement map now exist as a validated
+  component below this);
 - process-restart recovery from checkpoint plus synchronized retained WAL suffix
   into authoritative vNext access methods;
 - deterministic/bounded resource admission for arbitrary pin/buffer/allocation

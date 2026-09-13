@@ -136,9 +136,13 @@ algorithm replacements.
 
 ### Not implemented yet
 
-- page integrity/checksum envelope and out-of-place physical page placement/map;
-- structurally complete checkpoint publication retaining roots, object metadata,
-  allocation high-water marks, page map, owner outcomes and retention state;
+- an explicit store-incarnation binding in WAL and undo framing (the page store
+  now binds its own arena and maps) and cross-process exclusive writable
+  ownership;
+- structurally complete checkpoint *capture*: publication needs the runtime admission/drain
+  cut, roots/object metadata, allocation high-water marks, owner outcomes and
+  retention state. The checksummed page-image envelope and out-of-place placement
+  map now exist below this as validated components;
 - persistent recovery from checkpoint + synchronized retained WAL suffix into
   authoritative access methods; the current page dependency table is
   process-local working-state metadata, not restart authority;
@@ -197,9 +201,10 @@ frontiers from successful WAL/undo barriers.
 
 Remaining buffer/materialization work:
 
-- page integrity and out-of-place physical placement below logical `PageKey`;
-- a persistent checkpoint/page-map envelope containing dependency-equivalent
-  recovery metadata;
+- checkpoint *capture* over the now-implemented page image/map components:
+  runtime drain, structural closure, roots/object metadata, allocation high-water
+  marks and owner outcomes;
+- WAL/undo store-incarnation binding and cross-process exclusive ownership;
 - explicit admission/progress policy under arbitrary pin pressure or very small
   pools; the self-undo dependency cycle is no longer part of that problem;
 - background dirty queues and bounded materialization workers after the blocking
@@ -371,11 +376,16 @@ restart authority merely because their bytes reached storage.
 Do not use a maximum page LSN as a logical-redo skip watermark. Installation may
 finish out of LSN order and splits move logical effects between pages.
 
-The next major implementation milestone is a structurally complete checkpoint:
+The next major implementation milestone is a structurally complete checkpoint.
+The checksummed image envelope and out-of-place placement map are implemented in
+`crates/seerdb/src/vnext/page_store.rs` (with `page_image.rs`/`page_map.rs`):
+contained, unit-qualified work that establishes placement authority only. What
+remains is capture and publication:
 
-1. define a checksummed page image/envelope and out-of-place physical page map;
-2. acquire exclusive writable-store ownership and validate common store
-   incarnation across retained components;
+1. ~~define a checksummed page image/envelope and out-of-place physical page map~~
+   (implemented; placement authority only);
+2. acquire exclusive writable-store ownership and bind WAL/undo/page components
+   to a common store incarnation;
 3. close admission to new committing mutations, allow admitted work to finish
    installation/publication, then establish the exact `(CSN, decision LSN)` cut.
    Keep install/structural/GC and allocation metadata mutation quiescent during
@@ -503,9 +513,9 @@ retention/streaming/indexing policy before large-history qualification.
    stable/MSRV/all-features suites green, and clear Clippy on any new work.
    Qualify out-of-order installers, earlier-decision failure and pending-waiter
    wakeup as the surrounding runtime lifecycle lands.
-2. Define the shared runtime admission/drain/failure lifecycle. Implement
-   checksummed out-of-place pages, persistent page map and complete checkpoint
-   publication with exclusive writable ownership and store-incarnation binding.
+2. Define the shared runtime admission/drain/failure lifecycle and complete
+   checkpoint capture/publication over the implemented page store, with exclusive
+   writable ownership and WAL/undo store-incarnation binding.
 3. Recover checkpoint + synchronized retained WAL suffix through the existing
    applicator. Qualify runtime read/snapshot fencing, already-admitted writers,
    checkpoint cuts and two consecutive reopens before persistent exposure.
