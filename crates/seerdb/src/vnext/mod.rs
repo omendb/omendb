@@ -20,6 +20,7 @@ mod translation;
 mod txn;
 mod undo_store;
 mod visibility;
+mod write_intent;
 mod write_set;
 
 pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
@@ -50,9 +51,8 @@ pub use translation::{PublishResult, TranslationError, TranslationTable};
 pub use txn::{Transaction, TransactionError, TransactionPhase};
 pub use undo_store::{UndoIoOperation, UndoStore, UndoStoreError};
 pub use visibility::{VisibilityError, VisibilityFrontier};
-pub use write_set::{
-    FinalEffect, FinalWriteSetError, normalize_final_effects,
-};
+pub use write_intent::{WriteIntentError, WriteIntentGuard, WriteIntentTable};
+pub use write_set::{FinalEffect, FinalWriteSetError, normalize_final_effects};
 
 // Keep the already-proven logical identity domains instead of manufacturing
 // vNext-specific duplicates.
