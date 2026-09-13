@@ -145,8 +145,7 @@ impl PageDependencyTable {
 
     /// Advance the durable undo frontier after a successful barrier.
     pub fn advance_undo(&self, durable: VersionId) {
-        self.durable_undo
-            .fetch_max(durable.get(), Ordering::AcqRel);
+        self.durable_undo.fetch_max(durable.get(), Ordering::AcqRel);
     }
 
     #[must_use]
@@ -315,9 +314,13 @@ mod tests {
         dependencies.advance_undo(VersionId::new(12));
         dependencies.advance_undo(VersionId::new(4));
         let mut bytes = [0u8; 8];
-        io.read_page(key(3), &mut bytes).expect("read passes through");
+        io.read_page(key(3), &mut bytes)
+            .expect("read passes through");
 
-        assert_eq!(dependencies.requirements(key(3)).expect("requirements"), required);
+        assert_eq!(
+            dependencies.requirements(key(3)).expect("requirements"),
+            required
+        );
         assert_eq!(dependencies.durable_wal(), Lsn::new(50));
         assert_eq!(dependencies.durable_undo(), Some(VersionId::new(12)));
         assert!(dependencies.is_eligible(key(3)).expect("eligibility"));
