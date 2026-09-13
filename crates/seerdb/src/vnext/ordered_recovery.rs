@@ -10,8 +10,8 @@ use super::{
     BTreeError, BTreeObject, BufferPool, CommitSeq, FinalEffect, FinalWriteSetError,
     InstallContext, InstallEffectResult, MvccCodecError, MvccRecord, MvccValue,
     OrderedMvccInstallError, OrderedMvccInstaller, RecoveredTransaction, StatusTableError,
-    StorageObjectId, TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId,
-    VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    StorageObjectId, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
+    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -52,8 +52,9 @@ impl<'a> OrderedRecoveryApplier<'a> {
     }
 
     /// Apply one validated committed transaction after the current recovery
-    /// frontier. Repeating a transaction already covered by this process-local
-    /// frontier is an idempotent no-op after validating its durable status.
+    /// frontier. Repeating the exact transaction already covered by this
+    /// process-local frontier is an idempotent no-op; a different/missing owner
+    /// cannot claim an already-visible CSN.
     pub fn apply(
         &self,
         recovered: &RecoveredTransaction,
@@ -71,8 +72,16 @@ impl<'a> OrderedRecoveryApplier<'a> {
         let csn = recovered.position().csn;
         let visible = self.frontier.snapshot();
         if csn <= visible {
-            self.statuses.recover_committed(txn, csn)?;
-            return Ok(RecoveryApplyResult::AlreadyApplied);
+            let actual = self.statuses.status(txn)?;
+            if actual == Some(TransactionStatus::Committed(csn)) {
+                return Ok(RecoveryApplyResult::AlreadyApplied);
+            }
+            return self.fail(OrderedRecoveryError::AlreadyVisibleIdentity {
+                visible,
+                txn,
+                requested: csn,
+                actual,
+            });
         }
         let expected = visible
             .get()
@@ -213,6 +222,15 @@ pub enum OrderedRecoveryError {
         expected: CommitSeq,
         actual: CommitSeq,
     },
+    #[error(
+        "transaction {txn:?} cannot claim already-visible commit {requested:?} at frontier {visible:?}; status is {actual:?}"
+    )]
+    AlreadyVisibleIdentity {
+        visible: CommitSeq,
+        txn: TxnId,
+        requested: CommitSeq,
+        actual: Option<TransactionStatus>,
+    },
     #[error("ordered recovery object set contains duplicate object {0:?}")]
     DuplicateObject(StorageObjectId),
     #[error("ordered recovery is missing authoritative object {0:?}")]
@@ -240,11 +258,11 @@ pub enum OrderedRecoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::format::Lsn;
     use crate::vnext::{
         BTreeLookup, CommitDecision, LogRecord, LoggedMutation, ObjectAuthority, OrderedMvccReader,
         PageIo, PageKey, RecoveryAssembler, StorageObjectDescriptor, mutation_digest,
     };
-    use crate::storage::format::Lsn;
     use durable_fs::SyncClass;
     use std::io;
     use std::sync::{Arc, RwLock};
@@ -371,6 +389,38 @@ mod tests {
             RecoveryApplyResult::AlreadyApplied
         );
         assert_eq!(undo.durable_version(), Some(VersionId::new(1)));
+    }
+
+    #[test]
+    fn already_visible_csn_cannot_be_claimed_by_a_different_transaction() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let undo =
+            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let applier = OrderedRecoveryApplier::new(&statuses, &frontier, &intents, &undo);
+        let first = recovered(1, 1, &[(1, b"key", b"v1")]);
+        applier.apply(&first, &buffer, &[&tree]).expect("first applies");
+
+        let impostor = recovered(9, 1, &[(1, b"other", b"wrong")]);
+        assert!(matches!(
+            applier.apply(&impostor, &buffer, &[&tree]),
+            Err(OrderedRecoveryError::AlreadyVisibleIdentity {
+                txn,
+                requested,
+                actual: None,
+                ..
+            }) if txn == TxnId::new(9) && requested == CommitSeq::new(1)
+        ));
+        assert!(applier.is_fenced());
+        assert_eq!(
+            tree.lookup(&buffer, b"other").expect("lookup"),
+            BTreeLookup::NotFound
+        );
     }
 
     #[test]
