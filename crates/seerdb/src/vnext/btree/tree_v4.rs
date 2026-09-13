@@ -618,7 +618,11 @@ impl BTreeObject {
         if let Some(dependency) = dependency {
             let root_required = dependency
                 .required
-                .merged(dependency.table.requirements(self.page_key(root_leftmost))?)
+                .merged(
+                    dependency
+                        .table
+                        .requirements(self.page_key(root_leftmost))?,
+                )
                 .merged(dependency.table.requirements(self.page_key(right_id))?);
             dependency
                 .table
