@@ -3,9 +3,10 @@
 //! This is the first B-tree consumer of the shared transaction/status/undo
 //! primitives. It deliberately does not own commit scheduling or status
 //! publication. Callers must hold the addressed logical write intent. The
-//! dependency-aware entry point attaches the durable decision LSN and actual
-//! resulting undo head to the exact B-tree page mutation; the plain entry point
-//! remains available for transient standalone qualification.
+//! integrated runtime prepares predecessor/undo state for the whole transaction,
+//! synchronizes the required undo frontier once, then applies the prepared page
+//! mutations. The plain `install` entry point remains available for transient
+//! standalone qualification.
 
 use super::{
     BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, FinalEffect, Lsn, MvccCodecError,
@@ -40,6 +41,65 @@ pub enum InstallEffectResult {
     AlreadyInstalled { undo_head: Option<VersionId> },
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum PreparedPredecessor {
+    Absent,
+    Present(MvccRecord),
+}
+
+/// One effect whose predecessor has been validated and whose required
+/// before-image, if any, has already been appended to the undo store.
+///
+/// Preparation does not mutate B-tree pages. The intent guard must remain held
+/// through application so the expected logical predecessor cannot be replaced
+/// by another integrated writer between these phases.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedOrderedMvccEffect {
+    effect: FinalEffect,
+    context: InstallContext,
+    predecessor: PreparedPredecessor,
+    current: MvccRecord,
+    appended_undo: Option<VersionId>,
+}
+
+impl PreparedOrderedMvccEffect {
+    /// Highest undo version the resulting current record references.
+    #[must_use]
+    pub const fn required_undo(&self) -> Option<VersionId> {
+        self.current.undo_head()
+    }
+
+    /// Newly appended before-image allocated while preparing this effect.
+    #[must_use]
+    pub const fn appended_undo(&self) -> Option<VersionId> {
+        self.appended_undo
+    }
+
+    #[must_use]
+    pub const fn effect(&self) -> &FinalEffect {
+        &self.effect
+    }
+}
+
+/// Outcome of the non-page-mutating preparation phase.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PrepareEffectResult {
+    Prepared(PreparedOrderedMvccEffect),
+    AlreadyInstalled { undo_head: Option<VersionId> },
+}
+
+impl PrepareEffectResult {
+    /// Highest undo version that must be durable before this effect can be
+    /// safely materialized or published as complete.
+    #[must_use]
+    pub const fn required_undo(&self) -> Option<VersionId> {
+        match self {
+            Self::Prepared(prepared) => prepared.required_undo(),
+            Self::AlreadyInstalled { undo_head } => *undo_head,
+        }
+    }
+}
+
 /// Access-method-specific current-record installer over the shared vNext
 /// status and undo services.
 pub struct OrderedMvccInstaller<'a> {
@@ -53,66 +113,30 @@ impl<'a> OrderedMvccInstaller<'a> {
         Self { statuses, undo }
     }
 
-    /// Install one canonical final effect without page dependency attachment.
-    /// This remains useful for transient access-method qualification.
-    pub fn install(
+    /// Prepare one canonical final effect without mutating shared B-tree pages.
+    ///
+    /// This validates the exact current predecessor and appends any required
+    /// complete before-image. The caller may prepare every effect, issue one
+    /// grouped undo durability barrier, and then apply the resulting plans.
+    pub fn prepare(
         &self,
         tree: &BTreeObject,
         buffer: &BufferPool,
         intents: &WriteIntentGuard<'_>,
         effect: &FinalEffect,
         context: InstallContext,
-    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
-        self.install_inner(tree, buffer, intents, effect, context, None)
-    }
-
-    /// Install one canonical final effect and attach the exact durable WAL/undo
-    /// requirements to every B-tree page image changed by the operation.
-    pub fn install_with_dependencies(
-        &self,
-        tree: &BTreeObject,
-        buffer: &BufferPool,
-        intents: &WriteIntentGuard<'_>,
-        effect: &FinalEffect,
-        context: InstallContext,
-        dependencies: &PageDependencyTable,
-        required_wal: Lsn,
-    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
-        self.install_inner(
-            tree,
-            buffer,
-            intents,
-            effect,
-            context,
-            Some((dependencies, required_wal)),
-        )
-    }
-
-    /// The caller must retain an intent guard covering this `(object,key)` for
-    /// the complete read-before-image-replace sequence. A successful undo append
-    /// is intentionally not synchronized here so a transaction can group the
-    /// undo barrier across effects. If replacement fails after append, that undo
-    /// entry is unreachable allocation/GC work; retry must not invent an abort.
-    fn install_inner(
-        &self,
-        tree: &BTreeObject,
-        buffer: &BufferPool,
-        intents: &WriteIntentGuard<'_>,
-        effect: &FinalEffect,
-        context: InstallContext,
-        dependency: Option<(&PageDependencyTable, Lsn)>,
-    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+    ) -> Result<PrepareEffectResult, OrderedMvccInstallError> {
         self.validate_call(tree, intents, effect, context)?;
         let intended = intended_value(effect);
         let identity = effect.install_identity();
 
-        let (undo_head, appended_undo) = match tree.lookup(buffer, effect.key())? {
-            BTreeLookup::NotFound => (None, None),
+        let (predecessor, undo_head, appended_undo) = match tree.lookup(buffer, effect.key())? {
+            BTreeLookup::NotFound => (PreparedPredecessor::Absent, None, None),
             BTreeLookup::Found(bytes) => {
                 let current = MvccRecord::from_bytes(&bytes)?;
                 if current.has_install_identity(identity) {
                     if current.value() == &intended {
-                        return Ok(InstallEffectResult::AlreadyInstalled {
+                        return Ok(PrepareEffectResult::AlreadyInstalled {
                             undo_head: current.undo_head(),
                         });
                     }
@@ -122,7 +146,8 @@ impl<'a> OrderedMvccInstaller<'a> {
                     });
                 }
 
-                match current.owner() {
+                let predecessor = PreparedPredecessor::Present(current.clone());
+                let (undo_head, appended_undo) = match current.owner() {
                     RecordOwner::Transaction(owner) if owner == effect.txn_id() => {
                         return Err(OrderedMvccInstallError::DifferentEffectBySameTransaction {
                             txn: owner,
@@ -150,7 +175,8 @@ impl<'a> OrderedMvccInstaller<'a> {
                         let version = self.undo.append(&current)?;
                         (Some(version), Some(version))
                     }
-                }
+                };
+                (predecessor, undo_head, appended_undo)
             }
             BTreeLookup::Blob(_) => return Err(OrderedMvccInstallError::UnexpectedBlobCurrent),
             BTreeLookup::Deleted => {
@@ -158,23 +184,194 @@ impl<'a> OrderedMvccInstaller<'a> {
             }
         };
 
-        let current = MvccRecord::installed(effect.txn_id(), effect.ordinal(), undo_head, intended);
-        let encoded = current.to_bytes()?;
+        Ok(PrepareEffectResult::Prepared(PreparedOrderedMvccEffect {
+            effect: effect.clone(),
+            context,
+            predecessor,
+            current: MvccRecord::installed(
+                effect.txn_id(),
+                effect.ordinal(),
+                undo_head,
+                intended,
+            ),
+            appended_undo,
+        }))
+    }
+
+    /// Apply one prepared effect without page dependency attachment.
+    pub fn apply_prepared(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        prepared: &PreparedOrderedMvccEffect,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        self.apply_prepared_inner(tree, buffer, intents, prepared, None)
+    }
+
+    /// Apply one prepared effect and attach the exact durable WAL/undo
+    /// requirements to every B-tree page image changed by the operation.
+    pub fn apply_prepared_with_dependencies(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        prepared: &PreparedOrderedMvccEffect,
+        dependencies: &PageDependencyTable,
+        required_wal: Lsn,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        self.apply_prepared_inner(
+            tree,
+            buffer,
+            intents,
+            prepared,
+            Some((dependencies, required_wal)),
+        )
+    }
+
+    /// Convenience transient install. This preserves the original standalone
+    /// behavior: preparation and page mutation happen in one call and undo is
+    /// not synchronized here.
+    pub fn install(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        effect: &FinalEffect,
+        context: InstallContext,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        match self.prepare(tree, buffer, intents, effect, context)? {
+            PrepareEffectResult::AlreadyInstalled { undo_head } => {
+                Ok(InstallEffectResult::AlreadyInstalled { undo_head })
+            }
+            PrepareEffectResult::Prepared(prepared) => {
+                self.apply_prepared(tree, buffer, intents, &prepared)
+            }
+        }
+    }
+
+    /// Convenience dependency-aware install for isolated callers. Unlike the
+    /// transient entry point, this synchronizes the referenced undo head before
+    /// mutating the page and advances the supplied dependency frontier. The
+    /// integrated transaction/recovery paths use explicit batch preparation to
+    /// retain one grouped barrier across all effects.
+    pub fn install_with_dependencies(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        effect: &FinalEffect,
+        context: InstallContext,
+        dependencies: &PageDependencyTable,
+        required_wal: Lsn,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        match self.prepare(tree, buffer, intents, effect, context)? {
+            PrepareEffectResult::AlreadyInstalled { undo_head } => {
+                if let Some(version) = undo_head {
+                    let durable = self.undo.sync_through(version)?;
+                    dependencies.advance_undo(durable);
+                }
+                Ok(InstallEffectResult::AlreadyInstalled { undo_head })
+            }
+            PrepareEffectResult::Prepared(prepared) => {
+                if let Some(version) = prepared.required_undo() {
+                    let durable = self.undo.sync_through(version)?;
+                    dependencies.advance_undo(durable);
+                }
+                self.apply_prepared_with_dependencies(
+                    tree,
+                    buffer,
+                    intents,
+                    &prepared,
+                    dependencies,
+                    required_wal,
+                )
+            }
+        }
+    }
+
+    fn apply_prepared_inner(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        intents: &WriteIntentGuard<'_>,
+        prepared: &PreparedOrderedMvccEffect,
+        dependency: Option<(&PageDependencyTable, Lsn)>,
+    ) -> Result<InstallEffectResult, OrderedMvccInstallError> {
+        self.validate_call(
+            tree,
+            intents,
+            &prepared.effect,
+            prepared.context,
+        )?;
+
+        if let Some(result) = self.validate_prepared_predecessor(tree, buffer, prepared)? {
+            return Ok(result);
+        }
+
+        let encoded = prepared.current.to_bytes()?;
         if let Some((dependencies, required_wal)) = dependency {
             tree.upsert_with_dependencies(
                 buffer,
-                effect.key(),
+                prepared.effect.key(),
                 &encoded,
                 dependencies,
-                PageDependencies::new(required_wal, undo_head),
+                PageDependencies::new(required_wal, prepared.current.undo_head()),
             )?;
         } else {
-            tree.upsert(buffer, effect.key(), &encoded)?;
+            tree.upsert(buffer, prepared.effect.key(), &encoded)?;
         }
         Ok(InstallEffectResult::Installed {
-            undo_head,
-            appended_undo,
+            undo_head: prepared.current.undo_head(),
+            appended_undo: prepared.appended_undo,
         })
+    }
+
+    fn validate_prepared_predecessor(
+        &self,
+        tree: &BTreeObject,
+        buffer: &BufferPool,
+        prepared: &PreparedOrderedMvccEffect,
+    ) -> Result<Option<InstallEffectResult>, OrderedMvccInstallError> {
+        match tree.lookup(buffer, prepared.effect.key())? {
+            BTreeLookup::NotFound => {
+                if prepared.predecessor == PreparedPredecessor::Absent {
+                    Ok(None)
+                } else {
+                    Err(self.predecessor_changed(prepared))
+                }
+            }
+            BTreeLookup::Found(bytes) => {
+                let current = MvccRecord::from_bytes(&bytes)?;
+                if current.has_install_identity(prepared.effect.install_identity()) {
+                    if current.value() == prepared.current.value() {
+                        return Ok(Some(InstallEffectResult::AlreadyInstalled {
+                            undo_head: current.undo_head(),
+                        }));
+                    }
+                    return Err(OrderedMvccInstallError::IdentityContentMismatch {
+                        txn: prepared.effect.txn_id(),
+                        ordinal: prepared.effect.ordinal(),
+                    });
+                }
+                match &prepared.predecessor {
+                    PreparedPredecessor::Present(expected) if expected == &current => Ok(None),
+                    _ => Err(self.predecessor_changed(prepared)),
+                }
+            }
+            BTreeLookup::Blob(_) => Err(OrderedMvccInstallError::UnexpectedBlobCurrent),
+            BTreeLookup::Deleted => Err(OrderedMvccInstallError::UnexpectedRawTombstoneCurrent),
+        }
+    }
+
+    fn predecessor_changed(
+        &self,
+        prepared: &PreparedOrderedMvccEffect,
+    ) -> OrderedMvccInstallError {
+        OrderedMvccInstallError::PreparedPredecessorChanged {
+            txn: prepared.effect.txn_id(),
+            object: prepared.effect.object(),
+        }
     }
 
     fn validate_call(
@@ -279,6 +476,11 @@ pub enum OrderedMvccInstallError {
         "install identity ({txn:?}, {ordinal}) matches the current record but its logical value differs"
     )]
     IdentityContentMismatch { txn: TxnId, ordinal: u32 },
+    #[error("prepared predecessor changed before transaction {txn:?} could install object {object:?}")]
+    PreparedPredecessorChanged {
+        txn: TxnId,
+        object: StorageObjectId,
+    },
     #[error("current record commit {predecessor:?} is newer than writer snapshot {snapshot:?}")]
     SnapshotConflict {
         predecessor: CommitSeq,
@@ -435,6 +637,56 @@ mod tests {
     }
 
     #[test]
+    fn preparation_allocates_history_without_mutating_shared_page() {
+        let (buffer, tree, _directory, undo, statuses, intents) = setup(7);
+        let installer = OrderedMvccInstaller::new(&statuses, &undo);
+        let prior = MvccRecord::new(
+            RecordOwner::Frozen(CommitSeq::new(4)),
+            None,
+            MvccValue::Inline(b"old".to_vec()),
+        );
+        tree.insert(&buffer, b"key", &prior.to_bytes().expect("encode"))
+            .expect("seed");
+        statuses.begin(TxnId::new(70)).expect("writer begins");
+        let effect = make_effect(70, 7, b"key", Some(b"new"));
+        let effects = [effect.clone()];
+        let guard = intents
+            .try_acquire(TxnId::new(70), &effects)
+            .expect("intent");
+
+        let PrepareEffectResult::Prepared(prepared) = installer
+            .prepare(
+                &tree,
+                &buffer,
+                &guard,
+                &effect,
+                InstallContext::Live {
+                    snapshot: CommitSeq::new(4),
+                },
+            )
+            .expect("prepares")
+        else {
+            panic!("effect should require installation");
+        };
+        assert_eq!(prepared.required_undo(), Some(VersionId::new(1)));
+        assert_eq!(prepared.appended_undo(), Some(VersionId::new(1)));
+        assert_eq!(decode_current(&tree, &buffer, b"key"), prior);
+        assert_eq!(undo.durable_version(), None);
+
+        undo.sync_through(VersionId::new(1)).expect("undo syncs");
+        assert_eq!(
+            installer
+                .apply_prepared(&tree, &buffer, &guard, &prepared)
+                .expect("prepared effect applies"),
+            InstallEffectResult::Installed {
+                undo_head: Some(VersionId::new(1)),
+                appended_undo: Some(VersionId::new(1)),
+            }
+        );
+        assert_eq!(decode_current(&tree, &buffer, b"key").value(), &MvccValue::Inline(b"new".to_vec()));
+    }
+
+    #[test]
     fn dependency_aware_install_attaches_decision_and_actual_undo_head() {
         let (buffer, tree, _directory, undo, statuses, intents) = setup(6);
         let installer = OrderedMvccInstaller::new(&statuses, &undo);
@@ -474,6 +726,7 @@ mod tests {
                 appended_undo: Some(VersionId::new(1)),
             }
         );
+        assert_eq!(dependencies.durable_undo(), Some(VersionId::new(1)));
         assert_eq!(
             dependencies
                 .requirements(PageKey::new(tree.descriptor().id(), PageId::new(0)))
