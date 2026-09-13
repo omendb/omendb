@@ -298,11 +298,7 @@ mod tests {
         StorageObjectDescriptor::new(StorageObjectId::new(id), ObjectAuthority::Authoritative)
     }
 
-    fn recovered(
-        txn: u64,
-        csn: u64,
-        writes: &[(u64, &[u8], &[u8])],
-    ) -> RecoveredTransaction {
+    fn recovered(txn: u64, csn: u64, writes: &[(u64, &[u8], &[u8])]) -> RecoveredTransaction {
         let mutations: Vec<_> = writes
             .iter()
             .enumerate()
@@ -356,7 +352,9 @@ mod tests {
         let first = recovered(1, 1, &[(1, b"key", b"v1")]);
         let second = recovered(2, 2, &[(1, b"key", b"v2")]);
         assert_eq!(
-            applier.apply(&first, &buffer, &[&tree]).expect("first applies"),
+            applier
+                .apply(&first, &buffer, &[&tree])
+                .expect("first applies"),
             RecoveryApplyResult::Applied
         );
         assert_eq!(
@@ -404,7 +402,9 @@ mod tests {
         let intents = WriteIntentTable::new();
         let applier = OrderedRecoveryApplier::new(&statuses, &frontier, &intents, &undo);
         let first = recovered(1, 1, &[(1, b"key", b"v1")]);
-        applier.apply(&first, &buffer, &[&tree]).expect("first applies");
+        applier
+            .apply(&first, &buffer, &[&tree])
+            .expect("first applies");
 
         let impostor = recovered(9, 1, &[(1, b"other", b"wrong")]);
         assert!(matches!(
@@ -465,11 +465,7 @@ mod tests {
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
         let applier = OrderedRecoveryApplier::new(&statuses, &frontier, &intents, &undo);
-        let transaction = recovered(
-            5,
-            1,
-            &[(1, b"good", b"installed"), (2, b"bad", b"fails")],
-        );
+        let transaction = recovered(5, 1, &[(1, b"good", b"installed"), (2, b"bad", b"fails")]);
 
         assert!(matches!(
             applier.apply(&transaction, &buffer, &[&first, &second]),
@@ -481,7 +477,9 @@ mod tests {
         assert_eq!(frontier.snapshot(), CommitSeq::new(0));
         assert_eq!(
             statuses.status(TxnId::new(5)).expect("status"),
-            Some(super::super::TransactionStatus::Committed(CommitSeq::new(1)))
+            Some(super::super::TransactionStatus::Committed(CommitSeq::new(
+                1
+            )))
         );
         let reader = OrderedMvccReader::new(&statuses, &undo);
         assert_eq!(
