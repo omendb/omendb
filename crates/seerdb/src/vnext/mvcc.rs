@@ -2,7 +2,8 @@
 //!
 //! Physical page versions are deliberately not transaction visibility. A
 //! current record is owned either by a live `TxnId` or by a frozen `CommitSeq`,
-//! carries its logical value/tombstone, and links to a prior logical version.
+//! carries its logical value/tombstone, links to a prior logical version, and
+//! may retain the stable logical identity of the final effect that installed it.
 //! Publishing one transaction status therefore makes every record owned by that
 //! transaction visible together, even when records span multiple access-method
 //! objects. The append-oriented version store remains a separate service.
@@ -12,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 const RECORD_MAGIC: [u8; 4] = *b"OMV1";
-const RECORD_VERSION: u8 = 1;
-const RECORD_HEADER_SIZE: usize = 28;
+const RECORD_VERSION: u8 = 2;
+const RECORD_HEADER_SIZE: usize = 40;
 const OWNER_TRANSACTION: u8 = 1;
 const OWNER_FROZEN: u8 = 2;
 const VALUE_INLINE: u8 = 1;
@@ -25,6 +26,32 @@ const STATUS_SHARDS: usize = 64;
 pub enum RecordOwner {
     Transaction(TxnId),
     Frozen(CommitSeq),
+}
+
+/// Stable identity of one transaction's canonical final effect for a logical
+/// `(StorageObjectId, key)`. The object/key provide the remaining scope; this
+/// pair is not a chronological ordering domain.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct InstallIdentity {
+    txn_id: TxnId,
+    ordinal: u32,
+}
+
+impl InstallIdentity {
+    #[must_use]
+    pub const fn new(txn_id: TxnId, ordinal: u32) -> Self {
+        Self { txn_id, ordinal }
+    }
+
+    #[must_use]
+    pub const fn txn_id(self) -> TxnId {
+        self.txn_id
+    }
+
+    #[must_use]
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
 }
 
 /// Logical value stored in a current record or complete before-image.
@@ -39,15 +66,54 @@ pub enum MvccValue {
 pub struct MvccRecord {
     owner: RecordOwner,
     undo_head: Option<VersionId>,
+    install_identity: Option<InstallIdentity>,
     value: MvccValue,
 }
 
 impl MvccRecord {
+    /// Construct an identity-free logical record. This is suitable for base or
+    /// frozen state whose replay horizon no longer requires effect identity.
+    /// New transaction-owned current records should use [`Self::installed`].
     #[must_use]
     pub const fn new(owner: RecordOwner, undo_head: Option<VersionId>, value: MvccValue) -> Self {
         Self {
             owner,
             undo_head,
+            install_identity: None,
+            value,
+        }
+    }
+
+    /// Construct a transaction-owned current record with explicit replay/install
+    /// identity derived from the canonical final write set.
+    #[must_use]
+    pub const fn installed(
+        txn_id: TxnId,
+        ordinal: u32,
+        undo_head: Option<VersionId>,
+        value: MvccValue,
+    ) -> Self {
+        Self {
+            owner: RecordOwner::Transaction(txn_id),
+            undo_head,
+            install_identity: Some(InstallIdentity::new(txn_id, ordinal)),
+            value,
+        }
+    }
+
+    /// Construct a record while preserving an existing install identity, for
+    /// example when freezing a transaction-owned record to its commit sequence.
+    #[must_use]
+    pub const fn with_install_identity(
+        owner: RecordOwner,
+        undo_head: Option<VersionId>,
+        install_identity: InstallIdentity,
+        value: MvccValue,
+    ) -> Self {
+        Self {
+            owner,
+            undo_head,
+            install_identity: Some(install_identity),
             value,
         }
     }
@@ -63,8 +129,20 @@ impl MvccRecord {
     }
 
     #[must_use]
+    pub const fn install_identity(&self) -> Option<InstallIdentity> {
+        self.install_identity
+    }
+
+    #[must_use]
     pub const fn value(&self) -> &MvccValue {
         &self.value
+    }
+
+    /// Whether this record is the same canonical final effect expected by one
+    /// replay/install attempt. Content equality is intentionally separate.
+    #[must_use]
+    pub const fn has_install_identity(&self, identity: InstallIdentity) -> bool {
+        matches!(self.install_identity, Some(existing) if existing.txn_id.get() == identity.txn_id.get() && existing.ordinal == identity.ordinal)
     }
 
     /// Encode a compact fail-closed value envelope for an access-method record.
@@ -76,6 +154,23 @@ impl MvccRecord {
         if owner_id == 0 {
             return Err(MvccCodecError::ReservedOwner);
         }
+        let (install_txn, install_ordinal) = match self.install_identity {
+            Some(identity) => {
+                if identity.txn_id.get() == 0 {
+                    return Err(MvccCodecError::ReservedInstallTransaction);
+                }
+                if let RecordOwner::Transaction(owner) = self.owner {
+                    if owner != identity.txn_id {
+                        return Err(MvccCodecError::InstallOwnerMismatch {
+                            owner,
+                            install: identity.txn_id,
+                        });
+                    }
+                }
+                (identity.txn_id.get(), identity.ordinal)
+            }
+            None => (0, 0),
+        };
         let (value_kind, value) = match &self.value {
             MvccValue::Inline(value) => (VALUE_INLINE, value.as_slice()),
             MvccValue::Tombstone => (VALUE_TOMBSTONE, &[][..]),
@@ -92,6 +187,8 @@ impl MvccRecord {
         bytes.push(0);
         bytes.extend_from_slice(&owner_id.to_le_bytes());
         bytes.extend_from_slice(&self.undo_head.map_or(0, VersionId::get).to_le_bytes());
+        bytes.extend_from_slice(&install_txn.to_le_bytes());
+        bytes.extend_from_slice(&install_ordinal.to_le_bytes());
         bytes.extend_from_slice(&value_len.to_le_bytes());
         bytes.extend_from_slice(value);
         Ok(bytes)
@@ -115,7 +212,28 @@ impl MvccRecord {
             _ => return Err(MvccCodecError::UnsupportedFormat),
         };
         let undo_raw = read_u64(bytes, 16).ok_or(MvccCodecError::Malformed)?;
-        let value_len = read_u32(bytes, 24).ok_or(MvccCodecError::Malformed)? as usize;
+        let install_txn_raw = read_u64(bytes, 24).ok_or(MvccCodecError::Malformed)?;
+        let install_ordinal = read_u32(bytes, 32).ok_or(MvccCodecError::Malformed)?;
+        let install_identity = if install_txn_raw == 0 {
+            if install_ordinal != 0 {
+                return Err(MvccCodecError::Malformed);
+            }
+            None
+        } else {
+            Some(InstallIdentity::new(
+                TxnId::new(install_txn_raw),
+                install_ordinal,
+            ))
+        };
+        if let (RecordOwner::Transaction(owner_txn), Some(identity)) = (owner, install_identity) {
+            if owner_txn != identity.txn_id {
+                return Err(MvccCodecError::InstallOwnerMismatch {
+                    owner: owner_txn,
+                    install: identity.txn_id,
+                });
+            }
+        }
+        let value_len = read_u32(bytes, 36).ok_or(MvccCodecError::Malformed)? as usize;
         let expected = RECORD_HEADER_SIZE
             .checked_add(value_len)
             .ok_or(MvccCodecError::Malformed)?;
@@ -131,6 +249,7 @@ impl MvccRecord {
         Ok(Self {
             owner,
             undo_head: (undo_raw != 0).then_some(VersionId::new(undo_raw)),
+            install_identity,
             value,
         })
     }
@@ -144,6 +263,10 @@ pub enum MvccCodecError {
     UnsupportedFormat,
     #[error("MVCC record uses the reserved zero owner identity")]
     ReservedOwner,
+    #[error("MVCC install identity uses reserved transaction ID zero")]
+    ReservedInstallTransaction,
+    #[error("transaction-owned MVCC record owner {owner:?} disagrees with install identity {install:?}")]
+    InstallOwnerMismatch { owner: TxnId, install: TxnId },
     #[error("MVCC inline value exceeds the envelope length domain")]
     ValueTooLarge,
 }
@@ -362,12 +485,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_envelope_round_trips_transaction_frozen_and_tombstone_states() {
+    fn record_envelope_round_trips_install_identity_frozen_and_tombstone_states() {
         let records = [
-            MvccRecord::new(
-                RecordOwner::Transaction(TxnId::new(7)),
+            MvccRecord::installed(
+                TxnId::new(7),
+                5,
                 Some(VersionId::new(11)),
                 MvccValue::Inline(b"value".to_vec()),
+            ),
+            MvccRecord::with_install_identity(
+                RecordOwner::Frozen(CommitSeq::new(12)),
+                Some(VersionId::new(9)),
+                InstallIdentity::new(TxnId::new(6), 3),
+                MvccValue::Inline(b"older".to_vec()),
             ),
             MvccRecord::new(
                 RecordOwner::Frozen(CommitSeq::new(13)),
@@ -385,9 +515,45 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_unknown_record_envelopes_fail_closed() {
-        let record = MvccRecord::new(
+    fn installed_identity_is_stable_across_owner_freezing() {
+        let identity = InstallIdentity::new(TxnId::new(21), 7);
+        let current = MvccRecord::installed(
+            identity.txn_id(),
+            identity.ordinal(),
+            None,
+            MvccValue::Inline(b"value".to_vec()),
+        );
+        let frozen = MvccRecord::with_install_identity(
+            RecordOwner::Frozen(CommitSeq::new(42)),
+            current.undo_head(),
+            identity,
+            current.value().clone(),
+        );
+        assert!(current.has_install_identity(identity));
+        assert!(frozen.has_install_identity(identity));
+        assert_eq!(frozen.install_identity(), Some(identity));
+    }
+
+    #[test]
+    fn transaction_owner_and_install_identity_must_agree() {
+        let mismatched = MvccRecord::with_install_identity(
             RecordOwner::Transaction(TxnId::new(3)),
+            None,
+            InstallIdentity::new(TxnId::new(4), 0),
+            MvccValue::Inline(b"x".to_vec()),
+        );
+        assert!(matches!(
+            mismatched.to_bytes(),
+            Err(MvccCodecError::InstallOwnerMismatch { owner, install })
+                if owner == TxnId::new(3) && install == TxnId::new(4)
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unknown_record_envelopes_fail_closed() {
+        let record = MvccRecord::installed(
+            TxnId::new(3),
+            9,
             None,
             MvccValue::Inline(b"x".to_vec()),
         );
@@ -398,10 +564,17 @@ mod tests {
         ));
 
         let mut version = encoded.clone();
-        version[4] = 99;
+        version[4] = 1;
         assert!(matches!(
             MvccRecord::from_bytes(&version),
             Err(MvccCodecError::UnsupportedFormat)
+        ));
+
+        let mut malformed_identity = encoded.clone();
+        malformed_identity[24..32].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            MvccRecord::from_bytes(&malformed_identity),
+            Err(MvccCodecError::Malformed)
         ));
 
         let mut trailing = encoded;
