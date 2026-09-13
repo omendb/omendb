@@ -1071,16 +1071,25 @@ mod tests {
         });
         device.wait_until_writeback();
 
+        let (started, reader_started) = std::sync::mpsc::channel();
         let read_pool = Arc::clone(&pool);
         let reader = std::thread::spawn(move || {
+            started.send(()).expect("signal reader start");
             let guard = read_pool.pin(key(1)).expect("lookup survives writeback");
             guard.read().expect("read latch")[0]
         });
+        reader_started.recv().expect("reader starts");
 
-        for _ in 0..100 {
-            if pool.stats().expect("stats").writeback_waits > 0 {
-                break;
-            }
+        // The reader must reach the in-flight writeback before it is released.
+        // Bound the wait so a broken pool fails the assertion instead of hanging,
+        // but do not cap it by a retry count: reader progress depends on
+        // scheduling, not on how many times this thread yields.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pool.stats().expect("stats").writeback_waits == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader never waited for the in-flight writeback"
+            );
             std::thread::yield_now();
         }
         device.release_writeback();
