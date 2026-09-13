@@ -551,7 +551,9 @@ mod tests {
             page_dependencies.as_ref(),
         );
 
-        let mut first = coordinator.begin_write(TxnId::new(90)).expect("first begins");
+        let mut first = coordinator
+            .begin_write(TxnId::new(90))
+            .expect("first begins");
         first
             .stage_ordered_put(descriptor(9), b"key".to_vec(), b"v1".to_vec())
             .expect("first stages");
