@@ -49,10 +49,50 @@ pub enum BTreeError {
     DuplicateKey,
     #[error("logical page ID space is exhausted")]
     PageIdExhausted,
+    #[error(
+        "invalid object metadata: root {root:?} must be below the next unallocated page {next_page:?}"
+    )]
+    InvalidObjectMetadata { root: PageId, next_page: PageId },
     #[error("B-tree structural-modification lock is poisoned")]
     StructuralLockPoisoned,
     #[error("B-tree entry does not fit an empty page")]
     EntryTooLarge,
+}
+
+/// Checkpoint-capturable metadata of one ordered object.
+///
+/// `root` is the current root page and `next_page` is the allocation high-water
+/// mark: the next logical page ID this object may hand out. Recovery must reuse
+/// both together, because reusing a stale `next_page` would hand out a page ID
+/// that is still live in the recovered graph.
+///
+/// Reading the pair is not atomic with respect to a concurrent split, so capture
+/// must happen under the checkpoint admission/drain cut rather than by sampling
+/// a live object.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ObjectMetadata {
+    root: PageId,
+    next_page: PageId,
+}
+
+impl ObjectMetadata {
+    /// Construct capture metadata.
+    #[must_use]
+    pub const fn new(root: PageId, next_page: PageId) -> Self {
+        Self { root, next_page }
+    }
+
+    /// Return the captured root page.
+    #[must_use]
+    pub const fn root(self) -> PageId {
+        self.root
+    }
+
+    /// Return the captured allocation high-water mark.
+    #[must_use]
+    pub const fn next_page(self) -> PageId {
+        self.next_page
+    }
 }
 
 /// Ordered access-method metadata over the shared vNext buffer pool.
@@ -89,8 +129,11 @@ impl BTreeObject {
 
     /// Open already-materialized v4 object metadata.
     ///
-    /// `next_page` must be greater than every allocated page ID and is expected
-    /// to come from checkpoint/object metadata once that layer lands.
+    /// `next_page` must be strictly greater than every allocated page ID, which
+    /// in particular means strictly greater than `root`. The check is local: it
+    /// rejects metadata that would let allocation hand out a live page ID, but it
+    /// cannot prove that every reachable page is below the high-water mark. That
+    /// structural closure check belongs to checkpoint verification, not here.
     pub fn open(
         descriptor: StorageObjectDescriptor,
         root: PageId,
@@ -99,12 +142,24 @@ impl BTreeObject {
         if root.get() == RESERVED_PAGE_ID || next_page.get() == RESERVED_PAGE_ID {
             return Err(BTreeError::PageIdExhausted);
         }
+        if next_page.get() <= root.get() {
+            return Err(BTreeError::InvalidObjectMetadata { root, next_page });
+        }
         Ok(Self {
             descriptor,
             root: AtomicU64::new(root.get()),
             next_page: AtomicU64::new(next_page.get()),
             structural: Mutex::new(()),
         })
+    }
+
+    /// Capture the metadata a checkpoint must persist and recovery must reuse.
+    #[must_use]
+    pub fn metadata(&self) -> ObjectMetadata {
+        ObjectMetadata {
+            root: self.root(),
+            next_page: PageId::new(self.next_page.load(Ordering::Acquire)),
+        }
     }
 
     #[must_use]
@@ -1116,5 +1171,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn captured_metadata_reopens_the_same_ordered_object() {
+        let device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(16, 384, device).expect("buffer creates");
+        let tree = BTreeObject::create(descriptor(51), &buffer).expect("tree creates");
+        assert_eq!(
+            tree.metadata(),
+            ObjectMetadata::new(PageId::new(0), PageId::new(1))
+        );
+
+        for number in 0..24u32 {
+            let key = format!("m{number:04}");
+            tree.insert(&buffer, key.as_bytes(), &[b'x'; 40])
+                .expect("insert");
+        }
+        let captured = tree.metadata();
+        assert!(
+            captured.root().get() != 0 && captured.next_page().get() > captured.root().get(),
+            "a split root must stay below the allocation high-water mark"
+        );
+        let last = captured.next_page().get() - 1;
+        assert!(
+            tree.lookup(&buffer, format!("m{last:04}").as_bytes())
+                .is_ok(),
+            "the high-water mark describes an allocated page"
+        );
+
+        // Reopening from captured metadata must serve the same keys, and must not
+        // hand out a page ID below the captured high-water mark.
+        let reopened = BTreeObject::open(descriptor(51), captured.root(), captured.next_page())
+            .expect("metadata reopens");
+        assert_eq!(reopened.metadata(), captured);
+        for number in 0..24u32 {
+            let key = format!("m{number:04}");
+            assert_eq!(
+                reopened.lookup(&buffer, key.as_bytes()).expect("lookup"),
+                BTreeLookup::Found(vec![b'x'; 40])
+            );
+        }
+        assert_eq!(
+            reopened
+                .allocate_page()
+                .expect("allocates above the high-water mark"),
+            captured.next_page()
+        );
+    }
+
+    #[test]
+    fn metadata_that_would_reuse_a_live_page_id_is_refused() {
+        // next_page must be strictly greater than root, otherwise allocation
+        // would hand out a page ID that is still live in the recovered graph.
+        assert!(matches!(
+            BTreeObject::open(descriptor(52), PageId::new(7), PageId::new(7)),
+            Err(BTreeError::InvalidObjectMetadata { .. })
+        ));
+        assert!(matches!(
+            BTreeObject::open(descriptor(52), PageId::new(7), PageId::new(3)),
+            Err(BTreeError::InvalidObjectMetadata { .. })
+        ));
+        assert!(matches!(
+            BTreeObject::open(descriptor(52), PageId::new(0), PageId::new(0)),
+            Err(BTreeError::InvalidObjectMetadata { .. })
+        ));
+        // The reserved sentinel remains a distinct failure.
+        assert!(matches!(
+            BTreeObject::open(descriptor(52), PageId::new(u64::MAX), PageId::new(1)),
+            Err(BTreeError::PageIdExhausted)
+        ));
+        assert!(matches!(
+            BTreeObject::open(descriptor(52), PageId::new(0), PageId::new(u64::MAX)),
+            Err(BTreeError::PageIdExhausted)
+        ));
+        BTreeObject::open(descriptor(52), PageId::new(0), PageId::new(1))
+            .expect("the fresh-object pair remains valid");
     }
 }

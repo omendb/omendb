@@ -33,7 +33,7 @@ mod visibility;
 mod write_intent;
 mod write_set;
 
-pub use btree::{BTreeError, BTreeLookup, BTreeObject, RangeCursor};
+pub use btree::{BTreeError, BTreeLookup, BTreeObject, ObjectMetadata, RangeCursor};
 pub use buffer::{
     BufferError, BufferPool, BufferStats, PageGuard, PageIo, PageIoOperation, PageWriteGuard,
 };

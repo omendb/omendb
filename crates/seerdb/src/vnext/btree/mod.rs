@@ -16,4 +16,4 @@ mod failure_tests;
 mod stress_tests;
 
 pub use cursor_v4::RangeCursor;
-pub use tree_v4::{BTreeError, BTreeLookup, BTreeObject};
+pub use tree_v4::{BTreeError, BTreeLookup, BTreeObject, ObjectMetadata};
