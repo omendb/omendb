@@ -132,13 +132,16 @@ algorithm replacements.
   installs a page that depends on its own not-yet-durable undo and then needs to
   evict that page to finish the same transaction;
 - buffer victim contention fix so another loader stealing a just-evicted free
-  frame is treated as a retry rather than an invariant failure.
+  frame is treated as a retry rather than an invariant failure;
+- durable store identity plus exclusive writable directory ownership:
+  `StoreDirectory` holds a cross-process OS lock and an immutable, checksummed
+  `store.identity` incarnation, and per-component claims prevent a second
+  mutable WAL/undo/page handle. The mandatory 40-byte WAL segment header and
+  32-byte undo header bind those components to the same incarnation, as the page
+  arena and maps already were.
 
 ### Not implemented yet
 
-- an explicit store-incarnation binding in WAL and undo framing (the page store
-  now binds its own arena and maps) and cross-process exclusive writable
-  ownership;
 - structurally complete checkpoint *capture*: publication needs the runtime admission/drain
   cut, roots/object metadata, allocation high-water marks, owner outcomes and
   retention state. The checksummed page-image envelope and out-of-place placement
@@ -156,8 +159,9 @@ algorithm replacements.
   page application, status/frontier publication, checkpoint publication and two
   consecutive reopens;
 - owner freezing, retention-aware WAL/undo reclamation and physical GC;
-- cross-process exclusive writable directory ownership and store-incarnation
-  binding across WAL, undo, pages and manifests, required within Milestone F;
+- store-incarnation binding of a checkpoint/manifest and structurally complete
+  checkpoint authority; exclusive writable ownership and WAL/undo/page binding
+  already exist, required within Milestone F;
 - canonical row storage and OmenDB cutover;
 - optimized background writeback, durability batching, custom latches,
   translation fast paths or finer-grained SMO coordination.
@@ -204,7 +208,6 @@ Remaining buffer/materialization work:
 - checkpoint *capture* over the now-implemented page image/map components:
   runtime drain, structural closure, roots/object metadata, allocation high-water
   marks and owner outcomes;
-- WAL/undo store-incarnation binding and cross-process exclusive ownership;
 - explicit admission/progress policy under arbitrary pin pressure or very small
   pools; the self-undo dependency cycle is no longer part of that problem;
 - background dirty queues and bounded materialization workers after the blocking
@@ -384,8 +387,9 @@ remains is capture and publication:
 
 1. ~~define a checksummed page image/envelope and out-of-place physical page map~~
    (implemented; placement authority only);
-2. acquire exclusive writable-store ownership and bind WAL/undo/page components
-   to a common store incarnation;
+2. ~~acquire exclusive writable-store ownership and bind WAL/undo/page components
+   to a common store incarnation~~ (implemented as ownership and incarnation
+   binding only; it is not checkpoint or recovery authority);
 3. close admission to new committing mutations, allow admitted work to finish
    installation/publication, then establish the exact `(CSN, decision LSN)` cut.
    Keep install/structural/GC and allocation metadata mutation quiescent during
@@ -514,8 +518,9 @@ retention/streaming/indexing policy before large-history qualification.
    Qualify out-of-order installers, earlier-decision failure and pending-waiter
    wakeup as the surrounding runtime lifecycle lands.
 2. Define the shared runtime admission/drain/failure lifecycle and complete
-   checkpoint capture/publication over the implemented page store, with exclusive
-   writable ownership and WAL/undo store-incarnation binding.
+   checkpoint capture/publication over the implemented page store. Exclusive
+   writable ownership and WAL/undo/page store-incarnation binding now exist;
+   checkpoint/manifest binding and checkpoint authority do not.
 3. Recover checkpoint + synchronized retained WAL suffix through the existing
    applicator. Qualify runtime read/snapshot fencing, already-admitted writers,
    checkpoint cuts and two consecutive reopens before persistent exposure.

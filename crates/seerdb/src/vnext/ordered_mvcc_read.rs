@@ -195,6 +195,7 @@ mod tests {
     use super::*;
     use crate::vnext::{
         ObjectAuthority, PageIo, PageKey, RecordOwner, StorageObjectDescriptor, StorageObjectId,
+        StoreDirectory,
     };
     use durable_fs::SyncClass;
     use std::collections::HashMap;
@@ -241,8 +242,8 @@ mod tests {
             StorageObjectDescriptor::new(StorageObjectId::new(1), ObjectAuthority::Authoritative);
         let tree = BTreeObject::create(descriptor, &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         (buffer, tree, directory, undo, TransactionStatusTable::new())
     }
 

@@ -16,6 +16,8 @@ const HEADER_CHECKSUM_OFFSET: usize = 8;
 const RECORD_HEADER_SIZE: usize = 12; // length + version + kind + flags + header CRC
 const RECORD_TRAILER_SIZE: usize = 4; // whole-record CRC32C
 const MIN_RECORD_LENGTH: usize = RECORD_HEADER_SIZE - 4 + RECORD_TRAILER_SIZE;
+/// Smallest complete framed vNext record, used to bound WAL segment capacity.
+pub(super) const MIN_RECORD_BYTES: usize = RECORD_HEADER_SIZE + RECORD_TRAILER_SIZE;
 const MUTATION_FIXED_PAYLOAD: usize = 8 + 4 + 8 + 1 + 4 + 4;
 
 /// Classification of the suffix after parsing a vNext log prefix.

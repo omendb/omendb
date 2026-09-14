@@ -20,15 +20,17 @@ use super::page_image::{
     is_image_offset, page_image_bytes,
 };
 use super::page_map::{self, PageMap, PageMapEntry, PageMapId, PageMapRef};
-use super::{PageDependencyTable, PageIo, PageKey, StoreIncarnation};
+use super::store::ComponentLease;
+use super::{
+    PageDependencyTable, PageIo, PageKey, StoreComponent, StoreDirectory, StoreError,
+    StoreIncarnation,
+};
 use durable_fs::{SyncClass, fsync_dir, sync_file_all};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-const IMAGE_FILE_NAME: &str = "page-images.dat";
 
 /// Which page-store operation failed.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -63,6 +65,8 @@ pub enum PageStoreError {
     Fenced,
     #[error("page-store operation lock is poisoned")]
     Poisoned,
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("page-store {operation:?} failed: {source}")]
     Io {
         operation: PageStoreOperation,
@@ -80,12 +84,14 @@ struct PageStoreState {
 
 /// Append-only page-image arena plus an explicit working placement overlay.
 pub struct PersistentPageIo {
-    directory: PathBuf,
     store: StoreIncarnation,
     page_bytes: u32,
     sync_class: SyncClass,
     dependencies: Arc<PageDependencyTable>,
     state: Mutex<PageStoreState>,
+    /// Declared last so file handles close before the component claim and the
+    /// directory ownership are released.
+    _lease: ComponentLease,
 }
 
 impl PersistentPageIo {
@@ -94,17 +100,14 @@ impl PersistentPageIo {
     /// An existing arena is never adopted as a new store: the arena header is
     /// what binds images to a store incarnation.
     pub fn create(
-        directory: &Path,
-        store: StoreIncarnation,
+        store: &StoreDirectory,
         page_bytes: u32,
         sync_class: SyncClass,
     ) -> Result<Self, PageStoreError> {
         validate_page_bytes(page_bytes)?;
-        std::fs::create_dir_all(directory).map_err(|source| PageStoreError::Io {
-            operation: PageStoreOperation::Create,
-            source,
-        })?;
-        let path = directory.join(IMAGE_FILE_NAME);
+        let lease = store.claim(StoreComponent::Pages)?;
+        let incarnation = lease.incarnation();
+        let path = lease.image_path();
         let mut images = OpenOptions::new()
             .read(true)
             .write(true)
@@ -114,18 +117,17 @@ impl PersistentPageIo {
                 operation: PageStoreOperation::Create,
                 source,
             })?;
-        let header = encode_file_header(store, page_bytes);
+        let header = encode_file_header(incarnation, page_bytes);
         images
             .write_all(&header)
             .and_then(|()| images.sync_all())
-            .and_then(|()| fsync_dir(directory))
+            .and_then(|()| fsync_dir(lease.directory()))
             .map_err(|source| PageStoreError::Io {
                 operation: PageStoreOperation::Create,
                 source,
             })?;
         Ok(Self {
-            directory: directory.to_path_buf(),
-            store,
+            store: incarnation,
             page_bytes,
             sync_class,
             dependencies: Arc::new(PageDependencyTable::new()),
@@ -135,6 +137,7 @@ impl PersistentPageIo {
                 working: BTreeMap::new(),
                 fenced: false,
             }),
+            _lease: lease,
         })
     }
 
@@ -144,17 +147,18 @@ impl PersistentPageIo {
     /// caller now, a validated manifest later). Missing components are never
     /// created and no newest map is searched for.
     pub fn open(
-        directory: &Path,
-        expected_store: StoreIncarnation,
+        store: &StoreDirectory,
         selected: PageMapRef,
         sync_class: SyncClass,
     ) -> Result<(Self, PageMap), PageStoreError> {
-        let map_path = map_path(directory, selected.id());
+        let lease = store.claim(StoreComponent::Pages)?;
+        let expected_store = lease.incarnation();
+        let map_path = lease.map_path(selected.id().get());
         let map_bytes = read_exact_file(&map_path, selected.file_bytes())?;
         let map = page_map::decode(&map_bytes, selected, expected_store)?;
         let page_bytes = map.page_bytes();
 
-        let images_path = directory.join(IMAGE_FILE_NAME);
+        let images_path = lease.image_path();
         let mut images = OpenOptions::new()
             .read(true)
             .write(true)
@@ -281,7 +285,7 @@ impl PersistentPageIo {
             operation: PageStoreOperation::Open,
             source,
         })?;
-        fsync_dir(directory).map_err(|source| PageStoreError::Io {
+        fsync_dir(lease.directory()).map_err(|source| PageStoreError::Io {
             operation: PageStoreOperation::SyncDirectory,
             source,
         })?;
@@ -298,7 +302,6 @@ impl PersistentPageIo {
         }
 
         let io = Self {
-            directory: directory.to_path_buf(),
             store: expected_store,
             page_bytes,
             sync_class,
@@ -309,6 +312,7 @@ impl PersistentPageIo {
                 working: restored,
                 fenced: false,
             }),
+            _lease: lease,
         };
         Ok((io, map))
     }
@@ -458,7 +462,7 @@ impl PersistentPageIo {
         let image_file_end = state.end_offset;
         let (bytes, reference) =
             page_map::encode(id, self.store, self.page_bytes, image_file_end, entries)?;
-        let path = map_path(&self.directory, id);
+        let path = self._lease.map_path(id.get());
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -477,7 +481,7 @@ impl PersistentPageIo {
         let map_write = file
             .write_all(&bytes)
             .and_then(|()| file.sync_all())
-            .and_then(|()| fsync_dir(&self.directory));
+            .and_then(|()| fsync_dir(self._lease.directory()));
         if let Err(source) = map_write {
             state.fenced = true;
             return Err(PageStoreError::Io {
@@ -504,6 +508,11 @@ impl PersistentPageIo {
         key: PageKey,
         destination: &mut [u8],
     ) -> Result<PageImageMetadata, PageStoreError> {
+        if map.store() != self.store {
+            return Err(PageStoreError::Corruption(
+                "page-map belongs to another store incarnation",
+            ));
+        }
         if map.page_bytes() != self.page_bytes {
             return Err(PageStoreError::Corruption(
                 "page-map page size disagrees with the page store",
@@ -568,10 +577,6 @@ fn validate_page_bytes(page_bytes: u32) -> Result<(), PageStoreError> {
     Ok(())
 }
 
-fn map_path(directory: &Path, id: PageMapId) -> PathBuf {
-    directory.join(format!("page-map-{:016x}.map", id.get()))
-}
-
 fn read_exact_file(path: &Path, expected_len: u64) -> Result<Vec<u8>, PageStoreError> {
     let mut file = File::open(path).map_err(|source| PageStoreError::Io {
         operation: PageStoreOperation::Open,
@@ -633,6 +638,26 @@ fn page_store_to_io(error: PageStoreError) -> io::Error {
         PageStoreError::MissingPage(_) => io::ErrorKind::NotFound,
         PageStoreError::DependenciesNotDurable(_) => io::ErrorKind::WouldBlock,
         PageStoreError::Corruption(_) => io::ErrorKind::InvalidData,
+        PageStoreError::Store(StoreError::Busy | StoreError::ComponentBusy(_)) => {
+            io::ErrorKind::WouldBlock
+        }
+        PageStoreError::Store(StoreError::MissingLock | StoreError::MissingIdentity) => {
+            io::ErrorKind::NotFound
+        }
+        PageStoreError::Store(StoreError::AlreadyExists | StoreError::NotEmpty) => {
+            io::ErrorKind::AlreadyExists
+        }
+        PageStoreError::Store(
+            StoreError::Corruption { .. }
+            | StoreError::ForeignIncarnation { .. }
+            | StoreError::InvalidPath(_),
+        ) => io::ErrorKind::InvalidData,
+        PageStoreError::Store(
+            StoreError::UnsupportedPlatform
+            | StoreError::InvalidRandomIncarnation
+            | StoreError::Random(_)
+            | StoreError::Io { .. },
+        ) => io::ErrorKind::Other,
         PageStoreError::Fenced | PageStoreError::Poisoned => io::ErrorKind::Other,
         PageStoreError::InvalidInput(_)
         | PageStoreError::MapExists(_)
@@ -645,7 +670,7 @@ fn page_store_to_io(error: PageStoreError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::ids::test_incarnation;
+    use crate::vnext::store::IMAGE_FILE_NAME;
     use crate::vnext::{BufferPool, Lsn, PageDependencies, PageId, StorageObjectId, VersionId};
 
     const N: u32 = 64;
@@ -662,9 +687,12 @@ mod tests {
         PageMapId::new(value).expect("nonzero map identity")
     }
 
-    fn create(directory: &Path) -> PersistentPageIo {
-        PersistentPageIo::create(directory, test_incarnation(1), N, SyncClass::KernelBarrier)
-            .expect("creates")
+    fn store(dir: &Path) -> StoreDirectory {
+        StoreDirectory::create(dir).expect("store")
+    }
+
+    fn create(store: &StoreDirectory) -> PersistentPageIo {
+        PersistentPageIo::create(store, N, SyncClass::KernelBarrier).expect("creates")
     }
 
     fn arena_len(directory: &Path) -> u64 {
@@ -685,7 +713,8 @@ mod tests {
     #[test]
     fn out_of_place_rewrite_keeps_prior_maps_resolving_their_own_image() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let io = create(directory.path());
+        let store = store(directory.path());
+        let io = create(&store);
         let first = io.write_image(key(1), &page(0x11)).expect("writes");
         let map1 = io
             .write_map(map_id(1), &[PageMapEntry::new(key(1), first)])
@@ -713,11 +742,12 @@ mod tests {
     #[test]
     fn two_reopens_preserve_placement_and_continue_after_the_complete_prefix() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
         let first;
         let second;
         let mut reference;
         {
-            let io = create(directory.path());
+            let io = create(&store);
             first = io.write_image(key(1), &page(0x11)).expect("writes");
             second = io.write_image(key(2), &page(0x22)).expect("writes");
             reference = io
@@ -735,13 +765,8 @@ mod tests {
 
         // First reopen: read, then keep using the store and publish another map.
         {
-            let (io, map) = PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(1),
-                reference,
-                SyncClass::KernelBarrier,
-            )
-            .expect("first open");
+            let (io, map) = PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier)
+                .expect("first open");
             let mut buffer = [0u8; N as usize];
             io.read_mapped_page(&map, key(1), &mut buffer)
                 .expect("read");
@@ -766,13 +791,8 @@ mod tests {
         // Two further reopens of the recovered image stay valid.
         let mut buffer = [0u8; N as usize];
         for _ in 0..2 {
-            let (io, map) = PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(1),
-                reference,
-                SyncClass::KernelBarrier,
-            )
-            .expect("reopen");
+            let (io, map) = PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier)
+                .expect("reopen");
             assert_eq!(map.len(), 3);
             io.read_mapped_page(&map, key(3), &mut buffer)
                 .expect("third page");
@@ -782,8 +802,7 @@ mod tests {
 
         // An older selected map still resolves its own images.
         let (io, old) = PersistentPageIo::open(
-            directory.path(),
-            test_incarnation(1),
+            &store,
             PageMapRef::new(
                 map_id(1),
                 std::fs::metadata(
@@ -814,9 +833,10 @@ mod tests {
     #[test]
     fn unreferenced_incomplete_final_append_is_repaired_on_open() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
         let reference;
         {
-            let io = create(directory.path());
+            let io = create(&store);
             let location = io.write_image(key(1), &page(0x11)).expect("writes");
             reference = io
                 .write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
@@ -828,13 +848,8 @@ mod tests {
         append_bytes(directory.path(), &[0u8; 10]);
         assert_eq!(arena_len(directory.path()), complete + 10);
         {
-            let (io, map) = PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(1),
-                reference,
-                SyncClass::KernelBarrier,
-            )
-            .expect("reopen repairs the torn tail");
+            let (io, map) = PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier)
+                .expect("reopen repairs the torn tail");
             assert_eq!(arena_len(directory.path()), complete);
             let mut buffer = [0u8; N as usize];
             io.read_mapped_page(&map, key(1), &mut buffer)
@@ -846,7 +861,7 @@ mod tests {
         // other repairable shape.
         let slot = crate::vnext::page_image::page_image_bytes(N).expect("slot");
         let frame = crate::vnext::page_image::encode_image(
-            test_incarnation(1),
+            store.incarnation(),
             key(9),
             complete,
             N,
@@ -856,13 +871,8 @@ mod tests {
         .expect("encodes");
         append_bytes(directory.path(), &frame[..100]);
         assert!(arena_len(directory.path()) < complete + slot);
-        let (io, map) = PersistentPageIo::open(
-            directory.path(),
-            test_incarnation(1),
-            reference,
-            SyncClass::KernelBarrier,
-        )
-        .expect("reopen repairs the incomplete frame");
+        let (io, map) = PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier)
+            .expect("reopen repairs the incomplete frame");
         assert_eq!(arena_len(directory.path()), complete);
         let mut buffer = [0u8; N as usize];
         io.read_mapped_page(&map, key(1), &mut buffer)
@@ -875,15 +885,16 @@ mod tests {
     #[test]
     fn dangling_selected_reference_fails_closed_without_truncating_the_arena() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
         let complete = {
-            let io = create(directory.path());
+            let io = create(&store);
             let location = io.write_image(key(1), &page(0x11)).expect("writes");
             io.write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
                 .expect("map");
             arena_len(directory.path())
         };
         let frame = crate::vnext::page_image::encode_image(
-            test_incarnation(1),
+            store.incarnation(),
             key(2),
             complete,
             N,
@@ -897,7 +908,7 @@ mod tests {
         // validates references; craft it directly to prove open refuses it.
         let (bytes, reference) = crate::vnext::page_map::encode(
             map_id(7),
-            test_incarnation(1),
+            store.incarnation(),
             N,
             complete,
             &[PageMapEntry::new(
@@ -915,12 +926,7 @@ mod tests {
         .expect("writes map");
         let corrupted = arena_len(directory.path());
         assert!(matches!(
-            PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(1),
-                reference,
-                SyncClass::KernelBarrier,
-            ),
+            PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier),
             Err(PageStoreError::Corruption(_))
         ));
         assert_eq!(
@@ -933,30 +939,40 @@ mod tests {
     #[test]
     fn foreign_store_and_unmatched_image_references_fail_closed() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
         let location;
-        let reference;
         {
-            let io = create(directory.path());
+            let io = create(&store);
             location = io.write_image(key(1), &page(0x11)).expect("writes");
-            reference = io
-                .write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
-                .expect("map")
-                .reference();
+            io.write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
+                .expect("map");
         }
-        // Foreign incarnation.
+        // A map bound to a foreign incarnation is rejected before the arena is
+        // touched.
+        let foreign = StoreIncarnation::from_bytes([9; 16]).expect("foreign");
+        let (foreign_bytes, foreign_reference) = crate::vnext::page_map::encode(
+            map_id(9),
+            foreign,
+            N,
+            arena_len(directory.path()),
+            &[PageMapEntry::new(key(1), location)],
+        )
+        .expect("crafted foreign map encodes");
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("page-map-{:016x}.map", map_id(9).get())),
+            &foreign_bytes,
+        )
+        .expect("writes foreign map");
         assert!(matches!(
-            PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(2),
-                reference,
-                SyncClass::KernelBarrier,
-            ),
+            PersistentPageIo::open(&store, foreign_reference, SyncClass::KernelBarrier),
             Err(PageStoreError::Corruption(_))
         ));
         // A map that names a real slot with a different expected checksum.
         let (bytes, foreign_reference) = crate::vnext::page_map::encode(
             map_id(2),
-            test_incarnation(1),
+            store.incarnation(),
             N,
             arena_len(directory.path()),
             &[PageMapEntry::new(
@@ -973,12 +989,7 @@ mod tests {
         )
         .expect("writes map");
         assert!(matches!(
-            PersistentPageIo::open(
-                directory.path(),
-                test_incarnation(1),
-                foreign_reference,
-                SyncClass::KernelBarrier,
-            ),
+            PersistentPageIo::open(&store, foreign_reference, SyncClass::KernelBarrier),
             Err(PageStoreError::Corruption(_))
         ));
     }
@@ -986,7 +997,8 @@ mod tests {
     #[test]
     fn publication_rejects_an_image_that_belongs_to_another_key() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let io = create(directory.path());
+        let store = store(directory.path());
+        let io = create(&store);
         let location = io.write_image(key(1), &page(0x11)).expect("writes");
         // Control: the matching key and checksum publishes.
         io.write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
@@ -1010,7 +1022,8 @@ mod tests {
     #[test]
     fn map_identity_reuse_is_refused() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let io = create(directory.path());
+        let store = store(directory.path());
+        let io = create(&store);
         let location = io.write_image(key(1), &page(0x11)).expect("writes");
         io.write_map(map_id(1), &[PageMapEntry::new(key(1), location)])
             .expect("first map");
@@ -1023,11 +1036,12 @@ mod tests {
     #[test]
     fn dependencies_gate_publication_and_reopen_restores_requirements() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
         let required = PageDependencies::new(Lsn::new(5), Some(VersionId::new(3)));
         let location;
         let reference;
         {
-            let io = create(directory.path());
+            let io = create(&store);
             io.dependencies()
                 .merge(key(1), required)
                 .expect("requirement recorded");
@@ -1047,13 +1061,8 @@ mod tests {
                 .expect("map")
                 .reference();
         }
-        let (io, map) = PersistentPageIo::open(
-            directory.path(),
-            test_incarnation(1),
-            reference,
-            SyncClass::KernelBarrier,
-        )
-        .expect("reopen");
+        let (io, map) =
+            PersistentPageIo::open(&store, reference, SyncClass::KernelBarrier).expect("reopen");
         // Requirements travel with the image, and no durable frontier is
         // advanced by reopening page metadata.
         assert_eq!(
@@ -1086,7 +1095,8 @@ mod tests {
     #[test]
     fn page_io_surface_supports_dirty_eviction_and_reload() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let io = Arc::new(create(directory.path()));
+        let store = store(directory.path());
+        let io = Arc::new(create(&store));
         let pool = BufferPool::new(2, N as usize, io.clone()).expect("pool");
 
         // Three pages through a two-frame pool force eviction, which is what
@@ -1128,5 +1138,16 @@ mod tests {
         io.read_mapped_page(&map, key(2), &mut buffer)
             .expect("mapped read");
         assert_eq!(buffer.as_slice(), page(0x22));
+    }
+
+    #[test]
+    fn second_page_constructor_under_one_owner_is_component_busy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = store(directory.path());
+        let _io = create(&store);
+        assert!(matches!(
+            PersistentPageIo::create(&store, N, SyncClass::KernelBarrier),
+            Err(PageStoreError::Store(StoreError::ComponentBusy(_)))
+        ));
     }
 }

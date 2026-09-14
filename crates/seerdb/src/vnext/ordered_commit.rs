@@ -407,7 +407,7 @@ mod tests {
     use crate::vnext::{
         BTreeLookup, CommitSeq, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
         ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecordOwner,
-        StorageObjectDescriptor,
+        StorageObjectDescriptor, StoreDirectory,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -490,8 +490,8 @@ mod tests {
         let rows = BTreeObject::create(descriptor(1), &buffer).expect("rows");
         let index = BTreeObject::create(descriptor(2), &buffer).expect("index");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -574,8 +574,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, checked).expect("buffer");
         let tree = BTreeObject::create(descriptor(9), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -636,8 +636,8 @@ mod tests {
         tree.insert(&buffer, b"key", &newer.to_bytes().expect("encode"))
             .expect("seed newer predecessor");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -679,8 +679,8 @@ mod tests {
         tree.insert(&buffer, b"key", b"not-an-mvcc-record")
             .expect("corrupt logical seed");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -721,8 +721,8 @@ mod tests {
         let buffer = BufferPool::new(4, 384, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -754,8 +754,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device.clone()));
         let appender = CommitAppender::new(log, super::super::CommitSeq::new(0));
@@ -812,8 +812,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
         let appender = CommitAppender::new(log, CommitSeq::new(0));
@@ -918,8 +918,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let log_device = Arc::new(MemoryLogDevice::default());
         let log = Arc::new(DurableLog::new(log_device));
         let appender = CommitAppender::new(log, CommitSeq::new(0));

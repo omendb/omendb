@@ -327,7 +327,7 @@ mod tests {
     use crate::vnext::{
         BTreeLookup, CommitDecision, DependencyCheckedPageIo, LogRecord, LoggedMutation,
         ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecoveryAssembler,
-        StorageObjectDescriptor, mutation_digest,
+        StorageObjectDescriptor, StoreDirectory, mutation_digest,
     };
     use durable_fs::SyncClass;
     use std::io;
@@ -408,8 +408,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
@@ -466,8 +466,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, checked).expect("buffer");
         let tree = BTreeObject::create(descriptor(8), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
@@ -525,8 +525,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
@@ -559,8 +559,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
         let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
@@ -589,8 +589,8 @@ mod tests {
             .insert(&buffer, b"bad", b"not-an-mvcc-record")
             .expect("corrupt logical seed");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();

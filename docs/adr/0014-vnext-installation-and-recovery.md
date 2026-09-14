@@ -321,13 +321,15 @@ front-truncation/reuse protocol; do not reuse IDs or truncate the front as an
 ad-hoc GC mechanism.
 
 Checkpoint/object metadata must recover allocation high-water marks and prevent
-reuse of live transaction, object or page identities. WAL, undo and page-map
-components must be bound to the same database/store incarnation in the first
-persistent runtime so numeric IDs cannot accidentally validate a foreign
-component. The owning
-runtime also needs exclusive writable directory ownership; per-handle mutexes do
-not provide a cross-process writer lock. Both store binding and exclusive
-writable ownership are Milestone F acceptance requirements, not deferred GC work.
+reuse of live transaction, object or page identities. The WAL, undo and
+page-map components are now bound to a common persistent store incarnation
+(the `StoreDirectory` `store.identity`, the mandatory 40-byte WAL segment
+header and the 32-byte undo header), and the owning runtime holds a
+cross-process exclusive writable directory lock; per-handle mutexes alone do not
+provide that lock. This is ownership and incarnation binding only: no
+checkpoint, manifest or recovery authority exists yet. Checkpoint/manifest
+binding and structural checkpoint closure remain Milestone F acceptance
+requirements, not deferred GC work.
 
 The runtime lifecycle must also govern snapshot/read/checkpoint admission and
 pending commit completion after failure. Already-admitted writers need explicit

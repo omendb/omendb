@@ -158,7 +158,8 @@ mod tests {
     use crate::storage::format::CommitSeq;
     use crate::vnext::{
         MvccRecord, MvccValue, ObjectAuthority, PageIo, PageKey, RecordOwner,
-        StorageObjectDescriptor, StorageObjectId, TransactionStatusTable, TxnId, UndoStore,
+        StorageObjectDescriptor, StorageObjectId, StoreDirectory, TransactionStatusTable, TxnId,
+        UndoStore,
     };
     use durable_fs::SyncClass;
     use std::collections::HashMap;
@@ -214,8 +215,8 @@ mod tests {
         seed(&tree, &buffer, b"existing", b"base", 1);
 
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let reader = OrderedMvccReader::new(&statuses, &undo);
         let mut transaction = Transaction::new(TxnId::new(7), CommitSeq::new(1));
@@ -265,8 +266,8 @@ mod tests {
             MvccValue::Inline(b"old".to_vec()),
         );
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let older_id = undo.append(&older).expect("older undo");
         let writer = TxnId::new(9);
         let statuses = TransactionStatusTable::new();
@@ -302,8 +303,8 @@ mod tests {
         seed(&tree, &buffer, b"k5", b"v5", 1);
 
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
         let reader = OrderedMvccReader::new(&statuses, &undo);
         let mut transaction = Transaction::new(TxnId::new(12), CommitSeq::new(1));

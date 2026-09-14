@@ -489,7 +489,7 @@ mod tests {
     use super::*;
     use crate::vnext::{
         LoggedMutation, Lsn, ObjectAuthority, PageDependencyTable, PageId, PageIo, PageKey,
-        StorageObjectDescriptor, WriteIntentTable, normalize_final_effects,
+        StorageObjectDescriptor, StoreDirectory, WriteIntentTable, normalize_final_effects,
     };
     use durable_fs::SyncClass;
     use std::collections::HashMap;
@@ -570,8 +570,8 @@ mod tests {
         let buffer = BufferPool::new(8, 512, device).expect("buffer");
         let tree = BTreeObject::create(descriptor(object), &buffer).expect("tree");
         let directory = tempfile::tempdir().expect("tempdir");
-        let undo =
-            UndoStore::open(directory.path().join("undo"), SyncClass::KernelBarrier).expect("undo");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         (
             buffer,
             tree,

@@ -6,15 +6,20 @@
 //! an undo version until both the transaction WAL and this store's durability
 //! frontier cover the dependency.
 //!
-//! Recovery validates a checksummed fixed header before trusting its length.
-//! It truncates only an incomplete final header or frame, and fails closed on
-//! complete corruption. Retained undo links must point strictly backwards.
+//! Every undo file starts with a mandatory 32-byte container header that binds
+//! its frame region to one store incarnation. Recovery validates that header
+//! before trusting or truncating anything, truncates only an incomplete final
+//! frame, and fails closed on complete corruption. Retained undo links must
+//! point strictly backwards.
 
-use super::{MvccCodecError, MvccRecord, VersionId};
+use super::store::{ComponentLease, decode_bound_header, encode_bound_header};
+use super::{
+    MvccCodecError, MvccRecord, StoreComponent, StoreDirectory, StoreError, StoreIncarnation,
+    VersionId,
+};
 use durable_fs::{SyncClass, fsync_dir_chain, sync_file_all, sync_file_data};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -24,6 +29,11 @@ const HEADER_CHECKSUM_OFFSET: usize = 20;
 const FRAME_HEADER_SIZE: usize = 24;
 const FRAME_CHECKSUM_SIZE: usize = 4;
 const MAX_UNDO_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Magic of the mandatory 32-byte undo container header.
+pub(super) const UNDO_HEADER_MAGIC: [u8; 4] = *b"OMUA";
+/// Fixed size of the mandatory undo container header.
+pub(super) const UNDO_HEADER_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct UndoFrame {
@@ -43,57 +53,111 @@ struct UndoState {
 /// A failed append or sync fences further mutation until reopen because the
 /// physical outcome may be uncertain. Indexed reads remain available while
 /// fenced because a partial failed append is never published into the index.
-/// The database owner must exclude other handles/processes for this path.
 pub struct UndoStore {
+    store: StoreIncarnation,
     sync_class: SyncClass,
     state: Mutex<UndoState>,
     durable_version: AtomicU64,
     fenced: AtomicBool,
+    /// Declared last so the file handle closes before the component claim and
+    /// the directory ownership are released.
+    _lease: ComponentLease,
 }
 
 impl UndoStore {
-    /// Open or create an undo file and repair an incomplete final frame.
+    /// Create a new undo container bound to an owned store.
     ///
-    /// Existing complete frames and their directory entries are synchronized
-    /// before returning: existence after a process restart does not prove that
-    /// an earlier creation barrier finished. Scanning retains only one frame's
-    /// payload at a time plus the version-offset index.
-    pub fn open(path: impl AsRef<Path>, sync_class: SyncClass) -> Result<Self, UndoStoreError> {
-        let path = path.as_ref();
-        let parent = publication_parent(path);
-        fs::create_dir_all(parent).map_err(|source| UndoStoreError::Io {
-            operation: UndoIoOperation::Open,
-            source,
-        })?;
-
+    /// The mandatory header is written and synchronized before this returns.
+    /// An existing undo file is never adopted.
+    pub fn create(store: &StoreDirectory, sync_class: SyncClass) -> Result<Self, UndoStoreError> {
+        let lease = store.claim(StoreComponent::Undo)?;
+        let incarnation = lease.incarnation();
+        let path = lease.undo_path();
         let mut file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
-            .truncate(false)
-            .open(path)
+            .open(&path)
             .map_err(|source| UndoStoreError::Io {
                 operation: UndoIoOperation::Open,
                 source,
             })?;
-        fsync_dir_chain(parent).map_err(|source| UndoStoreError::Io {
-            operation: UndoIoOperation::Open,
-            source,
-        })?;
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, incarnation);
+        file.write_all(&header)
+            .and_then(|()| sync_file_all(&file, sync_class))
+            .and_then(|()| fsync_dir_chain(lease.directory()))
+            .map_err(|source| UndoStoreError::Io {
+                operation: UndoIoOperation::Open,
+                source,
+            })?;
+        file.seek(SeekFrom::Start(UNDO_HEADER_BYTES as u64))
+            .map_err(|source| UndoStoreError::Io {
+                operation: UndoIoOperation::Open,
+                source,
+            })?;
+        Ok(Self {
+            store: incarnation,
+            sync_class,
+            state: Mutex::new(UndoState {
+                file,
+                index: Vec::new(),
+                end_offset: UNDO_HEADER_BYTES as u64,
+            }),
+            durable_version: AtomicU64::new(0),
+            fenced: AtomicBool::new(false),
+            _lease: lease,
+        })
+    }
+
+    /// Open an existing undo container and repair an incomplete final frame.
+    ///
+    /// The mandatory header is validated before scanning or truncating any
+    /// frame. A missing file is never created and a foreign incarnation fails
+    /// closed. Existing complete frames and their directory entries are
+    /// synchronized before returning; scanning retains only one frame's payload
+    /// at a time plus the version-offset index.
+    pub fn open(store: &StoreDirectory, sync_class: SyncClass) -> Result<Self, UndoStoreError> {
+        let lease = store.claim(StoreComponent::Undo)?;
+        let incarnation = lease.incarnation();
+        let path = lease.undo_path();
+        if !path.is_file() {
+            return Err(UndoStoreError::Io {
+                operation: UndoIoOperation::Open,
+                source: io::Error::new(io::ErrorKind::NotFound, "undo store file is missing"),
+            });
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(open_error)?;
+
+        // Validate the complete fixed header, including the incarnation, before
+        // scanning or truncating a single frame. A file shorter than the header
+        // is corruption, not an empty store.
+        let mut header = Vec::new();
+        (&mut file)
+            .take(UNDO_HEADER_BYTES as u64)
+            .read_to_end(&mut header)
+            .map_err(open_error)?;
+        let decoded = decode_bound_header(&header, UNDO_HEADER_MAGIC, &path)?;
+        if decoded != incarnation {
+            return Err(StoreError::ForeignIncarnation {
+                path,
+                expected: incarnation,
+                actual: decoded,
+            }
+            .into());
+        }
 
         let (index, end_offset) = scan_and_repair(&mut file, sync_class)?;
-        sync_file_all(&file, sync_class).map_err(|source| UndoStoreError::Io {
-            operation: UndoIoOperation::Open,
-            source,
-        })?;
-        file.seek(SeekFrom::Start(end_offset))
-            .map_err(|source| UndoStoreError::Io {
-                operation: UndoIoOperation::Open,
-                source,
-            })?;
+        sync_file_all(&file, sync_class).map_err(open_error)?;
+        file.seek(SeekFrom::Start(end_offset)).map_err(open_error)?;
         let durable = u64::try_from(index.len()).map_err(|_| UndoStoreError::VersionIdExhausted)?;
 
         Ok(Self {
+            store: incarnation,
             sync_class,
             state: Mutex::new(UndoState {
                 file,
@@ -102,7 +166,14 @@ impl UndoStore {
             }),
             durable_version: AtomicU64::new(durable),
             fenced: AtomicBool::new(false),
+            _lease: lease,
         })
+    }
+
+    /// Store incarnation bound to this handle.
+    #[must_use]
+    pub const fn store(&self) -> StoreIncarnation {
+        self.store
     }
 
     /// Append one complete logical before-image and return its stable ID.
@@ -267,6 +338,9 @@ pub enum UndoStoreError {
     /// A complete retained frame is invalid and recovery must fail closed.
     #[error("undo store is corrupt: {0}")]
     Corruption(&'static str),
+    /// Store ownership or binding failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
     /// The embedded MVCC envelope is invalid.
     #[error(transparent)]
     Codec(#[from] MvccCodecError),
@@ -282,12 +356,6 @@ pub enum UndoStoreError {
         #[source]
         source: io::Error,
     },
-}
-
-fn publication_parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
 }
 
 fn version_index(id: VersionId) -> Result<usize, UndoStoreError> {
@@ -337,10 +405,10 @@ fn scan_and_repair(
     sync_class: SyncClass,
 ) -> Result<(Vec<UndoFrame>, u64), UndoStoreError> {
     let length = file.metadata().map_err(open_error)?.len();
-    file.seek(SeekFrom::Start(0)).map_err(open_error)?;
     let mut index = Vec::new();
-    let mut offset = 0u64;
+    let mut offset = UNDO_HEADER_BYTES as u64;
     let mut header = [0u8; FRAME_HEADER_SIZE];
+    file.seek(SeekFrom::Start(offset)).map_err(open_error)?;
 
     while offset < length {
         let remaining = length - offset;
@@ -502,7 +570,10 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{CommitSeq, MvccValue, RecordOwner, TxnId};
+    use crate::vnext::store::encode_bound_header;
+    use crate::vnext::{CommitSeq, MvccValue, RecordOwner, StoreDirectory, TxnId};
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     fn record(txn: u64, previous: Option<u64>, value: &[u8]) -> MvccRecord {
         MvccRecord::new(
@@ -512,69 +583,104 @@ mod tests {
         )
     }
 
+    fn store_dir(directory: &Path) -> PathBuf {
+        directory.join("undo.log")
+    }
+
     #[test]
     fn append_read_and_group_sync_advance_one_frontier() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
-        assert_eq!(store.durable_version(), None);
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
+        assert_eq!(undo.store(), store.incarnation());
+        assert_eq!(undo.durable_version(), None);
 
-        let first = store
+        let first = undo
             .append(&record(1, None, b"first"))
             .expect("first appends");
-        let second = store
+        let second = undo
             .append(&record(2, Some(first.get()), b"second"))
             .expect("second appends");
         assert_eq!(first, VersionId::new(1));
         assert_eq!(second, VersionId::new(2));
-        assert_eq!(store.durable_version(), None);
+        assert_eq!(undo.durable_version(), None);
         assert_eq!(
-            store.get(first).expect("first reads"),
+            undo.get(first).expect("first reads"),
             record(1, None, b"first")
         );
         assert_eq!(
-            store.get(second).expect("second reads"),
+            undo.get(second).expect("second reads"),
             record(2, Some(1), b"second")
         );
 
         assert_eq!(
-            store.sync_through(first).expect("sync succeeds"),
+            undo.sync_through(first).expect("sync succeeds"),
             VersionId::new(2)
         );
-        assert_eq!(store.durable_version(), Some(VersionId::new(2)));
+        assert_eq!(undo.durable_version(), Some(VersionId::new(2)));
     }
 
     #[test]
     fn reopen_preserves_versions_and_next_identity() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
         {
-            let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
-            let first = store.append(&record(3, None, b"alpha")).expect("append");
-            store.sync_through(first).expect("sync");
+            let store = StoreDirectory::create(directory.path()).expect("store");
+            let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
+            let first = undo.append(&record(3, None, b"alpha")).expect("append");
+            undo.sync_through(first).expect("sync");
         }
 
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store reopens");
-        assert_eq!(store.durable_version(), Some(VersionId::new(1)));
+        let store = StoreDirectory::open(directory.path(), None).expect("store reopens");
+        let undo = UndoStore::open(&store, SyncClass::KernelBarrier).expect("store reopens");
+        assert_eq!(undo.durable_version(), Some(VersionId::new(1)));
         assert_eq!(
-            store.get(VersionId::new(1)).expect("version reads"),
+            undo.get(VersionId::new(1)).expect("version reads"),
             record(3, None, b"alpha")
         );
         assert_eq!(
-            store.append(&record(4, Some(1), b"beta")).expect("append"),
+            undo.append(&record(4, Some(1), b"beta")).expect("append"),
             VersionId::new(2)
         );
     }
 
     #[test]
+    fn valid_empty_undo_container_reopens() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        {
+            let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("open");
+            assert_eq!(undo.durable_version(), None);
+        }
+        let path = store_dir(directory.path());
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").len(),
+            UNDO_HEADER_BYTES as u64
+        );
+        let undo = UndoStore::open(&store, SyncClass::KernelBarrier).expect("reopen");
+        assert_eq!(undo.durable_version(), None);
+    }
+
+    #[test]
+    fn open_never_creates_a_missing_undo_component() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        assert!(matches!(
+            UndoStore::open(&store, SyncClass::KernelBarrier),
+            Err(UndoStoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(!store_dir(directory.path()).exists());
+    }
+
+    #[test]
     fn reopen_truncates_only_an_incomplete_final_frame() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
         let original_len;
         {
-            let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
-            let first = store.append(&record(5, None, b"stable")).expect("append");
-            store.sync_through(first).expect("sync");
+            let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
+            let first = undo.append(&record(5, None, b"stable")).expect("append");
+            undo.sync_through(first).expect("sync");
             original_len = fs::metadata(&path).expect("metadata").len();
         }
         let mut file = OpenOptions::new()
@@ -586,10 +692,10 @@ mod tests {
         file.sync_all().expect("partial tail persists");
         drop(file);
 
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store repairs");
+        let undo = UndoStore::open(&store, SyncClass::KernelBarrier).expect("store repairs");
         assert_eq!(fs::metadata(&path).expect("metadata").len(), original_len);
         assert_eq!(
-            store.get(VersionId::new(1)).expect("version survives"),
+            undo.get(VersionId::new(1)).expect("version survives"),
             record(5, None, b"stable")
         );
     }
@@ -597,7 +703,9 @@ mod tests {
     #[test]
     fn every_truncation_preserves_complete_undo_versions() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, store.incarnation());
         let first = encode_frame(
             VersionId::new(1),
             &record(1, None, b"first").to_bytes().expect("payload"),
@@ -609,18 +717,17 @@ mod tests {
         )
         .expect("frame");
         for cut in 1..second.len() {
-            let mut bytes = first.clone();
+            let mut bytes = header.to_vec();
+            bytes.extend_from_slice(&first);
             bytes.extend_from_slice(&second[..cut]);
             fs::write(&path, bytes).expect("write partial file");
-            let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("repair");
+            let undo = UndoStore::open(&store, SyncClass::KernelBarrier).expect("repair");
+            assert_eq!(undo.durable_version(), Some(VersionId::new(1)), "cut {cut}");
+            let mut expected = header.to_vec();
+            expected.extend_from_slice(&first);
+            assert_eq!(fs::read(&path).expect("read repaired file"), expected);
             assert_eq!(
-                store.durable_version(),
-                Some(VersionId::new(1)),
-                "cut {cut}"
-            );
-            assert_eq!(fs::read(&path).expect("read repaired file"), first);
-            assert_eq!(
-                store.get(VersionId::new(1)).expect("read"),
+                undo.get(VersionId::new(1)).expect("read"),
                 record(1, None, b"first")
             );
         }
@@ -629,7 +736,9 @@ mod tests {
     #[test]
     fn corrupt_lengths_fail_without_truncating_the_file() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, store.incarnation());
         let frame = encode_frame(
             VersionId::new(1),
             &record(1, None, b"stable").to_bytes().expect("payload"),
@@ -637,11 +746,12 @@ mod tests {
         .expect("frame");
         for byte in 16..20 {
             for bit in 0..8 {
-                let mut corrupt = frame.clone();
-                corrupt[byte] ^= 1 << bit;
+                let mut corrupt = header.to_vec();
+                corrupt.extend_from_slice(&frame);
+                corrupt[UNDO_HEADER_BYTES + byte] ^= 1 << bit;
                 fs::write(&path, &corrupt).expect("write corruption");
                 assert!(matches!(
-                    UndoStore::open(&path, SyncClass::KernelBarrier),
+                    UndoStore::open(&store, SyncClass::KernelBarrier),
                     Err(UndoStoreError::Corruption("undo header checksum mismatch"))
                 ));
                 assert_eq!(fs::read(&path).expect("read unchanged file"), corrupt);
@@ -652,19 +762,24 @@ mod tests {
     #[test]
     fn invalid_predecessors_do_not_append_or_fence() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("open");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("open");
         for previous in [0, 1, 9] {
             assert!(matches!(
-                store.append(&record(1, Some(previous), b"invalid")),
+                undo.append(&record(1, Some(previous), b"invalid")),
                 Err(UndoStoreError::InvalidPredecessor { .. })
             ));
         }
-        assert_eq!(fs::metadata(&path).expect("metadata").len(), 0);
-        assert_eq!(store.durable_version(), None);
-        assert!(!store.is_fenced());
         assert_eq!(
-            store.append(&record(1, None, b"valid")).expect("append"),
+            fs::metadata(store_dir(directory.path()))
+                .expect("metadata")
+                .len(),
+            UNDO_HEADER_BYTES as u64
+        );
+        assert_eq!(undo.durable_version(), None);
+        assert!(!undo.is_fenced());
+        assert_eq!(
+            undo.append(&record(1, None, b"valid")).expect("append"),
             VersionId::new(1)
         );
     }
@@ -672,7 +787,9 @@ mod tests {
     #[test]
     fn checksummed_self_and_forward_links_fail_closed_on_reopen() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, store.incarnation());
         for previous in [1, 2] {
             let frame = encode_frame(
                 VersionId::new(1),
@@ -681,23 +798,26 @@ mod tests {
                     .expect("payload"),
             )
             .expect("frame");
-            fs::write(&path, &frame).expect("write invalid link");
+            let mut bytes = header.to_vec();
+            bytes.extend_from_slice(&frame);
+            fs::write(&path, &bytes).expect("write invalid link");
             assert!(matches!(
-                UndoStore::open(&path, SyncClass::KernelBarrier),
+                UndoStore::open(&store, SyncClass::KernelBarrier),
                 Err(UndoStoreError::InvalidPredecessor { .. })
             ));
-            assert_eq!(fs::read(&path).expect("read unchanged file"), frame);
+            assert_eq!(fs::read(&path).expect("read unchanged file"), bytes);
         }
     }
 
     #[test]
     fn complete_checksum_corruption_fails_closed() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
         {
-            let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
-            let first = store.append(&record(7, None, b"stable")).expect("append");
-            store.sync_through(first).expect("sync");
+            let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
+            let first = undo.append(&record(7, None, b"stable")).expect("append");
+            undo.sync_through(first).expect("sync");
         }
 
         let mut file = OpenOptions::new()
@@ -705,19 +825,20 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("raw file opens");
-        file.seek(SeekFrom::Start(FRAME_HEADER_SIZE as u64))
+        let frame_payload_offset = UNDO_HEADER_BYTES as u64 + FRAME_HEADER_SIZE as u64;
+        file.seek(SeekFrom::Start(frame_payload_offset))
             .expect("seek");
         let mut byte = [0u8; 1];
         file.read_exact(&mut byte).expect("read byte");
         byte[0] ^= 0x80;
-        file.seek(SeekFrom::Start(FRAME_HEADER_SIZE as u64))
+        file.seek(SeekFrom::Start(frame_payload_offset))
             .expect("seek back");
         file.write_all(&byte).expect("corruption writes");
         file.sync_all().expect("corruption persists");
         drop(file);
 
         assert!(matches!(
-            UndoStore::open(&path, SyncClass::KernelBarrier),
+            UndoStore::open(&store, SyncClass::KernelBarrier),
             Err(UndoStoreError::Corruption("undo frame checksum mismatch"))
         ));
     }
@@ -725,30 +846,198 @@ mod tests {
     #[test]
     fn zero_and_missing_versions_fail_without_changing_frontier() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
         assert!(matches!(
-            store.get(VersionId::new(0)),
+            undo.get(VersionId::new(0)),
             Err(UndoStoreError::ReservedVersion)
         ));
         assert!(matches!(
-            store.sync_through(VersionId::new(1)),
+            undo.sync_through(VersionId::new(1)),
             Err(UndoStoreError::MissingVersion(id)) if id == VersionId::new(1)
         ));
-        assert_eq!(store.durable_version(), None);
+        assert_eq!(undo.durable_version(), None);
     }
 
     #[test]
     fn frozen_and_tombstone_records_round_trip_through_store() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("undo.log");
-        let store = UndoStore::open(&path, SyncClass::KernelBarrier).expect("store opens");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("store opens");
         let frozen = MvccRecord::new(
             RecordOwner::Frozen(CommitSeq::new(9)),
             None,
             MvccValue::Tombstone,
         );
-        let id = store.append(&frozen).expect("append");
-        assert_eq!(store.get(id).expect("read"), frozen);
+        let id = undo.append(&frozen).expect("append");
+        assert_eq!(undo.get(id).expect("read"), frozen);
+    }
+
+    fn expect_header_failure(bytes: &[u8], store: StoreIncarnation) {
+        assert!(
+            decode_bound_header(bytes, UNDO_HEADER_MAGIC, Path::new("undo.log")).is_err()
+                || decode_bound_header(bytes, UNDO_HEADER_MAGIC, Path::new("undo.log"))
+                    .is_ok_and(|decoded| decoded != store),
+            "header must fail or resolve to a foreign incarnation"
+        );
+    }
+
+    #[test]
+    fn undo_header_golden_layout_and_crc_coverage() {
+        let incarnation = crate::vnext::ids::test_incarnation(11);
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, incarnation);
+        assert_eq!(header.len(), UNDO_HEADER_BYTES);
+        assert_eq!(&header[..4], b"OMUA");
+        assert_eq!(header[4], 1);
+        assert_eq!(header[5], 0);
+        assert_eq!(u16::from_le_bytes([header[6], header[7]]), 32);
+        assert_eq!(&header[8..24], incarnation.as_bytes());
+        assert_eq!(&header[24..28], &[0, 0, 0, 0]);
+        assert_eq!(
+            u32::from_le_bytes(header[28..32].try_into().expect("checksum")),
+            crc32c::crc32c(&header[..28])
+        );
+        assert_eq!(
+            decode_bound_header(&header, UNDO_HEADER_MAGIC, Path::new("undo.log"))
+                .expect("golden header"),
+            incarnation
+        );
+    }
+
+    #[test]
+    fn undo_header_field_mutations_fail_closed() {
+        let incarnation = crate::vnext::ids::test_incarnation(11);
+        let foreign = crate::vnext::ids::test_incarnation(12);
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, incarnation);
+        let path = Path::new("undo.log");
+
+        let mutate = |offset: usize, value: u8| {
+            let mut bytes = header;
+            bytes[offset] = value;
+            bytes
+        };
+        for bytes in [
+            mutate(0, b'X'),
+            mutate(4, 2),
+            mutate(5, 1),
+            mutate(6, 33),
+            mutate(24, 1),
+        ] {
+            assert!(decode_bound_header(&bytes, UNDO_HEADER_MAGIC, path).is_err());
+        }
+
+        // A recomputed-CRC file with a zero incarnation still fails.
+        let mut zero = header;
+        zero[8..24].fill(0);
+        let crc = crc32c::crc32c(&zero[..28]);
+        zero[28..32].copy_from_slice(&crc.to_le_bytes());
+        assert!(decode_bound_header(&zero, UNDO_HEADER_MAGIC, path).is_err());
+
+        // The wrong magic and a stale CRC fail.
+        assert!(decode_bound_header(&header, *b"OMU2", path).is_err());
+        assert!(
+            decode_bound_header(&mutate(28, header[28] ^ 0x01), UNDO_HEADER_MAGIC, path).is_err()
+        );
+
+        // A valid header decodes to its own incarnation, never a foreign one.
+        assert_eq!(
+            decode_bound_header(&header, UNDO_HEADER_MAGIC, path).expect("valid"),
+            incarnation
+        );
+        assert_ne!(foreign, incarnation);
+        expect_header_failure(&header, foreign);
+    }
+
+    #[test]
+    fn undo_header_truncations_extra_bytes_and_headerless_files_fail() {
+        let incarnation = crate::vnext::ids::test_incarnation(13);
+        let header = encode_bound_header(UNDO_HEADER_MAGIC, incarnation);
+        for cut in 0..UNDO_HEADER_BYTES {
+            assert!(
+                decode_bound_header(&header[..cut], UNDO_HEADER_MAGIC, Path::new("undo.log"))
+                    .is_err()
+            );
+        }
+        let mut extended = header.to_vec();
+        extended.push(0);
+        assert!(decode_bound_header(&extended, UNDO_HEADER_MAGIC, Path::new("undo.log")).is_err());
+        assert!(decode_bound_header(&[], UNDO_HEADER_MAGIC, Path::new("undo.log")).is_err());
+    }
+
+    #[test]
+    fn undo_header_truncations_fail_without_modifying_the_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
+        {
+            let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("open");
+            let id = undo.append(&record(1, None, b"stable")).expect("append");
+            undo.sync_through(id).expect("sync");
+        }
+        let original = fs::read(&path).expect("read");
+        for cut in 0..UNDO_HEADER_BYTES {
+            fs::write(&path, &original[..cut]).expect("truncate");
+            assert!(
+                matches!(
+                    UndoStore::open(&store, SyncClass::KernelBarrier),
+                    Err(UndoStoreError::Store(StoreError::Corruption { .. }))
+                ),
+                "truncation at {cut} must fail as corruption"
+            );
+            assert_eq!(
+                fs::read(&path).expect("read unchanged"),
+                original[..cut],
+                "truncation at {cut} must not be repaired"
+            );
+        }
+    }
+
+    #[test]
+    fn headerless_and_empty_files_fail_as_corruption() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let path = store_dir(directory.path());
+        let frame = encode_frame(
+            VersionId::new(1),
+            &record(1, None, b"headerless").to_bytes().expect("payload"),
+        )
+        .expect("frame");
+        for bytes in [Vec::new(), frame] {
+            fs::write(&path, &bytes).expect("write");
+            assert!(matches!(
+                UndoStore::open(&store, SyncClass::KernelBarrier),
+                Err(UndoStoreError::Store(StoreError::Corruption { .. }))
+            ));
+            assert_eq!(fs::read(&path).expect("read unchanged"), bytes);
+        }
+    }
+
+    #[test]
+    fn foreign_incarnation_fails_closed() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_store = StoreDirectory::create(source_dir.path()).expect("source store");
+        {
+            let undo = UndoStore::create(&source_store, SyncClass::KernelBarrier).expect("open");
+            let id = undo.append(&record(1, None, b"source")).expect("append");
+            undo.sync_through(id).expect("sync");
+        }
+        let target_dir = tempfile::tempdir().expect("target tempdir");
+        let target_store = StoreDirectory::create(target_dir.path()).expect("target store");
+        fs::copy(store_dir(source_dir.path()), store_dir(target_dir.path())).expect("copy undo");
+        assert!(matches!(
+            UndoStore::open(&target_store, SyncClass::KernelBarrier),
+            Err(UndoStoreError::Store(StoreError::ForeignIncarnation { .. }))
+        ));
+    }
+
+    #[test]
+    fn undo_store_component_claim_is_exclusive() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let _undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("open");
+        assert!(matches!(
+            UndoStore::open(&store, SyncClass::KernelBarrier),
+            Err(UndoStoreError::Store(StoreError::ComponentBusy(_)))
+        ));
     }
 }
