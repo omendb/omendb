@@ -1,5 +1,18 @@
 # OmenDB storage-kernel vNext handoff — 2026-09-12
 
+> **Dated design record, not the roadmap.** The
+> [vNext plan](../plans/storage-kernel-vnext.md) owns milestone order and open
+> gates; [ADR 0014](../adr/0014-vnext-installation-and-recovery.md) owns the
+> protocol; the repository-root `AGENTS.md` owns qualification entry points.
+> Read those first and treat this file as design context.
+>
+> The "Immediate next work" and "Suggested first instruction" sections below are
+> historical: they describe the concurrent buffer and page-resident B-tree work
+> now implemented as Milestones A–E. The "Phase A–F" letters used further down
+> do not correspond to the plan's Milestone F, which is checkpoint capture and
+> recovery. Do not resume from this file's sequence; resume from the plan's
+> "Immediate sequence".
+
 ## Purpose
 
 Continue the OmenDB redesign and implementation from the current `storage-kernel-vnext` branch without relying on the previous chat. The project is intentionally free to replace existing architecture, internal APIs, and disk formats until correctness and measurements justify stability.
