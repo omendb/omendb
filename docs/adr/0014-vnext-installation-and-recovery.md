@@ -389,7 +389,5 @@ Before persistent cutover, tests must cover at least:
 ## Implementation roadmap
 
 The [vNext plan](../plans/storage-kernel-vnext.md#immediate-sequence) owns the
-implementation sequence and open gates. Fix visibility completion first;
-qualify runtime lifecycle and store identity with checkpoint authority; then
-address measured architectural performance costs before canonical-row/product
-cutover. This ADR owns the protocol, not a second execution backlog.
+implementation sequence and open gates. This ADR owns the protocol, not a
+second execution backlog; consult the plan for current implementation status.
