@@ -70,18 +70,20 @@ requirements:
 - appended nullable/default-compatible columns can be materialized logically
   without rewriting every old row immediately.
 
-### 2. Primary-key columns live in the ordered key; do not duplicate them unless useful
+### 2. Do not duplicate row identity unless the chosen physical layout benefits
 
-The primary key is already encoded in SeerDB's ordered keyspace. Row-value
-families should not automatically duplicate full primary-key bytes merely to
-reconstruct a logical `Row`.
+The logical primary key and physical row identity are distinct concepts. In a
+clustered primary-B-tree layout, key bytes already identify the row and should
+not automatically be copied into the row payload. In a heap/row-page layout,
+the primary index may instead map the logical key to a compact row locator.
 
-The relational scan/decoder receives the row identity/key alongside the family
-value and reconstructs requested primary-key columns from that identity.
+The row decoder receives the logical/physical identity required by its access
+method and reconstructs requested primary-key columns without mandatory
+duplication. Intentional duplication remains valid for covering/locality or
+recovery reasons, but it is a measured layout choice rather than a format law.
 
-Intentional duplication remains valid when it improves locality for a declared
-family or covering/index use case, but it is a planner/layout decision rather
-than a mandatory format cost.
+This keeps ADR 0010 compatible with ADR 0013's required clustered-row versus
+heap+primary-index comparison.
 
 ### 3. One primary family is the default
 
@@ -112,30 +114,34 @@ Useful cases include:
 - large values whose separate lifetime reduces write amplification;
 - tables where a common hot subset fits substantially better in cache alone.
 
-A family has a stable family identifier in the catalog. Its SeerDB key is
-conceptually:
+A family has a stable family identifier in the catalog and shares one logical
+row identity. A clustered B-tree implementation may encode family identity next
+to the primary key; a row-page implementation may keep family references in the
+row header or a side structure. The physical mapping is access-method-specific.
 
-```text
-(table/tree prefix, primary key, family id)
-```
-
-or an equivalent ordered mapping that keeps all families of one row adjacent.
-The exact key shape must preserve efficient whole-row and family-specific
-access.
+Whichever layout wins must preserve efficient whole-row and family-specific
+access without multiplying transaction/MVCC state unnecessarily.
 
 The first implementation may use one family only. The format/catalog must avoid
 making that assumption irreversible.
 
-### 5. Large values may leave the B-tree leaf entirely
+### 5. Large values may use stable logical handles outside the hot row page
 
-Within a family record, sufficiently large variable values may be represented by
-compact handles to SeerDB's append-oriented large-value/blob storage. Separation
-thresholds should account for value size and observed access/update frequency,
-not be frozen at today's global constant.
+Sufficiently large/cold variable values may move into a kernel-managed
+large-value arena while the row/family stores a compact logical handle. This is
+not just a size threshold: access/update frequency, locality, page pressure and
+write amplification all matter.
 
-This follows the same trade-off seen in WiscKey and Pebble value separation:
-large/cold values reduce page and rewrite amplification when moved out of the
-ordered structure, but indirection hurts frequently-read small values.
+A large-value handle must be stable across physical relocation. Physical
+placement is private to the arena so compaction/GC does not rewrite every row
+reference. Any adopted design needs bounded indirection depth, locality-aware
+prefetch, exact liveness/retention accounting, crash-safe relocation/GC, and
+failure-atomic handle publication.
+
+This follows the trade-off seen in value-separated systems: moving bulky values
+out of hot index/row pages can reduce rewrite and cache amplification, but
+indirection and lost locality can make frequently-read values slower. The
+threshold and arena design therefore remain benchmark-gated.
 
 ### 6. Execution uses borrowed typed views before owned `Value`s
 
@@ -200,8 +206,11 @@ retention/migration policy, not allowed to grow forever.
 ### 9. Secondary indexes choose covering payloads deliberately
 
 A secondary index entry always contains enough information to reach the base row
-identity. It may additionally include declared/inferred covering columns in a
-compact schema-driven payload so common queries avoid a base-row fetch.
+identity. A compact generation-safe physical locator may be cached/embedded as
+an optimization only if relocation/reuse semantics prove it safe; logical row
+identity remains the correctness fallback. The entry may additionally include
+declared/inferred covering columns in a compact schema-driven payload so common
+queries avoid a base-row fetch.
 
 Do not copy the full row into every index by default. Covering payload and index
 key layout are optimizer/schema choices with write-amplification costs exposed in
@@ -251,8 +260,8 @@ the normal transaction/change-stream machinery.
 - nullable-column append remains metadata-only for old rows;
 - schema/version corruption fails closed;
 - row decode/encode fuzz/property tests cover every type and malformed offset;
-- point/RMW, 20+ column updates, wide/cold values, and projected scans are
-  benchmarked before choosing family heuristics;
+- point/RMW, 20+ column updates, wide/cold values, and projected scans are benchmarked before choosing family heuristics;
+- if large-value separation is enabled, relocation/GC/reopen tests prove stable handles cannot alias reclaimed content and measurements include both read-indirection and write-amplification effects;
 - covering index payloads show their read benefit and write/space cost;
 - retained snapshots remain able to decode every layout version they reference.
 

@@ -76,7 +76,25 @@ Because the representation is derived, its format can evolve faster than the
 transactional row format and corrupt/missing analytical state can be discarded
 and rebuilt rather than making the primary database unavailable.
 
-### 4. Hot and cold data may converge toward a single hybrid store
+### 4. Queryable encoding is distinct from outer compression
+
+Analytical chunks should remain executable in lightweight data-aware encodings
+where practical: dictionary IDs, frame-of-reference/delta forms, bit packing,
+run-length or string-specific encodings such as FSST. Filters, joins and
+aggregations should consume those encodings directly when doing so saves memory
+traffic and decode work.
+
+General-purpose compression such as zstd is an **outer storage policy**, not the
+execution representation. Apply it only when the I/O/space savings outweigh the
+extra CPU and materialization cost for that tier/workload. A chunk may therefore
+be queryable-encoded in memory/NVMe and additionally compressed in cold/object
+storage.
+
+Derived chunks, dictionaries and metadata are buffer-managed/evictable. Metadata
+should be loaded lazily when possible; no analytical representation is assumed
+to fit permanently in RAM.
+
+### 5. Hot and cold data may converge toward a single hybrid store
 
 A derived columnar cache is the lower-risk first implementation, but the
 architecture explicitly permits a Colibri-like hybrid store if measurements
@@ -107,7 +125,7 @@ hybrid row/column storage" remains benchmark-gated. OmenDB does not promise one
 before comparing mixed-workload performance, write amplification, cache
 footprint, recovery complexity, and operational behavior.
 
-### 5. Analytical freshness is explicit
+### 6. Analytical freshness is explicit
 
 Every analytical representation carries a covered logical frontier (CSN and,
 where needed, schema/catalog version). The planner may use it when:
@@ -118,7 +136,7 @@ where needed, schema/catalog version). The planner may use it when:
 
 No query silently reads stale analytical state because it happens to be faster.
 
-### 6. Automatic workload adaptation is a policy, not a correctness mechanism
+### 7. Automatic workload adaptation is a policy, not a correctness mechanism
 
 The database may sample query/column access, update frequency, selectivity,
 compression, and cache pressure to recommend or automatically populate
@@ -135,10 +153,12 @@ Auto-columnarization or hot/cold conversion must be:
 A manual policy/override remains available for operators who need deterministic
 layout.
 
-### 7. Storage tiers map naturally onto hot/cold analytics
+### 8. Storage tiers map naturally onto hot/cold analytics
 
 Deployment profiles from ADR 0006 can place analytical representations
-according to access pattern:
+according to access pattern and the full memory hierarchy. Hot dictionaries,
+zone metadata and routing/skipping state should occupy faster tiers than bulky
+cold payload when that improves effective cache/memory bandwidth:
 
 - DRAM: hottest dictionaries, metadata, frequently scanned columns;
 - local NVMe: large column chunks and scan cache;
@@ -150,7 +170,7 @@ Object storage is much more suitable for large immutable analytical chunks than
 for OLTP random page updates. This is one of the few places where it may be part
 of the normal query path rather than only backup/archive.
 
-### 8. Scale-out analytics remains supported through the same snapshot/change contract
+### 9. Scale-out analytics remains supported through the same snapshot/change contract
 
 A future `omen-olap` or remote analytical worker pool can bootstrap from:
 
@@ -167,7 +187,7 @@ based on size, freshness, locality, queue pressure and cost. Deployments that
 need strict OLTP isolation can keep heavy analytics off the primary server;
 smaller deployments do not have to operate another database.
 
-### 9. Indexing and analytics cooperate instead of duplicating everything
+### 10. Indexing and analytics cooperate instead of duplicating everything
 
 The primary B-tree and secondary indexes remain optimized for point/range OLTP.
 Analytical representations add scan-oriented statistics/chunks only when useful.
@@ -177,7 +197,7 @@ Do not maintain a columnar copy of every column by default. Workload-driven
 selection and cold-range conversion should avoid doubling write amplification
 for tables that never run analytical scans.
 
-### 10. The benchmark is mixed workload, not isolated TPC-H alone
+### 11. The benchmark is mixed workload, not isolated TPC-H alone
 
 A representation is accepted only if it improves useful mixed workloads without
 silently destroying transaction tail latency. Qualification includes:
@@ -192,7 +212,9 @@ silently destroying transaction tail latency. Qualification includes:
 - local NVMe and object-backed cold chunks where implemented.
 
 Report both analytical throughput/latency and OLTP p50/p95/p99, plus CPU,
-memory, bytes written, cache occupancy, conversion work and freshness lag.
+memory, bytes read/query, bytes written, cache occupancy, LLC/TLB/page-walk and
+memory-bandwidth evidence where available, conversion/compaction work, and
+freshness lag.
 
 ## Non-goals
 
@@ -200,6 +222,7 @@ memory, bytes written, cache occupancy, conversion work and freshness lag.
 - making every OLTP table columnar;
 - weakening transaction isolation for faster analytics;
 - loading a full columnar shadow copy into RAM by default;
+- requiring full decompression/materialization before every analytical operator;
 - coupling the public CDC format to one analytical physical representation.
 
 ## Research inputs
@@ -211,7 +234,10 @@ memory, bytes written, cache occupancy, conversion work and freshness lag.
   vectorized planner/executor beside a PostgreSQL-compatible transactional
   engine;
 - HyPer/Umbra lineage — MVCC snapshots, data-centric/code-generated execution,
-  and morsel-driven parallelism for mixed workloads.
+  and morsel-driven parallelism for mixed workloads;
+- CedarDB 2026 encoding/compression work — execute directly on lightweight encodings and treat general compression as a separate storage choice;
+- DuckDB 2026 asynchronous I/O work — decouple I/O concurrency from compute and memory-govern read-ahead, with strongest gains on remote/cold data;
+- Materialize 2026 dictionary-compression work — compact random-access mutable state can reduce memory traffic without becoming a pure column store.
 
 ## Consequences
 

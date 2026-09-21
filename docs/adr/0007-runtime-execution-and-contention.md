@@ -105,7 +105,10 @@ OLTP tail latency.
 
 The current scalar `cost` governor evolves into reservations over real
 resources, including memory bytes, spill/storage budget, I/O operations or
-bytes, and CPU work/quanta. Admission errors remain explicit.
+bytes, and CPU work/quanta. Read-ahead/prefetch queues consume the same bounded
+memory/I/O budgets rather than creating a hidden source of pressure. Future
+distributed coordinators extend the same model to exchange buffers, remote
+result queues and network bytes. Admission errors remain explicit.
 
 ### 5. Bind once; wire protocol does not infer semantics from SQL text
 
@@ -153,6 +156,13 @@ when page guards permit them. Operators are cancellation/admission checkpoints.
 The storage cursor advances from its current position; pagination/morsels never
 rescan the prefix already consumed.
 
+For scan/filter/visibility-heavy paths, batching is also the preferred internal
+storage/access-method interface, not merely an executor wrapper. Access methods
+should expose enough independent work for SIMD, prefetch, compressed decoding,
+and selection-vector production. Point lookups and short micro-plans stay direct;
+row-at-a-time iterators may adapt a batch cursor but must not force the hot scan
+path into one-item dispatch.
+
 ### 7. Execution has an explicit database IR with tiered optimization
 
 The binder/planner lowers into a database-specific typed IR rather than making
@@ -169,7 +179,9 @@ valid candidates because compilation must not dominate short queries. Any JIT
 must support at least x86-64 and AArch64 or retain an efficient portable path.
 
 Runtime-dispatched SIMD kernels handle architecture-specific vectorization.
-The logical IR remains architecture-neutral.
+The logical IR remains architecture-neutral. JIT/code generation is a later
+optimization: it should not precede a measured batch path and stable data
+representation merely because compilation technology is available.
 
 ### 8. Contention management is adaptive
 
@@ -268,9 +280,9 @@ Before declaring this runtime architecture implemented:
 - WAL/reclaim progress is demonstrably not starved under sustained OLTP;
 - a hot-key benchmark compares retry-only OCC to adaptive waiting and reports
   throughput plus p99 latency;
-- batch scans use a resumable cursor and bounded memory;
+- batch scans use a resumable cursor and bounded memory, and the storage/execution boundary can produce useful multi-row batches/selection vectors without mandatory per-row allocation or dispatch;
 - Describe/binding performs zero user query execution;
-- vector/batch execution reports allocation and cache/CPU profiles;
+- vector/batch execution reports allocation, compiler/vectorization evidence, cache/CPU profiles, and where relevant memory-bandwidth/TLB behavior;
 - deterministic-simulation tests cover representative transaction/GC/I/O
   interleavings.
 
@@ -284,7 +296,9 @@ Before declaring this runtime architecture implemented:
   discipline;
 - FoundationDB — OCC/conflict tracking and minimal transactional KV layering;
 - TiKV — pessimistic/optimistic transaction lessons over distributed KV;
-- LeanStore/Umbra — cache-local synchronization and modern hardware execution.
+- LeanStore/Umbra — cache-local synchronization and modern hardware execution;
+- Turbopuffer — production evidence that per-item Rust abstraction can block vectorization and that batched kernels can materially change search latency;
+- DuckDB — separate I/O/compute scheduling and memory-governed read-ahead, especially for remote/cold reads.
 
 ## Consequences
 

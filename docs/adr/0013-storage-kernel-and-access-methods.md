@@ -108,7 +108,8 @@ An access method receives transaction context and storage-object identity and ca
 - register logical read/write dependencies and intents;
 - stage redo/recovery information through the transaction log;
 - mark pages dirty without forcing them durable before transaction acknowledgement;
-- expose resumable cursors/batch iterators;
+- expose direct point operations plus resumable **batch-first** scans/selection vectors so vectorization, compressed decode and prefetch are not hidden behind mandatory per-item dispatch;
+- surface access/I/O intent where useful (random/sequential, expected lifetime, prefetchability) without leaking device policy into SQL semantics;
 - participate in checkpoint, verification and physical GC;
 - report memory/I/O/write-amplification metrics.
 
@@ -159,7 +160,29 @@ from the B-tree and row layout closely enough to benchmark at least:
 
 The chosen default may vary by deployment profile, but page formats should not be permanently polluted by one translation trick without measured benefit.
 
-### 9. SeerDB's independent package status is secondary to OmenDB architecture
+Translation/residency experiments must measure more than hit rate: LLC misses,
+TLB/page walks, memory bandwidth and NUMA movement can dominate very large DRAM
+caches. Huge pages, object-local arenas and tier-aware placement are therefore
+measured policies rather than permanent format requirements.
+
+### 9. Physical row/version references are optional optimization hints
+
+Specialized access methods may benefit from a compact reference that maps a hit
+directly to resident/persisted row state, conceptually something like
+`(PageId, SlotId, generation)` or another access-method-specific locator.
+
+Such a reference is **not** logical row identity and cannot become correctness
+authority by convenience. Before any format commits to it, experiments must
+define row movement, page/slot reuse, ABA protection, split/reorganization,
+MVCC-version lifetime, checkpoint/recovery validation, and GC invalidation.
+Every consumer needs either stable-handle semantics or a logical-identity
+fallback when the hint is stale.
+
+This seam is especially interesting for inverted indexes, graph adjacency and
+secondary-index payloads, but no physical reference is added to the first vNext
+formats merely to anticipate them.
+
+### 10. SeerDB's independent package status is secondary to OmenDB architecture
 
 The Apache-2.0 crate may remain independently publishable if useful, but package independence is not allowed to impose an artificial optimization boundary. Internal APIs may change freely during the alpha rewrite.
 
@@ -192,9 +215,12 @@ Before the replacement becomes mainline it must demonstrate:
 - measured page-translation overhead;
 - p50/p95/p99 and throughput under 1/4/16+ committers;
 - allocation count/bytes and CPU profile;
+- batch/selection-vector throughput versus row-at-a-time adapters for scan-heavy paths, with compiler/SIMD evidence where relevant;
+- cache/LLC/TLB/page-walk and memory-bandwidth evidence for large-buffer workloads where available;
 - logical, host and flash write amplification;
 - recovery time versus checkpoint/log distance;
 - no global database lock on ordinary reads/writes;
+- any adopted physical record-reference fast path proves stale/reused references cannot change query correctness across movement, recovery or GC;
 - x86-64 Linux/NVMe and AArch64 coverage where practical.
 
 ## Consequences

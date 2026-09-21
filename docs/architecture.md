@@ -443,10 +443,14 @@ The dependency-ordered roadmap is now:
 5. **Make planning semantic.** Introduce binder-owned result/parameter/effect
    metadata, typed IR, micro-plans and resumable typed batch pipelines; remove
    text-prefix statement classification and Describe execution probes.
-6. **Add rebuildable analytical acceleration.** Use the batch path and committed
-   frontier to prototype workload-selected columnar/cold representations under
-   ADR 0011; compare against a single-copy hybrid layout before making either a
-   stable physical-format commitment.
+6. **Prove specialized access methods and analytical acceleration.** After the
+   core row path is sound, use the batch/frontier contracts to prototype the
+   first workload-driven specialized access method and encoded analytical
+   representations. Current evidence makes an inverted/text index a useful seam
+   probe because it stresses batching, exact snapshot fallback, merge/maintenance
+   and index-specific layout, but product workload evidence decides ordering.
+   Compare derived columnar/cold representations against a single-copy hybrid
+   layout before making either a stable physical-format commitment.
 7. **Measure modern hardware policies.** Benchmark autonomous vs group/adaptive
    commit, page/node layouts, translation, allocation arenas, buffered/direct
    async I/O, hot-key waiting, RAM-heavy and larger-than-memory workloads on

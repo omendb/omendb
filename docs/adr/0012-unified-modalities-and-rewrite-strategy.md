@@ -50,15 +50,16 @@ multi-vector values when workloads justify them.
 
 The planner chooses among vector access paths just as it chooses B-tree access:
 
-- exact SIMD scan as the correctness oracle and selective-filter path;
-- HNSW as the first in-memory/general ANN candidate;
-- filtered traversal that cooperates with scalar/payload predicates rather than
-  blindly post-filtering one global graph;
-- quantized traversal plus canonical rerank when memory wins justify it;
-- NVMe-oriented DiskANN/PAG-family or segment-partitioned graph layouts when the
-  dataset exceeds RAM;
-- object-storage-native ANN only as a separately measured tier, never by forcing
-  an in-memory graph onto object storage.
+- exact SIMD/batch scan as the correctness oracle and selective-filter path;
+- a workload-appropriate derived ANN structure rather than one algorithm being
+  architectural law; HNSW remains a strong resident-memory candidate;
+- compact/quantized routing or candidate representations that fit faster memory
+  tiers, with canonical exact values fetched for final scoring/reranking;
+- filtered traversal that cooperates with scalar/payload predicates instead of
+  blindly post-filtering one global index;
+- NVMe-oriented graph/cluster/segment layouts when the dataset exceeds RAM;
+- object-storage-native ANN only as a separately measured deployment tier, never
+  by forcing an in-memory graph onto object storage.
 
 Canonical full-precision vectors remain available for exact scoring/reranking
 unless a declared storage policy explicitly trades that capability away.
@@ -80,6 +81,20 @@ vector search share the optimizer so hybrid queries can combine:
 Hybrid ranking belongs in typed query plans rather than an application-side join
 between unrelated search services.
 
+The inverted index chooses physical granularity for text/filter behavior rather
+than inheriting the B-tree, row, or vector partitioning scheme. Benchmark
+cardinality-adaptive posting representations, independently sized posting
+blocks, compressed SIMD-friendly IDs/bitmaps, and exact match output as
+selection vectors that downstream operators can consume directly. Mutable and
+immutable segments may coexist, but current-snapshot correctness still requires
+frontier coverage or an exact delta/fallback path.
+
+A compact generation-safe physical row/version reference is worth testing for
+postings because it can remove an ID-to-row lookup and improve page locality.
+It is an optimization only: logical row identity remains distinct, and no
+physical reference becomes a format contract until relocation, slot/page reuse,
+MVCC retention, recovery and GC prove its lifetime semantics.
+
 ### 4. Property graphs are catalog/query semantics over relational data
 
 OmenDB does not start with a separate graph storage engine. A property graph
@@ -98,10 +113,13 @@ traversals can always fall back to ordinary indexes/recursive execution.
 ### 5. Document data is a relational type, not a document-store fork
 
 A PostgreSQL-compatible JSON/JSONB-style type and schema-aware expressions cover
-the document use case inside tables. Path/value inverted indexes, existence
-indexes, expression indexes, and statistics are access methods over that value.
-Schema-less or partially typed tables may be supported as a relational catalog
-policy; they do not require another storage engine.
+the document use case inside tables. The long-term physical form should be a
+typed binary representation rather than permanently opaque text, with path
+statistics/pushdown and optional shredding of common fields when workloads
+justify it. Path/value inverted indexes, existence indexes, expression indexes,
+and statistics are access methods over that value. Schema-less or partially
+typed tables may be supported as a relational catalog policy; they do not
+require another storage engine.
 
 ### 6. Time-series and geospatial are specialized physical policies
 

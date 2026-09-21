@@ -494,6 +494,8 @@ Every serious design choice records, where meaningful:
 - CPU user/system and cycles/op;
 - allocation count/bytes and memory footprint;
 - buffer occupancy, hit/miss/translation/latch/conflict/retry/wait metrics;
+- LLC misses, TLB/page walks and memory bandwidth on large-cache workloads where hardware counters are available;
+- scan batch size, selection density, bytes read/query and row-at-a-time versus batch overhead for access-method/execution experiments;
 - logical WAL bytes, host writes and device/flash write amplification;
 - recovery time versus checkpoint/log distance;
 - database/checkpoint size and checkpoint pause/overhead;
@@ -510,6 +512,36 @@ Current recovery is not fully bounded-memory: undo payload scanning is bounded
 to one frame, but its version-offset index, WAL recovery output and pending/
 terminal transaction bookkeeping still scale with retained history. Add explicit
 retention/streaming/indexing policy before large-history qualification.
+
+## Work unlocked after the vNext cutover
+
+This is an experiment/architecture queue, **not** a reason to delay Milestones F
+or G and not a second implementation roadmap. Reorder it when product workload
+evidence changes priorities.
+
+1. Make the server/runtime use the batch-first storage/execution seams from ADR
+   0007/0013 and measure them against row-at-a-time adapters before adding JIT.
+2. Tune canonical rows with measured family placement and, if warranted, a
+   stable-handle large-value arena. Do not freeze physical row references until
+   movement/reuse/GC/recovery semantics are proven.
+3. Prove the specialized-access-method boundary with the highest-value product
+   workload. Current research makes native inverted text a strong candidate
+   because it exercises posting-specific layout, batching/selection vectors,
+   maintenance, and exact snapshot fallback without requiring a second database.
+4. Prototype HTAP chunks that execute directly on lightweight encodings, using
+   optional outer compression only where the I/O trade-off wins. Keep derived
+   state buffer-managed and frontier-qualified.
+5. Add vector search as canonical exact values plus workload-appropriate derived
+   compact/ANN representations and exact reranking; do not make one ANN algorithm
+   part of the architecture.
+6. Add deeper asynchronous/background I/O only from profiles. Keep I/O
+   concurrency and read-ahead independently budgeted from compute.
+7. Regional HA comes before general distribution. Then apply ADR 0008's stable
+   ranges/placement groups, symbolic route plans, bounded coordinators, safe
+   retry rules, reconciliation, and snapshot/change cutover while preserving the
+   single-range/local fast path.
+8. Treat object storage as an explicit cold/archive/disaggregated profile. Do not
+   reshape the local RAM+NVMe engine around object-store request economics.
 
 ## Immediate sequence
 
