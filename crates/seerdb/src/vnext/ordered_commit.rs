@@ -444,7 +444,7 @@ mod tests {
     use std::io;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Condvar, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -507,6 +507,76 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingSyncLogDevice {
+        bytes: Mutex<Vec<u8>>,
+        entered: Mutex<bool>,
+        entered_cv: Condvar,
+        release: Mutex<bool>,
+        release_cv: Condvar,
+    }
+
+    impl BlockingSyncLogDevice {
+        fn wait_until_sync(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut entered = self.entered.lock().expect("entered lock");
+            while !*entered {
+                let now = Instant::now();
+                assert!(now < deadline, "commit never reached WAL sync");
+                let (next, timeout) = self
+                    .entered_cv
+                    .wait_timeout(entered, deadline - now)
+                    .expect("entered wait");
+                entered = next;
+                assert!(
+                    !timeout.timed_out() || *entered,
+                    "commit never reached WAL sync"
+                );
+            }
+        }
+
+        fn release_sync(&self) {
+            let mut release = self.release.lock().expect("release lock");
+            *release = true;
+            drop(release);
+            self.release_cv.notify_all();
+        }
+    }
+
+    impl LogDevice for BlockingSyncLogDevice {
+        fn append(&self, bytes: &[u8]) -> io::Result<super::super::Lsn> {
+            let mut log = self
+                .bytes
+                .lock()
+                .map_err(|_| io::Error::other("log poisoned"))?;
+            log.extend_from_slice(bytes);
+            super::super::Lsn::from_wal_position(0, log.len() as u64)
+                .ok_or_else(|| io::Error::other("log LSN overflow"))
+        }
+
+        fn sync_through(&self, _lsn: super::super::Lsn) -> io::Result<()> {
+            let mut entered = self
+                .entered
+                .lock()
+                .map_err(|_| io::Error::other("entered lock poisoned"))?;
+            *entered = true;
+            drop(entered);
+            self.entered_cv.notify_all();
+
+            let mut release = self
+                .release
+                .lock()
+                .map_err(|_| io::Error::other("release lock poisoned"))?;
+            while !*release {
+                release = self
+                    .release_cv
+                    .wait(release)
+                    .map_err(|_| io::Error::other("release wait poisoned"))?;
+            }
+            Ok(())
         }
     }
 
@@ -652,6 +722,91 @@ mod tests {
         assert_eq!(page_dependencies.durable_undo(), Some(VersionId::new(1)));
         assert!(page_dependencies.is_eligible(page).expect("page eligible"));
         buffer.flush_page(page).expect("eligible page flushes");
+    }
+
+    #[test]
+    fn checkpoint_drain_waits_for_real_commit_through_visibility_completion() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(13), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(BlockingSyncLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let admission = RuntimeAdmission::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
+                .with_runtime_admission(&admission);
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(130))
+            .expect("transaction begins");
+        transaction
+            .stage_ordered_put(descriptor(13), b"key".to_vec(), b"value".to_vec())
+            .expect("stages");
+
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                commit_tx
+                    .send(coordinator.commit(&mut transaction, &buffer, &[&tree]))
+                    .expect("send commit result");
+            });
+
+            log_device.wait_until_sync();
+            assert_eq!(admission.active_commits().expect("count"), 1);
+
+            scope.spawn(|| {
+                let result = admission.begin_checkpoint();
+                match result {
+                    Ok(checkpoint) => {
+                        checkpoint_tx.send(Ok(())).expect("send checkpoint result");
+                        drop(checkpoint);
+                    }
+                    Err(error) => {
+                        checkpoint_tx
+                            .send(Err(error))
+                            .expect("send checkpoint error");
+                    }
+                }
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while admission.state().expect("state") != RuntimeAdmissionState::Checkpointing {
+                assert!(
+                    Instant::now() < deadline,
+                    "checkpoint never entered drain state"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                matches!(checkpoint_rx.try_recv(), Err(TryRecvError::Empty)),
+                "checkpoint completed while an admitted commit was still blocked in WAL sync"
+            );
+
+            log_device.release_sync();
+            let position = commit_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("commit returns")
+                .expect("commit succeeds");
+            assert_eq!(position.csn, CommitSeq::new(1));
+            checkpoint_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("checkpoint drain completes")
+                .expect("checkpoint succeeds");
+        });
+
+        assert_eq!(frontier.snapshot(), CommitSeq::new(1));
+        assert_eq!(admission.active_commits().expect("count"), 0);
+        assert_eq!(
+            admission.state().expect("state"),
+            RuntimeAdmissionState::Open
+        );
     }
 
     #[test]
