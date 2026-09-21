@@ -438,7 +438,7 @@ mod tests {
     use crate::vnext::{
         BTreeLookup, CommitSeq, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
         ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecordOwner,
-        StorageObjectDescriptor, StoreDirectory,
+        RuntimeAdmissionState, StorageObjectDescriptor, StoreDirectory,
     };
     use durable_fs::SyncClass;
     use std::io;
