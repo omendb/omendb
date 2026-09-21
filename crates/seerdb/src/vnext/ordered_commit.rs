@@ -15,9 +15,8 @@ use super::{
     MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
     PageDependencyTable, PageMaterialization, PrepareEffectResult, RuntimeAdmission,
     RuntimeAdmissionError, StatusTableError, StorageObjectId, Transaction, TransactionError,
-    TransactionPhase, TransactionStatus,
-    TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, VisibilityError,
-    VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
+    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
