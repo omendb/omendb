@@ -5,6 +5,7 @@
 - The storage-kernel rewrite is governed by [ADR 0013](docs/adr/0013-storage-kernel-and-access-methods.md), [ADR 0014](docs/adr/0014-vnext-installation-and-recovery.md), and the [vNext plan](docs/plans/storage-kernel-vnext.md). Read these before changing vNext protocol or persistence. The plan owns milestone order and open gates; older handoffs are context, not competing roadmaps.
 - Preserve the existing engine as the semantic/fault oracle until replacement qualification passes. Do not preserve obsolete physical ownership or maintain a permanent engine matrix.
 - One transaction/log/catalog authority spans authoritative access methods. Derived structures need explicit snapshot coverage or a correct delta/fallback path.
+- ADR 0013 supersedes older descriptions of SeerDB as OmenDB's universal ordered-KV physical boundary. Ordered KV is one access method/facade over the shared transaction/storage kernel, not a constraint on rows, text, vector, graph, JSON, or HTAP layouts.
 - A durable decision is irrevocable commit authority; synchronous success additionally requires contiguous visibility coverage. Ready publication alone is not acknowledgment.
 - Working spill pages are not restart authority without a complete, validated checkpoint and retained WAL suffix. A page's maximum LSN is not a logical replay-completeness marker.
 - Correctness and representative vNext performance gates precede product cutover. Research suggests experiments; it does not establish performance or authorize speculative protocol changes.

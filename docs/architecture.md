@@ -32,11 +32,11 @@ PostgreSQL clients / future native clients
                     |
        transaction and catalog layer
                     |
-                 SeerDB
+      shared transaction / storage kernel
                     |
- logical MVCC + ordered buffered B-trees
+ transaction / MVCC / log / buffer / recovery
                     |
- durable log + async physical materialization
+ B-tree / row / specialized derived access methods
                     |
  RAM / NVMe / analytical / archive tiers
 ```
@@ -64,66 +64,60 @@ omendb/
 ├── Cargo.toml       # root package and workspace
 ├── src/             # OmenDB server and relational engine
 ├── crates/
-│   └── seerdb/      # independent generic storage crate
+│   └── seerdb/      # shared transaction/storage kernel crate
 ├── docs/
 ├── benchmarks/
 └── tests/
 ```
 
-OmenDB remains `AGPL-3.0-only`. SeerDB remains an independently versioned and
-publishable `Apache-2.0` crate. The repository is the single writable source
-for both projects; SeerDB's former standalone repository is not a second
-implementation source.
+OmenDB remains `AGPL-3.0-only`. SeerDB remains `Apache-2.0`, but its
+independent package status is a packaging choice rather than an optimization
+boundary. The repository is the single writable source for both projects;
+SeerDB's former standalone repository is not a second implementation source.
 
-The current development dependency is a workspace path dependency. Registry
-releases remain independent: publish and qualify the Apache-2.0 `durable-fs`
-crate from `crates/durable-fs`, then SeerDB, then OmenDB against that SeerDB
-version. External consumers pin `durable-fs` to an OmenDB Git revision until a
-registry release is available. Neither package version is inherited from the
-workspace.
+During workspace development OmenDB uses the local path dependency. SeerDB and
+`durable-fs` may remain separately versioned/publishable when that serves real
+external consumers, but an OmenDB release must not preserve an artificial crate
+boundary at the expense of the integrated database. Release packaging is
+qualified from the actual workspace dependency graph rather than assumed by the
+architecture.
 
 ## OmenDB and SeerDB boundary
 
-SeerDB is a generic OLTP-oriented transactional ordered-KV engine. Its logical
-model is deliberately small:
+ADR 0013 defines SeerDB as OmenDB's **shared transaction/storage kernel**, not
+as a universal ordered-KV physical model. The kernel owns semantics and
+resources that every authoritative access method must share:
 
-```text
-TreeId + unsigned-lexicographically ordered key bytes + opaque value bytes
-```
+- `TxnId`/CSN/LSN identities, snapshots, transaction status, logical
+  dependencies/intents, and isolation state;
+- durable transaction records/decisions, recovery, checkpoint frontiers, and
+  committed-change framing;
+- `PageId`/frame guards, buffer translation, dirty tracking, admission,
+  eviction, I/O, out-of-place placement, and checkpoint publication;
+- version/lifetime services including snapshot, WAL/undo, object, and physical
+  retention/GC.
 
-SeerDB owns:
+OmenDB owns SQL and PostgreSQL-facing behavior, catalog/schema semantics, row
+layouts, index meaning, constraints, optimizer/typed IR, execution, and
+placement/distribution policy.
 
-- ordered-tree access and resumable cursors;
-- transactional tree lifecycle and atomic multi-tree mutation;
-- MVCC visibility, transaction status, logical write intents/conflicts, and
-  future adaptive contention waiting;
-- page/frame residency, dirty tracking, buffer translation, blob/large-value
-  storage, physical mappings, and physical garbage collection;
-- durable log ordering, checkpoint/recovery, durability transports, and storage
-  pressure;
-- generic committed changes and snapshot/restart positions.
+Physical storage objects are implemented by concrete compile-time access
+methods over the shared kernel. The first authoritative structures are the
+buffered ordered B-tree and canonical row-record path. Later inverted indexes,
+vector/search structures, graph projections, JSON/path indexes, and analytical
+representations may use different physical layouts without inventing another
+transaction or durability authority.
 
-OmenDB owns:
+The existing `TransactionDatabase`/ordered-KV surface may remain as a useful
+standalone/compatibility facade over the ordered B-tree. It must not force every
+OmenDB structure into `TreeId + ordered bytes + opaque bytes`, and package
+independence must not re-create that optimization boundary.
 
-- SQL and PostgreSQL-facing behavior;
-- catalogs, schema, row codecs, NULL/type semantics, row-layout versions, and
-  optional column-family placement;
-- primary and secondary index meaning and covering payloads;
-- constraints, DDL, optimizer, typed IR, and execution;
-- relational CDC interpretation, analytical representation metadata, and future
-  distribution/placement metadata.
-
-OmenDB encodes relational keys and row-family records into SeerDB's opaque byte
-boundary. SeerDB must not acquire SQL schema IDs, NULL bitmaps, column
-directories, or index semantics. OmenDB must not bypass SeerDB's
-transaction/MVCC machinery.
-
-A generic storage-plugin matrix is not the product architecture. OmenDB calls
-SeerDB through a capability-rich Rust API. Different deployment profiles may
-change durability transport, cache tiering, or physical materialization, but
-they do not become separate relational backends. The transaction/crash
-invariants are recorded in
-[ADR 0001](adr/0001-seerdb-transaction-contract.md).
+A generic storage-plugin matrix is not the product architecture. Access-method
+boundaries exist so one database can use specialized physical structures while
+retaining one transaction/log/buffer/lifetime authority. The transaction/crash
+invariants are recorded in [ADR 0001](adr/0001-seerdb-transaction-contract.md),
+and the physical boundary in [ADR 0013](adr/0013-storage-kernel-and-access-methods.md).
 
 ## Transaction and durability identities
 
@@ -215,8 +209,12 @@ execution paths:
 
 A database-specific typed IR permits several execution tiers: direct micro-plan
 execution, vectorized pipelines, and optional very-low-overhead JIT for hot
-plans. JIT is an optimization rather than a semantic boundary and must retain
-efficient x86-64 and AArch64 paths.
+plans. Batch/selection-vector interfaces are the native shape for scan/filter/
+visibility work where they expose vectorization, prefetch, and compact decoding;
+row-at-a-time iteration may adapt that interface but must not constrain it. JIT
+is an optimization rather than a semantic boundary, comes only after the batch
+and data-layout paths are measured, and must retain efficient x86-64 and AArch64
+paths.
 
 ## Relational row direction
 
@@ -246,13 +244,13 @@ mechanism**.
 The target local architecture is:
 
 ```text
-logical key/value MVCC + transaction status
+transaction / MVCC + storage-object authority
         |
-shared buffered B-tree records
+concrete access methods (B-tree / row / later specialized structures)
         |
-optimistic page/node guards and fine-grained structural updates
+buffered pages/records + fine-grained structural coordination
         |
-DRAM buffer residency + low-overhead PageId translation
+DRAM hot set + low-overhead PageId translation
         |
 dirty pages
         |
@@ -291,7 +289,10 @@ metadata.
 Each representation names the CSN/catalog frontier it covers. The planner uses
 it only when it is valid for the requested snapshot or when a bounded delta
 merge can bridge to that snapshot. Missing/corrupt derived state can be rebuilt
-instead of making the primary unavailable.
+instead of making the primary unavailable. Analytical chunks should remain
+queryable in lightweight encodings (for example dictionary/FOR/bit-packed
+forms) where practical; general compression is an optional outer storage layer,
+not a requirement to inflate every value before execution.
 
 A later single-copy hybrid row/column store is explicitly allowed if mixed-
 workload benchmarks show that it beats the simpler row-source + columnar-
@@ -371,8 +372,13 @@ related tables/indexes on the same range boundaries and distribution key.
 
 The native optimizer inserts routing/exchange operators and sends typed OmenDB
 plan fragments to OmenDB nodes. It does not ship SQL to a second PostgreSQL
-planner. Single-range transactions use the normal local fast path; only
-cross-range transactions allocate a distributed transaction protocol.
+planner. Cached prepared plans retain symbolic routing expressions and topology
+version dependencies; execution resolves current range placement rather than
+baking a physical node into the plan. Distributed costing includes fan-out,
+network bytes/requests, coordinator memory/spill, exchange work, and tail
+latency, with filters/partial aggregates/co-located joins pushed to ranges when
+semantically valid. Single-range transactions use the normal local fast path;
+only cross-range transactions allocate a distributed transaction protocol.
 
 Live split/move reuses the snapshot/change contract:
 

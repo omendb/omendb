@@ -30,17 +30,23 @@ the **durability and materialization strategy** used by a deployment.
 
 ## Decision
 
-### 1. One transactional engine, not a storage-engine plugin matrix
+### 1. One transaction/storage kernel, not a backend matrix
 
-SeerDB remains OmenDB's ordered transactional KV engine. OmenDB will not grow a
-first-party RocksDB/Pebble/Fjall/etc. backend matrix. Different deployments may
-use different durability transports, cache tiers, and materialization services,
-but all must implement the same SeerDB transaction, snapshot, CSN, LSN, and
-change-stream semantics.
+ADR 0013 revises the older assumption that SeerDB itself is one universal
+ordered-KV engine below OmenDB. SeerDB is the shared transaction/storage kernel:
+transaction state, durability, recovery, buffer/page management, and physical
+lifetime services. Concrete compile-time access methods use that kernel; the
+ordered B-tree/KV facade is the first, not the only, physical structure.
+
+OmenDB will not grow a first-party RocksDB/Pebble/Fjall/etc. backend matrix.
+Different deployments may use different durability transports, cache tiers,
+materialization services, and specialized access methods, but they share the
+same transaction, snapshot, CSN/LSN, checkpoint, and change-stream authority.
 
 The durable commit decision remains the visibility authority. Physical page
-materialization, cache residency, checkpoints, object-store archival, and
-replication are subordinate to that decision.
+materialization, cache residency, derived indexes, analytical chunks,
+checkpoints, object-store archival, and replication are subordinate to that
+decision.
 
 ### 2. RAM is the hot tier; local NVMe is the primary local capacity tier
 
@@ -48,13 +54,11 @@ The default local/server architecture is larger-than-memory rather than
 in-memory-only:
 
 ```text
-transaction / ordered KV
+transaction / MVCC + storage-object authority
         |
-logical MVCC + version history
+concrete access methods
         |
-ordered B-tree indexes
-        |
-low-overhead buffer translation
+low-overhead buffer/page translation
         |
 DRAM hot set
         |
@@ -225,6 +229,7 @@ performance. They need not share one physical checkpoint representation.
 
 - Optimize the uncontended path for modern many-core x86-64 and AArch64.
 - Treat cache locality and cross-core ownership as first-class costs.
+- Measure the whole memory hierarchy: LLC misses, TLB/page walks and memory bandwidth are first-class evidence for large caches. Huge-page-backed arenas are an experiment, not a default, and must be weighed against fragmentation, NUMA and platform behavior.
 - Use runtime-dispatched vector kernels (portable scalar fallback, NEON/SVE2,
   AVX2/AVX-512 where profitable) rather than compiling the whole database for
   one CPU model.
@@ -270,6 +275,12 @@ The direction is informed by, but not coupled to, the following systems/work:
   materialized storage;
 - SlateDB — object-native LSM trade-offs;
 - FoundationDB — minimal ordered transactional KV layering.
+
+These systems are mechanism references, not operational-reliability proof. In
+particular, Neon provides useful evidence about separating durability from
+materialization and about cache/TLB behavior, but OmenDB's HA/control-plane
+availability must be qualified independently rather than inferred from a
+storage architecture.
 
 ## Consequences
 

@@ -123,15 +123,19 @@ Incremental maintenance runs under the same resource/admission system as other
 background work and publishes its covered CSN. It must never block log/recovery
 progress or silently serve a stale view as current.
 
-### 8. KV remains SeerDB's native product boundary
+### 8. Ordered KV is an optional facade, not the physical product boundary
 
-SeerDB is already the ordered transactional KV substrate. OmenDB should not add
-a second Redis/FoundationDB-style product API that bypasses its catalog and SQL
-semantics merely to claim another model.
+ADR 0013 revises the earlier assumption that SeerDB's generic ordered-KV API is
+the internal narrow waist for every OmenDB structure. Ordered KV remains useful
+as the first access method and may remain a standalone compatibility/product
+facade if there is real demand.
 
-Applications that genuinely want generic ordered KV can use SeerDB directly.
-OmenDB can still expose efficient byte-key/byte-value relational tables and the
-same transaction engine internally.
+OmenDB must not add a second Redis/FoundationDB-style API merely to claim
+another model, and it must not force rows, inverted indexes, vector structures,
+graph projections, JSON indexes, or analytical chunks through an unnatural
+ordered-byte-map representation. They share the kernel's transaction, log,
+buffer, visibility, and lifetime services while choosing physical layouts suited
+to their workload.
 
 ## Repository and rewrite strategy
 
@@ -200,7 +204,7 @@ unsafe/performance kernels justify it. A likely long-term shape is:
 
 ```text
 omendb                 SQL/catalog/planner/server/product API
-seerdb                  transaction/MVCC/log/ordered storage
+seerdb                  transaction/MVCC/log/buffer/lifetime kernel + ordered facade
 omendb-exec (optional)  typed scalar + batch execution runtime
 omendb-search (optional) vector + inverted-index access methods/kernels
 omendb-analytic (optional) derived columnar representations/maintenance
