@@ -82,9 +82,7 @@ impl RuntimeAdmission {
             RuntimeAdmissionState::Checkpointing => {
                 Err(RuntimeAdmissionError::CheckpointInProgress)
             }
-            RuntimeAdmissionState::RecoveryRequired => {
-                Err(RuntimeAdmissionError::RecoveryRequired)
-            }
+            RuntimeAdmissionState::RecoveryRequired => Err(RuntimeAdmissionError::RecoveryRequired),
         }
     }
 
