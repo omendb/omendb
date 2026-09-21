@@ -13,8 +13,9 @@ use super::{
     BTreeError, BTreeObject, BufferError, BufferPool, CommitAppendError, CommitAppender,
     CommitPosition, DurableLogError, FinalEffect, FinalWriteSetError, InstallContext,
     MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
-    PageDependencyTable, PageMaterialization, PrepareEffectResult, StatusTableError,
-    StorageObjectId, Transaction, TransactionError, TransactionPhase, TransactionStatus,
+    PageDependencyTable, PageMaterialization, PrepareEffectResult, RuntimeAdmission,
+    RuntimeAdmissionError, StatusTableError, StorageObjectId, Transaction, TransactionError,
+    TransactionPhase, TransactionStatus,
     TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, VisibilityError,
     VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
@@ -34,6 +35,7 @@ pub struct OrderedCommitCoordinator<'a> {
     intents: &'a WriteIntentTable,
     undo: &'a UndoStore,
     page_dependencies: Option<&'a PageDependencyTable>,
+    runtime_admission: Option<&'a RuntimeAdmission>,
     fenced: AtomicBool,
 }
 
@@ -55,6 +57,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: None,
+            runtime_admission: None,
             fenced: AtomicBool::new(false),
         }
     }
@@ -84,8 +87,21 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: Some(page_dependencies),
+            runtime_admission: None,
             fenced: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the runtime admission/drain authority used by checkpoint capture.
+    ///
+    /// Commit admission is acquired at the start of `commit` and held through
+    /// page installation and visibility completion. Checkpoint drain therefore
+    /// cannot establish its capture cut while an admitted commit is still able
+    /// to mutate authoritative state.
+    #[must_use]
+    pub fn with_runtime_admission(mut self, runtime_admission: &'a RuntimeAdmission) -> Self {
+        self.runtime_admission = Some(runtime_admission);
+        self
     }
 
     /// Begin one write transaction at the current contiguous visibility
@@ -109,7 +125,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
         }
         self.statuses.abort(transaction.id())?;
         if let Err(error) = transaction.abort() {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Transaction(error));
         }
         Ok(())
@@ -131,6 +147,10 @@ impl<'a> OrderedCommitCoordinator<'a> {
         trees: &[&BTreeObject],
     ) -> Result<CommitPosition, OrderedCommitError> {
         self.ensure_open()?;
+        let _runtime_admission = self
+            .runtime_admission
+            .map(RuntimeAdmission::admit_commit)
+            .transpose()?;
         if transaction.phase() != TransactionPhase::Active {
             return Err(OrderedCommitError::WrongPhase(transaction.phase()));
         }
@@ -160,7 +180,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     if prepare_failure_requires_fence(&error) {
-                        self.fenced.store(true, Ordering::Release);
+                        self.fence_admission();
                     }
                     return Err(OrderedCommitError::Install(error));
                 }
@@ -310,13 +330,13 @@ impl<'a> OrderedCommitCoordinator<'a> {
         transaction: &mut Transaction,
     ) -> Result<(), OrderedCommitError> {
         if let Err(error) = self.statuses.abort(transaction.id()) {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Status(error));
         }
         if transaction.phase() != TransactionPhase::Aborted
             && let Err(error) = transaction.abort()
         {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Transaction(error));
         }
         Ok(())
@@ -328,19 +348,28 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// waiters are woken with recovery-required semantics instead of blocking on
     /// a frontier that cannot advance until recovery.
     fn fence_after_wal(&self, transaction: &mut Transaction) {
-        self.fenced.store(true, Ordering::Release);
+        self.fence_admission();
         if transaction.phase() != TransactionPhase::RecoveryRequired {
             let _ = transaction.mark_recovery_required();
         }
         self.frontier.require_recovery();
     }
 
+    fn fence_admission(&self) {
+        self.fenced.store(true, Ordering::Release);
+        if let Some(runtime_admission) = self.runtime_admission {
+            runtime_admission.require_recovery();
+        }
+    }
+
     fn ensure_open(&self) -> Result<(), OrderedCommitError> {
         if self.is_fenced() {
-            Err(OrderedCommitError::Fenced)
-        } else {
-            Ok(())
+            return Err(OrderedCommitError::Fenced);
         }
+        if let Some(runtime_admission) = self.runtime_admission {
+            runtime_admission.ensure_read_admission()?;
+        }
+        Ok(())
     }
 }
 
@@ -377,6 +406,8 @@ pub enum OrderedCommitError {
         txn: TxnId,
         actual: Option<TransactionStatus>,
     },
+    #[error(transparent)]
+    Admission(#[from] RuntimeAdmissionError),
     #[error(transparent)]
     WriteSet(#[from] FinalWriteSetError),
     #[error(transparent)]
@@ -621,6 +652,49 @@ mod tests {
         assert_eq!(page_dependencies.durable_undo(), Some(VersionId::new(1)));
         assert!(page_dependencies.is_eligible(page).expect("page eligible"));
         buffer.flush_page(page).expect("eligible page flushes");
+    }
+
+    #[test]
+    fn checkpoint_drain_refuses_new_commit_before_wal_and_reopens_cleanly() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(14), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let admission = RuntimeAdmission::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
+                .with_runtime_admission(&admission);
+
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(140))
+            .expect("transaction begins");
+        transaction
+            .stage_ordered_put(descriptor(14), b"key".to_vec(), b"value".to_vec())
+            .expect("stages");
+
+        let checkpoint = admission.begin_checkpoint().expect("checkpoint starts");
+        assert!(matches!(
+            coordinator.commit(&mut transaction, &buffer, &[&tree]),
+            Err(OrderedCommitError::Admission(
+                RuntimeAdmissionError::CheckpointInProgress
+            ))
+        ));
+        assert_eq!(transaction.phase(), TransactionPhase::Active);
+        assert!(log_device.bytes().is_empty());
+        drop(checkpoint);
+
+        coordinator
+            .commit(&mut transaction, &buffer, &[&tree])
+            .expect("commit proceeds after checkpoint interval");
+        assert_eq!(admission.active_commits().expect("count"), 0);
     }
 
     #[test]
