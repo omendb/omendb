@@ -24,6 +24,7 @@ mod page_image;
 mod page_map;
 mod page_store;
 mod recovery;
+mod runtime_admission;
 mod segment_log;
 mod store;
 mod translation;
@@ -77,6 +78,10 @@ pub use page_image::{ImageLocation, PageImageMetadata};
 pub use page_map::{PageMap, PageMapEntry, PageMapId, PageMapRef};
 pub use page_store::{PageStoreError, PageStoreOperation, PersistentPageIo};
 pub use recovery::{RecoveredTransaction, RecoveryAssembler, RecoveryError};
+pub use runtime_admission::{
+    CheckpointAdmission, CommitAdmission, RuntimeAdmission, RuntimeAdmissionError,
+    RuntimeAdmissionState,
+};
 pub use segment_log::{SegmentedFileLogDevice, SegmentedLogConfig};
 pub use store::{StoreComponent, StoreDirectory, StoreError};
 pub use translation::{PublishResult, TranslationError, TranslationTable};
