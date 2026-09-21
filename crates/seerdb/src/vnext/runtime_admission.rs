@@ -94,9 +94,7 @@ impl RuntimeAdmission {
     pub fn ensure_read_admission(&self) -> Result<(), RuntimeAdmissionError> {
         match self.state()? {
             RuntimeAdmissionState::Open | RuntimeAdmissionState::Checkpointing => Ok(()),
-            RuntimeAdmissionState::RecoveryRequired => {
-                Err(RuntimeAdmissionError::RecoveryRequired)
-            }
+            RuntimeAdmissionState::RecoveryRequired => Err(RuntimeAdmissionError::RecoveryRequired),
         }
     }
 
