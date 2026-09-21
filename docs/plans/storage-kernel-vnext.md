@@ -104,6 +104,12 @@ algorithm replacements.
   remain unreachable garbage on later clean abort;
 - post-WAL runtime write fencing before unresolved intents can drop, with clean
   deterministic refusal kept before the durable decision where currently known;
+- process-local `RuntimeAdmission` checkpoint fencing: a commit admission guard
+  is acquired before the ordered commit path can enter WAL/installation and is
+  held through contiguous visibility completion; checkpoint drain blocks new
+  commits and waits for all already-admitted commit/install/publication work;
+  recovery-required state monotonically refuses new commit/read admission and
+  wakes a draining checkpoint rather than reopening in-process;
 - point MVCC snapshot resolution through transaction status and multi-hop undo,
   including own installed writes, active/aborted bypass, newer-commit traversal,
   tombstones and fail-closed unknown owners;
@@ -152,9 +158,12 @@ algorithm replacements.
 - full deterministic/bounded admission for arbitrary buffer and allocation
   pressure. The transaction's own undo-dependency cycle is fixed, but an
   undersized pool or externally pinned frames may still produce `NoVictim`;
-- runtime-wide failure fencing for reads, snapshots, checkpoint admission and
-  pending/already-admitted committers; current fencing is write-admission scope
-  only. These are persistent-runtime gates, not post-checkpoint polish;
+- full server/runtime integration of the admission authority: ordered commits now
+  participate in checkpoint drain and recovery-required state rejects new
+  read/commit admission, but every read/snapshot entry point and long-running
+  operation still needs to consult the shared gate, and checkpoint capture must
+  quiesce structural/GC/allocation mutators outside the ordered commit path.
+  These are persistent-runtime gates, not post-checkpoint polish;
 - complete failpoint/crash matrix across dependency-aware prepare, undo barrier,
   page application, status/frontier publication, checkpoint publication and two
   consecutive reopens;
@@ -356,8 +365,28 @@ core rather than inside the low-level intent table.
 
 ## Milestone F — page materialization and checkpoint recovery
 
-**Status: exact in-process write-ahead materialization gating implemented;
-persistent page/checkpoint authority is now the primary blocker.**
+**Status: exact in-process write-ahead materialization gating plus ordered-commit
+checkpoint admission/drain implemented; persistent page/checkpoint authority is
+now the primary blocker.**
+
+`RuntimeAdmission` now establishes the first runtime cut primitive: a commit
+that enters the real `OrderedCommitCoordinator` holds admission through WAL
+sync, undo durability, authoritative installation and contiguous visibility.
+`begin_checkpoint` closes new commit admission and waits for those guards to
+drain. The integration test blocks a real commit at WAL sync, starts checkpoint
+drain, proves the checkpoint cannot acquire its capture interval, then releases
+the commit and observes drain complete only after visibility publication. A
+recovery-required failure is monotonic for the process lifetime and wakes the
+drain. CI run 35642180481 passed on revision
+`05425052e70ba1c975587b5797bc5ac696a6dbc4` after rerunning one unrelated
+pre-existing store-lock test that failed once and then passed; stable
+Linux/macOS, Rust 1.89, all-features, Clippy, package lists, PostgreSQL oracle,
+perf smoke and durable-fs MSRV were green.
+
+This does **not** establish a checkpoint yet. Read/snapshot/server entry points
+still need to share the admission authority, and the checkpoint interval must
+also quiesce structural/GC/allocation metadata mutation while it captures one
+complete authoritative graph.
 
 For every dependency-aware current page image, the runtime retains at least:
 
@@ -390,11 +419,14 @@ remains is capture and publication:
 2. ~~acquire exclusive writable-store ownership and bind WAL/undo/page components
    to a common store incarnation~~ (implemented as ownership and incarnation
    binding only; it is not checkpoint or recovery authority);
-3. close admission to new committing mutations, allow admitted work to finish
-   installation/publication, then establish the exact `(CSN, decision LSN)` cut.
-   Keep install/structural/GC and allocation metadata mutation quiescent during
-   graph capture; do not stop installers needed by the drain. A failed drain
-   enters recovery-required state rather than publishing a partial checkpoint;
+3. use the implemented `RuntimeAdmission::begin_checkpoint` cut: close new
+   commit admission, drain already-admitted ordered commits through installation
+   and visibility, then establish the exact `(CSN, decision LSN)` cut. Wire all
+   actual read/snapshot/server entry points to fail closed on recovery-required
+   state, and add the remaining capture-time quiescence for structural/GC and
+   allocation-metadata mutators. Do not stop installers needed by the drain. A
+   failed drain enters recovery-required state rather than publishing a partial
+   checkpoint;
 4. capture every reachable authoritative page plus roots, object metadata,
    logical-to-physical mapping, allocation high-water marks, retained owner
    outcomes and retention metadata;
@@ -549,10 +581,12 @@ evidence changes priorities.
    stable/MSRV/all-features suites green, and clear Clippy on any new work.
    Qualify out-of-order installers, earlier-decision failure and pending-waiter
    wakeup as the surrounding runtime lifecycle lands.
-2. Define the shared runtime admission/drain/failure lifecycle and complete
-   checkpoint capture/publication over the implemented page store. Exclusive
-   writable ownership and WAL/undo/page store-incarnation binding now exist;
-   checkpoint/manifest binding and checkpoint authority do not.
+2. Extend the now-implemented `RuntimeAdmission` beyond ordered commits to the
+   real read/snapshot/server surfaces and remaining structural/GC/allocation
+   mutators, then complete checkpoint graph capture/publication over the
+   implemented page store. Exclusive writable ownership and WAL/undo/page
+   store-incarnation binding exist; checkpoint/manifest binding and checkpoint
+   authority do not.
 3. Recover checkpoint + synchronized retained WAL suffix through the existing
    applicator. Qualify runtime read/snapshot fencing, already-admitted writers,
    checkpoint cuts and two consecutive reopens before persistent exposure.
