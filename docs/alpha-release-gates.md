@@ -2,7 +2,10 @@
 
 This is the release contract for the relational OmenDB line. It is a gate, not
 an announcement: the current tree is **not alpha-ready** until every required
-gate has evidence attached to a release commit.
+gate has evidence attached to a release commit. The 2026-10-11 audit reopened
+product correctness gates in the [gap register](gap-register.md). Checked items
+below describe bounded historical evidence, not qualification of the uncovered
+cases or the replacement kernel.
 
 ## Package identity
 
@@ -62,7 +65,9 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 ### Storage and transaction foundation
 
-- [ ] the shared transaction/storage kernel provides multi-writer snapshot MVCC with distinct `TxnId`, CSN, and LSN identities;
+- [ ] the shared transaction/storage kernel provides multi-writer MVCC with
+      distinct `TxnId`, CSN and LSN identities, preserving the advertised
+      SERIALIZABLE point/absence/range dependencies as well as snapshot visibility;
 - [ ] authoritative B-tree/row storage, atomic multi-object transactions, and snapshot `{CSN, restart LSN}` export are exercised through OmenDB without requiring every object to use the ordered-KV facade;
 - [ ] committed changes are restartable without reconstructing history by
       rescanning relational tables;
@@ -97,17 +102,29 @@ matrix provides the storage-side crash coverage below.
       `tests/project_typed_values.rs` + the typed-value oracle differential);
       schema evolution (multi-operation ALTER TABLE, DROP TABLE/INDEX) is
       covered by `tests/project_schema_evolution.rs` (54883b8);
-- [x] logical dump/restore round-trips: one read-consistent snapshot
-      renders as plain SQL that restores into OmenDB and into real
-      PostgreSQL, with the differential running in the live-PG oracle CI
-      job (`feat/logical-backup`, 7f94fdc;
-      `tests/project_dump_restore.rs`).
+- [x] bounded logical dump/restore fixtures round-trip one read-consistent
+      snapshot through OmenDB and real PostgreSQL in the live-PG oracle CI job
+      (`feat/logical-backup`, 7f94fdc; `tests/project_dump_restore.rs`);
+- [ ] conversion preserves every supported catalog semantic, including typed FK
+      delete actions, or explicitly refuses unsupported export. Current Cascade
+      to Restrict conversion does not satisfy the full round-trip contract;
+- [ ] authorization applies to Describe as well as Execute, Describe performs no
+      user-query execution, and restricted roles can roll back without DDL grants;
+- [ ] explicit-block errors include binding, authorization and precommit result
+      admission, while post-decision delivery errors do not fabricate an abort.
 
 ### Correctness and isolation
 
+- [ ] failed direct/SQL mutations cannot commit partial row/index/catalog state;
+- [ ] typed and SQL FK creation validate and publish in one schema transaction
+      with dependencies retained across concurrent parent/child writes;
+- [ ] binding, identity, access-path choice and decoding share one retained
+      transaction/catalog view across schema changes;
+- [ ] index cursor continuation returns each matching row once at batch
+      boundaries, and parameterized batches reject mismatched inputs before work;
 - [x] typed and SQL tests pass on the direct SeerDB backend (the
       storage-kernel seam and temporary backend were deleted per
-      [ADR 0005](adr/0005-delete-storage-kernel-seem.md));
+      [ADR 0005](adr/0005-delete-storage-kernel-seam.md));
 - [x] SQL three-valued logic tests cover `NULL`, `IN`, `NOT IN`, `BETWEEN`,
       joins, and `DISTINCT` with pagination;
 - [x] differential SQL tests compare the overlapping bounded subset with an
@@ -156,7 +173,7 @@ matrix provides the storage-side crash coverage below.
       with every field above; recorded rows live in
       [`docs/benchmarks.md`](benchmarks.md) and the baselines table below);
 - [x] the same workload runs against the OmenDB backend (direct SeerDB
-      storage, [ADR 0005](adr/0005-delete-storage-kernel-seem.md); the
+      storage, [ADR 0005](adr/0005-delete-storage-kernel-seam.md); the
       earlier second backend was the deleted temporary seam) and SQLite
       without changing semantics — each run verifies its engine's final
       state against an independent expected-state oracle and the recorded

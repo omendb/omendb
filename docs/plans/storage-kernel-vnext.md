@@ -7,8 +7,11 @@
 ## Strategy
 
 This is a replacement implementation inside the existing repository, not a
-permanent backend matrix. The current engine remains the semantic/recovery
-oracle until vNext passes equivalent correctness, fault and performance gates.
+permanent backend matrix. The current engine remains a semantic/recovery
+reference until vNext passes correctness, fault and performance gates. Known
+legacy defects are not the specification: use independent PostgreSQL/SQLite
+oracles and the accepted contract where current output is wrong. The
+[gap register](../gap-register.md) owns current relational defects.
 
 Reuse semantics and test oracles where they are strong. Do not preserve an old
 physical ownership model merely to reduce diff size. The vNext tree, transaction
@@ -36,6 +39,15 @@ completion and frontier wakeup tests cover both outcomes. Runtime-wide admission
 and drain authority for reads, snapshots, checkpoint cuts and already-admitted
 writers remains open below.
 
+The 2026-10-11 source audit at `fc98820` reopened two foundation gates:
+`buffer.rs::load_miss` can publish a stale read after a competing load has been
+modified and evicted, and empty-leaf record preflight can accept a durable
+transaction that later fails split/fence representation during both installation
+and replay. Repair and qualify those paths before stacking checkpoint capture.
+The same audit found that caught commit unwinding can release drain membership
+without fencing, and placement-map duplicate checks are quadratic. These are
+current implementation gaps, not evidence that checkpoint authority exists.
+
 Keep the full CI matrix green before stacking persistence changes. The
 architecture remains a correctness baseline,
 not demonstrated state-of-the-art performance. Performance qualification must
@@ -51,15 +63,17 @@ algorithm replacements.
 - concurrent frame lifecycle, exact-incarnation pins, frame-local guards and
   sharded `PageKey -> FrameRef` translation without a global buffer mutex on
   cache hits;
-- CLOCK/second-chance eviction baseline, duplicate-load publication handling,
-  direct dirty-page creation and writeback/install race handling;
+- CLOCK/second-chance eviction baseline, resident duplicate-load detection,
+  direct dirty-page creation and writeback/install race handling; stale publication
+  after a competing load's mutation/eviction remains an open correctness defect;
 - native variable-size slotted B-link pages with cached key heads, high fences,
   right siblings, lazy compaction, byte-balanced leaf/internal splits, root
   replacement, point lookup, forward range traversal and key-restart cursors;
 - atomic B-tree `upsert` distinct from duplicate-rejecting `insert`, including
   larger/smaller replacement, split-on-growth and unchanged-on-oversize behavior;
-- pure configured-page-size ordered-record preflight using the real leaf builder,
-  so an unrepresentable encoded current record can be refused before WAL I/O;
+- pure configured-page-size empty-leaf record preflight using the real builder;
+  it rejects some oversized records but does not yet guarantee split/fence or
+  internal-routing representability before WAL I/O;
 - transaction-scoped logical WAL with contiguous mutation ordinals, separate
   commit decisions, CRC32C, exact record-end LSNs and fail-closed parsing;
 - WAL outer format v2 with a checksummed fixed header validated before trusting
@@ -164,6 +178,10 @@ algorithm replacements.
   operation still needs to consult the shared gate, and checkpoint capture must
   quiesce structural/GC/allocation mutators outside the ordered commit path.
   These are persistent-runtime gates, not post-checkpoint polish;
+- runtime-owned commit-attempt responsibility: an unresolved attempt, including
+  unwinding in a continuing process, fences admission/visibility before releasing
+  intents and drain membership; process-termination panic profiles must state
+  and qualify their different hosting contract;
 - complete failpoint/crash matrix across dependency-aware prepare, undo barrier,
   page application, status/frontier publication, checkpoint publication and two
   consecutive reopens;
@@ -199,7 +217,8 @@ synchronization simply because a lower-level primitive looks faster in isolation
 
 ## Milestone B — concurrent buffer manager
 
-**Status: synchronous dependency-aware materialization baseline implemented.**
+**Status: synchronous dependency-aware materialization implemented; load-publication
+correctness reopened.**
 
 The buffer provides sharded translation, CLOCK victim selection, dirty
 writeback, direct new-page installation and transient writeback waits.
@@ -214,6 +233,11 @@ frontiers from successful WAL/undo barriers.
 
 Remaining buffer/materialization work:
 
+- single-flight loading per `PageKey`: reserve authoritative loading ownership
+  before reading bytes; contenders join that load, and failure/cancellation
+  retires only its exact token. Do not hold translation-shard locks across I/O.
+  Qualify a delayed load against competing mutation, durable writeback, eviction
+  and a new post-ACK snapshot—not only two simultaneous resident winners;
 - checkpoint *capture* over the now-implemented page image/map components:
   runtime drain, structural closure, roots/object metadata, allocation high-water
   marks and owner outcomes;
@@ -227,8 +251,8 @@ Remaining buffer/materialization work:
 
 ## Milestone C — page-resident B-link tree
 
-**Status: ordered-access correctness and dependency propagation baseline
-substantially qualified.**
+**Status: dependency propagation baseline implemented; split-aware record admission
+and feasible pivot selection remain correctness blockers.**
 
 Implemented:
 
@@ -247,11 +271,17 @@ Implemented:
 
 Still required:
 
-1. Qualify structural persistence through complete checkpoint graph closure and
+1. Define supported inline key/value limits that guarantee leaf fences and
+   internal separators remain representable. Select split pivots from feasible
+   candidate pages, then balance bytes; empty-leaf fit is not sufficient. Live
+   admission and replay use the same contract. Shortened separators or overflow
+   support are separate layout choices if conservative limits cannot satisfy
+   the supported relational key/value contract.
+2. Qualify structural persistence through complete checkpoint graph closure and
    crash/reopen testing.
-2. Benchmark page size, prefix/fence truncation and slot hints before format
+3. Benchmark page size, prefix/fence truncation and slot hints before format
    stabilization.
-3. Replace the structural mutex only when measured contention justifies a more
+4. Replace the structural mutex only when measured contention justifies a more
    complex page-local protocol.
 
 Do not move checksum/page-LSN authority into the B-tree hot-path format merely
@@ -408,6 +438,12 @@ restart authority merely because their bytes reached storage.
 Do not use a maximum page LSN as a logical-redo skip watermark. Installation may
 finish out of LSN order and splits move logical effects between pages.
 
+Before capture, give the persistent runtime one owner for admission/failure,
+visibility/status, intents, dependency frontiers, snapshot leases and component
+ownership. Transaction/read/checkpoint capabilities come from that owner, not
+independently assembled optional services. A zero-member drain proves a cut only
+when every attempt completed, cleanly refused or fenced before membership ended.
+
 The next major implementation milestone is a structurally complete checkpoint.
 The checksummed image envelope and out-of-place placement map are implemented in
 `crates/seerdb/src/vnext/page_store.rs` (with `page_image.rs`/`page_map.rs`):
@@ -427,9 +463,13 @@ remains is capture and publication:
    allocation-metadata mutators. Do not stop installers needed by the drain. A
    failed drain enters recovery-required state rather than publishing a partial
    checkpoint;
-4. capture every reachable authoritative page plus roots, object metadata,
-   logical-to-physical mapping, allocation high-water marks, retained owner
-   outcomes and retention metadata;
+4. capture every reachable authoritative page and child/right link plus roots,
+   object metadata, logical-to-physical mapping, allocation high-water marks,
+   reachable current/undo history and each referenced owner's durable outcome
+   or safely frozen ownership. Retain the history needed by live snapshots and
+   the prior checkpoint. Use one placement-map validator with nonquadratic
+   duplicate detection; the current repeated `Vec::contains` checks do not
+   qualify checkpoint scale;
 5. prove each captured image satisfies its WAL/undo durability requirements;
 6. durably publish one complete checkpoint/manifest while retaining the previous
    complete checkpoint;
@@ -469,6 +509,34 @@ Secondary scalar indexes remain B-tree access-method objects. The acceptance
 proof is one transaction atomically changing a row, secondary index,
 unique/constraint state and catalog/object metadata under one durable decision,
 including kill/reopen at every durability/application/publication boundary.
+
+Atomic installation and snapshot isolation do not alone protect relational
+predicates. Preserve the existing adapter's catalog, unique-value and FK range
+dependencies through the replacement boundary. Order predicate certification
+against concurrent commit decisions, or use proven shared logical constraint
+intents; a pre-WAL callback with an unprotected validate/decide gap is insufficient.
+Qualify disjoint-row inserts of the same unique value, child insert versus parent
+delete, and DML versus incompatible DDL. Constraint semantics hold even when the
+user transaction runs below SERIALIZABLE; broader serializable dependency
+tracking remains isolation-mode-specific. Preserve the current SQL surface's
+advertised SERIALIZABLE point, absent-key and range dependencies; a snapshot
+reader with exact write intents does not implement that contract.
+
+Product integration must also prove:
+
+- one transaction/catalog view for binding, identity, access-path selection and
+  row decoding; authorization and zero-execution Describe share bound semantics;
+- operation-failure atomicity and failed-block lifecycle, including precommit
+  result admission, without aborting an already durable decision;
+- transactional catalog/object creation, activation and retirement with retained
+  readers and an actual canonical-record participant, not only several B-trees;
+- native resumable cursor/guarded-row/batch interfaces and bounded ordinary
+  execution without database-wide read/write locking. Inclusive cursor restart
+  and full-prefix morsel rescans are not qualifying implementations;
+- an explicit data-continuity policy: disposable preview recreation or validated
+  offline migration. A conversion must preserve supported FK actions, constraint
+  timing, layouts and index/catalog semantics or refuse unsupported input.
+  Temporary old readers/converters are not a permanent dual-engine product.
 
 Then wire a temporary OmenDB adapter and run the existing product oracle:
 
@@ -552,8 +620,10 @@ This is an experiment/architecture queue, **not** a reason to delay Milestones F
 or G and not a second implementation roadmap. Reorder it when product workload
 evidence changes priorities.
 
-1. Make the server/runtime use the batch-first storage/execution seams from ADR
-   0007/0013 and measure them against row-at-a-time adapters before adding JIT.
+1. Tune the qualified server/runtime's batch-first storage/execution seams from
+   ADR 0007/0013 against row-at-a-time adapters before adding JIT. The minimal
+   cursor/batch/concurrent runtime contract is a cutover gate, not work deferred
+   until after cutover.
 2. Tune canonical rows with measured family placement and, if warranted, a
    stable-handle large-value arena. Do not freeze physical row references until
    movement/reuse/GC/recovery semantics are proven.
@@ -578,13 +648,15 @@ evidence changes priorities.
 
 ## Immediate sequence
 
-1. Keep the completed visibility-completion fix, the Clippy-clean tree and the
-   stable/MSRV/all-features suites green, and clear Clippy on any new work.
-   Qualify out-of-order installers, earlier-decision failure and pending-waiter
-   wakeup as the surrounding runtime lifecycle lands.
+1. Repair single-flight page loading and split-aware record admission before
+   checkpoint capture. Reproduce the acknowledged-value resurrection and the
+   accepted-but-unreplayable durable decision, then qualify their repairs through
+   the real coordinator and replay path. Preserve the visibility-completion fix
+   and keep stable/MSRV/all-features and Clippy gates green.
 2. Extend the now-implemented `RuntimeAdmission` beyond ordered commits to the
    real read/snapshot/server surfaces and remaining structural/GC/allocation
-   mutators, then complete checkpoint graph capture/publication over the
+   mutators. Bind them under one runtime owner, define unresolved-attempt/unwind
+   fencing, and complete checkpoint graph capture/publication over the
    implemented page store. Exclusive writable ownership and WAL/undo/page
    store-incarnation binding exist; checkpoint/manifest binding and checkpoint
    authority do not.

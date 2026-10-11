@@ -1,157 +1,82 @@
-# ADR 0003: SeerDB commit and recovery state machine
+# ADR 0003: SeerDB commit outcome and recovery ownership
 
-- **Status:** accepted target architecture; implementation pending
-- **Scope:** transaction commit, durable outcome, recovery, and ambiguous I/O
+- **Status:** accepted outcome/failure contract; vNext ordering is owned by ADR 0014
+- **Scope:** durable transaction outcome, recovery ownership and ambiguous I/O
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md) and
   [ADR 0002](0002-seerdb-mvcc-version-storage.md)
+- **Refined by:** [ADR 0014](0014-vnext-installation-and-recovery.md)
 
 ## Decision
 
-SeerDB treats a transaction's durable commit decision as the visibility
-boundary. Data/version records may be appended before that decision, and
-physical pages may be materialized after it, but no reader may expose a
-transaction unless recovery can establish its committed CSN from a complete
-durable decision.
+A complete durable commit decision is irrevocable transaction-outcome authority.
+It does not by itself establish visible completion. Synchronous acknowledgment
+requires the selected durability barriers, complete authoritative installation
+and contiguous visibility coverage. Recovery must derive the same logical
+outcome even if materialization or response delivery was interrupted. Any
+asynchronous receipt must explicitly distinguish its non-durable state from a
+synchronous acknowledgment. Read-only work may complete at its captured snapshot
+without assigning a new CSN.
 
-The state machine is:
+A proven clean refusal before WAL authority remains abortable. An uncertain WAL
+attempt or unresolved durable decision requires recovery, not a fabricated
+abort. `RecoveryRequired` describes the runtime/caller's need to resolve state;
+it is not a committed or aborted transaction outcome.
 
-```text
-                 +------------------+
-                 |                  v
-Active -> Validating -> Prepared -> WalDurable -> Committed(CSN) -> Released
-  |          |             |             |
-  +--------> Aborted <-----+-------------+
-                              uncertain I/O
-                                   |
-                                   v
-                            RecoveryRequired
-```
-
-`RecoveryRequired` is a caller-visible state for an ambiguous operation. It is
-not an outcome. The caller must reopen or otherwise invoke the recovery
-boundary before deciding whether to retry an application operation.
+The former prepared-prefix/two-barrier sketch is superseded for vNext. ADR 0014
+owns WAL/undo/install ordering, replay identity, checkpoint closure and retained
+history; this ADR does not maintain a second protocol or execution sequence.
 
 ## State ownership
 
-- The transaction manager owns state transitions, write intents, active
-  snapshot registration, and release.
-- The WAL manager owns record ordering, framing, sync barriers, and LSNs.
-- The recovery manager owns interpretation of durable transaction decisions
-  after restart.
-- The page publisher owns physical checkpoint/materialization and page-map
-  publication. It cannot independently publish transaction visibility.
-- The logical change stream owns decoding committed generic tree/key events
-  from durable transaction records; it does not rescan tables.
+- The transaction manager owns transaction state, intents, snapshots and release.
+- The log owns record order, framing, synchronization and durable LSNs.
+- Recovery interprets durable outcomes and restores complete authoritative state.
+- Materialization owns physical images and checkpoint/page-map publication; it
+  cannot independently advance logical transaction visibility.
+- Committed-change decoding preserves transaction boundaries and historical
+  effects; fetching present-day rows is not historical replay.
 
-Each layer exposes outcomes to the next layer rather than duplicating a commit
-frontier or inferring success from file existence.
+One persistent runtime binds these services and their failure authority.
+Components report outcomes rather than infer success from file existence or
+maintain independent commit frontiers.
 
-## Commit protocol
+## Failure outcomes
 
-For a transaction with snapshot `S`:
-
-1. **Validating:** acquire/validate logical key and range intents, check
-   first-committer-wins conflicts, and run the configured dependency
-   certifier.
-2. **Prepared:** append the transaction's version/current-record records and
-   generic change records. They reference `TxnId` and remain invisible.
-3. **WalDurable:** make the complete prepared prefix durable according to the
-   selected durability mode. A prepared prefix without a durable commit
-   decision is not visible.
-4. **Committed(CSN):** append a commit decision containing the CSN, transaction
-   identity, covered record/change range, and durable position. Make that
-   decision durable before synchronous acknowledgement.
-5. **Released:** publish the in-memory committed status, release intents, and
-   unregister the ordinary snapshot. Physical checkpoint and GC may follow.
-
-The commit decision is one transaction boundary across all touched trees. A
-read-only transaction can complete at its captured snapshot without allocating
-a new CSN.
-
-An asynchronous durability mode may return a clearly different non-durable
-status, but it must never label a transaction as synchronously durable. The
-public result always distinguishes logical CSN from LSN.
-
-## Recovery algorithm
-
-Recovery performs these steps before accepting new transactions:
-
-```text
-select latest valid physical manifest/checkpoint
- -> restore page mapping and transaction metadata
- -> scan/replay WAL after the checkpoint
- -> validate record framing, transaction boundaries, CSN order, and LSNs
- -> resolve every prepared transaction from its durable decision
- -> discard/queue abandoned prepared state with no decision
- -> validate current-record/undo/blob references
- -> register durable snapshot/change-consumer leases
- -> expose the recovered frontier
-```
-
-A complete durable commit decision makes the transaction committed, even when
-its physical page materialization was interrupted; WAL replay or a later
-checkpoint must make the logical state available. A prepared transaction with
-no durable decision is aborted/ignored and its allocations become GC work. A
-truncated or contradictory decision is corruption, not an implicit commit.
-
-## Crash matrix
-
-| Failure point | Reopen result |
+| Boundary | Required outcome |
 |---|---|
-| before prepare append | transaction absent; prior state remains |
-| during prepared record append | prior state or a validated incomplete prefix; transaction invisible |
-| after prepared records, before durable barrier | transaction invisible; incomplete records truncated/ignored |
-| after prepared barrier, before commit decision | transaction invisible; prepared state is abort/GC work |
-| during commit-decision append | transaction invisible unless a complete valid decision exists |
-| after commit decision is durable, before page publication | transaction committed; replay/materialization completes it |
-| after page publication, before manifest/authority publication | old or complete-new physical root; logical outcome remains unambiguous |
-| after authority publication, before cleanup | committed state; cleanup is retryable |
-| during version/undo GC | all versions reachable from retained snapshots remain readable |
-| during WAL/segment reclamation | no required checkpoint, replica, CDC, or snapshot position is lost |
+| Proven clean refusal before WAL authority | No commit decision; prior committed state remains; caller may abort/retry |
+| Uncertain append/sync | Fence the runtime; recovery validates whether a complete decision exists |
+| Durable decision before installation/visibility | Committed outcome; finish or recover every authoritative effect; no success ACK yet |
+| Interrupted checkpoint publication | Prior complete checkpoint remains retained; publish no partial authority |
+| Interrupted response after completion | Commit remains committed; retry safety requires application/request semantics |
+| History or image reclamation | Every retained checkpoint, reader and recovery dependency remains reachable |
 
-The old-or-new rule applies only where the operation is not yet logically
-committed. Once the durable commit decision exists, reopening must not roll the
-logical transaction back merely because cleanup or page publication was
-interrupted.
+Only a provably incomplete final append is repairable as a torn tail. Complete
+bad framing, checksums, contradictory decisions or missing retained references
+are corruption. Reopening must re-establish durability before exposing recovered
+frontiers. No automatic fallback may silently discard acknowledged history.
 
-## Ambiguous failure handling
+## Failure lifecycle
 
-Any error after an external write, sync, rename, or commit-decision attempt may
-be partial or uncertain. The handle becomes fenced for further writes and
-returns `RecoveryRequired` unless the operation can prove it failed before the
-authoritative effect. Callers must not blindly retry the same transaction
-identity against a fenced handle.
+Uncertain external effects fence further admission and wake completion/drain
+waiters. Fencing precedes release of unresolved ownership. Caught unwinding in a
+continuing process obeys the same responsibility contract; an explicit
+process-abort profile is a different hosting policy. Cancel/disconnect after a
+durable decision does not make commit responsibility disappear.
 
-Recovery diagnostics must identify:
+Diagnostics distinguish transaction identity, last phase, decision position,
+affected objects, resolved outcome and the next safe action. Callers do not
+blindly retry against a fenced handle or treat an ambiguous result as an abort.
 
-- transaction identity;
-- last observed state;
-- prepared and decision LSNs;
-- affected tree/key range when available;
-- whether the outcome is committed, aborted, or corrupt;
-- the next safe action.
+## Qualification and formats
 
-## Fault and simulation requirements
+The [vNext plan](../plans/storage-kernel-vnext.md) owns unfinished gates; the
+[qualification procedure](../../.agents/skills/vnext-qualification/SKILL.md)
+owns the recurring checks. Cross durability, installation, checkpoint and
+reclamation boundaries through the real runtime and verify logical state after
+two consecutive reopens, not merely successful directory opening.
 
-The implementation must provide deterministic seams for:
-
-- short/torn writes and sync failure;
-- crash before and after each WAL barrier;
-- crash before and after commit-decision publication;
-- page/blob publication interruption;
-- recovery replay and truncation;
-- version-store append and GC interruption;
-- allocation/capacity refusal;
-- change-consumer advancement and WAL retention.
-
-Each fault case must reopen at least twice and verify the logical model, not
-only that the directory opens. Tests must distinguish process refusal,
-committed outcome, aborted outcome, corruption, and resource equivalence.
-
-## Compatibility and migration
-
-This is a new target protocol, not a promise to preserve the current v3
-inline-chain format. Until the replacement passes its recovery gates, the
-current format remains a transitional development format. A future format
-version must fail closed on old bytes or use an explicit offline migration;
-there is no silent dual-format fallback.
+Experimental formats may change before stability. Fail closed on unsupported
+bytes or use an explicit validated migration; no silent dual-format fallback.
+The existing engine remains a qualification reference, not the permanent
+physical architecture or an infallible semantic specification.

@@ -1,20 +1,29 @@
 # OmenDB
 
-## Architecture and authority
+## Design owners and entry points
 
-- The storage-kernel rewrite is governed by [ADR 0013](docs/adr/0013-storage-kernel-and-access-methods.md), [ADR 0014](docs/adr/0014-vnext-installation-and-recovery.md), and the [vNext plan](docs/plans/storage-kernel-vnext.md). Read these before changing vNext protocol or persistence. The plan owns milestone order and open gates; older handoffs are context, not competing roadmaps.
-- Preserve the existing engine as the semantic/fault oracle until replacement qualification passes. Do not preserve obsolete physical ownership or maintain a permanent engine matrix.
-- One transaction/log/catalog authority spans authoritative access methods. Derived structures need explicit snapshot coverage or a correct delta/fallback path.
-- ADR 0013 supersedes older descriptions of SeerDB as OmenDB's universal ordered-KV physical boundary. Ordered KV is one access method/facade over the shared transaction/storage kernel, not a constraint on rows, text, vector, graph, JSON, or HTAP layouts.
-- A durable decision is irrevocable commit authority; synchronous success additionally requires contiguous visibility coverage. Ready publication alone is not acknowledgment.
-- Working spill pages are not restart authority without a complete, validated checkpoint and retained WAL suffix. A page's maximum LSN is not a logical replay-completeness marker.
-- Correctness and representative vNext performance gates precede product cutover. Research suggests experiments; it does not establish performance or authorize speculative protocol changes.
+- For kernel boundary changes, read [ADR 0013](docs/adr/0013-storage-kernel-and-access-methods.md). SeerDB is the shared transaction/storage kernel; ordered KV is one access method, not the universal physical model.
+- For vNext commit, MVCC or persistence changes, read [ADR 0014](docs/adr/0014-vnext-installation-and-recovery.md) and the [vNext plan](docs/plans/storage-kernel-vnext.md). The ADR owns the protocol; the plan owns milestone order and open gates. Older handoffs are historical context.
+- For relational or wire changes, start with [architecture](docs/architecture.md), the [compatibility matrix](docs/pgwire-compatibility.md), and the [SQL gap register](docs/gap-register.md). PostgreSQL-wire support is not full PostgreSQL compatibility.
+- Keep the existing engine as a semantic/fault reference until qualified cutover, not an infallible specification. Resolve known defects against accepted contracts and independent oracles. Do not maintain a permanent engine matrix.
+
+## Persistence boundaries
+
+- A durable decision is irrevocable commit authority; synchronous success also requires contiguous visibility. Ready publication alone is not acknowledgment.
+- Working spill pages are not restart authority without a complete checkpoint and retained WAL suffix. A page's maximum LSN is not logical replay completeness.
+- One transaction/log/catalog authority spans authoritative access methods. Derived structures need retained snapshot coverage or an exact delta/fallback path; an applied frontier alone does not prove an older snapshot is readable.
 
 ## Qualification
 
 For vNext commit, MVCC, buffer, checkpoint or recovery changes, load [.agents/skills/vnext-qualification/SKILL.md](.agents/skills/vnext-qualification/SKILL.md).
 
-Primary local gates (repository root):
+Focused kernel check (repository root):
+
+```sh
+cargo test -p seerdb --lib vnext:: --locked
+```
+
+Primary implementation gates:
 
 ```sh
 cargo fmt --all -- --check

@@ -23,12 +23,15 @@ storage product.
 | Physical updates | Generation-COW engine | Buffered pages, logical MVCC, log-authoritative commit, asynchronous out-of-place materialization |
 | Server concurrency | `Arc<RwLock<RelationalDatabase>>`, lock polling and `spawn_blocking` | Concurrent database handle and bounded execution/admission runtime |
 | Rows and execution | Bootstrap row codec and materialized row results | Schema-driven guarded row views, OLTP micro-plans and typed batch pipelines |
-| Planning | SQL classification and Describe probes remain | Binder-owned types, effects, dependencies and result schema |
+| Planning | SQL classification, executable Describe probes and mixed catalog views remain | Binder-owned types, privileges, effects, dependencies and result schema from one transaction/catalog view |
+| Operation failure | Some errors leave committable partial relational state | Private statement delta or failed transaction; no partial row/index/catalog commit |
 | Analytics/search | Future integration | Snapshot-qualified access paths over the same transactional authority |
 
-The existing engine remains the semantic and crash/fault oracle until the
-replacement passes correctness and representative performance gates. There is
-no permanent backend matrix. Cutover deletes the superseded physical engine;
+The existing engine remains a semantic and crash/fault reference until the
+replacement passes correctness and representative performance gates. Known
+legacy defects in the [gap register](gap-register.md) are not the specification;
+independent PostgreSQL/SQLite semantics and accepted contracts resolve those
+cases. There is no permanent backend matrix. Cutover deletes the superseded physical engine;
 a temporary adapter is qualification machinery, not product extensibility.
 
 ## Target ownership
@@ -207,8 +210,12 @@ Durability, recovery and essential reclamation retain progress capacity even
 under foreground or analytical saturation. See
 [ADR 0007](adr/0007-runtime-execution-and-contention.md).
 
-Parsing, binding, authorization, Describe, planning and execution share semantic
-metadata. Describe must not execute a fabricated user query to infer its schema.
+Parsing, binding, authorization, Describe, planning and execution share one
+transaction/catalog view and semantic metadata. A relational operation owns its
+private mutation delta: before durable commit authority, failure restores that
+delta or leaves a failed transaction that must roll back. After the decision,
+response delivery failure cannot abort the commit. Describe must not execute a
+fabricated user query to infer its schema.
 Prepared plans retain catalog-object dependencies rather than relying on one
 whole-catalog invalidation marker. Constraint enforcement uses mutation-driven
 probes, not routine whole-table foreign-key scans.

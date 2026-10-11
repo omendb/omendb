@@ -8,7 +8,9 @@ direct Rust API is also available.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.
-See the [release gates](docs/alpha-release-gates.md) for the release contract.
+Known authorization and failed-statement integrity gaps make the current preview
+unsuitable for untrusted clients or irreplaceable data. See the
+[gap register](docs/gap-register.md) and [release gates](docs/alpha-release-gates.md).
 
 ## Run the server
 

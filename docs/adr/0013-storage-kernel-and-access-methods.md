@@ -1,6 +1,6 @@
 # ADR 0013: Storage kernel and access-method boundary
 
-- **Status:** accepted target architecture; implementation begins on `storage-kernel-vnext`
+- **Status:** accepted target architecture; ordered kernel baseline implemented on `storage-kernel-vnext`, persistent recovery and relational cutover pending
 - **Scope:** SeerDB/OmenDB physical boundary, transaction/storage kernel, access methods, recovery participation, and multimodal derived state
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md), [ADR 0003](0003-seerdb-commit-recovery-state-machine.md), [ADR 0006](0006-deployment-storage-and-durability.md), [ADR 0009](0009-buffered-btree-and-materialization.md), [ADR 0011](0011-htap-and-analytical-representations.md), and [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md)
 - **Revises:** the earlier assumption that `TreeId + ordered key bytes + opaque value bytes` is the only OmenDB↔SeerDB narrow waist, including target-boundary language in ADRs 0005, 0006, 0010 and 0012
@@ -190,6 +190,13 @@ from the B-tree and row layout closely enough to benchmark at least:
 - NUMA/tier-aware placement.
 
 The chosen default may vary by deployment profile, but page formats should not be permanently polluted by one translation trick without measured benefit.
+
+Residency correctness precedes choosing a faster translation strategy. Loading
+ownership must serialize publication for a `PageKey` across I/O, mutation,
+writeback and eviction; checking only for a currently resident winner permits
+a delayed obsolete image to reappear. Exact frame incarnation protects frame
+reuse but does not by itself establish logical page-load freshness. The current
+optimistic duplicate-load implementation has this gap; the plan owns its repair.
 
 Translation/residency experiments must measure more than hit rate: LLC misses,
 TLB/page walks, memory bandwidth and NUMA movement can dominate very large DRAM

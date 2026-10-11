@@ -1,14 +1,16 @@
 # ADR 0001: SeerDB transaction and durability contract
 
-- **Status:** accepted architecture; implementation in progress
+- **Status:** accepted transaction semantics; physical boundary refined by ADR 0013 and vNext commit protocol by ADR 0014
 - **Scope:** OmenDB ↔ SeerDB boundary
 - **Supersedes:** the global expected-`CommitId` CAS batch as the final
   production transaction API
 
 ## Decision
 
-OmenDB will call SeerDB through a capability-rich generic ordered-KV
-transaction API. SeerDB remains SQL-agnostic and exposes only:
+SeerDB supplies OmenDB's shared transaction/storage semantics and remains
+SQL-agnostic. [ADR 0013](0013-storage-kernel-and-access-methods.md) supersedes
+this ADR's original universal ordered-KV boundary: the following is the ordered
+access-method facade, not the only physical representation:
 
 ```text
 TreeId + unsigned-lexicographically ordered key bytes + opaque value bytes
@@ -58,15 +60,14 @@ OmenDB must not maintain a second independent commit frontier.
 
 ```text
 Active
-  -> Validating
-  -> WalReserved
-  -> WalDurable
-  -> Committed(CSN)
+  -> Validating / Prepared
+  -> WalAppended
+  -> DurableDecision
+  -> Visible (contiguous CSN coverage)
   -> Released
 
-Active -> Aborted
-Any pre-visibility failure -> Aborted or Retryable
-Any ambiguous durability/publication failure -> RecoveryRequired
+Proven clean pre-WAL refusal -> remains abortable
+Uncertain WAL attempt or unresolved durable decision -> RecoveryRequired
 ```
 
 For synchronous local durability, the acknowledgement invariant is:
@@ -75,6 +76,10 @@ For synchronous local durability, the acknowledgement invariant is:
 acknowledged commit => WAL and required publication state survive the
                        selected local durability barrier
 ```
+
+A durable decision is irrevocable even before visibility. Readiness publication
+alone does not acknowledge success. [ADR 0014](0014-vnext-installation-and-recovery.md)
+owns the exact vNext ordering and completion/failure protocol.
 
 Recovery must derive the same committed/aborted outcome from durable records;
 it must never expose a partial multi-tree transaction.
@@ -99,17 +104,15 @@ commit/recovery protocol is specified in [ADR 0003](0003-seerdb-commit-recovery-
 
 ## Snapshot and change position
 
-Snapshot export returns one atomic pair:
+The target export is a retained handoff containing snapshot CSN `X`, a logical
+consumer cursor/restart position, source incarnation and atomically registered
+snapshot/history leases. A position pair alone is not a copyable snapshot or a
+retained stream. The current `snapshot_export` reports a durable position only.
 
-```text
-snapshot CSN X
-restart LSN Y
-```
-
-A consumer reads snapshot X and then requests committed changes strictly after
-Y. The stream preserves transaction boundaries and generic tree/key
-operations; physical WAL and page layout remain private to recovery and
-physical replication.
+[ADR 0013 §11](0013-storage-kernel-and-access-methods.md#11-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers)
+owns the complete contract, including historical effects, transaction-atomic
+consumer progress and separate physical retention floors. Physical WAL/page
+formats remain private to recovery and physical replication.
 
 ## Consequences
 

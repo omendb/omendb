@@ -1,6 +1,7 @@
 # ADR 0002: SeerDB transactional MVCC and version storage
 
-- **Status:** accepted target architecture; implementation pending
+- **Status:** accepted visibility/retention semantics; ordered before-image baseline implemented, freezing/reclamation pending
+- **Refined by:** [ADR 0013](0013-storage-kernel-and-access-methods.md) permits access-method-aware physical version layouts; [ADR 0014](0014-vnext-installation-and-recovery.md) owns vNext durability/recovery ordering
 - **Scope:** SeerDB logical record visibility, transaction status, retention, and
   version garbage collection
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md)

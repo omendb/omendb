@@ -110,6 +110,20 @@ memory/I/O budgets rather than creating a hidden source of pressure. Future
 distributed coordinators extend the same model to exchange buffers, remote
 result queues and network bytes. Admission errors remain explicit.
 
+Admission that can park a session is transaction-grain: acquire it before the
+transaction takes a snapshot, intents or locks, and retain ownership until the
+transaction ends. Later statements, nested execution and completion work of an
+already-admitted transaction do not queue behind work waiting for its locks.
+Idle or aborted explicit transactions still own resources; account for them and
+bound their lifetime rather than releasing and reacquiring their admission slot.
+
+This workload/resource admission is distinct from vNext `RuntimeAdmission`'s
+checkpoint cut. The latter drains committing mutations through installation and
+visibility; it is not an overload scheduler. Checkpoint closure must not prevent
+an admitted installer, WAL completion or rollback from making the progress needed
+by the drain. One runtime owns their composition, with separately observable
+queueing, active-transaction and checkpoint states.
+
 ### 5. Bind once; wire protocol does not infer semantics from SQL text
 
 Parsing produces an AST. Binding/semantic analysis produces a stable object
@@ -119,8 +133,9 @@ containing at least:
 BoundStatement
   parameter types
   result schema
-  referenced catalog object versions
-  effects (read/write/schema/session)
+  referenced catalog/layout versions from the transaction view
+  effects (read/write/schema/session/transaction control)
+  required privileges
   logical plan
 ```
 
@@ -130,7 +145,16 @@ and result encoding consume this shared semantic representation.
 `Describe` must never execute a user query with fabricated values to discover
 its type. Transaction control, DDL classification, RETURNING behavior, and
 row-producing behavior are AST/binder properties, not whitespace/token-prefix
-heuristics.
+heuristics. Authorization precedes both Describe and execution; Describe may not
+infer protected data through expression errors. A prepared plan is not a cached
+authorization grant. Transaction control is session/transaction lifecycle, not
+schema administration; rollback remains available for cleanup.
+
+Binding, access-path selection, row identity and decoding consume the same
+transaction/catalog view. Retain every layout/catalog version that view needs;
+new schema metadata must not be combined with old row interpretation. Grant
+revocation for already-open transactions needs an explicit policy distinct from
+data-snapshot visibility; do not infer it from catalog or prepared-plan lifetime.
 
 ### 6. Two physical execution paths share one typed logical plan
 
@@ -224,6 +248,15 @@ range dependencies. There is no validate-then-publish TOCTOU seam.
 All DDL funnels through one schema-transaction protocol; bespoke per-command
 publication paths are transitional.
 
+A relational operation owns its complete private mutation delta. If validation,
+index maintenance or result admission fails before commit authority, either
+restore that delta or put the transaction into a failed state that can only roll
+back. Publishing the remaining staged mutations is not failure atomicity.
+Direct APIs and wire execution share that rule. In PostgreSQL-compatible explicit
+blocks, binding, authorization, execution and precommit result-admission errors
+enter aborted-block semantics consistently. After a durable decision, response
+encoding failure or disconnect cannot convert the commit into an abort.
+
 ### 10. Catalog state is immutable and versioned at object granularity
 
 The current whole-catalog marker is a correctness-friendly bootstrap format,
@@ -278,10 +311,19 @@ Before declaring this runtime architecture implemented:
   outer lock;
 - bounded worker count replaces one blocking task per statement;
 - WAL/reclaim progress is demonstrably not starved under sustained OLTP;
+- admission never parks a lock-holding transaction behind its waiters; explicit
+  transactions, pipelined/nested execution, cancellation and disconnect return
+  resource ownership exactly once without preventing checkpoint drain;
 - a hot-key benchmark compares retry-only OCC to adaptive waiting and reports
   throughput plus p99 latency;
 - batch scans use a resumable cursor and bounded memory, and the storage/execution boundary can produce useful multi-row batches/selection vectors without mandatory per-row allocation or dispatch;
-- Describe/binding performs zero user query execution;
+- Describe/binding performs zero user query execution and cannot infer protected
+  data; restricted roles can enter/end transaction blocks without DDL privileges;
+- failed relational operations cannot commit partial row/index/catalog deltas;
+  explicit blocks enforce the same failure lifecycle for execution and result
+  admission, while post-decision response errors preserve committed outcome;
+- old transaction/catalog views remain consistent across concurrent schema
+  changes, including binding, access-path selection, identity and decoding;
 - vector/batch execution reports allocation, compiler/vectorization evidence, cache/CPU profiles, and where relevant memory-bandwidth/TLB behavior;
 - deterministic-simulation tests cover representative transaction/GC/I/O
   interleavings.

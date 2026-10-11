@@ -40,6 +40,14 @@ state, and a buffer victim could be stolen between `Evicting -> Free` and a
 second `Free -> Loading` transition. Those defects are fixed in the current
 vNext branch.
 
+The 2026-10-11 audit reopened two other foundation contracts: a delayed duplicate
+buffer load can publish obsolete bytes after a competing update is acknowledged
+and evicted, and empty-leaf admission can accept a decision whose split/fence
+representation fails during installation and replay. Caught unwinding also
+currently releases commit/drain membership without establishing recovery-required
+state. The plan owns those repairs; the invariants below are requirements, not
+claims that those implementation paths are qualified.
+
 ## Current implementation boundary
 
 Implemented and integrated:
@@ -143,6 +151,14 @@ For a writing transaction:
    current record. If a visible predecessor must become history, append its
    complete before-image to undo **without mutating shared pages**. A clean
    pre-WAL refusal may leave such an unreferenced undo record as GC work.
+
+   The admission contract covers every layout needed to install and replay an
+   accepted effect, including leaf fences, sibling splits and internal routing.
+   An empty unfenced leaf is not that proof. Conservative inline bounds and
+   feasible split selection are a valid baseline; shortened separators or
+   overflow require a qualified layout rather than post-decision `EntryTooLarge`
+   recovery that can never succeed.
+
 4. Enter transaction validation, assign CSN and append the complete
    mutation/decision batch in the ordered append lane. Keep predecessor analysis,
    page work and fsync outside that lane.
@@ -337,6 +353,12 @@ checkpoint, manifest or recovery authority exists yet. Checkpoint/manifest
 binding and structural checkpoint closure remain Milestone F acceptance
 requirements, not deferred GC work.
 
+Checkpoint closure includes current/undo history and the outcome of every
+reachable owner, not only page links. Candidate publication and reclamation
+account for the retained prior checkpoint and all reader/history leases. There
+is one shared validation path for placement references; duplicate detection
+must not introduce quadratic map publication/reopen work.
+
 The implemented `RuntimeAdmission` supplies commit membership and checkpoint
 waiting for attached ordered coordinators. The complete runtime must use the
 same gate for snapshot/read/server admission and long-running operation checks,
@@ -344,6 +366,21 @@ plus quiescence for structural/GC/allocation mutators outside commit. A gate
 available to callers is insufficient if real entry points bypass it. Either
 fence reads or prove an explicit safe-prior read boundary before exposing a
 persistent runtime.
+
+A persistent runtime constructs and owns admission, visibility/status, intents,
+page dependencies, component leases and snapshot registration together. Its
+transaction/read/checkpoint capabilities preserve that identity; independent
+service bundles and optional attachment are useful component-test seams, not
+proof of persistent integration.
+
+Commit-attempt ownership ends only after explicit completion, a proven clean
+refusal, or terminal recovery fencing. In a process that can catch worker
+unwinding, an unresolved attempt must fence runtime/frontier before releasing
+intents and checkpoint membership. A zero-member count alone cannot establish a
+safe cut. A process-abort panic profile may instead terminate, but that hosting
+contract must be explicit; catching a panic and continuing the unfenced runtime
+is not supported. User-visible cancel/disconnect after a durable decision stops
+response delivery, not commit responsibility.
 
 ## 7. Format and resource qualification
 
@@ -392,8 +429,12 @@ Before persistent cutover, tests must cover at least:
   attempts at every crash boundary;
 - checkpointed owner outcomes, allocation high-water marks and WAL/undo
   retention;
-- small-buffer progress, allocation refusal and oversized deterministic
-  precommit rejection.
+- small-buffer progress, allocation refusal and split/fence/internal-routing
+  representability of every admitted effect in both live install and replay;
+- delayed page-load publication after competing mutation, writeback and eviction
+  cannot resurrect pre-commit bytes;
+- unresolved commit unwinding in a continuing process fences before checkpoint
+  membership ends, or the documented process-abort profile terminates.
 
 ## Implementation roadmap
 

@@ -1,8 +1,10 @@
-# Modern database architecture research — September 2026
+# Modern database architecture research — September survey and October update
 
-**Status:** research input for ADRs 0006–0008. This file records observations,
-not permanent architecture. Re-check sources and benchmarks whenever a design
-choice becomes implementation-critical.
+**Status:** research input, not architecture or performance qualification. The
+September survey informed ADRs 0006–0008; ADR 0013 subsequently replaced the
+universal ordered-KV boundary. Local-kernel mechanisms and pgrust source were
+rechecked on 2026-10-11. Dated vendor observations below are not automatically
+current; recheck a source when its claim becomes implementation-critical.
 
 ## Executive synthesis
 
@@ -21,8 +23,8 @@ combined with deployment-aware physical policy:
   archival, but poor as a fine-grained random-write OLTP substrate;
 - object-native LSMs are valuable for cost-first/disaggregated profiles, not a
   reason to make every local database an LSM;
-- a minimal ordered transactional KV boundary remains a powerful relational
-  substrate;
+- ordered transactional KV is a useful facade, but a shared kernel may host
+  specialized row/index layouts without making every representation an opaque KV;
 - a modern server should own sessions, worker scheduling, memory/I/O admission,
   and typed execution rather than recreate process-per-connection behavior;
 - global scale should partition the logical ordered keyspace into ranges and
@@ -97,26 +99,31 @@ Sources:
 - <https://pgrust.com/blog/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/>
 - <https://pgrust.com/blog/jit-compiling-code-in-5-us/>
 
-The public `main` branch was relatively quiet in the first half of September;
-its latest public commit on 2026-09-08 linked Michael Malis's PlanetScale talk.
-The architectural work remains directly relevant:
+The v0.3 README and source were checked at
+[`79ad992`](https://github.com/malisper/pgrust/tree/79ad992ede22bcf6ae0c4fdead6fb01eeac5a990)
+on 2026-10-11. The project still describes itself as not production-ready.
+Its multithreaded, vectorized/fused execution remains relevant, but published
+performance and conformance counts are author claims, not OmenDB evidence.
+The documented JIT performance is architecture-specific; do not copy its
+numbers into a portable execution budget.
 
-- multithreaded rather than process-per-connection server;
-- vectorized push-based/fused execution;
-- low-overhead copy-and-patch ARM64 JIT;
-- query scheduling / overload handling;
-- cache-aware structures;
-- strong PostgreSQL behavioral compatibility/testing.
+Two inspected mechanisms provide more precise lessons:
 
-This is the closest direct comparison to OmenDB's *engine* work. The
-competitive distinction should remain clear: pgrust aggressively preserves
-PostgreSQL behavior and substantial internal lineage while modernizing it;
-OmenDB uses PostgreSQL compatibility at external boundaries while keeping the
-freedom to choose a new storage, transaction, runtime, and execution design.
+- [`admission.rs`](https://github.com/malisper/pgrust/blob/79ad992ede22bcf6ae0c4fdead6fb01eeac5a990/crates/backend/tcop/postgres/src/admission.rs)
+  retains admission across a transaction, rather than parking later statements
+  while they hold locks needed by queued work. OmenDB should preserve that
+  invariant without copying pgrust's session exemptions or bypass policy.
+- [`flushpipe.rs`](https://github.com/malisper/pgrust/blob/79ad992ede22bcf6ae0c4fdead6fb01eeac5a990/crates/backend/access/transam/transam_xlog/src/flushpipe.rs)
+  implements directed durable-LSN completion waits and a progress fallback. Its
+  module explicitly keeps lock release/visibility/acknowledgment after durability,
+  despite broader early-lock-release language in the README. Deferred-tail APIs
+  are not proof of an integrated alternative commit protocol.
 
-A September external `objkv` PR stack experimented with object-store-backed
-PostgreSQL table/index access methods, but it was closed unmerged and should not
-be treated as pgrust's product direction.
+Benchmark completion scheduling separately from changing transaction ordering.
+SeerDB still owes both WAL and undo durability plus contiguous visibility; a
+faster wait queue cannot remove any of those obligations. Full PostgreSQL
+behavior remains pgrust's goal, while OmenDB deliberately bounds compatibility
+at external interfaces.
 
 ## Turso
 
@@ -145,8 +152,9 @@ Relevant lessons for OmenDB:
   the core is factored correctly.
 
 OmenDB should not copy SQLite's physical constraints merely to gain embedding.
-Its differentiator remains an ordered transactional engine designed for modern
-RAM/NVMe and future distributed profiles.
+Its target remains a shared transaction/storage kernel with specialized physical
+representations, designed first for RAM/NVMe. An ordered-KV facade is one use of
+that kernel, not its universal physical model.
 
 ## Local OLTP storage engines and current papers
 
@@ -157,7 +165,8 @@ References:
 - LeanStore publications / code: <https://github.com/leanstore/leanstore>
 - "B-Trees Are Back: Engineering Fast and Pageable Node Layouts" — SIGMOD 2025
 - "How to Write to SSDs" — PVLDB 2026:
-  <https://www.vldb.org/pvldb/vol19/p1469-lee.pdf>
+  <https://arxiv.org/pdf/2603.09927> (extended v3, checked 2026-10-11);
+  artifact: <https://github.com/LeeBohyun/ZLeanStore>.
 
 The 2026 SSD work is especially strong evidence for retaining SeerDB's
 out-of-place direction: converting LeanStore to an out-of-place write design
@@ -168,6 +177,14 @@ Takeaway: do not switch to an LSM merely because SSDs/object storage are modern.
 A carefully engineered B-tree can be the right local OLTP structure. Page/node
 layout and buffer translation remain open measurement questions; the current
 4 KiB node is not sacred.
+
+The artifact's placement/GC techniques do not make SeerDB's current append-only
+page arena reclaimable. A placement map, retained checkpoints and readers all
+constrain image lifetime. Measure logical, host and flash writes separately;
+compression/page packing and lifetime-aware placement are experiments after
+that reachability contract is qualified. Results obtained with direct-device
+I/O or device-specific ZNS/FDP controls do not establish filesystem behavior on
+macOS or commodity buffered I/O.
 
 ### Autonomous commit
 
@@ -190,14 +207,39 @@ commit policies before the architecture is frozen.
 
 Reference:
 
-- "Predictive Translation: Bridging the Performance and Memory-Overhead Gap in
-  Buffer Management" — SIGMOD 2026.
+- "Predictive Translation: High-Performance Buffer Management Without the
+  Trade-Offs" — SIGMOD 2026:
+  <https://db.in.tum.de/~zinsmeister/papers/predictive-translation.pdf>.
+- Reproducible PrediCache artifact:
+  <https://github.com/umbra-db/predictivetranslation-sigmod2026>.
+  Paper and artifact checked 2026-10-11; the artifact is Linux-oriented and is
+  not a demonstrated portable replacement for SeerDB's translation baseline.
 
 The work targets the page-id -> buffer-frame lookup overhead that becomes
 visible when storage is fast and the working set is large. Its broader lesson
 is more important than one exact algorithm: page translation is hot-path CPU
 work on modern NVMe, so SeerDB must profile and benchmark translation designs
 instead of assuming a generic hash table is negligible.
+
+### Hybrid MVCC and large transactions
+
+"Swan: Hybrid MVCC Management for Efficient Transaction Processing in
+LSM-Tree-Based Key-Value Stores", PVLDB 19(9), 2026:
+<https://www.vldb.org/pvldb/vol19/p1977-guo.pdf>;
+artifact: <https://github.com/LAccordeur/swan>. Paper checked 2026-10-11.
+
+Swan separates common small transactions from large writes to trade visibility
+lookup cost against memory/commit cost. Its stash and memtable mechanisms are
+LSM-specific and do not justify replacing SeerDB's B-tree. The useful experiment
+is narrower: compare the persistent-undo baseline with memory-optimized recent
+versions plus a bounded durable fallback, under large writes, long snapshots,
+abort/recovery and pressure. Neither alternative may acknowledge before its
+required durability or reclaim a version still needed by a reader.
+
+CedarDB's [2026-10-08 release notes](https://cedardb.com/docs/releases/#v2026-10-08)
+report undo-segment reuse and reduced recovery memory. Those are unmeasured
+vendor observations here, but reinforce tracking retained-history memory and
+recovery bytes rather than measuring only foreground commit throughput.
 
 ## Cloud/disaggregated OLTP
 
@@ -274,13 +316,12 @@ Sources:
 - <https://apple.github.io/foundationdb/technical-overview.html>
 - <https://apple.github.io/foundationdb/layer-concept.html>
 
-FoundationDB validates OmenDB's small storage boundary: lexicographically
-ordered binary keys + opaque values + true transactions are sufficient to build
-higher-level indexes and data models as layers. It also demonstrates the power
-of deterministic simulation and explicit conflict ranges.
-
-OmenDB should keep SQL/table/index semantics above SeerDB rather than teaching
-the storage engine relational concepts.
+FoundationDB demonstrates that ordered binary keys, opaque values and true
+transactions can support higher-level data models. It also demonstrates the
+value of deterministic simulation and explicit conflict ranges. That is evidence
+for a useful facade, not a requirement that every OmenDB physical representation
+use it. SQL/table/index meaning stays above SeerDB; specialized physical access
+methods share its transaction, log, buffer and lifetime services.
 
 ### CockroachDB / TiKV / Yugabyte-style ranges
 
@@ -353,9 +394,10 @@ network/object requests and monetary cost.
 
 The existing architecture contains several correct foundations that should
 survive redesign: distinct TxnId/CSN/LSN identities, logical MVCC separate from
-physical page versions, one ordered transactional-KV boundary, snapshot +
-zero-gap change positions, external PostgreSQL compatibility boundaries, and
-out-of-place local storage.
+physical page versions, a shared transaction/storage kernel, external PostgreSQL
+compatibility boundaries, and out-of-place local storage. Retained snapshot plus
+change-stream handoff is a target contract, not something established by the
+current position-only `snapshot_export` API.
 
 The following are explicitly transitional and should be replaced/benchmarked:
 

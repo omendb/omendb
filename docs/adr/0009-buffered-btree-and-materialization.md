@@ -2,6 +2,7 @@
 
 - **Status:** accepted target architecture; replaces whole-tree/per-generation
   copy-on-write as the long-term OLTP update model
+- **Refined by:** [ADR 0014](0014-vnext-installation-and-recovery.md) supersedes pre-decision shared installation for vNext; the buffer/materialization separation remains
 - **Scope:** SeerDB B-tree concurrency, buffer residency, dirty-page handling,
   page mapping, and checkpoint materialization
 - **Depends on:** [ADR 0002](0002-seerdb-mvcc-version-storage.md),

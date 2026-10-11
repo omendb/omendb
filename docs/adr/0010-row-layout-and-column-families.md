@@ -188,6 +188,12 @@ A table catalog object maps each row-layout version to column IDs/types/family
 placement. New writes use the current layout. Readers can decode retained older
 versions while migration/backfill proceeds.
 
+The transaction's retained catalog/layout view is shared by binding, access-path
+selection, row identity and decode. A live database catalog cannot supply a new
+projection shape while the transaction decodes against an older layout. Catalog
+invalidation/refusal must be deliberate and dependency-based, not an accidental
+mixed-generation execution error.
+
 Metadata-only changes should remain metadata-only when possible:
 
 - rename column: no row rewrite;
@@ -263,7 +269,9 @@ the normal transaction/change-stream machinery.
 - point/RMW, 20+ column updates, wide/cold values, and projected scans are benchmarked before choosing family heuristics;
 - if large-value separation is enabled, relocation/GC/reopen tests prove stable handles cannot alias reclaimed content and measurements include both read-indirection and write-amplification effects;
 - covering index payloads show their read benefit and write/space cost;
-- retained snapshots remain able to decode every layout version they reference.
+- retained snapshots remain able to decode every layout version they reference,
+  and binding/identity/access-path selection use that same catalog view across
+  concurrent add/rename/drop/index changes.
 
 ## Research inputs
 
