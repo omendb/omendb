@@ -68,7 +68,16 @@ PostgreSQL-class comparison where the supported workload overlaps.
 - [ ] the shared transaction/storage kernel provides multi-writer MVCC with
       distinct `TxnId`, CSN and LSN identities, preserving the advertised
       SERIALIZABLE point/absence/range dependencies as well as snapshot visibility;
-- [ ] authoritative B-tree/row storage, atomic multi-object transactions, and snapshot `{CSN, restart LSN}` export are exercised through OmenDB without requiring every object to use the ordered-KV facade;
+- [ ] authoritative ordered/record participants and atomic multi-object decisions
+      are exercised through OmenDB; retained snapshot/change export includes source
+      identity and atomically registered leases, not only `{CSN, restart LSN}`;
+- [ ] decision-ordered certification sees earlier accepted uninstalled effects;
+      resource/history pressure cannot discard evidence and permit success;
+- [ ] runtime-owned completion fences before unresolved ownership release, and
+      protected reservations cover original WAL, future undo and structural/overflow
+      work before possible decision append;
+- [ ] every supported ordered record has actual fenced split/internal/root and
+      replay representation; overflow, retention and retry-space are qualified;
 - [ ] committed changes are restartable without reconstructing history by
       rescanning relational tables;
 - [ ] crash/recovery tests cover commit, WAL, page-map, checkpoint, GC, and
@@ -105,13 +114,18 @@ matrix provides the storage-side crash coverage below.
 - [x] bounded logical dump/restore fixtures round-trip one read-consistent
       snapshot through OmenDB and real PostgreSQL in the live-PG oracle CI job
       (`feat/logical-backup`, 7f94fdc; `tests/project_dump_restore.rs`);
-- [ ] conversion preserves every supported catalog semantic, including typed FK
-      delete actions, or explicitly refuses unsupported export. Current Cascade
-      to Restrict conversion does not satisfy the full round-trip contract;
+- [ ] explicit offline preview conversion preserves supported logical rows and
+      catalog semantics, including FK actions/timing, or refuses incompatible input.
+      Current Cascade-to-Restrict conversion does not satisfy this contract;
 - [ ] authorization applies to Describe as well as Execute, Describe performs no
       user-query execution, and restricted roles can roll back without DDL grants;
 - [ ] explicit-block errors include binding, authorization and precommit result
-      admission, while post-decision delivery errors do not fabricate an abort.
+      admission, while post-decision delivery errors do not fabricate an abort;
+- [ ] current-grant checks at Describe/execution prevent cached-plan grant reuse;
+      revocation alone does not cancel prior work or reauthorize commit, while a
+      later authorization error makes an explicit block rollback-only;
+- [ ] concurrent direct/wire execution has bounded workers and transaction-grain
+      admission, with protected completion capacity and byte/work-bounded batches.
 
 ### Correctness and isolation
 
@@ -119,7 +133,10 @@ matrix provides the storage-side crash coverage below.
 - [ ] typed and SQL FK creation validate and publish in one schema transaction
       with dependencies retained across concurrent parent/child writes;
 - [ ] binding, identity, access-path choice and decoding share one retained
-      transaction/catalog view across schema changes;
+      transaction/catalog view; enforcement/name/lifecycle dependencies prevent old
+      writers bypassing newly activated indexes or constraints;
+- [ ] immediate constraints enforce their declared mutation/statement boundary;
+      deferred semantics are explicit and timing-preserving conversion is qualified;
 - [ ] index cursor continuation returns each matching row once at batch
       boundaries, and parameterized batches reject mismatched inputs before work;
 - [x] typed and SQL tests pass on the direct SeerDB backend (the
@@ -212,8 +229,9 @@ performance work.
 
 ### Packaging and support
 
-- [x] stable Rust and the documented MSRV (1.89, pinned in CI) pass format,
-      tests, clippy, and package checks;
+- [ ] stable Rust and the documented MSRV pass the current CI matrix. Historical
+      passes do not close current store-ownership test and stable Clippy failures;
+      [CI configuration](../.github/workflows/ci.yml) owns toolchains and checks;
 - [x] supported platform and filesystem assumptions are documented
       (`docs/runbook.md`);
 - [ ] `cargo package --list` contains only intended files for each package;

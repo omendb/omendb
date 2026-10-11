@@ -1,446 +1,288 @@
-# ADR 0014: vNext installation, replay and checkpoint boundaries
+# ADR 0014: vNext decisions, installation and checkpoint recovery
 
-- **Status:** accepted integration contract; transaction/MVCC/dependency-aware materialization baseline implemented, persistent checkpoint authority pending
+- **Status:** accepted target protocol; component baseline implemented, integrated runtime/certification/checkpoint qualification pending
 - **Scope:** storage-kernel vNext, not the legacy production engine
 - **Depends on:** [ADR 0013](0013-storage-kernel-and-access-methods.md)
-- **Refines:** [ADR 0003](0003-seerdb-commit-recovery-state-machine.md) and
-  [ADR 0009](0009-buffered-btree-and-materialization.md). For vNext, the ordering
-  below supersedes their allowance for installing shared current records before
-  the durable decision. Their transaction-outcome and MVCC semantics remain.
+- **Refines:** [ADR 0003](0003-seerdb-commit-recovery-state-machine.md) and [ADR 0009](0009-buffered-btree-and-materialization.md). For vNext, durable-decision-first installation supersedes speculative shared installation. ADR 0009 owns ordered-page representation; this ADR owns transaction and recovery authority.
 
-## Context
+## Decision and rationale
 
-The storage-kernel rewrite intentionally separated transaction logging, MVCC,
-ordered access, undo durability and physical page materialization so each layer
-could be qualified before they became one crash-sensitive runtime. That exposed
-several integration hazards that are easy to miss when the pieces are reviewed
-in isolation:
+Keep private mutations until a complete transaction decision is durable. Use one
+runtime to own certification, log ordering, completion, visibility, resource and
+history leases, and checkpoint authority. A collection of independently fenced
+components is not a persistent database.
 
-- shared-record installation and WAL ordering had been described inconsistently;
-- write-conflict/predecessor validation must complete before an irrevocable
-  commit decision is created;
-- a dirty page could otherwise reach `PageIo` before the WAL and referenced undo
-  state were durable;
-- a transaction could otherwise install a page referencing its own unsynced undo
-  and then need that ineligible page as an eviction victim to finish commit;
-- a page's maximum WAL dependency does not prove that every older logical effect
-  has actually been installed;
-- independently durable page images do not by themselves form a structurally
-  coherent recoverable B-link tree;
-- replay needs stable effect identity without confusing transaction identity,
-  commit ordering and physical page ordering;
-- transaction owner status, allocation identities and replay evidence must remain
-  recoverable after WAL retention advances.
+Durability, logical visibility and physical materialization are separate:
 
-The review also found concrete implementation defects in the foundation. WAL and
-undo length fields were previously trusted before torn-tail classification,
-retained undo scanning read the entire file into RAM, undo links did not reject
-self/forward references, reopened WAL segments lost pending synchronization
-state, and a buffer victim could be stolen between `Evicting -> Free` and a
-second `Free -> Loading` transition. Those defects are fixed in the current
-vNext branch.
+- a durable decision is irrevocable commit authority;
+- synchronous success requires every authoritative effect installed and the
+  contiguous visibility frontier covering that decision;
+- working page images obey write-ahead dependencies but are not restart
+  authority without a complete checkpoint and retained committed WAL suffix.
 
-The 2026-10-11 audit reopened two other foundation contracts. Delayed duplicate
-loading has since been replaced by pre-I/O Loading ownership and exact-frame
-completion/cleanup, preventing obsolete publication after ACK and eviction.
-Empty-leaf admission still accepts decisions whose split/fence representation
-fails during installation and replay. Caught commit unwinding also still releases
-drain membership without establishing recovery-required state. The plan owns
-those remaining repairs; the invariants below are not claims of their qualification.
+The component implementation in `crates/seerdb/src/vnext` establishes useful
+pieces of this protocol, not all of it. In particular, optional coordinator
+admission, empty-leaf preflight, fixed snapshots plus write intents, and lexical
+commit guards do not establish the target contracts. The
+[vNext plan](../plans/storage-kernel-vnext.md) owns status and remaining gates.
 
-## Current implementation boundary
+## 1. Runtime-owned transaction and completion capabilities
 
-Implemented and integrated:
+One persistent runtime constructs and owns:
 
-- single-flight page loading through exact Loading `FrameRef` ownership before
-  device reads, frame-local completion waits and conditional failure/unwind
-  cleanup; newly created images become dirty before pinned residency publication;
-- atomic B-tree `upsert` separate from duplicate-rejecting `insert`, including
-  replacement growth that can split and unchanged-on-oversize behavior;
-- repeated raw logical put/delete replay under split-heavy tiny-buffer eviction;
-- one shared canonical final-effect reducer over the validated original mutation
-  sequence, preserving the final logical ordinal for each `(object,key)`;
-- sharded nonblocking write-intent ownership with canonical batch acquisition,
-  conflict rollback, same-owner idempotence and RAII release;
-- MVCC record envelope version 2 with optional install identity
-  `(TxnId, final mutation ordinal)`; newly installed transaction-owned current
-  records carry it and freezing may preserve it;
-- ordered MVCC prepare/apply: predecessor visibility/order is validated and any
-  complete before-image is appended without page mutation, required undo is
-  group-synchronized, then the exact predecessor is revalidated before install;
-- live predecessor/write-conflict validation under retained intents before WAL
-  append, including clean snapshot/active-writer rejection with no commit
-  decision; pre-WAL before-images may remain unreachable GC work on clean abort;
-- durable-WAL-first multi-object commit coordination, exact WAL sync on the same
-  owned log, grouped undo durability, authoritative page installation, status
-  publication and contiguous visibility;
-- private point/range read-your-writes and point/range fixed-snapshot traversal
-  through the shared current/undo visibility resolver;
-- sequential ordered recovery using the same canonical effects, intents,
-  prepared predecessor state, grouped undo barrier, installer and visibility
-  frontier as live commit;
-- standalone durable undo storage with strictly backward predecessor links;
-- outer WAL and undo framing version 2 with checksummed fixed headers validated
-  before length-based torn-tail repair;
-- reopen durability barriers for retained WAL/undo directory state;
-- frame-by-frame undo scanning, while the retained version-offset index still
-  grows with retained history;
-- sharded in-process per-page WAL/undo dependency tracking and a checked `PageIo`
-  gate that refuses physical writeback until both durability frontiers cover the
-  exact page requirements;
-- a checksummed out-of-place page store below logical `PageKey`: a versioned
-  image arena bound to a persisted store incarnation, an immutable
-  caller-selected placement map, and a `PageIo` implementation. Requirements are
-  captured from the dependency table once per image, references fail closed for
-  missing, dangling, duplicate, foreign or mismatched images, and only an
-  unreferenced incomplete final append is repaired. This is placement authority
-  only: no map is discovered or selected automatically, and no uncheckpointed
-  image becomes restart authority;
-- synchronous completion: `VisibilityFrontier` distinguishes readiness
-  publication from completion, waits for contiguous coverage, and reports
-  recovery-required instead of blocking or acknowledging when an earlier durable
-  decision cannot complete;
-- dependency-aware B-tree upsert that attaches requirements while the exact page
-  remains pinned and conservatively inherits source requirements through leaf
-  splits, internal splits and root replacement;
-- live commit/recovery page dependency frontier wiring: decision WAL is covered
-  before page mutation, referenced undo is group-synchronized before page
-  mutation, and each resulting page image records decision LSN plus actual
-  resulting undo head;
-- process-local `RuntimeAdmission` attached to ordered commits: guards cover
-  installation through contiguous visibility completion, checkpoint drain blocks
-  new commits and waits for admitted work, and recovery-required state refuses
-  new read/commit admission and wakes checkpoint waiters.
+```text
+store incarnation + exclusive component/directory ownership
+transaction/status/visibility authority
+snapshot, catalog/object and certification-history leases
+write intents + certification/decision sequencer
+WAL/undo/page dependency services
+workload reservations + protected progress capacity
+commit-attempt responsibility + checkpoint mutation drain
+```
 
-Still incomplete:
+Transactions, reads, installers and checkpoints obtain capabilities from that
+owner. Independent service bundles and optional attachment remain component-test
+seams, not supported persistent entry points. SQL meaning stays above the kernel.
+Every actual read/snapshot/direct/server entry point checks runtime failure;
+long-running operations recheck at bounded work boundaries. The baseline fences
+reads on recovery-required state rather than claiming an unproven safe-prior
+read boundary.
 
-- structurally complete checkpoint/manifest publication retaining roots, object
-  metadata, allocation high-water marks, page map, owner outcomes and retention
-  (the page-image envelope and out-of-place placement map now exist as a validated
-  component below this);
-- process-restart recovery from checkpoint plus synchronized retained WAL suffix
-  into authoritative vNext access methods;
-- deterministic/bounded resource admission for arbitrary pin/buffer/allocation
-  pressure and whole-transaction WAL bounds;
-- complete runtime integration of the admission gate: actual read/snapshot/server
-  entry points and long-running operations must consult it; structural/GC and
-  allocation mutators outside ordered commit must quiesce during checkpoint
-  capture. The commit/drain primitive is implemented, not a complete persistent
-  lifecycle or checkpoint;
-- complete failpoint/crash matrix and two consecutive reopens across transaction,
-  dependency, structural and checkpoint boundaries;
-- freezing, owner-status retention, undo/WAL reclamation and physical GC;
-- canonical row storage and OmenDB cutover.
+Workload admission is transaction-grain and precedes snapshot/intents. Retain it
+through explicit transaction lifetime; later statements and completion do not
+queue behind waiters needing that transaction's resources. Checkpoint membership
+is distinct: it covers committing mutations through installation and contiguous
+visibility. Checkpoint closure must not park installers, WAL completion, rollback
+or other work required by its own drain. Structural, freezing, GC and allocation
+mutators use the same capture authority.
 
-The in-process dependency-aware page path is deliberately **not** proof of
-restart-safe persistent current-record integration. Until a complete checkpoint
-and page-map authority exists, durable working spill pages are not recovery
-authority after a crash.
+Establish commit-attempt responsibility **before entering any append that could
+succeed**, not after recording a returned ticket. Ownership ends only with:
 
-## 1. Durable-WAL-first shared installation
+1. explicit contiguous-visibility completion;
+2. a proven clean refusal before possible decision append; or
+3. terminal recovery fencing established before releasing unresolved intents,
+   reservations or drain membership.
 
-The integrated runtime uses private staged writes until a complete transaction
-decision is durable. Read-your-writes comes from that private transaction view;
-it does not require speculative replacement in shared pages.
+In a continuing-process host, unresolved unwind fences runtime admission and
+visibility waiters before ownership drops. A process-aborting panic profile is
+an explicit alternative hosting contract, not an assumption for an embeddable
+library or a server catching worker failure. Cancellation/disconnect after
+possible append abandons response delivery, never commit responsibility. No
+ordinary retry is safe after an unknown outcome without durable request identity
+or outcome lookup.
+
+## 2. Decision-ordered optimistic certification
+
+The initial SERIALIZABLE implementation uses fixed snapshots and conservative
+optimistic certification ordered with commit decisions. Exact write intents
+alone provide write conflict protection, not serializability.
+
+A writing transaction at snapshot `S` freezes its effects and logical dependencies:
+
+- existing and absent point reads;
+- ranges and gaps, including deletions;
+- catalog/name resolution, table enforcement and object lifecycle dependencies;
+- constraint probes required independently of user isolation mode.
+
+Certify these observations against **every earlier accepted decision after S**,
+including uninstalled, unsynchronized or not-yet-visible effects. Acceptance,
+CSN assignment, complete WAL append and publication of the conflict summary have
+one sequencer authority. No later certifier may pass through a validate/decide
+or decide/summary gap. Uncertain append fences the runtime; it cannot leave a
+usable sequencer with missing conflict evidence.
+
+Prepare predecessors, evaluate constraints and search historical summaries
+outside the short decision lane. Recheck the remaining decision tail under that
+lane before acceptance. Do not run table scans, page I/O or synchronization
+there. Physical page latches and cursor positions are not logical predicates.
+Conservative range coverage is acceptable where tighter LIMIT/search dependency
+coverage is not yet proven.
+
+Retain indexed, CSN-ordered write/object summaries after the oldest snapshot
+that may still write. Row versions, layouts and retired objects have separate
+leases. Dependency sets and summary bytes are budgeted; pressure may spill,
+coarsen conservatively, refuse new work or explicitly expire an abortable
+transaction. Never discard evidence and then report successful certification;
+never pressure-abort an unresolved accepted decision.
+
+This imposes decision order as the serial order of accepted writers, rejecting
+some histories that another serial order could accept. It is not PostgreSQL SSI.
+SSI or pessimistic ranges are measured alternatives only if abort/retention costs
+justify their dependency graph or deadlock machinery. A genuinely read-only
+transaction can serialize at its snapshot when the prefix consists of these
+certified writers; a future mixed-isolation design must revisit that exemption.
+Certification indexes need not survive restart when all old live transactions
+end and new admission waits for complete recovery.
+
+Primary comparison: [FoundationDB transaction semantics](https://apple.github.io/foundationdb/developer-guide.html#transactions-in-foundationdb)
+support fixed-snapshot optimistic validation, not adopting its transaction-duration
+or record-size limits. [PostgreSQL isolation](https://www.postgresql.org/docs/18/transaction-iso.html)
+describes a different SSI trade-off. Sources checked 2026-10-11.
+
+## 3. Admission and durable-decision-first installation
 
 For a writing transaction:
 
-1. Validate the original mutation sequence and compute canonical final effects.
-2. Acquire logical write intents for the unique `(StorageObjectId, key)` set in
-   canonical order.
-3. Preflight deterministic representability/object failures and, while intents
-   remain held, inspect each actual predecessor. Resolve write/write and snapshot
-   conflicts, reject corrupt/unknown current owners, and prepare the resulting
-   current record. If a visible predecessor must become history, append its
-   complete before-image to undo **without mutating shared pages**. A clean
-   pre-WAL refusal may leave such an unreferenced undo record as GC work.
+1. Validate the original mutation stream and reduce it to canonical final effects.
+2. Acquire logical intents in canonical order. Preflight objects, codecs, logical
+   limits and every physical layout needed by install/replay. Reserve bounded
+   progress capacity for the original WAL batch, complete predecessor undo,
+   overflow/structural allocation, scratch, status and dependency metadata.
+3. Under retained intents inspect each actual predecessor, reject write/snapshot
+   conflicts and unknown/corrupt owners, and prepare complete logical before-images
+   without mutating shared pages. Clean pre-WAL refusal may leave unreachable undo.
+4. Certify at the sequencer, assign CSN, append the complete transaction/decision
+   and publish its conflict summary under the ordering contract above.
+5. Synchronize through the decision LSN on the same owned WAL. Only then advance
+   the in-process page WAL frontier. The decision is now irrevocable.
+6. Group-synchronize all required undo before any shared page mutation; only then
+   advance the page undo frontier.
+7. Revalidate exact prepared predecessors, install all authoritative effects,
+   and finish structural obligations using reserved capacity. Attach exact WAL/undo
+   dependencies with each guarded mutation, including overflow and split pages.
+8. Publish owner status and CSN readiness; advance visibility only through the
+   contiguous ready prefix. Wait for coverage before acknowledging and releasing.
 
-   The admission contract covers every layout needed to install and replay an
-   accepted effect, including leaf fences, sibling splits and internal routing.
-   An empty unfenced leaf is not that proof. Conservative inline bounds and
-   feasible split selection are a valid baseline; shortened separators or
-   overflow require a qualified layout rather than post-decision `EntryTooLarge`
-   recovery that can never succeed.
+Resource reservations are a progress contract under healthy storage and stated
+configuration limits, not immunity to permanent I/O failure. They must survive
+concurrent structural growth and account for peak pins and worst-case split/root
+work, not merely a leaf observed during preflight. Keep a coordinated, protected
+installer slow path rather than retrying indefinitely after decision authority.
+Do not hold page byte latches or arbitrary foreground pins across WAL barriers.
 
-4. Enter transaction validation, assign CSN and append the complete
-   mutation/decision batch in the ordered append lane. Keep predecessor analysis,
-   page work and fsync outside that lane.
-5. Synchronize through the decision LSN. The durable decision is irrevocable
-   commit authority even if installation has not finished. Only after this
-   barrier may the in-process page WAL frontier advance.
-6. Group-synchronize undo through the highest `VersionId` referenced by any
-   prepared effect. Only after this barrier may the page undo frontier advance.
-7. Under the retained intents, revalidate each exact prepared predecessor and
-   atomically install the canonical transaction-owned current record. Attach the
-   decision LSN and actual resulting undo head to the same guarded page mutation.
-   Split siblings/parents/roots conservatively inherit copied-state dependencies.
-   Finish every authoritative object before publication.
-8. Publish committed transaction status and mark its CSN ready. Advance new
-   snapshots only through the contiguous ready frontier.
-9. Wait until the contiguous frontier covers this transaction's CSN before
-   returning synchronous success; marking a CSN ready is not completion. Release
-   intents and the ordinary transaction snapshot on completion. An unresolved
-   earlier decision wakes pending completion waits with recovery-required
-   semantics rather than allowing success or an indefinite wait.
+Deterministic refusal belongs before device I/O. In particular, bound the complete
+original WAL stream, not only reduced effects; the current segmented device
+requires a batch wholly within one segment's record region and the LSN offset
+domain. A known-too-large batch is not an ambiguous commit. Uncertain I/O and
+post-decision failure instead fence before ownership release.
 
-Pre-WAL snapshot/write conflicts are ordinary clean refusals: they create no WAL
-decision and leave the transaction active for caller-directed abort/retry.
-Corrupt current state, uncertain undo I/O or poisoned critical state fails closed
-and may fence the runtime even before WAL because continuing could make later
-transactions depend on untrustworthy storage state. Any uncertain WAL operation
-or post-decision failure fences runtime write admission and requires recovery,
-not a fabricated abort. The runtime fence must be established before unresolved
-writer ownership is released.
+Supported logical records must remain representable as future undo before-images
+on update/delete. Current undo framing caps encoded records at 16 MiB while MVCC
+and WAL have other framing limits. Own a coherent logical admission policy across
+those codecs and memory budgets; larger support requires changing the limiting
+framing, not bypassing it with page overflow. Neither a slot width nor one framing
+constant is the general-purpose database's permanent logical-size requirement.
 
-Preparing undo before WAL is safe because no shared page references those bytes
-until after both the WAL decision and required undo are durable. The trade-off is
-that a clean pre-WAL abort may leave unreachable undo allocation. Avoiding that
-space leak would require a more elaborate reservation/deduplication protocol and
-is not part of the correctness baseline.
+This baseline forgoes shared speculative install during WAL sync. Reordering or
+removing a WAL/undo barrier requires a separate recovery proof and measurements.
 
-This baseline intentionally forgoes speculative shared installation while WAL is
-syncing. A future measured alternative needs its own abort, eviction and recovery
-proof rather than silently reversing the protocol.
+## 4. Logical effect identity and structural completion
 
-## 2. Canonical final effects and install identity
+Validate original WAL count, digest and contiguous ordinals before reducing to
+the final mutation per `(object,key)`, sorted canonically. Live and recovery use
+one reducer. The retained install identity is `(TxnId, final logical ordinal)`
+within that object/key, never transaction chronological order.
 
-The original WAL mutation count, digest and contiguous ordinals remain the
-transaction authenticity contract. Only after validation is the sequence reduced
-to the final mutation for every `(object,key)`, sorted canonically. Live commit
-and recovery use the same reducer.
+- Same identity and same logical value/tombstone: allocation-free logical no-op.
+- Same identity with different logical content: corruption.
+- One transaction's different identity cannot replace its own retained effect.
+- Older recovery cannot replace newer committed state by comparing page LSNs.
+- Delete leaves an MVCC tombstone/replay evidence, not raw erasure.
+- Aborted predecessors are bypassed through undo; unknown owners fail closed.
 
-The install identity is:
+Logical idempotence is not proof of completed structural installation. A leaf
+B-link publication may precede parent/root work. The installer must finish that
+work before readiness, and a retained logical effect must not silently discharge
+an unresolved structural obligation. Start with coarse structural coordination,
+reserved/prebuilt split work and explicit completion ownership. Do not introduce
+a durable installation ledger merely to recover arbitrary uncheckpointed spill.
 
-```text
-(TxnId, final logical mutation ordinal)
-```
+Preparation can leave unreachable undo or overflow allocations on failure.
+Allocation-free repeats apply to retained completed effects, not to recovery
+restarted from an older checkpoint. See the retry-space contract below.
 
-within the addressed `(StorageObjectId, key)`. It identifies one canonical
-logical effect. It is **not** a chronological ordering key; `TxnId` magnitude
-must never be used to order transactions.
+## 5. Exact page dependencies are not logical replay completion
 
-Required semantics:
+Each captured image carries at least its highest required WAL LSN and referenced
+undo VersionId. Attach bytes and dependencies while the exact page remains pinned
+and writer-owned; post-hoc attachment can lose to writeback. Copied split state,
+parents/new roots and immutable overflow pages inherit conservative requirements.
+An image reaches working storage only after both durability frontiers cover it.
 
-- same retained install identity plus the same intended value/tombstone is a
-  no-op;
-- matching identity with different logical content is corruption;
-- one transaction's different final identity may not silently replace its own
-  already-installed current record;
-- older recovery may not replace a newer committed current state merely because
-  its LSN is smaller;
-- MVCC delete installs a versioned tombstone rather than physically erasing
-  replay evidence;
-- aborted current state is bypassed through its undo link and is not appended as
-  visible history;
-- missing owner status fails closed unless recovery has explicitly established
-  the outcome.
+A maximum page LSN cannot skip logical redo. Independent keys can install out of
+LSN order; a page requiring 200 can lack effect 100, and splits move effects.
+Replay skips only a complete checkpoint prefix or validated per-effect evidence.
+Frame versions, dirty bits, root generations and process-local dependency tables
+are not substitutes for that authority.
 
-A crash or clean refusal after undo append but before current replacement can
-leave an unreferenced undo record. Install identity in a later current record
-cannot prevent that orphan. The baseline therefore requires logical/history
-idempotence and allocation-free repeats of a retained completed install, while
-permitting unreachable allocation to become GC work. Stronger allocation
-deduplication would require a separate durable installation ledger and is not
-currently justified.
+## 6. Complete checkpoint and restart authority
 
-## 3. Atomic upsert is an access-method primitive, not a persistence protocol
+The first persistent model is a structurally complete checkpoint plus committed
+logical WAL suffix:
 
-The ordered B-tree has a distinct atomic `upsert` path. It builds a complete
-candidate leaf off to the side while holding the page write guard and publishes
-it only after validation. Ordinary `insert` remains duplicate-rejecting. Growth
-that requires a split enters structural coordination and revalidates before the
-B-link split is published. Oversized replacement leaves the old logical record
-unchanged.
+1. Close new committing-mutation admission; let admitted work reach installation
+   and contiguous visibility. Establish the exact `(visible CSN, decision LSN)`
+   cut after drain. Quiesce structural/freezing/GC/allocation mutations during
+   capture. A failed drain fences; zero members alone is not a safe cut.
+2. Capture reference closure: child/right links; leaf keys, fences, separators,
+   value chains and successors; roots, object lifecycle and allocation high-water
+   marks; placement map; reachable undo, owner outcomes and retained history.
+3. Satisfy image, WAL, undo and directory barriers. Publish a store-bound complete
+   manifest only after dependencies are durable. Retain prior complete authority
+   and its dependencies until candidate publication succeeds.
+4. Reopen the selected complete authority, re-establish durable file/directory
+   boundaries, validate/synchronize the retained suffix, replay canonical effects
+   in contiguous CSN order, validate resulting references, then expose visibility.
 
-Raw logical replay is qualified by applying mixed inserts/replacements/deletes
-twice under a tiny buffer with forced eviction and split pressure and comparing
-the final ordered state to a `BTreeMap` oracle.
+Snapshot/history lease registration and capture of retention floors share runtime
+authority. Readers may continue during capture, but capture cannot wait indefinitely
+for every reader pin: use guarded stable image capture and bounded pin lifetimes.
+No byte latch spans output suspension. Reuse unchanged immutable images where valid.
+One cohesive placement/reference validator rejects foreign, duplicate, dangling,
+spliced and corrupt references without quadratic map work.
 
-This does **not** make B-tree persistence crash safe. A B-link right sibling
-keeps concurrent traversal correct, but arbitrary independently materialized
-old/new sibling, parent and root images need not form a valid recovery graph.
-All same-key transactional replacement paths retain logical intent ownership for
-the entire prepare-before-image-revalidate-upsert sequence.
+Every reachable transaction owner needs a durable checkpoint outcome or safe
+freezing before reclaiming its decision. Retain install identity until the replay
+horizon permits removal. Allocation metadata prevents reuse of live transaction,
+object, version and page IDs. The current undo format has no front-truncation or
+reuse protocol; never invent GC by truncating it ad hoc.
 
-## 4. Page dependencies and logical replay completion are different
+Recovery attempts have explicit working-allocation ownership. Restarting from the
+same prior checkpoint must not consume unbounded undo/page arena space or force
+reopen to scan all abandoned images forever. Implement disposable recovery working
+epochs with reclaimable unreferenced allocations, or qualify an explicit bounded
+retry-space policy before persistent exposure. Reclamation requires closure over
+current/prior checkpoints and reader/history leases; do not truncate shared undo
+or ignore corrupt referenced images. Append-only/no-reuse is an acceptable bounded
+prototype, not a large-history or unlimited-retry claim.
 
-For every captured page image, the materialization layer retains at least:
+Blocking capture is a correctness baseline, not a brief-pause promise. Measure
+graph traversal and materialization versus database size/dirty fraction. Replace
+it with a coherent epoch or qualified physiological/structural logging if cutover
+pause budgets require it; do not retain long pauses by inertia.
 
-```text
-required WAL LSN  = highest WAL durability dependency of that exact image
-required undo ID  = highest referenced undo VersionId, if any
-```
+## 7. Formats and qualification
 
-The page bytes and dependencies are attached while the exact page remains pinned
-and writer-owned. A post-hoc metadata update is insufficient because writeback
-could observe the new bytes first. Split siblings inherit every conservative
-dependency of copied state as well as dependencies introduced by the mutation
-causing the split; structural parents/new roots inherit the relevant maxima.
+Current experimental WAL/undo outer framing and MVCC envelope are version 2.
+Ordered-page overflow requires a new experimental format, not silently interpreting
+v4 bytes. Legacy production formats are unaffected. Only provably incomplete final
+appends are repairable; complete bad headers, unknown kinds/flags, checksum failures
+and invalid retained references fail closed.
 
-Before an image can reach physical working-page storage, require both frontiers
-to cover its dependencies. The generic materialization envelope owns this
-authority; a frame version, dirty bit, root generation or transaction CSN is not
-a substitute.
+Frame-at-a-time undo scanning is not bounded-history recovery: undo indexes,
+retained WAL output and pending/terminal owner bookkeeping still grow with history.
+Streaming/indexing, retention and retry-space limits are required before that claim.
 
-A maximum page WAL LSN is **not** a logical-redo skip watermark. Example: two
-independent keys share a page, and installation for decision LSN 200 completes
-before installation for LSN 100. An image requiring WAL 200 can still lack the
-effect at 100. Splits can then move records to different pages. Logical replay
-may be skipped only using a complete checkpoint prefix or explicit validated
-per-effect replay evidence.
+Qualify through real runtime entry points, not only codecs:
 
-The current dependency table is process-local. It makes in-process spill obey
-write-ahead ordering, but its loss on crash is exactly why written working pages
-are not yet restart authority.
+- clean pre-decision conflicts/size/resource refusal produce no decision;
+- certify point/absence/range/catalog/constraint dependencies against a paused,
+  earlier accepted but uninstalled decision; retain evidence under pressure;
+- unwind/cancel/error at append, WAL/undo sync, partial install, structural finish,
+  status/readiness and visibility; fence before ownership release and wake waiters;
+- later readiness cannot acknowledge across an earlier gap; checkpoint drain cannot
+  outrun unresolved completion or prevent protected progress;
+- admitted layout and future undo conversion work under split/root/overflow pressure;
+- out-of-order same-page installers, dependency inheritance, image/writeback races
+  and delayed loads cannot resurrect an acknowledged predecessor;
+- candidate failure preserves prior authority; missing/foreign/spliced chains,
+  outcomes and allocation metadata fail closed;
+- crash during recovery, two consecutive reopens and a subsequent normal mutation
+  preserve outcomes within stated memory/storage budgets;
+- long snapshots, retained prior authority, catalog/object retirement and reclamation
+  never invalidate admitted views.
 
-## 5. Structurally complete checkpoints precede persistent cutover
-
-The WAL/undo durability frontiers prevent write-ahead violations but do not prove
-that independently durable pages form a complete B-tree graph or that every
-logical transaction before a replay boundary is represented.
-
-The first recovery model is therefore one structurally complete checkpoint plus
-the committed logical WAL suffix:
-
-1. Close admission to new committing mutations, while allowing admitted work
-   to finish installation/publication. After draining, establish the exact
-   `(visible CSN, decision LSN)` cut. Hold install/structural/GC and allocation
-   metadata mutation quiescent during graph capture. Do not park installers
-   needed by the drain or include partially installed transactions above the
-   checkpoint prefix. Failed drains require recovery, not partial publication.
-2. Materialize the complete reachable authoritative graph and checkpoint
-   metadata: roots, logical-to-physical map, allocation high-water marks,
-   retained owner outcomes and retention state. Enforce WAL/undo barriers and
-   integrity checks for every referenced image.
-3. Publish the checkpoint only after all dependencies are durable. Retain the
-   prior complete checkpoint and its dependencies until publication succeeds.
-4. Reopen one complete checkpoint, validate and synchronize the retained WAL
-   suffix, replay committed canonical final effects in validated order, validate
-   resulting object/current/undo references, then publish the recovered
-   visibility frontier.
-
-Uncheckpointed eviction images may be useful working spill state during the
-running process, but their existence or in-memory page-map publication does not
-advance recovery authority. After a crash they can be ignored unless a later
-protocol explicitly proves them part of a coherent checkpoint epoch.
-
-Checkpoint quiescence is a correctness baseline, not a desired permanent
-latency strategy or a promise of a brief pause. Graph traversal and materializing
-dirty images can hold admission closed through substantial I/O. Reuse unchanged
-immutable images where valid and measure pause cost against database size and
-dirty fraction. A nonblocking coherent epoch or crash-qualified structural
-logging may replace it only after proving reference closure, replay completeness
-and retention. Meet checkpoint latency budgets before product cutover.
-
-## 6. Owner status, identity and retention are checkpoint state
-
-A process-local transaction-status table rebuilt only from retained WAL is
-insufficient once old decisions are reclaimed. Every reachable transaction-owned
-current or undo record must either have a checkpointed durable outcome or be
-safely frozen to its CSN before its decision disappears. Freezing install
-identity also requires proving the replay horizon no longer needs it.
-
-Snapshot, CDC, replica and backup leases constrain reclamation together. The
-current undo file is append-only with contiguous logical `VersionId`s and no
-front-truncation/reuse protocol; do not reuse IDs or truncate the front as an
-ad-hoc GC mechanism.
-
-Checkpoint/object metadata must recover allocation high-water marks and prevent
-reuse of live transaction, object or page identities. The WAL, undo and
-page-map components are now bound to a common persistent store incarnation
-(the `StoreDirectory` `store.identity`, the mandatory 40-byte WAL segment
-header and the 32-byte undo header), and the owning runtime holds a
-cross-process exclusive writable directory lock; per-handle mutexes alone do not
-provide that lock. This is ownership and incarnation binding only: no
-checkpoint, manifest or recovery authority exists yet. Checkpoint/manifest
-binding and structural checkpoint closure remain Milestone F acceptance
-requirements, not deferred GC work.
-
-Checkpoint closure includes current/undo history and the outcome of every
-reachable owner, not only page links. Candidate publication and reclamation
-account for the retained prior checkpoint and all reader/history leases. There
-is one shared validation path for placement references; duplicate detection
-must not introduce quadratic map publication/reopen work.
-
-The implemented `RuntimeAdmission` supplies commit membership and checkpoint
-waiting for attached ordered coordinators. The complete runtime must use the
-same gate for snapshot/read/server admission and long-running operation checks,
-plus quiescence for structural/GC/allocation mutators outside commit. A gate
-available to callers is insufficient if real entry points bypass it. Either
-fence reads or prove an explicit safe-prior read boundary before exposing a
-persistent runtime.
-
-A persistent runtime constructs and owns admission, visibility/status, intents,
-page dependencies, component leases and snapshot registration together. Its
-transaction/read/checkpoint capabilities preserve that identity; independent
-service bundles and optional attachment are useful component-test seams, not
-proof of persistent integration.
-
-Commit-attempt ownership ends only after explicit completion, a proven clean
-refusal, or terminal recovery fencing. In a process that can catch worker
-unwinding, an unresolved attempt must fence runtime/frontier before releasing
-intents and checkpoint membership. A zero-member count alone cannot establish a
-safe cut. A process-abort panic profile may instead terminate, but that hosting
-contract must be explicit; catching a panic and continuing the unfenced runtime
-is not supported. User-visible cancel/disconnect after a durable decision stops
-response delivery, not commit responsibility.
-
-## 7. Format and resource qualification
-
-The experimental vNext formats deliberately fail closed rather than silently
-reinterpret incompatible bytes:
-
-- outer transaction WAL framing: version 2;
-- outer undo-store framing: version 2;
-- inner `MvccRecord` envelope: version 2 with optional install identity.
-
-Version-1 vNext files/envelopes are disposable development formats and are not
-silently migrated. The legacy production engine's formats are unaffected.
-
-Checksummed fixed headers distinguish length corruption from a valid-header torn
-append. Unknown formats and complete checksum/payload corruption fail closed;
-only an incomplete final header/frame is repairable under the append/torn-write
-failure model.
-
-Undo payload scanning is bounded to one frame, but the offset index, WAL
-recovery vectors and pending/terminal transaction bookkeeping still grow with
-retained history. Explicit retention and streaming/indexing policy remain
-required before claiming bounded-memory large-history recovery.
-
-## Required integration qualification
-
-Before persistent cutover, tests must cover at least:
-
-- same-key writers and multi-object decisions with intents retained through
-  publication;
-- pre-WAL snapshot/active-writer conflict rejection with no decision bytes;
-- canonical repeated writes and exact install-identity replay;
-- active, aborted, frozen and committed predecessor classification;
-- clean refusal/failure after unreachable pre-WAL undo append;
-- failure after decision WAL sync, after grouped undo sync and after subsets of
-  current-record installation;
-- failure around status publication and frontier advancement;
-- a later installed CSN cannot acknowledge success while an earlier CSN leaves a
-  frontier gap; completing the gap releases waiters, and unresolved failure wakes
-  them with recovery-required semantics;
-- already-admitted writers and checkpoint drains racing runtime failure;
-- runtime fencing before unresolved intent release;
-- out-of-order installers on different keys of one page;
-- page dependency inheritance through split sibling/parent/root publication;
-- writeback of one captured image while a newer frame version becomes dirty;
-- structurally complete checkpoint graph closure and two consecutive reopen
-  attempts at every crash boundary;
-- checkpointed owner outcomes, allocation high-water marks and WAL/undo
-  retention;
-- small-buffer progress, allocation refusal and split/fence/internal-routing
-  representability of every admitted effect in both live install and replay;
-- delayed page-load publication after competing mutation, writeback and eviction
-  cannot resurrect pre-commit bytes;
-- unresolved commit unwinding in a continuing process fences before checkpoint
-  membership ends, or the documented process-abort profile terminates.
-
-## Implementation roadmap
-
-The [vNext plan](../plans/storage-kernel-vnext.md#immediate-sequence) owns the
-implementation sequence and open gates. This ADR owns the protocol, not a
-second execution backlog; consult the plan for current implementation status.
+The [qualification skill](../../.agents/skills/vnext-qualification/SKILL.md) owns
+the reusable procedure; the [plan](../plans/storage-kernel-vnext.md#immediate-sequence)
+owns work order and open evidence, not this ADR.

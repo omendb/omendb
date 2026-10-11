@@ -273,18 +273,13 @@ slot implementation. References checked 2026-10-11.
 
 ## Migration plan
 
-The rewrite proceeds alongside the current implementation only long enough to preserve a continuously testable oracle:
-
-1. Add a vNext kernel namespace/module on `storage-kernel-vnext` with IDs, transaction state machine interfaces, log framing, page/frame guard types and storage-object identities.
-2. Implement the buffered ordered B-tree over the new buffer manager without OmenDB SQL integration.
-3. Implement log-authoritative commit/recovery and qualify it with SeerDB's existing crash/fault matrix.
-4. Add the compact canonical row path and enough scalar index support to run OmenDB's existing relational differential tests.
-5. Run old-vs-new semantic differential tests plus YCSB/TPC-C-shaped performance and write-amplification measurements.
-6. Cut OmenDB over once correctness gates pass and the new path has no material regression in its intended regimes.
-7. Delete the generation-COW/current transactional implementation rather than maintaining two engines.
-8. Port vector/text/analytical access methods only onto the new kernel.
-
-The compatibility facade must never cause OmenDB to keep the old physical architecture alive.
+The [vNext roadmap](../plans/storage-kernel-vnext.md) is the sole execution owner.
+Keep the current engine only as a semantic/fault reference until qualified cutover;
+known defects require independent oracles. Canonical records prove a distinct
+access-method lifecycle alongside ordered indexes under one decision and recovery
+protocol, not merely another opaque value codec. No compatibility facade may keep
+the old physical architecture alive. Explicit offline conversion preserves supported
+logical preview data or refuses it; physical-format upgrade stability is not implied.
 
 ## Acceptance gates
 

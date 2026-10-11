@@ -1,11 +1,11 @@
 # OmenDB gap register
 
 Evidence-backed register of open product gaps, ordered by quality dimension.
-This is the input to roadmap prioritization, not a commitment list: items move
-into the project task tracker and `docs/alpha-release-gates.md` (release
-evidence) when they become active. Evidence citations refer to tests, source
-files, or measured baselines in this repository. Current source audit:
-2026-10-11 at `fc98820`. "Landed" records implementation history, not whole-contract
+The [vNext roadmap](plans/storage-kernel-vnext.md) owns replacement work order;
+[alpha gates](alpha-release-gates.md) own release evidence. This register records
+current defects and unsupported behavior, not a second commitment list. Evidence
+citations refer to tests, source or measured baselines. Source audit: 2026-10-11
+at `fc98820`, with the constraint-timing follow-up at `0783097`. "Landed" records implementation history, not whole-contract
 qualification; the reopened gates below supersede broader earlier claims.
 
 ## Correctness gates reopened — 2026-10-11
@@ -23,9 +23,10 @@ incorrect legacy outputs must not become the replacement's oracle.
 | Cursor progress | An inclusive secondary-index restart duplicates the boundary row: 256 matching rows return 257. | `src/seer_direct.rs::index_get` |
 | Batch input | Separate statement/parameter slices are zipped without length validation, silently omitting statements. | `src/relational_database.rs::execute_sql_batch_with_params` |
 | Logical conversion | Dump/restore omits supported FK delete actions; a typed Cascade constraint becomes Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |
+| Constraint timing | Typed `Immediate` and `DeferredToPublication` both validate FKs at publication, while SQL calls supported FKs immediate; statement-time compatibility and timing-preserving conversion are unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity`, `src/sql_schema.rs` |
 
-The typed FK publication race is source-established. The other boundaries have
-out-of-tree direct-API/wire/conversion reproductions; these are not a complete
+The typed FK publication race and timing mismatch are source-established. The
+other boundaries have out-of-tree direct-API/wire/conversion reproductions; these are not a complete
 locked-dependency CI run. Qualification must exercise the repaired real entry
 points and independent semantics, not add tests that bless current output.
 The [vNext plan](plans/storage-kernel-vnext.md) separately owns load-publication,
@@ -76,7 +77,7 @@ has no unsigned 64-bit integer). Engine-level archive/restore
 (`crates/seerdb/src/db/archive.rs`) remains the physical-path
 primitive.
 
-## Isolation level — closed (2026-09-05)
+## Isolation — legacy evidence (2026-09-05), vNext open
 
 - Serializable certification is implemented and tested: every read a
   transaction performs registers an anti-dependency. Point reads
@@ -87,8 +88,11 @@ primitive.
   doctors-on-call patterns now abort with SQLSTATE 40001.
 - `SHOW TRANSACTION_ISOLATION` reports `serializable`. SQL-level selection
   of alternative isolation modes remains outside the current surface.
+- This evidence applies to the legacy transactional path. vNext has fixed
+  snapshots/write intents without the required read/range/catalog certification.
+  ADR 0014 owns its decision-ordered replacement; no legacy pass closes that gate.
 
-## SQL breadth — closed (2026-09-06)
+## SQL breadth — supported legacy subset (2026-09-06)
 
 - Strong core: joins (inner/non-equi/cross/left/right/full, USING,
   NATURAL), scalar/IN/EXISTS subqueries, aggregates, set operations,
@@ -122,8 +126,8 @@ by the correctness or maintenance tests.
 - Implemented: persistent `omendbd`, SCRAM-SHA-256, table grants,
   cancellation (57014), statement deadlines, result bounds, SIGKILL/reopen,
   `EXPLAIN` (the executor's own access-path decision), slow-statement
-  logging (`--slow-statement-ms`, one structured stderr line), static
-  describe types (catalog/aggregate/arithmetic-derived, not probe samples).
+  logging (`--slow-statement-ms`, one structured stderr line). Describe still
+  contains executable sample probes; static result typing is an open binder gate.
 - TLS: explicitly declined, not silently missing — the server answers
   `SSLRequest` with 'N' (`sslmode=require` fails immediately, `prefer`
   proceeds cleartext). Policy until first-party TLS: loopback/private bind

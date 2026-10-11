@@ -1,7 +1,7 @@
-//! Referential-action conformance across both backends:
-//! `CONSTRAINT_TIMING_CONTRACT.md` — ON DELETE {Restrict, Cascade, SetNull},
-//! eager cascade staging, bounded depth, and deferred resolution at
-//! publication validation.
+//! Legacy direct-adapter referential-action evidence: Restrict, Cascade and
+//! SetNull, with bounded cascade staging and publication-time FK validation.
+//! Target timing and schema-transaction rules are owned by ADR 0007; these tests
+//! do not establish immediate-statement semantics or qualify the vNext path.
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,

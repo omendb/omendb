@@ -19,8 +19,8 @@ TreeId + unsigned-lexicographically ordered key bytes + opaque value bytes
 The API must support first-class tree lifecycle, multi-writer transactions,
 point/range cursors, atomic multi-tree mutation, snapshot visibility, conflict
 observations, explicit durability, and a restartable committed-change stream.
-The existing `StorageKernel` trait remains a temporary semantic-conformance
-seam while this API is implemented; it is not expanded into an engine matrix.
+The temporary `StorageKernel` seam was deleted under [ADR 0005](0005-delete-storage-kernel-seam.md).
+The replacement must not revive it as a permanent engine matrix.
 
 ## Identity rules
 
@@ -49,8 +49,9 @@ OmenDB must not maintain a second independent commit frontier.
    conditional insert also conflicts with a concurrent insert into the same
    absent key/gap.
 4. Point reads, absent-key reads, range reads, and writes produce enough
-   dependency information for a serializable certifier without putting SQL
-   semantics into SeerDB.
+   dependency information for the decision-ordered certifier in ADR 0014 without
+   putting SQL semantics into SeerDB. Mandatory constraint/catalog observations
+   remain certified even if weaker user isolation modes are introduced.
 5. Older snapshots can read previous key/value versions and dropped trees until
    retention-safe reclamation. Physical page versions are not transaction MVCC.
 6. A borrowed record reference cannot outlive its page/frame guard. Batch

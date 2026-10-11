@@ -23,8 +23,10 @@ storage product.
 | Physical updates | Generation-COW engine | Buffered pages, logical MVCC, log-authoritative commit, asynchronous out-of-place materialization |
 | Server concurrency | `Arc<RwLock<RelationalDatabase>>`, lock polling and `spawn_blocking` | Concurrent database handle and bounded execution/admission runtime |
 | Rows and execution | Bootstrap row codec and materialized row results | Schema-driven guarded row views, OLTP micro-plans and typed batch pipelines |
-| Planning | SQL classification, executable Describe probes and mixed catalog views remain | Binder-owned types, privileges, effects, dependencies and result schema from one transaction/catalog view |
-| Operation failure | Some errors leave committable partial relational state | Private statement delta or failed transaction; no partial row/index/catalog commit |
+| Planning | SQL classification, executable Describe probes and mixed catalog views remain | One typed binder over a retained catalog view, with current-grant authorization at each statement boundary |
+| Operation failure | Some errors leave committable partial relational state | Private statement deltas and transaction-owned failed state; no partial row/index/catalog commit |
+| Isolation | Legacy certification; vNext fixed snapshots and write intents only | Decision-ordered point/absence/range/catalog/constraint certification |
+| Ordered records | v4 empty-leaf preflight can admit uninstallable decisions | Bounded physical cells, logical key/value overflow and feasibility-first fenced splits |
 | Analytics/search | Future integration | Snapshot-qualified access paths over the same transactional authority |
 
 The existing engine remains a semantic and crash/fault reference until the
@@ -119,8 +121,8 @@ The vNext baseline is:
 
 ```text
 private writes
-  -> validate effects / acquire intents / preflight predecessors
-  -> append complete transaction + decision in CSN order
+  -> freeze dependencies / acquire intents / reserve progress / prepare predecessors
+  -> certify against earlier accepted decisions / append + publish conflict summary
   -> synchronize decision WAL
   -> synchronize required undo
   -> install every authoritative effect with exact page dependencies
@@ -142,18 +144,28 @@ allocation metadata, owner outcomes, retention state and a validated page map.
 Recovery loads that checkpoint and applies the synchronized committed WAL suffix
 before exposing the recovered visibility frontier.
 
-One runtime lifecycle owns admission, checkpoint drain, terminal failure,
-read/snapshot safety and pending-commit wakeup. The process-local
-`RuntimeAdmission` primitive now blocks new commits during checkpoint drain and
-holds admitted ordered commits through contiguous visibility completion. Its
-recovery-required state refuses new read/commit admission and wakes drain waiters.
+One runtime owns transaction/history leases, workload reservations, checkpoint
+mutation drain, terminal failure and post-decision completion. Establish attempt
+responsibility before possible append; unwind/cancel/disconnect cannot release
+unresolved ownership without fencing admission and visibility waiters. All real
+entry points and structural/object/allocation mutators use that authority.
+Optional component attachment is not a persistent runtime.
 
-Full integration remains a cutover blocker: every read/snapshot/server entry point
-and long-running operation must consult that gate, and structural/GC/allocation
-mutators outside the ordered commit path must quiesce during graph capture.
-Independent component fences or an optionally attached coordinator gate do not
-establish a complete persistent runtime. See
-[ADR 0014](adr/0014-vnext-installation-and-recovery.md).
+SERIALIZABLE uses decision-ordered optimistic certification against earlier
+accepted writers, including effects not yet installed or visible. Register logical
+point/absence/range, catalog/enforcement and mandatory constraint dependencies;
+retain and budget conflict summaries for every snapshot that may still write.
+A validation callback with a gap before append is insufficient. Fixed snapshots
+plus exact write intents do not implement this target.
+[ADR 0014](adr/0014-vnext-installation-and-recovery.md) owns the protocol.
+
+Ordered pages use bounded key/fence/separator/value descriptors and immutable
+logical overflow rather than narrowing logical records to empty-page fit. Actual
+fenced candidates and useful internal fanout determine feasible splits. Reserve
+chain/structural/pin/scratch capacity before decisions and finish parent/root work
+before readiness. Overflow does not bypass future undo, WAL or reader-memory
+limits, select the canonical-row layout, or establish chain GC. See
+[ADR 0009](adr/0009-buffered-btree-and-materialization.md).
 
 ## Derived state and snapshot correctness
 
@@ -210,15 +222,26 @@ Durability, recovery and essential reclamation retain progress capacity even
 under foreground or analytical saturation. See
 [ADR 0007](adr/0007-runtime-execution-and-contention.md).
 
-Parsing, binding, authorization, Describe, planning and execution share one
-transaction/catalog view and semantic metadata. A relational operation owns its
-private mutation delta: before durable commit authority, failure restores that
-delta or leaves a failed transaction that must roll back. After the decision,
-response delivery failure cannot abort the commit. Describe must not execute a
-fabricated user query to infer its schema.
-Prepared plans retain catalog-object dependencies rather than relying on one
-whole-catalog invalidation marker. Constraint enforcement uses mutation-driven
-probes, not routine whole-table foreign-key scans.
+One typed binder supplies parameter/result types, effects, privileges and
+catalog/name/enforcement dependencies to Describe, planning and execution. Data
+and layout interpretation use one retained transaction view; authorization checks
+current grants at each Describe/execution boundary. Cached plans are not grants;
+revocation alone does not cancel authorized work or trigger commit reauthorization.
+A later authorization error still makes an explicit block rollback-only. Describe
+performs zero user-query evaluation.
+
+Private statement deltas include rows, indexes, cascades, constraints and catalog
+state. A fixed statement input view prevents DML from consuming its own output.
+Explicit-block errors leave transaction-owned rollback-only state through direct
+and wire APIs, including bind/auth/result admission. After possible decision
+append, completion is kernel responsibility, not ordinary rollback.
+
+Object-granularity catalog dependencies include table enforcement membership so
+old writers cannot bypass newly added indexes/constraints. Mutation-driven probes
+and authoritative child-side FK lookup replace routine whole-table validation.
+The target checks immediate constraints at their declared mutation/statement
+boundary and explicitly deferred work before decision; current publication-time
+FK behavior is not proof of immediate SQL semantics. ADR 0007 owns these contracts.
 
 Point/range OLTP uses compact micro-plans and short-lived guarded row views.
 Native scan/access-method interfaces expose typed batches and selection vectors;
@@ -259,14 +282,15 @@ not replace database replication/leadership fencing. See
 The [vNext plan](plans/storage-kernel-vnext.md) is the sole detailed execution
 sequence. In summary:
 
-1. Complete runtime admission/failure and checkpoint/restart authority.
-2. Qualify bounded resources, retention and crash/reopen behavior.
-3. Measure the actual vNext path, including checkpoint pauses, serial WAL/undo
-   barriers, visibility waits and larger-than-memory operation.
-4. Add canonical rows and cross-object relational qualification; compare
-   clustered versus heap placement.
-5. Pass product semantic/crash oracles and agreed performance budgets, cut over,
-   and delete the superseded engine.
+Runtime completion responsibility, decision-ordered certification and protected
+resource admission precede checkpoint qualification. Bounded ordered layout and
+structural completion precede persistent graph capture. Relational binder,
+statement-failure and catalog corrections can proceed against the current adapter
+without waiting for canonical rows. Then qualify checkpoint/restart, retention and
+bounded work/recovery; measure the actual vNext path; integrate canonical records
+and pass product semantic/crash/performance gates before cutover and deletion.
+Explicit offline preview conversion preserves supported logical semantics or
+refuses input; it does not imply stable-format upgrades or a permanent dual engine.
 
 Keep fault effects and scheduling explicit enough to support deterministic
 exploration of concurrency and later distributed interleavings. Simulation must

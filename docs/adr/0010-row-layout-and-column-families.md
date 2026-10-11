@@ -127,6 +127,10 @@ making that assumption irreversible.
 
 ### 5. Large values may use stable logical handles outside the hot row page
 
+Ordered-page overflow in ADR 0009 is required for supported record representability;
+it is not this optional per-column/family optimization and does not choose between
+clustered records and heap pages. Keep these concerns distinct.
+
 Sufficiently large/cold variable values may move into a kernel-managed
 large-value arena while the row/family stores a compact logical handle. This is
 not just a size threshold: access/update frequency, locality, page pressure and

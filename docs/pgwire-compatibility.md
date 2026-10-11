@@ -9,6 +9,12 @@ in `tests/project_pgwire_server.rs`:
 cargo test --features pgwire --test project_pgwire_server
 ```
 
+Known negative-path defects in the [gap register](gap-register.md) qualify the
+ordinary evidence below: executable/unauthorized Describe, restricted transaction
+controls and committable result-admission errors remain open. Target binder,
+authorization and statement-failure rules are in [ADR 0007](adr/0007-runtime-execution-and-contention.md),
+not claims that the serving path already implements them.
+
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
 representative documented subset against PostgreSQL. It is ignored in ordinary
 local test runs because it requires a PostgreSQL server; CI runs it against
@@ -30,7 +36,7 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Result payload bound | `ServerConfig::max_result_bytes` and `--max-result-bytes` reject an estimated materialized result payload above the configured bound with `54000`. This limits response payload admission, not execution memory. | `persistent_server_rejects_result_over_byte_bound` |
 | Trust startup | Empty auth catalogs use trust only on loopback. | `wire_trust_mode_refuses_non_loopback_listener` |
 | SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
-| Authorization | Provisioned grants distinguish read, write, and schema-admin access; ungranted tables, including tables referenced by nested subqueries, deny access. | `wire_grant_enforcement_reader_writer_admin` |
+| Authorization | Execute distinguishes read, write, and schema-admin grants, including nested access. Describe bypass and restricted transaction-control classification remain open defects. | `wire_grant_enforcement_reader_writer_admin` |
 | Diagnostics | `RunningServer::status()` reports connection admission and tracked query/describe worker outcomes. | `persistent_server_reopens_durable_database_after_shutdown`, `query_worker_tracker_records_terminal_operation_outcomes` (unit) |
 | Slow statement log | `ServerConfig::slow_statement_threshold` / `--slow-statement-ms N` log statements (execution plus commit publication) above the threshold to stderr as one structured line: duration, authenticated user, single-line statement. Default off. | `omendbd_logs_slow_statements_when_threshold_set` |
 | EXPLAIN | `EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` reports the same access path the executor takes: primary-key lookup, index scan, NULL short-circuit, or seq scan. `EXPLAIN ANALYZE` is refused. Grant analysis recurses into the explained statement. | `explain_names_the_access_path_execution_takes`, `explain_reports_access_path_through_wire` |
@@ -46,17 +52,16 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Simple queries | Semicolon-separated statements, transaction control, and ordinary SQL execute through the wire handler. | `wire_transaction_block_rollback_discards_writes`, `wire_transaction_block_commit_persists_and_crosses_connections` |
 | Extended queries | Parse, parameter type resolution, bind, describe, and execute are exercised through `tokio-postgres`; repeated parameterized execution is covered. Parameter inference includes the supported `BETWEEN` form so bound values inherit the compared column's logical type. | `wire_hot_statement_repeats_across_params`, `sql_parameter_types_infer_between_bounds_from_column`, all `Client::query`/`Client::execute` tests |
 | Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; supported DML `RETURNING` uses static target-table metadata rather than depending on a probe row. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |
-| Transactions | `BEGIN`/`START`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local transaction blocks. Failed blocks reject later statements with `25P02` until rollback. | `wire_transaction_block_commit_persists_and_crosses_connections`, `wire_aborted_block_rejects_until_rollback` |
+| Transactions | `BEGIN`/`START`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks; covered execution failures reject later statements with `25P02`. Bind/auth/result-admission failure lifecycle and restricted-role cleanup are not fully qualified. | `wire_transaction_block_commit_persists_and_crosses_connections`, `wire_aborted_block_rejects_until_rollback` |
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
 
 ## Scalar value types
 
 The typed scalars below ride the standard binary result and parameter
-encodings. Each encoder was pinned byte-for-byte against PostgreSQL `COPY
-BINARY` probes (see `/tmp/pgprobe` methodology: probe first, then implement),
-and the live oracle compares decoded values and type OIDs for a representative
-typed workload in every CI run.
+encodings. Each encoder was checked byte-for-byte against PostgreSQL `COPY BINARY`
+probes; maintained typed-value tests and the live oracle compare decoded values
+and type OIDs for a representative typed workload in every CI run.
 
 | Type | Storage | Wire encoding | Semantics | Evidence |
 | --- | --- | --- | --- | --- |
@@ -124,8 +129,11 @@ or later compatibility work:
   still report a generic internal wire error rather than their
   PostgreSQL-specific SQLSTATE;
 - query-result execution-memory quotas; the result-payload bound is an
-  estimated pre-encoding check and is not a full memory quota; and
-- process-level kill/reopen coverage at each durable publication seam.
+  estimated pre-encoding check and is not a full memory quota;
+- full serving-path and replacement-kernel process-level kill/reopen coverage;
+  existing SeerDB legacy publication tests do not qualify vNext;
+- statement-time immediate FK semantics and action/timing-preserving conversion:
+  legacy typed FK validation occurs at publication even when labelled immediate.
 
 ## Parameter and window semantics
 

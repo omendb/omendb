@@ -1,11 +1,13 @@
 # OmenDB benchmark results
 
-Measured with `examples/oltp_bench.rs` (`cargo run --release --example
-oltp_bench`) on Apple Silicon (APFS), omendb 0.1.0-alpha.1 with the
-DirectSeerStore backend. Numbers are single-process; treat them as
-engineering baselines, not marketing claims.
+Historical September 2026 measurements of the legacy DirectSeerStore path on
+Apple Silicon/APFS, including `examples/oltp_bench.rs` and the probes cited below.
+These were recorded under the development `0.1.0-alpha.1` package version, not a
+published release. They are single-process engineering evidence, not current
+vNext qualification or competitive claims. The [vNext roadmap](plans/storage-kernel-vnext.md)
+owns replacement-path budgets and comparisons.
 
-## Current numbers
+## Historical baseline numbers
 
 | Workload | Throughput |
 |---|---|
@@ -216,13 +218,10 @@ honestly: blob separation triggers only for large values and
 manifest/history artifacts update on generation boundaries, not per
 wave.
 
-## Known follow-ups
+## Interpretation limits
 
-- Publication-wave cost: the ~10 ms wave floor (version-store sync +
-  full candidate B-tree clone per wave) is the dominant write latency;
-  restructuring publication toward PostgreSQL's single-log append is
-  the next measured lever.
-- Serializable scan transactions: `RelationalDatabaseTransaction::
-  scan_serializable` registers the table range as a read dependency, so
-  mixed read-write transactions fail on phantom inserts. Plain `scan`
-  remains snapshot-isolated by design.
+The corrected device-barrier attribution above supersedes the earlier clone/
+version-store hypothesis; do not reinstate that hypothesis as a current bottleneck.
+Legacy scan/certification evidence does not establish vNext SERIALIZABLE behavior.
+New measurements must exercise its actual decision/certification/history path,
+not inherit these numbers or optimize the obsolete publication engine by inertia.

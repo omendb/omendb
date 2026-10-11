@@ -133,10 +133,11 @@ containing at least:
 BoundStatement
   parameter types
   result schema
-  referenced catalog/layout versions from the transaction view
+  resolved object/column IDs and typed expressions/coercions
+  catalog/layout/name/enforcement dependencies from the transaction view
   effects (read/write/schema/session/transaction control)
   required privileges
-  logical plan
+  typed logical plan
 ```
 
 PostgreSQL Parse/Describe/Bind/Execute, authorization, admission, plan caching,
@@ -150,11 +151,22 @@ infer protected data through expression errors. A prepared plan is not a cached
 authorization grant. Transaction control is session/transaction lifecycle, not
 schema administration; rollback remains available for cleanup.
 
-Binding, access-path selection, row identity and decoding consume the same
-transaction/catalog view. Retain every layout/catalog version that view needs;
-new schema metadata must not be combined with old row interpretation. Grant
-revocation for already-open transactions needs an explicit policy distinct from
-data-snapshot visibility; do not infer it from catalog or prepared-plan lifetime.
+Binding, access-path selection, row identity and decoding consume one retained
+transaction/catalog view, including object lifecycle leases. Parameter values may
+specialize a plan, but cannot be required to discover result types. Replace the
+competing projection, RETURNING and Describe semantic paths with one typed binder;
+a Describe-only type walker would preserve the underlying inconsistency.
+
+Authorization uses **current committed grants at each Describe/execution boundary**,
+not grants pinned to the data snapshot or cached plan. Retain the authorization
+view for that statement. Revocation alone does not cancel already-authorized work
+or trigger commit-time reauthorization. Later boundaries check current grants;
+an authorization error in an explicit transaction still makes the block rollback-only,
+including its earlier staged writes. This policy is not implicit-savepoint behavior
+or automatic cancellation. Explicit cancellation remains phase-aware;
+rollback/cleanup never requires schema-admin permission. A trusted direct API may
+retain an explicit privileged capability rather than adopting wire authentication.
+The current serving implementation does not yet qualify this complete policy.
 
 ### 6. Two physical execution paths share one typed logical plan
 
@@ -178,7 +190,13 @@ storage cursor -> typed batch -> filter -> project -> join/aggregate -> sink
 A batch carries typed vectors, null/selection state, and short-lived references
 when page guards permit them. Operators are cancellation/admission checkpoints.
 The storage cursor advances from its current position; pagination/morsels never
-rescan the prefix already consumed.
+rescan the prefix already consumed. Its contract is conceptually
+`next_batch(row_limit, byte_limit, work_budget) -> Batch | Yield | End`, retaining
+snapshot/catalog/overlay identity and strict logical continuation. A root re-descent
+from the last key is valid; an inclusive restart or repeated prefix scan is not.
+Budget physical slots, invisible/tombstoned records, undo hops, chain reads and
+I/O—not only visible rows. Release byte latches before suspension/output, bound
+retained pins, and copy surviving fields into budgeted batch storage.
 
 For scan/filter/visibility-heavy paths, batching is also the preferred internal
 storage/access-method interface, not merely an executor wrapper. Access methods
@@ -243,19 +261,47 @@ Normal DML records only the constraint work its mutations introduce:
 
 Creating a new constraint may scan existing rows once, but validation and the
 catalog publication occur in the **same schema transaction** with registered
-range dependencies. There is no validate-then-publish TOCTOU seam.
+range dependencies. There is no validate-then-publish TOCTOU seam. Authoritative
+child-side FK lookup makes parent checks selective. Cascade expansion uses a
+bounded worklist with explicit visited/effect ownership, not repeated recursive
+expansion; supported action semantics and explicit resource refusal remain.
+
+Constraint observations are mandatory certification dependencies even below
+SERIALIZABLE. [ADR 0014](0014-vnext-installation-and-recovery.md#2-decision-ordered-optimistic-certification)
+owns their decision-order contract; a validate callback before an unprotected
+append is insufficient. Adding/removing an index or constraint changes a table's
+enforcement membership dependency, so an old writer cannot silently omit new
+maintenance obligations.
+
+The target makes timing observable at its named boundary: nondeferrable unique
+and row constraints enforce their required mutation checks; immediate FKs must
+satisfy the constraint before a statement succeeds; explicitly deferred constraints
+resolve before transaction decision. Referential actions keep their declared
+semantics. The legacy typed `Immediate` and `DeferredToPublication` both currently
+validate FKs at publication, while SQL calls them immediate. That is a contract
+mismatch, not evidence of statement-time compatibility. Revise the experimental
+typed timing interface deliberately when migrating; do not rename expectations
+to bless legacy output or export deferred behavior as nondeferrable SQL.
+[PostgreSQL constraint timing](https://www.postgresql.org/docs/18/sql-set-constraints.html)
+is the independent comparison (checked 2026-10-11).
 
 All DDL funnels through one schema-transaction protocol; bespoke per-command
 publication paths are transitional.
 
-A relational operation owns its complete private mutation delta. If validation,
-index maintenance or result admission fails before commit authority, either
-restore that delta or put the transaction into a failed state that can only roll
-back. Publishing the remaining staged mutations is not failure atomicity.
-Direct APIs and wire execution share that rule. In PostgreSQL-compatible explicit
-blocks, binding, authorization, execution and precommit result-admission errors
-enter aborted-block semantics consistently. After a durable decision, response
-encoding failure or disconnect cannot convert the commit into an abort.
+A relational transaction owns failure state and each statement's complete private
+delta: base rows, indexes, cascades, constraint work, catalog effects and resources.
+Bind/authorize, execute against a fixed statement input view, validate immediate
+constraints and admit results before merging the complete delta. DML scans cannot
+consume their own new effects or update the same row repeatedly. Earlier successful
+statement effects and supporting dependencies remain retained.
+
+Any explicit-block bind/auth/execute/cancel/precommit result-admission error makes
+the transaction rollback-only; direct and wire callers share that state. Private
+deltas provide atomic operation scope, not an implicit savepoint feature or permission
+to commit a failed block. No partial row/index/catalog state is committable. After
+possible decision append, kernel-owned responsibility replaces ordinary rollback;
+post-decision encoding failure/disconnect cannot convert the commit into an abort.
+One internal schema transaction does not by itself add SQL DDL-in-block support.
 
 ### 10. Catalog state is immutable and versioned at object granularity
 
@@ -266,6 +312,12 @@ The target catalog has versioned database/schema/table/index/constraint
 objects plus a catalog root/epoch. Transactions and cached plans record the
 specific object versions they depend on. Unrelated DDL need not invalidate
 all writers or every prepared plan.
+
+Dependencies include namespace/name absence and each table's enforcement membership,
+not just object versions already found. Classify semantic dependencies requiring
+refusal/rebind, physical-plan dependencies requiring replanning, and statistics
+that do not invalidate semantics. Retain layouts and logically retired objects
+until reader/recovery leases end; logical retirement is not physical reclamation.
 
 Catalog data remains ordinary transactional SeerDB data; it does not become a
 second metadata database with separate durability.
@@ -322,8 +374,14 @@ Before declaring this runtime architecture implemented:
 - failed relational operations cannot commit partial row/index/catalog deltas;
   explicit blocks enforce the same failure lifecycle for execution and result
   admission, while post-decision response errors preserve committed outcome;
+- current-grant checks prevent prepared-plan authorization reuse; revocation alone
+  does not cancel authorized work or trigger commit reauthorization, while a later
+  authorization error makes an explicit block rollback-only;
+- immediate/deferred constraint timing and conversion agree with the declared
+  phase, while certification protects unique/FK/catalog predicates;
 - old transaction/catalog views remain consistent across concurrent schema
-  changes, including binding, access-path selection, identity and decoding;
+  changes, including binding, access-path selection, identity and decoding; old
+  writers cannot bypass newly added constraints or authoritative participants;
 - vector/batch execution reports allocation, compiler/vectorization evidence, cache/CPU profiles, and where relevant memory-bandwidth/TLB behavior;
 - deterministic-simulation tests cover representative transaction/GC/I/O
   interleavings.

@@ -1,7 +1,6 @@
 # ADR 0009: Buffered B-tree state and asynchronous physical materialization
 
-- **Status:** accepted target architecture; replaces whole-tree/per-generation
-  copy-on-write as the long-term OLTP update model
+- **Status:** accepted target architecture, including bounded ordered cells and logical overflow; overflow format/progress not yet implemented or qualified
 - **Refined by:** [ADR 0014](0014-vnext-installation-and-recovery.md) supersedes pre-decision shared installation for vNext; the buffer/materialization separation remains
 - **Scope:** SeerDB B-tree concurrency, buffer residency, dirty-page handling,
   page mapping, and checkpoint materialization
@@ -59,9 +58,10 @@ shared B-tree page
                                  Committed N -> visible according to snapshot
 ```
 
-This permits logical installation and B-tree maintenance to be decoupled from
-the durable commit decision. Structural changes such as page split/merge are
-physical/index maintenance and must not themselves imply row visibility.
+Logical visibility and B-tree maintenance remain separate. In vNext, shared
+installation follows durable decision authority under ADR 0014; an Active owner
+is not permission to install speculatively. Structural split/merge does not imply
+row visibility, and logical effect identity does not prove parent/root completion.
 
 ### 3. The durable log contains enough information to recover logical state
 
@@ -158,20 +158,73 @@ benchmark 4/8/16 KiB and adaptive/packed variants for:
 - physical and device write amplification;
 - compression/packing efficiency.
 
-The B-tree node layout should incorporate the modern variable-record techniques
-from *B-Trees Are Back* rather than preserving today's representation for
-compatibility.
+Modern variable-record layouts are experiment inputs, not required algorithms.
+Preserve no layout solely for experimental-format compatibility. Production page
+size and inline thresholds remain measurement-gated.
 
-### 8. Small values favor clustered locality; large/cold values may be separated
+### 8. Bound physical ordered cells; overflow logical keys and values
 
-Primary/secondary ordered access benefits from keeping small records close to
-keys in leaf pages. Large values, infrequently read columns/objects, and large
-MVCC history should use separate append-oriented storage when the extra
-indirection reduces cache/write amplification.
+Page fit is not a logical record-size contract. Every supported ordered key and
+value must remain representable through fenced leaf splits, internal routing,
+root creation, replacement and replay. Empty-leaf fit does not prove this.
 
-The current blob threshold is therefore a policy to benchmark rather than one
-universal constant. Future storage-temperature hints may alter placement without
-changing logical rows or index keys.
+Use small inline records for locality and immutable, object-local logical overflow
+for larger keys and complete encoded values. Keys, high fences and separators use
+one bounded descriptor representation: an inline key or cached prefix plus logical
+chain reference. Values similarly use inline bytes or a logical reference. Never
+reuse legacy physical `BlobPointer`s as logical identity. WAL, MVCC equality and
+undo remain logical; replay may choose different physical chains.
+
+For page size `P`, derive bounds from the **actual codec**: header/reserved bytes,
+maximum fence descriptor, slots, tags, length fields and references. Bound complete
+leaf cells so a worst-case fenced page can hold at least two, and preserve useful
+internal fanout with nonempty separator sets on both split sides. A proposed v5
+encoding with 33-byte key descriptors yields a 62-byte pointer leaf cell and a
+53-byte separator cell; its arithmetic is an implementation candidate, not a
+qualified minimum page size or stable format. Alignments and extra fields must be
+included before admission accepts that configuration.
+
+Build complete left/right fenced candidates for each feasible pivot **before**
+choosing byte balance or publishing. Preserve the inherited right fence/link;
+prebuild or reserve all propagation/root work under structural coordination.
+Shortened separators may improve density but cannot alone bound arbitrarily long
+common prefixes. Oversized logical records use overflow, not silently reduced
+supported sizes. Failure before publication preserves the prior logical record.
+
+Overflow chains have typed pages, stable logical PageIds, declared total length,
+validated chunk offsets/lengths and exact terminal links. Build tail-to-head after
+required WAL/undo durability, attaching dependencies before each dirty page can
+become resident. Allocate from the owning object's namespace/high-water authority.
+Validate head, kind, store/object identity, successor sequence and termination;
+bound decoding memory, visited work and I/O. Checksums/store binding stay in the
+existing image envelope rather than acquiring a second page authority.
+
+Compare logical key bytes, never tags, pointer bytes or padded cached prefixes.
+Resolve ambiguous prefixes outside tree byte latches and long-lived pins. Writers
+capture a page version/descriptor set, resolve needed keys, then revalidate before
+publication; splits move bounded descriptors rather than expanding all payloads.
+Reader/installer leases keep referenced chains alive. Repeated retained completed
+effects allocate nothing. Checkpoint closure includes leaf/fence/separator/value
+references, successors and allocation high-water marks.
+
+The first overflow baseline stores the complete encoded MVCC value. It is simple
+but may fetch a large chain merely to inspect visibility metadata; compare inline
+MVCC metadata plus immutable payload objects before format stability/cutover if
+history-read cost warrants it. That alternative requires explicit history and
+payload liveness, not another hidden arena. Ordered overflow does not select the
+canonical-row access method or imply per-column value separation in ADR 0010.
+
+No PageId reuse or chain GC is qualified. Abandoned allocations need declared
+accounting and recovery retry-space policy under ADR 0014. Bounded cells prove
+representability, **not** buffer/allocation progress: reserve chain, split, scratch
+and installer capacity before a possible decision. Logical limits must also close
+under future undo conversion; overflow cannot bypass WAL/undo or memory bounds.
+
+Independent references, checked 2026-10-11:
+[SQLite overflow and index fanout](https://www.sqlite.org/fileformat2.html#b_tree_pages)
+demonstrate bounded local payload; [PostgreSQL B-tree limits](https://www.postgresql.org/docs/current/btree.html)
+show an index-entry limit is distinct from general row storage. Neither system's
+thresholds specify SeerDB.
 
 ### 9. Checkpoints bound recovery, they do not define every commit
 
@@ -185,21 +238,11 @@ plus optional archival backups.
 
 ## Migration strategy
 
-Do not rewrite the current storage layer all at once. The replacement vertical
-slice should establish:
-
-1. a shared buffered page/frame API with explicit page guards;
-2. one transactional tree using logical MVCC visibility independent of root
-   generation;
-3. WAL-authoritative commit/recovery for that tree;
-4. out-of-place dirty-page flush plus durable mapping checkpoint;
-5. fault tests at log, page-image, mapping, checkpoint, and GC boundaries;
-6. side-by-side benchmarks against the current generation implementation;
-7. only then move catalog/remaining trees and delete the old path.
-
-There is no storage-format compatibility obligation before the declared stable
-format. An experimental implementation should use a new format version and fail
-closed on old bytes.
+The [vNext plan](../plans/storage-kernel-vnext.md) owns the replacement sequence.
+Keep the legacy engine only as a semantic/fault reference until qualified cutover;
+known legacy defects are not expected behavior. New experimental layouts use new
+versions and fail closed on old bytes, with explicit offline conversion where
+supported data must be retained.
 
 ## Acceptance gates
 
@@ -209,6 +252,11 @@ closed on old bytes.
   before any corresponding page flush;
 - aborted/uncommitted records installed in buffered pages are never visible to
   another snapshot and are safely reclaimable;
+- admitted keys/values fit actual fenced leaf/internal/root layouts and replay,
+  including common-prefix overflow, inline/overflow replacement and deletion;
+- chain corruption/missing references fail closed, retained readers survive
+  replacement, and failure-atomic publication preserves the old logical value;
+- reserved installer capacity finishes structural obligations before readiness;
 - repeated updates of one hot page can be coalesced into fewer physical writes;
 - reader traversal stays lock-light and correct during split/merge;
 - buffer translation, page latch, allocator and WAL costs are individually
