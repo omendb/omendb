@@ -1,8 +1,10 @@
 # OmenDB
 
-Relational database server in Rust, built on [SeerDB](crates/seerdb).
-OmenDB targets single-node OLTP and PostgreSQL ecosystem integration through
-an experimental PostgreSQL wire interface. A direct Rust API is also available.
+Relational database server in Rust, built on the shared transaction/storage
+kernel in [SeerDB](crates/seerdb). OmenDB targets single-node OLTP first, with
+PostgreSQL ecosystem integration through an experimental PostgreSQL wire
+interface and a path to integrated search, analytics, HA, and distribution. A
+direct Rust API is also available.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.
@@ -56,11 +58,14 @@ commit several statements together.
 
 ## Storage and tools
 
-OmenDB owns SQL, schemas, rows, indexes, and relational semantics. SeerDB owns
-transactional ordered-KV storage and durability. Both are developed in this
-workspace; SeerDB remains an independently versioned Apache-2.0 crate.
-Shared filesystem durability primitives live in the independently versioned
-Apache-2.0 crate [`durable-fs`](crates/durable-fs).
+OmenDB owns SQL, catalog and relational semantics plus the physical meaning of
+rows and specialized access paths. SeerDB is the shared transaction/storage
+kernel: transaction state, MVCC, durability, recovery, buffer/page management,
+and physical lifetime services. Its ordered-KV surface is one access
+method/facade, not OmenDB's universal storage model. Both are developed in this
+workspace; SeerDB remains Apache-2.0 and may remain independently publishable
+where that packaging boundary is useful. Shared filesystem durability primitives
+live in the Apache-2.0 crate [`durable-fs`](crates/durable-fs).
 
 Logical SQL dump and restore are available through the bundled tool:
 

@@ -16,23 +16,21 @@ The old line is not deleted or recreated. Existing dependents that require
 `omendb ^0.0.37` remain on that line. A new alpha dependency must opt into the
 `0.1.0-alpha.*` line explicitly.
 
-OmenDB and SeerDB are independently versioned and published, but an OmenDB
-release records the exact SeerDB version it was qualified against. During
-workspace development OmenDB uses the local path dependency. For a registry
-release:
+OmenDB and SeerDB are currently independently versioned, but ADR 0013 makes
+that a packaging choice rather than an architectural requirement. An OmenDB
+release records the exact SeerDB workspace/package revision it was qualified
+against.
 
-1. publish a compatible SeerDB prerelease, initially `seerdb 0.1.0-alpha.1`;
-2. change OmenDB's release manifest from the workspace path dependency to the
-   exact compatible registry requirement;
-3. run package and install checks for both crates from a clean checkout;
-4. publish `omendb 0.1.0-alpha.1` only after the release gate passes.
+If SeerDB is published separately for an alpha, publish and qualify
+`durable-fs` and SeerDB before OmenDB, then run package/install checks from a
+clean checkout. If the integrated architecture no longer benefits from a
+separate SeerDB release, do not preserve one merely because earlier alpha plans
+assumed it.
 
-The crate licenses remain distinct: OmenDB is AGPL-3.0-only and SeerDB is
-Apache-2.0.
-
-`cargo publish --dry-run` is required before either publish. No published
-version is overwritten. A bad prerelease can be yanked, but its source and
-version remain part of the public history.
+The crate licenses remain distinct while both crates exist: OmenDB is
+AGPL-3.0-only and SeerDB is Apache-2.0. `cargo publish --dry-run` is required
+for every package that will actually be published. No published version is
+overwritten; a bad prerelease can be yanked but remains part of public history.
 
 ## Alpha application contract
 
@@ -64,10 +62,8 @@ PostgreSQL-class comparison where the supported workload overlaps.
 
 ### Storage and transaction foundation
 
-- [ ] SeerDB provides multi-writer snapshot MVCC with distinct `TxnId`, CSN,
-      and LSN identities;
-- [ ] first-class trees, ordered cursors, atomic multi-tree transactions, and
-      snapshot `{CSN, restart LSN}` export are exercised through OmenDB;
+- [ ] the shared transaction/storage kernel provides multi-writer snapshot MVCC with distinct `TxnId`, CSN, and LSN identities;
+- [ ] authoritative B-tree/row storage, atomic multi-object transactions, and snapshot `{CSN, restart LSN}` export are exercised through OmenDB without requiring every object to use the ordered-KV facade;
 - [ ] committed changes are restartable without reconstructing history by
       rescanning relational tables;
 - [ ] crash/recovery tests cover commit, WAL, page-map, checkpoint, GC, and

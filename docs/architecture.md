@@ -139,12 +139,18 @@ allocation metadata, owner outcomes, retention state and a validated page map.
 Recovery loads that checkpoint and applies the synchronized committed WAL suffix
 before exposing the recovered visibility frontier.
 
-One runtime lifecycle must own admission, checkpoint drain, terminal failure,
-read/snapshot safety and pending-commit wakeup. Independent component fences are
-necessary but insufficient. The current coordinator fences write entry; the
-persistent-runtime contract must also resolve already-admitted work and prevent
-partial checkpoint/read exposure. This remains a cutover blocker, not optional
-hardening. See [ADR 0014](adr/0014-vnext-installation-and-recovery.md).
+One runtime lifecycle owns admission, checkpoint drain, terminal failure,
+read/snapshot safety and pending-commit wakeup. The process-local
+`RuntimeAdmission` primitive now blocks new commits during checkpoint drain and
+holds admitted ordered commits through contiguous visibility completion. Its
+recovery-required state refuses new read/commit admission and wakes drain waiters.
+
+Full integration remains a cutover blocker: every read/snapshot/server entry point
+and long-running operation must consult that gate, and structural/GC/allocation
+mutators outside the ordered commit path must quiesce during graph capture.
+Independent component fences or an optionally attached coordinator gate do not
+establish a complete persistent runtime. See
+[ADR 0014](adr/0014-vnext-installation-and-recovery.md).
 
 ## Derived state and snapshot correctness
 
@@ -189,7 +195,7 @@ Consumers must tolerate replay after a crash, apply transaction boundaries
 atomically, bind positions to a source incarnation, and fail explicitly if
 required history is gone. Physical WAL framing is not the stable public CDC
 format. The shared bootstrap/retention contract is in
-[ADR 0013](adr/0013-storage-kernel-and-access-methods.md#10-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers).
+[ADR 0013](adr/0013-storage-kernel-and-access-methods.md#11-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers).
 
 ## Runtime, planning and data layout
 
@@ -208,8 +214,10 @@ whole-catalog invalidation marker. Constraint enforcement uses mutation-driven
 probes, not routine whole-table foreign-key scans.
 
 Point/range OLTP uses compact micro-plans and short-lived guarded row views.
-Scans, joins and aggregates use typed batches and selection vectors, decoding
-only needed columns. The schema-driven row codec includes layout versions,
+Native scan/access-method interfaces expose typed batches and selection vectors;
+row-at-a-time iterators are adapters, not the mandatory hot-path boundary.
+Scans, joins and aggregates decode only needed columns, and analytical execution
+should operate directly on queryable lightweight encodings where useful. The schema-driven row codec includes layout versions,
 NULL metadata and typed payloads; additional families or large-value indirection
 require measured benefit and explicit relocation/retention semantics. JIT, custom
 latches and SIMD refinements follow profiles rather than define semantics.
@@ -259,6 +267,11 @@ exercise the same state machines, not a separate mock database. Qualification
 includes two consecutive reopens at persistence boundaries and recovery memory
 versus retained history. Current recovery structures still grow with history;
 there is no bounded-memory large-history claim yet.
+
+Measure the entire memory hierarchy, including LLC/TLB/page walks, bandwidth
+and NUMA placement where applicable, not just buffer hit rate. Huge pages,
+validated translation hints, physical row/version references and large-value
+arenas remain conditional experiments with lifecycle and end-to-end evidence.
 
 No default translation, page size, MVCC layout, autonomous commit policy or
 analytical format is established by another system's benchmark. The

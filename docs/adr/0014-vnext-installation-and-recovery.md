@@ -95,7 +95,11 @@ Implemented and integrated:
 - live commit/recovery page dependency frontier wiring: decision WAL is covered
   before page mutation, referenced undo is group-synchronized before page
   mutation, and each resulting page image records decision LSN plus actual
-  resulting undo head.
+  resulting undo head;
+- process-local `RuntimeAdmission` attached to ordered commits: guards cover
+  installation through contiguous visibility completion, checkpoint drain blocks
+  new commits and waits for admitted work, and recovery-required state refuses
+  new read/commit admission and wakes checkpoint waiters.
 
 Still incomplete:
 
@@ -107,9 +111,11 @@ Still incomplete:
   into authoritative vNext access methods;
 - deterministic/bounded resource admission for arbitrary pin/buffer/allocation
   pressure and whole-transaction WAL bounds;
-- runtime-wide read/snapshot/checkpoint admission fencing and pending-commit
-  wakeup after unresolved post-decision failures, including defined handling for
-  already-admitted writers; current fencing is write-admission scope;
+- complete runtime integration of the admission gate: actual read/snapshot/server
+  entry points and long-running operations must consult it; structural/GC and
+  allocation mutators outside ordered commit must quiesce during checkpoint
+  capture. The commit/drain primitive is implemented, not a complete persistent
+  lifecycle or checkpoint;
 - complete failpoint/crash matrix and two consecutive reopens across transaction,
   dependency, structural and checkpoint boundaries;
 - freezing, owner-status retention, undo/WAL reclamation and physical GC;
@@ -331,10 +337,13 @@ checkpoint, manifest or recovery authority exists yet. Checkpoint/manifest
 binding and structural checkpoint closure remain Milestone F acceptance
 requirements, not deferred GC work.
 
-The runtime lifecycle must also govern snapshot/read/checkpoint admission and
-pending commit completion after failure. Already-admitted writers need explicit
-drain/stop behavior; an entry-only fence is insufficient. Either fence reads or
-prove an explicit safe-prior read boundary before exposing a persistent runtime.
+The implemented `RuntimeAdmission` supplies commit membership and checkpoint
+waiting for attached ordered coordinators. The complete runtime must use the
+same gate for snapshot/read/server admission and long-running operation checks,
+plus quiescence for structural/GC/allocation mutators outside commit. A gate
+available to callers is insufficient if real entry points bypass it. Either
+fence reads or prove an explicit safe-prior read boundary before exposing a
+persistent runtime.
 
 ## 7. Format and resource qualification
 

@@ -96,9 +96,23 @@ Remote nodes execute OmenDB physical fragments, not SQL text that a second
 independent PostgreSQL planner must reinterpret. The PostgreSQL wire protocol is
 an external interface, not the inter-node execution protocol.
 
-The optimizer prefers co-located execution, predicate routing, partial
-aggregation, and local joins before repartitioning data. Scatter/gather is a
-last resort made explicit in plans/EXPLAIN.
+Prepared/cached plans retain **symbolic routing expressions** plus catalog and
+topology-version dependencies. Binding/execution resolves the current
+`RangeId`/epoch/leader from parameter values and cached topology; a plan does
+not bake one physical endpoint into a long-lived prepared statement.
+
+Distributed costing adds dimensions that local costing does not have: range
+fan-out, remote request count, network bytes, exchange/repartition work,
+coordinator memory, spill, and tail-latency exposure. The optimizer prefers
+co-located execution, predicate routing, decomposable partial aggregation, and
+local joins before repartitioning data. Scatter/gather is a last resort made
+explicit in plans/EXPLAIN.
+
+Fragments stream typed batches rather than generic rows or SQL text. Each remote
+execution carries an explicit immutable context containing the authenticated
+principal/capabilities, transaction or snapshot identity, catalog/topology
+versions, relevant session semantics, deadline/cancellation token, and resource
+budget. Process-local session state is never an implicit distributed contract.
 
 ### 4. The local transaction remains the fast path
 
@@ -124,6 +138,17 @@ contract is stable above it.
 Each writable range normally has a single active write leader in one region and
 a quorum-replicated log as described by ADR 0006. Followers/materializers can
 serve reads when the requested consistency level proves their snapshot safe.
+
+Each range has an explicit durability policy as versioned topology/catalog
+state. Membership or leader changes must preserve or deliberately transition
+that policy; durability is not an incidental process configuration.
+
+During failover, a router/coordinator may buffer only operations whose retry
+safety is known, under explicit byte/count/time bounds, and must release queued
+work gradually so a replacement leader is not hit by a thundering herd.
+Ambiguous writes are never replayed merely because the client has not yet seen a
+response; safe replay requires request identity/idempotence or a proven
+pre-decision failure.
 
 Closed timestamps / safe read frontiers are valid candidates for follower reads.
 The normal local/regional write should not contact unrelated ranges or a global
@@ -170,6 +195,11 @@ No dual-write protocol is required during the bulk copy. If a future storage
 profile can clone immutable checkpoints more cheaply than logical key copy, the
 same logical cutover protocol can use that physical acceleration.
 
+This copy + zero-gap change-catch-up + epoch cutover primitive should be reused
+where it genuinely matches the semantics: table/range moves, online index builds,
+physical row/layout rewrites, or selected online schema rewrites. Native typed
+committed changes are preferred over replaying SQL text.
+
 Topology epochs prevent a stale router or participant from committing against
 ownership that has moved.
 
@@ -180,8 +210,15 @@ Operations such as split, merge, move, replica change, and leader move are state
 machines with resumable durable intent.
 
 The control plane owns desired placement and orchestration. The data plane owns
-transaction correctness. Losing the control plane must not make already healthy
-ranges unable to serve local traffic.
+transaction correctness. Controllers reconcile **desired topology** with
+observed replica/leader state through idempotent, resumable transitions rather
+than assuming orchestration succeeded. Losing the control plane must not make
+already healthy ranges unable to serve local traffic.
+
+Routers/coordinators cache topology but are not durable data authorities. Cache
+refresh and epoch rejection repair stale routing; durable range ownership,
+transaction decisions, replica membership and catalog state live in replicated
+authoritative state below/beside the coordinator.
 
 A small authoritative metadata range/service may own global database metadata,
 but ordinary query routing should use cached topology rather than synchronously
@@ -234,12 +271,12 @@ Before a global mode is trusted, deterministic tests must explore:
 ## Acceptance gates before distribution ships
 
 - single-range mode remains measurably equivalent to the local fast path;
-- range routing is predicate-aware and plans expose scatter/exchange costs;
+- range routing is predicate/parameter-aware, cached plans re-resolve symbolic routes after topology changes, and plans expose scatter/exchange costs;
 - split/move preserves transactions through snapshot + change catch-up with no
   gap or duplicate committed effect;
 - range epochs reject stale owners/routers;
-- quorum loss, coordinator loss, and participant loss have deterministic
-  recovery outcomes;
+- quorum loss, coordinator loss, participant loss, bounded safe-retry buffering, and control-plane unavailability have deterministic recovery/service outcomes;
+- distributed operators respect explicit coordinator memory/spill/network budgets and apply backpressure rather than allowing remote producers to exhaust a node;
 - object-store bootstrap and local replica catch-up are benchmarked for time,
   bytes, and cost;
 - a TPC-C-style partitionable workload demonstrates that local transactions

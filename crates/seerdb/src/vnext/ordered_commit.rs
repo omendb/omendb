@@ -13,10 +13,10 @@ use super::{
     BTreeError, BTreeObject, BufferError, BufferPool, CommitAppendError, CommitAppender,
     CommitPosition, DurableLogError, FinalEffect, FinalWriteSetError, InstallContext,
     MvccCodecError, MvccRecord, MvccValue, OrderedMvccInstallError, OrderedMvccInstaller,
-    PageDependencyTable, PageMaterialization, PrepareEffectResult, StatusTableError,
-    StorageObjectId, Transaction, TransactionError, TransactionPhase, TransactionStatus,
-    TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId, VisibilityError,
-    VisibilityFrontier, WriteIntentError, WriteIntentTable,
+    PageDependencyTable, PageMaterialization, PrepareEffectResult, RuntimeAdmission,
+    RuntimeAdmissionError, StatusTableError, StorageObjectId, Transaction, TransactionError,
+    TransactionPhase, TransactionStatus, TransactionStatusTable, TxnId, UndoStore, UndoStoreError,
+    VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,7 @@ pub struct OrderedCommitCoordinator<'a> {
     intents: &'a WriteIntentTable,
     undo: &'a UndoStore,
     page_dependencies: Option<&'a PageDependencyTable>,
+    runtime_admission: Option<&'a RuntimeAdmission>,
     fenced: AtomicBool,
 }
 
@@ -55,6 +56,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: None,
+            runtime_admission: None,
             fenced: AtomicBool::new(false),
         }
     }
@@ -84,8 +86,21 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: Some(page_dependencies),
+            runtime_admission: None,
             fenced: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the runtime admission/drain authority used by checkpoint capture.
+    ///
+    /// Commit admission is acquired at the start of `commit` and held through
+    /// page installation and visibility completion. Checkpoint drain therefore
+    /// cannot establish its capture cut while an admitted commit is still able
+    /// to mutate authoritative state.
+    #[must_use]
+    pub fn with_runtime_admission(mut self, runtime_admission: &'a RuntimeAdmission) -> Self {
+        self.runtime_admission = Some(runtime_admission);
+        self
     }
 
     /// Begin one write transaction at the current contiguous visibility
@@ -109,7 +124,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
         }
         self.statuses.abort(transaction.id())?;
         if let Err(error) = transaction.abort() {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Transaction(error));
         }
         Ok(())
@@ -131,6 +146,10 @@ impl<'a> OrderedCommitCoordinator<'a> {
         trees: &[&BTreeObject],
     ) -> Result<CommitPosition, OrderedCommitError> {
         self.ensure_open()?;
+        let _runtime_admission = self
+            .runtime_admission
+            .map(RuntimeAdmission::admit_commit)
+            .transpose()?;
         if transaction.phase() != TransactionPhase::Active {
             return Err(OrderedCommitError::WrongPhase(transaction.phase()));
         }
@@ -160,7 +179,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     if prepare_failure_requires_fence(&error) {
-                        self.fenced.store(true, Ordering::Release);
+                        self.fence_admission();
                     }
                     return Err(OrderedCommitError::Install(error));
                 }
@@ -310,13 +329,13 @@ impl<'a> OrderedCommitCoordinator<'a> {
         transaction: &mut Transaction,
     ) -> Result<(), OrderedCommitError> {
         if let Err(error) = self.statuses.abort(transaction.id()) {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Status(error));
         }
         if transaction.phase() != TransactionPhase::Aborted
             && let Err(error) = transaction.abort()
         {
-            self.fenced.store(true, Ordering::Release);
+            self.fence_admission();
             return Err(OrderedCommitError::Transaction(error));
         }
         Ok(())
@@ -328,19 +347,28 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// waiters are woken with recovery-required semantics instead of blocking on
     /// a frontier that cannot advance until recovery.
     fn fence_after_wal(&self, transaction: &mut Transaction) {
-        self.fenced.store(true, Ordering::Release);
+        self.fence_admission();
         if transaction.phase() != TransactionPhase::RecoveryRequired {
             let _ = transaction.mark_recovery_required();
         }
         self.frontier.require_recovery();
     }
 
+    fn fence_admission(&self) {
+        self.fenced.store(true, Ordering::Release);
+        if let Some(runtime_admission) = self.runtime_admission {
+            runtime_admission.require_recovery();
+        }
+    }
+
     fn ensure_open(&self) -> Result<(), OrderedCommitError> {
         if self.is_fenced() {
-            Err(OrderedCommitError::Fenced)
-        } else {
-            Ok(())
+            return Err(OrderedCommitError::Fenced);
         }
+        if let Some(runtime_admission) = self.runtime_admission {
+            runtime_admission.ensure_read_admission()?;
+        }
+        Ok(())
     }
 }
 
@@ -378,6 +406,8 @@ pub enum OrderedCommitError {
         actual: Option<TransactionStatus>,
     },
     #[error(transparent)]
+    Admission(#[from] RuntimeAdmissionError),
+    #[error(transparent)]
     WriteSet(#[from] FinalWriteSetError),
     #[error(transparent)]
     Intent(#[from] WriteIntentError),
@@ -407,13 +437,13 @@ mod tests {
     use crate::vnext::{
         BTreeLookup, CommitSeq, DependencyCheckedPageIo, DurableLog, LogDevice, LogIoOperation,
         ObjectAuthority, OrderedMvccReader, PageId, PageIo, PageKey, RecordOwner,
-        StorageObjectDescriptor, StoreDirectory,
+        RuntimeAdmissionState, StorageObjectDescriptor, StoreDirectory,
     };
     use durable_fs::SyncClass;
     use std::io;
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{Arc, Condvar, Mutex, RwLock};
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -476,6 +506,76 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingSyncLogDevice {
+        bytes: Mutex<Vec<u8>>,
+        entered: Mutex<bool>,
+        entered_cv: Condvar,
+        release: Mutex<bool>,
+        release_cv: Condvar,
+    }
+
+    impl BlockingSyncLogDevice {
+        fn wait_until_sync(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut entered = self.entered.lock().expect("entered lock");
+            while !*entered {
+                let now = Instant::now();
+                assert!(now < deadline, "commit never reached WAL sync");
+                let (next, timeout) = self
+                    .entered_cv
+                    .wait_timeout(entered, deadline - now)
+                    .expect("entered wait");
+                entered = next;
+                assert!(
+                    !timeout.timed_out() || *entered,
+                    "commit never reached WAL sync"
+                );
+            }
+        }
+
+        fn release_sync(&self) {
+            let mut release = self.release.lock().expect("release lock");
+            *release = true;
+            drop(release);
+            self.release_cv.notify_all();
+        }
+    }
+
+    impl LogDevice for BlockingSyncLogDevice {
+        fn append(&self, bytes: &[u8]) -> io::Result<super::super::Lsn> {
+            let mut log = self
+                .bytes
+                .lock()
+                .map_err(|_| io::Error::other("log poisoned"))?;
+            log.extend_from_slice(bytes);
+            super::super::Lsn::from_wal_position(0, log.len() as u64)
+                .ok_or_else(|| io::Error::other("log LSN overflow"))
+        }
+
+        fn sync_through(&self, _lsn: super::super::Lsn) -> io::Result<()> {
+            let mut entered = self
+                .entered
+                .lock()
+                .map_err(|_| io::Error::other("entered lock poisoned"))?;
+            *entered = true;
+            drop(entered);
+            self.entered_cv.notify_all();
+
+            let mut release = self
+                .release
+                .lock()
+                .map_err(|_| io::Error::other("release lock poisoned"))?;
+            while !*release {
+                release = self
+                    .release_cv
+                    .wait(release)
+                    .map_err(|_| io::Error::other("release wait poisoned"))?;
+            }
+            Ok(())
         }
     }
 
@@ -621,6 +721,134 @@ mod tests {
         assert_eq!(page_dependencies.durable_undo(), Some(VersionId::new(1)));
         assert!(page_dependencies.is_eligible(page).expect("page eligible"));
         buffer.flush_page(page).expect("eligible page flushes");
+    }
+
+    #[test]
+    fn checkpoint_drain_waits_for_real_commit_through_visibility_completion() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(13), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(BlockingSyncLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let admission = RuntimeAdmission::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
+                .with_runtime_admission(&admission);
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(130))
+            .expect("transaction begins");
+        transaction
+            .stage_ordered_put(descriptor(13), b"key".to_vec(), b"value".to_vec())
+            .expect("stages");
+
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                commit_tx
+                    .send(coordinator.commit(&mut transaction, &buffer, &[&tree]))
+                    .expect("send commit result");
+            });
+
+            log_device.wait_until_sync();
+            assert_eq!(admission.active_commits().expect("count"), 1);
+
+            scope.spawn(|| {
+                let result = admission.begin_checkpoint();
+                match result {
+                    Ok(checkpoint) => {
+                        checkpoint_tx.send(Ok(())).expect("send checkpoint result");
+                        drop(checkpoint);
+                    }
+                    Err(error) => {
+                        checkpoint_tx
+                            .send(Err(error))
+                            .expect("send checkpoint error");
+                    }
+                }
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while admission.state().expect("state") != RuntimeAdmissionState::Checkpointing {
+                assert!(
+                    Instant::now() < deadline,
+                    "checkpoint never entered drain state"
+                );
+                std::thread::yield_now();
+            }
+            assert!(
+                matches!(checkpoint_rx.try_recv(), Err(TryRecvError::Empty)),
+                "checkpoint completed while an admitted commit was still blocked in WAL sync"
+            );
+
+            log_device.release_sync();
+            let position = commit_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("commit returns")
+                .expect("commit succeeds");
+            assert_eq!(position.csn, CommitSeq::new(1));
+            checkpoint_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("checkpoint drain completes")
+                .expect("checkpoint succeeds");
+        });
+
+        assert_eq!(frontier.snapshot(), CommitSeq::new(1));
+        assert_eq!(admission.active_commits().expect("count"), 0);
+        assert_eq!(
+            admission.state().expect("state"),
+            RuntimeAdmissionState::Open
+        );
+    }
+
+    #[test]
+    fn checkpoint_drain_refuses_new_commit_before_wal_and_reopens_cleanly() {
+        let page_device = Arc::new(MemoryPageIo::default());
+        let buffer = BufferPool::new(8, 512, page_device).expect("buffer");
+        let tree = BTreeObject::create(descriptor(14), &buffer).expect("tree");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
+        let log_device = Arc::new(MemoryLogDevice::default());
+        let log = Arc::new(DurableLog::new(log_device.clone()));
+        let appender = CommitAppender::new(log, CommitSeq::new(0));
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        let intents = WriteIntentTable::new();
+        let admission = RuntimeAdmission::new();
+        let coordinator =
+            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
+                .with_runtime_admission(&admission);
+
+        let mut transaction = coordinator
+            .begin_write(TxnId::new(140))
+            .expect("transaction begins");
+        transaction
+            .stage_ordered_put(descriptor(14), b"key".to_vec(), b"value".to_vec())
+            .expect("stages");
+
+        let checkpoint = admission.begin_checkpoint().expect("checkpoint starts");
+        assert!(matches!(
+            coordinator.commit(&mut transaction, &buffer, &[&tree]),
+            Err(OrderedCommitError::Admission(
+                RuntimeAdmissionError::CheckpointInProgress
+            ))
+        ));
+        assert_eq!(transaction.phase(), TransactionPhase::Active);
+        assert!(log_device.bytes().is_empty());
+        drop(checkpoint);
+
+        coordinator
+            .commit(&mut transaction, &buffer, &[&tree])
+            .expect("commit proceeds after checkpoint interval");
+        assert_eq!(admission.active_commits().expect("count"), 0);
     }
 
     #[test]

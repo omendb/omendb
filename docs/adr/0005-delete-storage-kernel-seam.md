@@ -1,6 +1,6 @@
 # ADR 0005: Delete the storage-kernel seam; DirectSeerStore becomes the backend
 
-- **Status:** accepted; implemented
+- **Status:** accepted and implemented for the pre-vNext relational integration; target physical boundary revised by ADR 0013
 - **Scope:** OmenDB relational facade, SQL integration, kernel modules
 - **Depends on:** [ADR 0004](0004-group-commit-publication-lane.md)
 
@@ -46,6 +46,14 @@ Delete the seam rather than porting it. The target shape:
 3. Adapt integration tests and examples; delete feature-dead test files —
    **done** (`ea0ffa7`).
 4. Documentation cleanup — **done** (this change).
+
+## Later revision
+
+This ADR removed a redundant OmenDB facade/backend abstraction and remains
+correct about having one transaction path. It does **not** require SeerDB to
+remain a universal ordered-KV physical boundary. [ADR 0013](0013-storage-kernel-and-access-methods.md)
+revises that target: SeerDB becomes the shared transaction/storage kernel and
+ordered KV becomes one access method/facade over it.
 
 ## Consequences
 
