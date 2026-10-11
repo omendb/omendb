@@ -40,10 +40,11 @@ OmenDB has one authoritative transaction outcome, MVCC history, catalog, and
 committed-change order. Analytical representations do not define independent
 transaction truth.
 
-A query that requires the latest committed snapshot can therefore execute
-against row or analytical representations only when the representation proves it
-covers that snapshot. Otherwise the planner falls back to the authoritative row
-path or combines a stable analytical base with newer transactional deltas.
+A query can execute against row or analytical representations only when they
+resolve the same requested snapshot. Completeness through a newer frontier does
+not prove historical readability. Otherwise the planner falls back to the
+authoritative row path or combines a stable analytical base with complete
+transactional deltas.
 
 ### 2. In-engine analytics is a first-class execution mode
 
@@ -109,14 +110,22 @@ footprint, recovery complexity, and operational behavior.
 
 ### 5. Analytical freshness is explicit
 
-Every analytical representation carries a covered logical frontier (CSN and,
-where needed, schema/catalog version). The planner may use it when:
+Analytical representations follow the common derived-object publication and
+snapshot-validity contract in
+[ADR 0013](0013-storage-kernel-and-access-methods.md#3-storage-objects-have-explicit-authority-classes).
+An applied CSN frontier is a completeness marker, not a promise that overwritten
+historical values remain available.
 
-- the query snapshot is at or below the frontier; or
-- a delta-merge path can apply committed changes from the frontier to the query
-  snapshot within a configured cost bound.
+The planner may use a representation when its retained view resolves the exact
+query snapshot, or when a complete transaction-aware delta path bridges an older
+base to that snapshot within a configured cost bound. Source incarnation,
+object/schema dependencies and reader retention must also match. All inputs to a
+join/aggregate use the same requested snapshot; taking the minimum of unrelated
+latest-only frontiers does not reconstruct a common view.
 
-No query silently reads stale analytical state because it happens to be faster.
+No query silently reads stale or future analytical state because it is faster.
+If a requested snapshot is no longer retained, use an authoritative fallback or
+report the unsupported snapshot rather than reinterpret the request.
 
 ### 6. Automatic workload adaptation is a policy, not a correctness mechanism
 
@@ -158,14 +167,22 @@ A future `omen-olap` or remote analytical worker pool can bootstrap from:
 snapshot CSN X + restart LSN Y
 ```
 
-and apply committed changes after Y. It therefore shares transaction truth with
-in-engine analytical projections rather than introducing a second replication
-contract.
+and apply committed changes after Y, using the retained handoff in
+[ADR 0013](0013-storage-kernel-and-access-methods.md#10-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers).
+Such a worker is a projection/execution role over OmenDB transaction truth, not
+an independently writable namespace authority.
 
 The optimizer may choose local HTAP execution or remote analytical execution
-based on size, freshness, locality, queue pressure and cost. Deployments that
-need strict OLTP isolation can keep heavy analytics off the primary server;
-smaller deployments do not have to operate another database.
+based on size, snapshot support, locality, queue pressure and cost. Remote
+progress is explicit: a query may wait for its requested snapshot, fall back, or
+use a separately declared stale-read mode. Source commit success does not imply
+remote projection completion.
+
+This does not settle the standalone OmenDB OLAP product's future. A CDC-fed
+independent analytical database is a different deployment/consistency contract,
+not automatically this remote-worker role. Deployments needing strict OLTP
+isolation may keep heavy analytics off the primary; smaller deployments do not
+have to operate another database.
 
 ### 9. Indexing and analytics cooperate instead of duplicating everything
 

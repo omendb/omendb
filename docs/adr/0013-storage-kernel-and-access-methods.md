@@ -95,9 +95,40 @@ A storage object declares whether it is **authoritative** or **derived**.
 
 **Authoritative objects** participate in the transaction's durable recovery record before acknowledgement. Examples include canonical row families, primary indexes required to locate rows, unique/constraint indexes, catalog objects and other state whose loss would change committed SQL semantics.
 
-**Derived objects** name the CSN/catalog frontier they cover and may lag, rebuild or catch up from the committed-change stream. Examples may include ANN graphs, some BM25 acceleration structures, columnar analytical chunks, graph adjacency projections, zone maps and optional materialized search structures.
+**Derived objects** may lag, rebuild or catch up from the committed-change stream. Examples may include ANN graphs, some BM25 acceleration structures, columnar analytical chunks, graph adjacency projections, zone maps and optional materialized search structures.
 
-A feature is not automatically derived merely because rebuilding is possible. If current-snapshot SQL semantics or a declared constraint requires the structure synchronously, the planner/storage design must either make it authoritative or provide an exact delta/fallback path that preserves semantics.
+Their publication descriptor must establish:
+
+- source store incarnation and storage-object/schema dependencies;
+- one immutable or otherwise reader-stable representation generation;
+- the contiguous applied CSN frontier, not merely the largest observed CSN;
+- which snapshots remain readable after overwrite or compaction;
+- any complete delta interval needed to reach the query snapshot.
+
+An applied frontier `F` alone does not permit reads at every `X <= F`. A
+latest-only representation supports its exact published snapshot, not arbitrary
+older snapshots. A versioned representation may declare a retained interval
+`[oldest_readable, F]` only if it can resolve each snapshot in that interval
+without exposing later changes. A base at `B` may serve a later `X` only with
+complete transaction-aware deltas `(B, X]`, including updates and deletes.
+Otherwise use authoritative data or an explicitly requested stale-read contract.
+
+Capture the representation descriptor and required delta/history leases as one
+reader-stable view. Validate source identity and schema compatibility before
+use. Compaction/rebuild/GC may not invalidate that captured view. Canonical
+snapshot validation must still enforce row identity, deletions and authorization;
+ANN approximation is a ranking contract, not permission to weaken those checks.
+
+A feature is not automatically derived merely because rebuilding is possible.
+If current-snapshot SQL semantics or a declared constraint requires the structure
+synchronously, make it authoritative or provide an exact delta/fallback path.
+The qualification oracle must exercise update/delete, old snapshots, lag,
+compaction, rebuild replacement and incompatible schema—not just insert-only
+latest-snapshot reads.
+
+Materialize's [read/write frontier distinction](https://materialize.com/docs/sql/explain-timestamp/)
+is independent evidence for separating retained readability from completeness;
+its timestamp representation is not an OmenDB implementation requirement.
 
 ### 4. Access methods share transaction and page primitives
 
@@ -164,6 +195,49 @@ The chosen default may vary by deployment profile, but page formats should not b
 The Apache-2.0 crate may remain independently publishable if useful, but package independence is not allowed to impose an artificial optimization boundary. Internal APIs may change freely during the alpha rewrite.
 
 If a clean separation later emerges, the generic ordered-KV facade can remain a public SeerDB product over the shared kernel. If not, `seerdb` simply remains OmenDB's reusable storage-kernel crate. The database architecture, not branding or historical package structure, decides the boundary.
+
+### 10. Snapshot/bootstrap is a retained handoff, not just two numbers
+
+The target `snapshot CSN X + restart LSN Y` contract includes source incarnation,
+a live retained snapshot, the corresponding committed-change suffix and its
+retention ownership. Register the pins under the same authority that establishes
+the cut; copying data and acquiring a lease later can race reclamation.
+
+The current ordered-KV `TransactionDatabase::snapshot_export` returns a durable
+position only. It does not implement this complete bootstrap handoff. No external
+consumer may infer a pinned snapshot or gap-free stream from that return value.
+
+Keep separate:
+
+- the snapshot's logical CSN;
+- the consumer cursor after the exported cut;
+- the physical WAL/undo/catalog recovery floors required to reproduce changes;
+- the consumer's last durably applied transaction.
+
+A physical recovery floor may precede the consumer cursor. Names and APIs must
+not imply that one LSN grants all four properties. The eventual logical change
+format carries transaction boundaries, stable effect identity and enough
+historical values/schema information for its declared consumer contract; it does
+not expose physical page redo as the public CDC API.
+
+A consumer applies complete source transactions idempotently and commits its
+progress with the resulting destination effects before acknowledging retention
+advancement. Chunking a large transaction must not publish a partial source
+transaction as fully covered. Replayed delivery is permitted; duplicate effects
+are not. If the destination cannot provide that atomic unit, expose the weaker
+integration contract explicitly instead of calling it shared SQL atomicity.
+
+Pins need observable byte/age pressure and explicit release, advancement and
+invalidation semantics. Lost history or a mismatched source incarnation requires
+an explicit rebootstrap/error, never silent continuation. Exact API and retention
+policy remain implementation choices; they must be qualified before backup,
+CDC or remote projection uses this handoff.
+
+Primary reference: PostgreSQL 18 documents
+[exported snapshots, crash replay and slot retention](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html),
+and distinguishes [physical restart retention from consumer progress](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
+These support the boundary semantics, not a requirement to copy PostgreSQL's
+slot implementation. References checked 2026-10-11.
 
 ## Migration plan
 

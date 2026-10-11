@@ -254,8 +254,8 @@ because the B-tree is the first access method.
 implemented; checkpoint authority and broader progress/fault qualification
 remain.**
 
-The live write path below includes the required completion fix explicitly marked
-as not yet implemented:
+The live write path includes the implemented contiguous-visibility completion
+fix; broader runtime admission/drain authority remains incomplete:
 
 ```text
 private staged writes

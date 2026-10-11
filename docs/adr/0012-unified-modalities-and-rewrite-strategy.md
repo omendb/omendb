@@ -1,6 +1,6 @@
 # ADR 0012: Unified modalities and rewrite strategy
 
-- **Status:** accepted target architecture; implementation staged
+- **Status:** accepted DBNext integration architecture; implementation staged; standalone-product consolidation left open on 2026-10-11
 - **Scope:** vector, text search, graph, document, time-series, KV boundaries, and how the current implementation is replaced
 - **Depends on:** ADR 0006 through ADR 0011
 
@@ -13,9 +13,11 @@ At the same time, separate OmenDB OLAP and vector repositories explored useful
 specialized engines with their own WALs, manifests, segment stores, and query
 runtimes.
 
-Keeping those as independent databases would recreate exactly the state
-synchronization problem OmenDB can avoid: one application fact would acquire
-separate relational, vector, text, graph, and analytical authorities.
+Using independent database authorities *inside a DBNext SQL transaction* would
+recreate the state synchronization problem OmenDB can avoid. DBNext therefore
+integrates modalities over its own transaction authority. This does not rule out
+independent products with independent datasets or explicit asynchronous
+projection contracts.
 
 Modern systems demonstrate two useful facts at once:
 
@@ -38,9 +40,11 @@ ordering. A vector index, inverted text index, graph adjacency projection,
 columnar chunk, materialized view, bitmap, zone map, or other accelerator may
 never define a contradictory transaction history.
 
-Derived state records the CSN/catalog frontier it covers. The optimizer may use
-it only when it covers the query snapshot or when a proven delta path can close
-the gap. Otherwise execution falls back to a canonical exact path.
+Derived state follows
+[ADR 0013's snapshot-validity contract](0013-storage-kernel-and-access-methods.md#3-storage-objects-have-explicit-authority-classes).
+A complete applied frontier alone is insufficient for an older snapshot after
+values have been overwritten. Use a retained exact view or a complete delta
+path; otherwise fall back to a canonical exact path.
 
 ### 2. Vector search is a type plus access methods, not a sibling database
 
@@ -156,42 +160,53 @@ green, but it is not a permanent engine matrix. Once the replacement satisfies
 semantic, fault, and performance gates, it becomes `seerdb` and the legacy path
 is deleted.
 
+### Standalone-product decision remains open
+
+The 2026-10-11 review leaves consolidation versus independent Vector/OLAP
+products unresolved. This supersedes the earlier assumption of sibling archival;
+no repository retirement, wholesale merge or cross-product release commitment
+follows from this ADR. Keep the currently implemented product boundaries explicit
+while evaluating them.
+
+Two coherent outcomes remain:
+
+- **Integrated DBNext modalities:** use OmenDB canonical rows, catalog and
+  transaction/log authority. Reuse useful algorithms and evidence, not a sibling
+  database's independent commit protocol.
+- **Independent products:** each owns its durable mutations and lifecycle.
+  External projections need source identity, a retained bootstrap/change
+  contract, durable consumer progress and explicit freshness. Independent writes
+  are not part of a shared DBNext SQL transaction.
+
+Compare these outcomes using actual workload needs, operational cost, useful
+specialist performance and maintenance capacity. Shared branding, Rust or
+filesystem helpers do not settle the product choice.
+
 ### OmenDB OLAP repository
 
-`omendb-olap` is not merged wholesale. Its independent WAL, SQLite manifest,
-namespace transaction authority, and LSM/Parquet database lifecycle conflict
-with ADR 0011's one-authority HTAP direction.
+The current standalone core uses a namespace WAL, metadata-log publication,
+Arrow tails and immutable Parquet segments. It is not the former SQLite-manifest
+implementation, and it is not automatically a DBNext remote analytical worker.
 
-Before archival, salvage:
-
-- Arrow/Parquet interoperability tests;
-- streaming/spill/resource-budget lessons;
-- immutable segment/manifest and compaction fault tests that generalize to
-  derived analytical representations;
-- benchmark datasets and CH/analytical harness ideas.
-
-Fresh HTAP implementation lives in the OmenDB monorepo. It may become an
-internal crate (for example an analytical representation/executor crate) if that
-creates a real compile-time ownership boundary, but it shares the OmenDB catalog,
-transaction log, snapshot frontier, runtime, and optimizer.
+Useful inputs to integrated HTAP include Arrow/Parquet interoperability,
+streaming/spill/resource-budget lessons, segment/compaction fault cases and
+mixed-workload harnesses. If reused, the integrated implementation lives in the
+OmenDB workspace and shares its catalog, transaction log, snapshot validity,
+runtime and optimizer. Independently writable OLAP retains its own authority
+unless a separate product decision changes that contract.
 
 ### OmenDB Vector repository
 
-`omendb-vector` is also not merged as a second database. Its independent WAL,
-record store, segment manifest, and transaction model are replaced by OmenDB's
-canonical rows/log.
+The standalone retrieval engine currently owns its record store, WAL and segment
+publication. That authority cannot be imported as a second commit protocol inside
+DBNext.
 
-Salvage and port only components that remain useful as algorithms/evidence:
-
-- exact-search oracle and recall harnesses;
-- HNSW/quantization implementations if they remain competitive after review;
-- filtered-search routing and selectivity tests;
-- BM25/filter/hybrid-ranking test corpus;
-- ANN datasets, OOD tests, recall/latency benchmark methodology;
-- segment-native ANN research where it fits the new derived-index model.
-
-The resulting vector/text implementation becomes OmenDB access methods and
-planner operators over transactional tables.
+Useful inputs include exact-search/recall oracles, competitive HNSW/quantization
+kernels, filtered-search/selectivity cases, BM25/hybrid-ranking corpora, OOD and
+recall/latency methodology, and segment-native ANN research. Integrated
+vector/text implementations become OmenDB access methods and planner operators
+over transactional tables. The independent retrieval product's future remains
+open rather than implicitly replaced by that integration.
 
 ## Crate boundaries
 
@@ -200,7 +215,7 @@ unsafe/performance kernels justify it. A likely long-term shape is:
 
 ```text
 omendb                 SQL/catalog/planner/server/product API
-seerdb                  transaction/MVCC/log/ordered storage
+seerdb                  transaction/MVCC/log/buffer/lifetime kernel
 omendb-exec (optional)  typed scalar + batch execution runtime
 omendb-search (optional) vector + inverted-index access methods/kernels
 omendb-analytic (optional) derived columnar representations/maintenance
