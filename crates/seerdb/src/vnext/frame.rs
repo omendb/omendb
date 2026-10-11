@@ -164,9 +164,9 @@ impl FrameMeta {
 
     /// Publish initialized bytes as resident while retaining an installer pin.
     ///
-    /// Translation publication happens after this transition. The installer pin
-    /// prevents eviction until the caller either returns the guard or discards a
-    /// duplicate load.
+    /// Translation may already identify this Loading frame. The transition
+    /// makes initialized bytes readable; the installer pin prevents eviction
+    /// before the caller returns its guard.
     pub fn finish_load_pinned(&self) -> Result<FramePin<'_>, FrameTransitionError> {
         let incarnation = self
             .incarnation()
@@ -186,6 +186,13 @@ impl FrameMeta {
             meta: self,
             incarnation,
         })
+    }
+
+    /// Publish a newly created image as dirty before any reader can pin it.
+    /// The buffer's loading owner alone may invoke this transition.
+    pub(crate) fn finish_new_page_pinned(&self) -> Result<FramePin<'_>, FrameTransitionError> {
+        self.dirty.store(true, Ordering::Release);
+        self.finish_load_pinned()
     }
 
     /// Abandon a failed load and make the frame reusable.
@@ -267,18 +274,6 @@ impl FrameMeta {
             return Err(FrameTransitionError::Dirty);
         }
         self.begin_exclusive_state(FrameState::Evicting)
-    }
-
-    /// Discard an initialized frame that was never published in translation.
-    ///
-    /// Unlike normal eviction this may drop a dirty image. The operation is
-    /// crate-private because it is only valid while the caller still owns the
-    /// unpublished installation path; using it for an authoritative resident
-    /// page would violate the buffer durability invariant.
-    pub(crate) fn try_begin_unpublished_discard(&self) -> Result<(), FrameTransitionError> {
-        self.begin_exclusive_state(FrameState::Evicting)?;
-        self.dirty.store(false, Ordering::Release);
-        Ok(())
     }
 
     /// Cancel eviction before the frame identity has been cleared.
@@ -511,20 +506,6 @@ mod tests {
         assert!(frame.try_pin().is_none());
         frame.abort_evict().expect("eviction can be cancelled");
         assert_eq!(frame.state(), FrameState::Resident);
-    }
-
-    #[test]
-    fn unpublished_dirty_frame_can_be_discarded_explicitly() {
-        let frame = FrameMeta::new_free();
-        frame.begin_load().expect("load reserves");
-        let pin = frame.finish_load_pinned().expect("load publishes pinned");
-        drop(pin.try_write().expect("initialization marks dirty"));
-        drop(pin);
-        frame
-            .try_begin_unpublished_discard()
-            .expect("unpublished frame can be discarded");
-        assert!(!frame.is_dirty());
-        frame.finish_evict().expect("discard frees frame");
     }
 
     #[test]

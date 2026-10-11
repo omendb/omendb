@@ -40,18 +40,21 @@ state, and a buffer victim could be stolen between `Evicting -> Free` and a
 second `Free -> Loading` transition. Those defects are fixed in the current
 vNext branch.
 
-The 2026-10-11 audit reopened two other foundation contracts: a delayed duplicate
-buffer load can publish obsolete bytes after a competing update is acknowledged
-and evicted, and empty-leaf admission can accept a decision whose split/fence
-representation fails during installation and replay. Caught unwinding also
-currently releases commit/drain membership without establishing recovery-required
-state. The plan owns those repairs; the invariants below are requirements, not
-claims that those implementation paths are qualified.
+The 2026-10-11 audit reopened two other foundation contracts. Delayed duplicate
+loading has since been replaced by pre-I/O Loading ownership and exact-frame
+completion/cleanup, preventing obsolete publication after ACK and eviction.
+Empty-leaf admission still accepts decisions whose split/fence representation
+fails during installation and replay. Caught commit unwinding also still releases
+drain membership without establishing recovery-required state. The plan owns
+those remaining repairs; the invariants below are not claims of their qualification.
 
 ## Current implementation boundary
 
 Implemented and integrated:
 
+- single-flight page loading through exact Loading `FrameRef` ownership before
+  device reads, frame-local completion waits and conditional failure/unwind
+  cleanup; newly created images become dirty before pinned residency publication;
 - atomic B-tree `upsert` separate from duplicate-rejecting `insert`, including
   replacement growth that can split and unchanged-on-oversize behavior;
 - repeated raw logical put/delete replay under split-heavy tiny-buffer eviction;

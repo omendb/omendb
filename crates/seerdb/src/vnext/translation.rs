@@ -1,4 +1,4 @@
-//! Concurrent logical-page to resident-frame translation baseline.
+//! Concurrent logical-page to loading/resident-frame translation baseline.
 //!
 //! The implementation is intentionally replaceable. It establishes a measured,
 //! correct baseline before predictive translation, swizzling, object-local
@@ -17,12 +17,12 @@ const DEFAULT_SHARDS: usize = 64;
 #[error("page translation shard is poisoned")]
 pub struct TranslationError;
 
-/// Result of publishing a fully initialized resident page.
+/// Result of claiming a logical page for one exact frame incarnation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PublishResult {
-    /// This frame became the authoritative resident translation.
+    /// This frame became the authoritative translation, possibly still Loading.
     Published,
-    /// Another concurrent loader published first.
+    /// Another loading or resident frame already owns this logical page.
     Existing(FrameRef),
 }
 
@@ -56,19 +56,20 @@ impl TranslationTable {
         }
     }
 
-    /// Look up a resident frame reference.
+    /// Look up a claimed frame reference. The buffer validates its incarnation
+    /// and lifecycle before returning bytes; Loading frames must be joined.
     pub fn get(&self, key: PageKey) -> Result<Option<FrameRef>, TranslationError> {
         let shard = self.shard(key);
         let guard = self.shards[shard].read().map_err(|_| TranslationError)?;
         Ok(guard.get(&key).copied())
     }
 
-    /// Publish a translation only if no loader has already won for this page.
+    /// Claim a translation only if no frame already owns this logical page.
     ///
-    /// Buffer loading happens before this call. Refusing to overwrite an
-    /// existing mapping gives duplicate concurrent misses a single winner and a
-    /// deterministic loser-cleanup path instead of silently orphaning a live
-    /// resident frame.
+    /// Buffer loading claims its Loading frame before I/O. A losing contender
+    /// has not read bytes and releases its reserved frame, then joins the winner.
+    /// This ownership persists through initialization, residency and writeback;
+    /// it is removed only on load failure or exact-incarnation eviction.
     pub fn publish_if_absent(
         &self,
         key: PageKey,
@@ -98,7 +99,7 @@ impl TranslationTable {
         }
     }
 
-    /// Number of published translations, for diagnostics and tests.
+    /// Number of claimed translations (Loading or resident), for diagnostics.
     pub fn len(&self) -> Result<usize, TranslationError> {
         self.shards.iter().try_fold(0usize, |total, shard| {
             let guard = shard.read().map_err(|_| TranslationError)?;

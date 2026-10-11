@@ -195,8 +195,10 @@ Residency correctness precedes choosing a faster translation strategy. Loading
 ownership must serialize publication for a `PageKey` across I/O, mutation,
 writeback and eviction; checking only for a currently resident winner permits
 a delayed obsolete image to reappear. Exact frame incarnation protects frame
-reuse but does not by itself establish logical page-load freshness. The current
-optimistic duplicate-load implementation has this gap; the plan owns its repair.
+reuse but does not by itself establish logical page-load freshness. The baseline
+now claims an exact Loading frame before device reads and wakes contenders on
+completion or cleanup. Independent read-then-publish duplicate loading is removed;
+the plan owns further residency and persistence qualification.
 
 Translation/residency experiments must measure more than hit rate: LLC misses,
 TLB/page walks, memory bandwidth and NUMA movement can dominate very large DRAM

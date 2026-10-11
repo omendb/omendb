@@ -39,14 +39,15 @@ completion and frontier wakeup tests cover both outcomes. Runtime-wide admission
 and drain authority for reads, snapshots, checkpoint cuts and already-admitted
 writers remains open below.
 
-The 2026-10-11 source audit at `fc98820` reopened two foundation gates:
-`buffer.rs::load_miss` can publish a stale read after a competing load has been
-modified and evicted, and empty-leaf record preflight can accept a durable
-transaction that later fails split/fence representation during both installation
-and replay. Repair and qualify those paths before stacking checkpoint capture.
-The same audit found that caught commit unwinding can release drain membership
-without fencing, and placement-map duplicate checks are quadratic. These are
-current implementation gaps, not evidence that checkpoint authority exists.
+The 2026-10-11 source audit at `fc98820` reopened two foundation gates. Buffer
+load freshness is now repaired with pre-I/O Loading ownership and exact-frame
+completion: the real-coordinator ACK/writeback/eviction regression fails the old
+implementation and passes the replacement. Empty-leaf record preflight still
+accepts durable decisions that cannot be represented during split installation
+or replay; repair that path before stacking checkpoint capture. Caught commit
+unwinding can still release drain membership without fencing, and placement-map
+duplicate checks remain quadratic. None of these components establishes
+checkpoint authority.
 
 Keep the full CI matrix green before stacking persistence changes. The
 architecture remains a correctness baseline,
@@ -63,9 +64,11 @@ algorithm replacements.
 - concurrent frame lifecycle, exact-incarnation pins, frame-local guards and
   sharded `PageKey -> FrameRef` translation without a global buffer mutex on
   cache hits;
-- CLOCK/second-chance eviction baseline, resident duplicate-load detection,
-  direct dirty-page creation and writeback/install race handling; stale publication
-  after a competing load's mutation/eviction remains an open correctness defect;
+- CLOCK/second-chance eviction baseline, pre-I/O single-flight loading,
+  exact-incarnation completion waits and load-error/unwind cleanup;
+- direct new-page creation that publishes dirty residency atomically with its
+  installer pin, plus writeback/install race handling; obsolete read-then-publish
+  duplicate loading and unpublished dirty-frame discard have been removed;
 - native variable-size slotted B-link pages with cached key heads, high fences,
   right siblings, lazy compaction, byte-balanced leaf/internal splits, root
   replacement, point lookup, forward range traversal and key-restart cursors;
@@ -217,11 +220,17 @@ synchronization simply because a lower-level primitive looks faster in isolation
 
 ## Milestone B — concurrent buffer manager
 
-**Status: synchronous dependency-aware materialization implemented; load-publication
-correctness reopened.**
+**Status: synchronous dependency-aware materialization and single-flight loading
+implemented and tested; complete checkpoint capture pending.**
 
 The buffer provides sharded translation, CLOCK victim selection, dirty
-writeback, direct new-page installation and transient writeback waits.
+writeback, direct new-page installation and transient writeback waits. Loading
+claims an exact Loading `FrameRef` before device reads; contenders join its
+frame-local completion without holding translation locks across I/O. Failure or
+unwinding removes only that claim, releases the reserved frame and wakes joiners.
+The tests cover acknowledged-version resurrection, one-frame concurrent misses,
+and retry after read failure/unwind; the former duplicate-read and dirty-discard
+tests were replaced by these lifecycle contracts.
 `PageDependencyTable` retains conservative WAL/undo requirements across
 residency changes within one process. `DependencyCheckedPageIo` blocks a physical
 write until both frontiers cover the recorded requirement.
@@ -233,11 +242,6 @@ frontiers from successful WAL/undo barriers.
 
 Remaining buffer/materialization work:
 
-- single-flight loading per `PageKey`: reserve authoritative loading ownership
-  before reading bytes; contenders join that load, and failure/cancellation
-  retires only its exact token. Do not hold translation-shard locks across I/O.
-  Qualify a delayed load against competing mutation, durable writeback, eviction
-  and a new post-ACK snapshot—not only two simultaneous resident winners;
 - checkpoint *capture* over the now-implemented page image/map components:
   runtime drain, structural closure, roots/object metadata, allocation high-water
   marks and owner outcomes;
@@ -648,11 +652,10 @@ evidence changes priorities.
 
 ## Immediate sequence
 
-1. Repair single-flight page loading and split-aware record admission before
-   checkpoint capture. Reproduce the acknowledged-value resurrection and the
-   accepted-but-unreplayable durable decision, then qualify their repairs through
-   the real coordinator and replay path. Preserve the visibility-completion fix
-   and keep stable/MSRV/all-features and Clippy gates green.
+1. Repair split-aware record admission before checkpoint capture. Reproduce the
+   accepted-but-unreplayable durable decision, then qualify its repair through
+   the real coordinator and replay path. Preserve single-flight load freshness
+   and visibility completion; keep stable/MSRV/all-features and Clippy gates green.
 2. Extend the now-implemented `RuntimeAdmission` beyond ordered commits to the
    real read/snapshot/server surfaces and remaining structural/GC/allocation
    mutators. Bind them under one runtime owner, define unresolved-attempt/unwind

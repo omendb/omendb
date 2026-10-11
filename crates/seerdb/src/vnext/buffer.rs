@@ -2,9 +2,10 @@
 //!
 //! The hot cache-hit path uses a sharded translation lookup, atomic frame pin,
 //! and frame-local byte latch. There is no database-wide or buffer-wide mutex.
-//! Misses reserve a frame before I/O; translation is published only after the
-//! bytes and logical identity are initialized and the frame is resident with an
-//! installer pin.
+//! Misses claim a logical page with an exact Loading frame before I/O. Other
+//! misses join that load rather than reading independently. Residency is
+//! published only after bytes and identity are initialized, with an installer
+//! pin; load failure or unwinding retires the claim and wakes its waiters.
 //!
 //! This is deliberately a correctness/measurement baseline. Page translation,
 //! eviction policy, byte latching, wait policy, and I/O remain replaceable
@@ -18,7 +19,7 @@ use super::translation::{PublishResult, TranslationError, TranslationTable};
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Logical-page I/O seam below the buffer pool.
 ///
@@ -47,8 +48,8 @@ pub enum BufferError {
     InvalidPageSize,
     #[error("page image has {actual} bytes; buffer page size is {expected}")]
     PageSizeMismatch { expected: usize, actual: usize },
-    #[error("logical page {0:?} is already resident")]
-    PageAlreadyResident(PageKey),
+    #[error("logical page {0:?} is already loading or resident")]
+    PageAlreadyClaimed(PageKey),
     #[error("buffer frame {0:?} is outside this pool")]
     FrameOutOfRange(FrameId),
     #[error("no evictable buffer frame is currently available")]
@@ -89,7 +90,7 @@ pub struct BufferStats {
     pub loads: u64,
     pub load_failures: u64,
     pub new_pages: u64,
-    pub duplicate_loads: u64,
+    pub load_waits: u64,
     pub pins: u64,
     pub latch_retries: u64,
     pub eviction_attempts: u64,
@@ -118,7 +119,7 @@ struct BufferMetrics {
     loads: AtomicU64,
     load_failures: AtomicU64,
     new_pages: AtomicU64,
-    duplicate_loads: AtomicU64,
+    load_waits: AtomicU64,
     pins: AtomicU64,
     latch_retries: AtomicU64,
     eviction_attempts: AtomicU64,
@@ -137,6 +138,7 @@ struct FrameSlot {
     page: RwLock<Option<PageKey>>,
     bytes: RwLock<Box<[u8]>>,
     referenced: AtomicBool,
+    load_completion: (Mutex<()>, Condvar),
 }
 
 impl FrameSlot {
@@ -147,6 +149,7 @@ impl FrameSlot {
             page: RwLock::new(None),
             bytes: RwLock::new(vec![0u8; page_size].into_boxed_slice()),
             referenced: AtomicBool::new(false),
+            load_completion: (Mutex::new(()), Condvar::new()),
         }
     }
 }
@@ -154,6 +157,7 @@ impl FrameSlot {
 enum PinAttempt<'a> {
     Pinned(FramePin<'a>),
     Busy,
+    Loading,
     Stale,
 }
 
@@ -229,6 +233,11 @@ impl BufferPool {
                         std::thread::yield_now();
                         continue;
                     }
+                    PinAttempt::Loading => {
+                        self.metrics.load_waits.fetch_add(1, Ordering::Relaxed);
+                        self.wait_for_load(reference)?;
+                        continue;
+                    }
                     PinAttempt::Stale => {
                         self.metrics
                             .stale_translations
@@ -259,11 +268,10 @@ impl BufferPool {
 
     /// Install a newly allocated logical page directly into the buffer.
     ///
-    /// The image is marked dirty before translation publication. If a duplicate
-    /// publisher wins, the losing unpublished dirty frame is discarded through
-    /// an explicit lifecycle transition that cannot be used for normal pages.
-    /// Logical page ID allocation remains an access-method/object-metadata
-    /// concern.
+    /// Claim Loading ownership before initializing the image, and mark it dirty
+    /// before making the frame resident. A concurrent load or creator already
+    /// owning the same page causes refusal without reading or discarding a live
+    /// image. Logical allocation remains an access-method/object-metadata concern.
     pub(crate) fn create_page(
         &self,
         key: PageKey,
@@ -279,54 +287,16 @@ impl BufferPool {
             .translation_lookups
             .fetch_add(1, Ordering::Relaxed);
         if self.translation.get(key)?.is_some() {
-            return Err(BufferError::PageAlreadyResident(key));
+            return Err(BufferError::PageAlreadyClaimed(key));
         }
 
-        let (slot, incarnation) = self.reserve_for_load()?;
-        if let Err(error) = self.initialize_slot(slot, key, Some(image)) {
-            self.abort_loading(slot);
-            return Err(error);
-        }
-        let pin = match slot.meta.finish_load_pinned() {
-            Ok(pin) => pin,
-            Err(source) => {
-                self.abort_loading(slot);
-                return Err(self.frame_transition(slot.id, source));
-            }
-        };
-        let reference = FrameRef::new(slot.id, incarnation);
-
-        let dirty_error = {
-            match pin.try_write() {
-                Ok(latch) => {
-                    drop(latch);
-                    None
-                }
-                Err(source) => Some(source),
-            }
-        };
-        if let Some(source) = dirty_error {
-            drop(pin);
-            let _ = self.discard_unpublished(slot);
-            return Err(self.frame_transition(slot.id, source));
-        }
-
-        match self.translation.publish_if_absent(key, reference) {
-            Ok(PublishResult::Published) => {
-                self.metrics.new_pages.fetch_add(1, Ordering::Relaxed);
-                Ok(self.guard_from_pin(key, reference, pin))
-            }
-            Ok(PublishResult::Existing(_)) => {
-                drop(pin);
-                self.discard_unpublished(slot)?;
-                Err(BufferError::PageAlreadyResident(key))
-            }
-            Err(error) => {
-                drop(pin);
-                let _ = self.discard_unpublished(slot);
-                Err(BufferError::Translation(error))
-            }
-        }
+        let loading = self
+            .reserve_page(key)?
+            .ok_or(BufferError::PageAlreadyClaimed(key))?;
+        self.initialize_slot(loading.slot, key, image)?;
+        let guard = loading.finish(true)?;
+        self.metrics.new_pages.fetch_add(1, Ordering::Relaxed);
+        Ok(guard)
     }
 
     /// Materialize one dirty page if it is resident and currently unpinned.
@@ -361,7 +331,7 @@ impl BufferPool {
             loads: self.metrics.loads.load(Ordering::Relaxed),
             load_failures: self.metrics.load_failures.load(Ordering::Relaxed),
             new_pages: self.metrics.new_pages.load(Ordering::Relaxed),
-            duplicate_loads: self.metrics.duplicate_loads.load(Ordering::Relaxed),
+            load_waits: self.metrics.load_waits.load(Ordering::Relaxed),
             pins: self.metrics.pins.load(Ordering::Relaxed),
             latch_retries: self.metrics.latch_retries.load(Ordering::Relaxed),
             eviction_attempts: self.metrics.eviction_attempts.load(Ordering::Relaxed),
@@ -395,21 +365,19 @@ impl BufferPool {
     }
 
     fn load_miss(&self, key: PageKey) -> Result<Option<PageGuard<'_>>, BufferError> {
-        let (slot, incarnation) = self.reserve_for_load()?;
-
-        let read_result = match slot.bytes.write() {
-            Ok(mut bytes) => self.io.read_page(key, &mut bytes),
-            Err(_) => {
-                self.abort_loading(slot);
-                return Err(BufferError::Poisoned {
-                    frame: slot.id,
-                    component: "bytes",
-                });
-            }
+        let Some(loading) = self.reserve_page(key)? else {
+            return Ok(None);
+        };
+        let slot = loading.slot;
+        let read_result = {
+            let mut bytes = slot.bytes.write().map_err(|_| BufferError::Poisoned {
+                frame: slot.id,
+                component: "bytes",
+            })?;
+            self.io.read_page(key, &mut bytes)
         };
         if let Err(source) = read_result {
             self.metrics.load_failures.fetch_add(1, Ordering::Relaxed);
-            self.abort_loading(slot);
             return Err(BufferError::Io {
                 key,
                 operation: PageIoOperation::Read,
@@ -421,42 +389,65 @@ impl BufferPool {
             .bytes_read
             .fetch_add(self.page_size as u64, Ordering::Relaxed);
 
-        if let Err(error) = self.set_page_identity(slot, key) {
-            self.abort_loading(slot);
-            return Err(error);
-        }
-        let pin = match slot.meta.finish_load_pinned() {
-            Ok(pin) => pin,
-            Err(source) => {
-                self.abort_loading(slot);
-                return Err(self.frame_transition(slot.id, source));
-            }
-        };
-        let reference = FrameRef::new(slot.id, incarnation);
+        self.set_page_identity(slot, key)?;
+        Ok(Some(loading.finish(false)?))
+    }
 
-        match self.translation.publish_if_absent(key, reference) {
-            Ok(PublishResult::Published) => Ok(Some(self.guard_from_pin(key, reference, pin))),
-            Ok(PublishResult::Existing(_)) => {
-                self.metrics.duplicate_loads.fetch_add(1, Ordering::Relaxed);
-                drop(pin);
-                self.discard_unpublished(slot)?;
-                Ok(None)
-            }
-            Err(error) => {
-                drop(pin);
-                let _ = self.discard_unpublished(slot);
-                Err(BufferError::Translation(error))
-            }
+    fn reserve_page(&self, key: PageKey) -> Result<Option<ReservedLoad<'_>>, BufferError> {
+        if self.translation.get(key)?.is_some() {
+            return Ok(None);
         }
+        let (slot, incarnation) = match self.reserve_for_load() {
+            Ok(reserved) => reserved,
+            // Another loader may have claimed the last available frame between
+            // lookup and reservation. Join its mapping rather than refusing it.
+            Err(BufferError::NoVictim) if self.translation.get(key)?.is_some() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut loading = ReservedLoad {
+            pool: self,
+            slot,
+            key,
+            reference: FrameRef::new(slot.id, incarnation),
+            owns_mapping: false,
+            finished: false,
+        };
+        match self.translation.publish_if_absent(key, loading.reference)? {
+            PublishResult::Published => {
+                loading.owns_mapping = true;
+                Ok(Some(loading))
+            }
+            PublishResult::Existing(_) => Ok(None),
+        }
+    }
+
+    fn wait_for_load(&self, reference: FrameRef) -> Result<(), BufferError> {
+        let slot = self.slot(reference.frame())?;
+        let (lock, changed) = &slot.load_completion;
+        let mut completion = lock.lock().map_err(|_| BufferError::Poisoned {
+            frame: slot.id,
+            component: "load completion",
+        })?;
+        while slot.meta.incarnation() == Some(reference.incarnation())
+            && slot.meta.state() == FrameState::Loading
+        {
+            completion = changed
+                .wait(completion)
+                .map_err(|_| BufferError::Poisoned {
+                    frame: slot.id,
+                    component: "load completion",
+                })?;
+        }
+        Ok(())
     }
 
     fn initialize_slot(
         &self,
         slot: &FrameSlot,
         key: PageKey,
-        image: Option<&[u8]>,
+        image: &[u8],
     ) -> Result<(), BufferError> {
-        if let Some(image) = image {
+        {
             let mut bytes = slot.bytes.write().map_err(|_| BufferError::Poisoned {
                 frame: slot.id,
                 component: "bytes",
@@ -511,7 +502,8 @@ impl BufferPool {
         }
         match slot.meta.state() {
             FrameState::Writeback | FrameState::Resident => Ok(PinAttempt::Busy),
-            FrameState::Free | FrameState::Loading | FrameState::Evicting => Ok(PinAttempt::Stale),
+            FrameState::Loading => Ok(PinAttempt::Loading),
+            FrameState::Free | FrameState::Evicting => Ok(PinAttempt::Stale),
         }
     }
 
@@ -665,21 +657,6 @@ impl BufferPool {
         Ok(())
     }
 
-    fn discard_unpublished(&self, slot: &FrameSlot) -> Result<(), BufferError> {
-        slot.meta
-            .try_begin_unpublished_discard()
-            .map_err(|source| self.frame_transition(slot.id, source))?;
-        let mut page = slot.page.write().map_err(|_| BufferError::Poisoned {
-            frame: slot.id,
-            component: "identity",
-        })?;
-        *page = None;
-        drop(page);
-        slot.meta
-            .finish_evict()
-            .map_err(|source| self.frame_transition(slot.id, source))
-    }
-
     fn abort_loading(&self, slot: &FrameSlot) {
         if let Ok(mut page) = slot.page.write() {
             *page = None;
@@ -695,6 +672,55 @@ impl BufferPool {
 
     fn frame_transition(&self, frame: FrameId, source: FrameTransitionError) -> BufferError {
         BufferError::FrameTransition { frame, source }
+    }
+}
+
+/// Own a reserved frame and, once claimed, its logical-page load. Cleanup runs
+/// before waking joiners, including when the I/O implementation unwinds.
+struct ReservedLoad<'a> {
+    pool: &'a BufferPool,
+    slot: &'a FrameSlot,
+    key: PageKey,
+    reference: FrameRef,
+    owns_mapping: bool,
+    finished: bool,
+}
+
+impl<'a> ReservedLoad<'a> {
+    fn finish(mut self, dirty: bool) -> Result<PageGuard<'a>, BufferError> {
+        let (lock, changed) = &self.slot.load_completion;
+        let _completion = lock.lock().map_err(|_| BufferError::Poisoned {
+            frame: self.slot.id,
+            component: "load completion",
+        })?;
+        let pin = if dirty {
+            self.slot.meta.finish_new_page_pinned()
+        } else {
+            self.slot.meta.finish_load_pinned()
+        }
+        .map_err(|source| self.pool.frame_transition(self.slot.id, source))?;
+        self.finished = true;
+        changed.notify_all();
+        Ok(self.pool.guard_from_pin(self.key, self.reference, pin))
+    }
+}
+
+impl Drop for ReservedLoad<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let (lock, changed) = &self.slot.load_completion;
+        let _completion = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.owns_mapping {
+            // A poisoned shard already refuses subsequent translation access.
+            // Conditional removal cannot retire a newer incarnation's claim.
+            let _ = self.pool.translation.remove_if(self.key, self.reference);
+        }
+        self.pool.abort_loading(self.slot);
+        changed.notify_all();
     }
 }
 
@@ -794,327 +820,4 @@ impl DerefMut for PageWriteGuard<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vnext::{PageId, StorageObjectId};
-    use std::collections::HashMap;
-    use std::sync::{Barrier, Condvar, Mutex};
-
-    const TEST_PAGE_SIZE: usize = 64;
-
-    fn key(page: u64) -> PageKey {
-        PageKey::new(StorageObjectId::new(1), PageId::new(page))
-    }
-
-    #[derive(Default)]
-    struct MemoryPageIo {
-        pages: RwLock<HashMap<PageKey, Vec<u8>>>,
-        reads: AtomicU64,
-        writes: AtomicU64,
-    }
-
-    impl MemoryPageIo {
-        fn insert(&self, key: PageKey, value: u8) {
-            self.pages
-                .write()
-                .expect("memory page map writable")
-                .insert(key, vec![value; TEST_PAGE_SIZE]);
-        }
-
-        fn first_byte(&self, key: PageKey) -> u8 {
-            self.pages
-                .read()
-                .expect("memory page map readable")
-                .get(&key)
-                .expect("page exists")[0]
-        }
-    }
-
-    impl PageIo for MemoryPageIo {
-        fn read_page(&self, key: PageKey, destination: &mut [u8]) -> io::Result<()> {
-            self.reads.fetch_add(1, Ordering::Relaxed);
-            let pages = self
-                .pages
-                .read()
-                .map_err(|_| io::Error::other("memory page map poisoned"))?;
-            let page = pages
-                .get(&key)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing page"))?;
-            if page.len() != destination.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "page size mismatch",
-                ));
-            }
-            destination.copy_from_slice(page);
-            Ok(())
-        }
-
-        fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
-            self.writes.fetch_add(1, Ordering::Relaxed);
-            self.pages
-                .write()
-                .map_err(|_| io::Error::other("memory page map poisoned"))?
-                .insert(key, source.to_vec());
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn cache_hit_does_not_repeat_io() {
-        let device = Arc::new(MemoryPageIo::default());
-        device.insert(key(1), 7);
-        let pool = BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
-
-        {
-            let guard = pool.pin(key(1)).expect("first pin loads");
-            assert_eq!(guard.read().expect("read latch")[0], 7);
-        }
-        {
-            let guard = pool.pin(key(1)).expect("second pin hits");
-            assert_eq!(guard.read().expect("read latch")[0], 7);
-        }
-
-        assert_eq!(device.reads.load(Ordering::Relaxed), 1);
-        let stats = pool.stats().expect("stats");
-        assert_eq!(stats.misses, 1);
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.translation_entries, 1);
-    }
-
-    #[test]
-    fn concurrent_page_writers_wait_inside_guard() {
-        let device = Arc::new(MemoryPageIo::default());
-        device.insert(key(1), 0);
-        let pool = Arc::new(BufferPool::new(2, TEST_PAGE_SIZE, device).expect("pool creates"));
-        {
-            let guard = pool.pin(key(1)).expect("page loads");
-            assert_eq!(guard.read().expect("read latch")[0], 0);
-        }
-        let start = Arc::new(Barrier::new(8));
-        let mut workers = Vec::new();
-        for _ in 0..8 {
-            let pool = Arc::clone(&pool);
-            let start = Arc::clone(&start);
-            workers.push(std::thread::spawn(move || {
-                let guard = pool.pin(key(1)).expect("page pins");
-                start.wait();
-                let mut bytes = guard.write().expect("writer waits internally");
-                bytes[0] = bytes[0].checked_add(1).expect("test counter fits");
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("writer completes");
-        }
-        let guard = pool.pin(key(1)).expect("page remains resident");
-        assert_eq!(guard.read().expect("read latch")[0], 8);
-    }
-
-    #[test]
-    fn newly_created_page_is_dirty_without_a_device_read() {
-        let device = Arc::new(MemoryPageIo::default());
-        let pool = BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
-        let image = vec![13u8; TEST_PAGE_SIZE];
-
-        let guard = pool.create_page(key(7), &image).expect("new page installs");
-        assert_eq!(guard.read().expect("read latch")[0], 13);
-        drop(guard);
-
-        let stats = pool.stats().expect("stats");
-        assert_eq!(stats.new_pages, 1);
-        assert_eq!(stats.loads, 0);
-        assert_eq!(stats.bytes_read, 0);
-        assert_eq!(stats.dirty_frames, 1);
-        assert_eq!(device.reads.load(Ordering::Relaxed), 0);
-        assert!(pool.flush_page(key(7)).expect("new page flushes"));
-        assert_eq!(device.first_byte(key(7)), 13);
-    }
-
-    #[test]
-    fn dirty_eviction_writes_before_reusing_single_frame() {
-        let device = Arc::new(MemoryPageIo::default());
-        device.insert(key(1), 1);
-        device.insert(key(2), 2);
-        let pool = BufferPool::new(1, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
-
-        {
-            let guard = pool.pin(key(1)).expect("page one loads");
-            let mut bytes = guard.write().expect("page is writable");
-            bytes[0] = 9;
-        }
-        {
-            let guard = pool.pin(key(2)).expect("page two evicts page one");
-            assert_eq!(guard.read().expect("read latch")[0], 2);
-        }
-
-        assert_eq!(device.first_byte(key(1)), 9);
-        assert_eq!(device.writes.load(Ordering::Relaxed), 1);
-        let stats = pool.stats().expect("stats");
-        assert_eq!(stats.evictions, 1);
-        assert_eq!(stats.writebacks, 1);
-        assert_eq!(stats.dirty_frames, 0);
-    }
-
-    struct BarrierPageIo {
-        inner: MemoryPageIo,
-        reads_meet: Barrier,
-    }
-
-    impl PageIo for BarrierPageIo {
-        fn read_page(&self, key: PageKey, destination: &mut [u8]) -> io::Result<()> {
-            self.inner.read_page(key, destination)?;
-            self.reads_meet.wait();
-            Ok(())
-        }
-
-        fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
-            self.inner.write_page(key, source)
-        }
-    }
-
-    #[test]
-    fn concurrent_duplicate_misses_publish_one_resident_mapping() {
-        let inner = MemoryPageIo::default();
-        inner.insert(key(1), 42);
-        let device = Arc::new(BarrierPageIo {
-            inner,
-            reads_meet: Barrier::new(2),
-        });
-        let pool =
-            Arc::new(BufferPool::new(4, TEST_PAGE_SIZE, device.clone()).expect("pool creates"));
-
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let pool = Arc::clone(&pool);
-            workers.push(std::thread::spawn(move || {
-                let guard = pool.pin(key(1)).expect("concurrent pin succeeds");
-                assert_eq!(guard.read().expect("read latch")[0], 42);
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker completes");
-        }
-
-        assert_eq!(device.inner.reads.load(Ordering::Relaxed), 2);
-        let stats = pool.stats().expect("stats");
-        assert_eq!(stats.duplicate_loads, 1);
-        assert_eq!(stats.translation_entries, 1);
-        assert_eq!(stats.resident_frames, 1);
-    }
-
-    struct BlockingWritePageIo {
-        inner: MemoryPageIo,
-        entered: (Mutex<bool>, Condvar),
-        release: (Mutex<bool>, Condvar),
-    }
-
-    impl BlockingWritePageIo {
-        fn wait_until_writeback(&self) {
-            let (lock, cv) = &self.entered;
-            let mut entered = lock.lock().expect("entered mutex");
-            while !*entered {
-                entered = cv.wait(entered).expect("entered wait");
-            }
-        }
-
-        fn release_writeback(&self) {
-            let (lock, cv) = &self.release;
-            *lock.lock().expect("release mutex") = true;
-            cv.notify_all();
-        }
-    }
-
-    impl PageIo for BlockingWritePageIo {
-        fn read_page(&self, key: PageKey, destination: &mut [u8]) -> io::Result<()> {
-            self.inner.read_page(key, destination)
-        }
-
-        fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
-            {
-                let (lock, cv) = &self.entered;
-                *lock.lock().map_err(|_| io::Error::other("entered mutex"))? = true;
-                cv.notify_all();
-            }
-            {
-                let (lock, cv) = &self.release;
-                let mut released = lock.lock().map_err(|_| io::Error::other("release mutex"))?;
-                while !*released {
-                    released = cv
-                        .wait(released)
-                        .map_err(|_| io::Error::other("release wait"))?;
-                }
-            }
-            self.inner.write_page(key, source)
-        }
-    }
-
-    #[test]
-    fn lookup_during_writeback_waits_instead_of_reloading_stale_device_bytes() {
-        let inner = MemoryPageIo::default();
-        inner.insert(key(1), 1);
-        let device = Arc::new(BlockingWritePageIo {
-            inner,
-            entered: (Mutex::new(false), Condvar::new()),
-            release: (Mutex::new(false), Condvar::new()),
-        });
-        let pool =
-            Arc::new(BufferPool::new(2, TEST_PAGE_SIZE, device.clone()).expect("pool creates"));
-
-        {
-            let guard = pool.pin(key(1)).expect("page loads");
-            guard.write().expect("write latch")[0] = 9;
-        }
-
-        let flush_pool = Arc::clone(&pool);
-        let flusher = std::thread::spawn(move || {
-            assert!(flush_pool.flush_page(key(1)).expect("flush succeeds"));
-        });
-        device.wait_until_writeback();
-
-        let (started, reader_started) = std::sync::mpsc::channel();
-        let read_pool = Arc::clone(&pool);
-        let reader = std::thread::spawn(move || {
-            started.send(()).expect("signal reader start");
-            let guard = read_pool.pin(key(1)).expect("lookup survives writeback");
-            guard.read().expect("read latch")[0]
-        });
-        reader_started.recv().expect("reader starts");
-
-        // The reader must reach the in-flight writeback before it is released.
-        // Bound the wait so a broken pool fails the assertion instead of hanging,
-        // but do not cap it by a retry count: reader progress depends on
-        // scheduling, not on how many times this thread yields.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pool.stats().expect("stats").writeback_waits == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "reader never waited for the in-flight writeback"
-            );
-            std::thread::yield_now();
-        }
-        device.release_writeback();
-        flusher.join().expect("flusher completes");
-        assert_eq!(reader.join().expect("reader completes"), 9);
-        assert_eq!(device.inner.reads.load(Ordering::Relaxed), 1);
-        assert!(pool.stats().expect("stats").writeback_waits > 0);
-    }
-
-    #[test]
-    fn failed_load_returns_reserved_frame_to_free_state() {
-        let device = Arc::new(MemoryPageIo::default());
-        let pool = BufferPool::new(1, TEST_PAGE_SIZE, device.clone()).expect("pool creates");
-
-        assert!(matches!(
-            pool.pin(key(3)),
-            Err(BufferError::Io {
-                operation: PageIoOperation::Read,
-                ..
-            })
-        ));
-        assert_eq!(pool.stats().expect("stats").occupied_frames, 0);
-
-        device.insert(key(3), 5);
-        let guard = pool.pin(key(3)).expect("retry loads after failure");
-        assert_eq!(guard.read().expect("read latch")[0], 5);
-    }
-}
+mod tests;
