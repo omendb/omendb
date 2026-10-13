@@ -1,309 +1,202 @@
 # ADR 0013: Storage kernel and access-method boundary
 
-- **Status:** accepted target architecture; ordered kernel baseline implemented on `storage-kernel-vnext`, persistent recovery and relational cutover pending
-- **Scope:** SeerDB/OmenDB physical boundary, transaction/storage kernel, access methods, recovery participation, and multimodal derived state
-- **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md), [ADR 0003](0003-seerdb-commit-recovery-state-machine.md), [ADR 0006](0006-deployment-storage-and-durability.md), [ADR 0009](0009-buffered-btree-and-materialization.md), [ADR 0011](0011-htap-and-analytical-representations.md), and [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md)
-- **Revises:** the earlier assumption that `TreeId + ordered key bytes + opaque value bytes` is the only OmenDB↔SeerDB narrow waist, including target-boundary language in ADRs 0005, 0006, 0010 and 0012
+- **Status:** accepted target; ordered component baseline exists, persistent
+  recovery and product cutover remain unqualified
+- **Scope:** shared transaction/storage services, physical access methods and lifetime
+- **Revises:** the universal ordered-KV boundary in earlier ADRs; reviewed 2026-10-13
+- **Related owners:** [ADR 0014](0014-vnext-installation-and-recovery.md) for commit/recovery,
+  [ADR 0009](0009-buffered-btree-and-materialization.md) for ordered pages,
+  [ADR 0010](0010-row-layout-and-column-families.md) for rows,
+  [ADR 0011](0011-htap-and-analytical-representations.md) for analytics and
+  [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md) for product/repository boundaries
 
 ## Context
 
-The existing SeerDB implementation proved important correctness properties: explicit `TxnId`/CSN/LSN identities, crash-safe transaction decisions, ordered access, snapshots, version retention, change positions, and fault qualification. Those semantics remain valuable.
-
-Its current product abstraction, however, was designed as a generic transactional ordered-KV engine. OmenDB maps rows, catalogs, scalar secondary indexes, constraints, and every other durable relational structure into ordered byte trees. That boundary resembles FoundationDB's successful layer model and is excellent when the primary goal is a general distributed KV substrate.
-
-OmenDB's target is different. It must optimize one integrated database for:
-
-- low-overhead OLTP on RAM + NVMe;
-- compact row storage and scalar secondary indexes;
-- vector, text, graph, JSON and future specialized access paths;
-- derived columnar/HTAP representations;
-- local, HA and later distributed deployment profiles;
-- one transaction/log authority across all authoritative state.
-
-Modern high-performance systems such as Umbra/CedarDB integrate buffer management, MVCC, page/index structures, and physical representations more tightly than an opaque value boundary permits. A generic KV facade remains useful, but it must not force every storage structure to pretend it is an ordered byte map.
-
-This ADR therefore keeps the semantic core that SeerDB established while lowering the internal narrow waist.
+A transactional ordered KV layer can maintain relational data and indexes atomically.
+[FoundationDB's layer model](https://apple.github.io/foundationdb/layer-concept.html)
+is a credible alternative, not an obsolete design. OmenDB instead needs direct
+control of RAM/NVMe locality, guarded typed records, batch execution and specialized
+representations. Choose the shared kernel because it exposes those mechanisms
+without duplicating transaction authority, not because byte APIs imply weak semantics.
 
 ## Decision
 
 ### 1. SeerDB becomes the shared transaction/storage kernel
 
-`seerdb` remains the working crate/name during the rewrite, but its architectural role changes. It is no longer defined as "the generic ordered-KV database below OmenDB." It becomes the shared kernel that owns transaction state, durability, buffer/page management, recovery and physical resource lifecycle.
+SeerDB owns transaction identities/outcomes, snapshots, visibility, conflicts and
+intents, log ordering/durability/recovery, buffer residency, storage-object identity,
+physical materialization, resource admission and retention. SQL types, constraints,
+query plans, BM25 and vector-distance meaning remain outside the kernel.
 
-The kernel owns at least:
-
-```text
-transaction manager
-  TxnId / CSN / LSN
-  snapshots and isolation state
-  transaction status
-  conflict/dependency tracking
-  adaptive write-intent wait state
-
-log + recovery
-  ordered transaction records
-  durable commit decisions
-  durability scheduler/transport
-  recovery replay
-  checkpoint frontier
-  generic committed-change framing
-
-buffer + storage
-  PageId / frame guards
-  page-to-frame translation
-  dirty tracking
-  eviction/admission
-  NUMA / memory-tier placement
-  async reads/writes
-  out-of-place NVMe placement
-  page-map/checkpoint publication
-  physical GC and retention
-
-version / lifetime services
-  logical version identities where needed
-  snapshot retention
-  WAL/log retention
-  storage-object lifecycle
-```
-
-None of these layers acquire SQL table, column, NULL, vector, BM25, graph, or query-planner semantics.
+One runtime constructs these services and owns their failure/lifetime boundary.
+Separate independently fenced component bundles are not a persistent database.
 
 ### 2. Ordered KV becomes one access method/facade, not the universal physical model
 
-The kernel supports storage objects implemented by compile-time access methods. The first authoritative access method remains an ordered B-tree. The existing `TransactionDatabase`/ordered-KV surface may survive as a compatibility and standalone facade implemented on that access method.
+The ordered B-tree is the first access method. The public ordered-KV facade uses
+it without requiring every row, posting or column chunk to be an opaque KV value.
+Access methods are concrete compiled code, not a runtime plugin ABI or backend matrix.
+Share primitives where useful; static dispatch and inlining remain available.
 
-Conceptually:
-
-```text
-                       OmenDB
-                         |
-              transaction/storage kernel
-             /        |        |        \
-       ordered      row/     inverted   derived
-       B-tree       record     index     structures
-          |           |          |          |
-          +-----------+----------+----------+
-                         |
-                buffer / log / MVCC
-```
-
-The kernel does **not** grow a runtime plugin ABI or a RocksDB-style backend matrix. Initial access methods are compiled with the database so hot paths can use static dispatch, concrete layouts and inlining. Modularity exists to permit distinct physical structures to share one transaction/durability substrate, not to support arbitrary third-party binary plugins.
+Do not replace the KV restriction with a universal page restriction. Mutable tree
+nodes/rows use guarded frames; large immutable vector, posting and column extents
+can use range reads, prefetch, different cache units and encoding-aware scans.
+Both participate in store identity, checksums, publication, retention and resource
+accounting. One transaction authority does not mean one page size, cache policy,
+file layout or mandatory index algorithm.
 
 ### 3. Storage objects have explicit authority classes
 
-A storage object declares whether it is **authoritative** or **derived**.
+**Authoritative objects** participate in durable transaction recovery before
+acknowledgement: canonical rows, required primary/unique/constraint indexes and
+catalog state. **Derived objects** can lag/rebuild only when the declared query
+semantics remain available through valid coverage, complete deltas, an exact
+fallback or an explicit approximation/staleness contract.
 
-**Authoritative objects** participate in the transaction's durable recovery record before acknowledgement. Examples include canonical row families, primary indexes required to locate rows, unique/constraint indexes, catalog objects and other state whose loss would change committed SQL semantics.
+A published representation identifies:
 
-**Derived objects** may lag, rebuild or catch up from the committed-change stream. Examples may include ANN graphs, some BM25 acceleration structures, columnar analytical chunks, graph adjacency projections, zone maps and optional materialized search structures.
+- source incarnation and object/schema dependencies;
+- a reader-stable generation and contiguous applied CSN frontier;
+- the snapshots actually retained and readable;
+- complete transactional delta intervals needed to reach a requested snapshot.
 
-Their publication descriptor must establish:
+A latest-only representation at `F` does not answer every `X <= F`. A base at `B`
+can answer `X > B` only with complete updates, deletes and lifecycle changes through
+`X`. The minimum of unrelated latest-only frontiers does not manufacture a common
+snapshot. Capture descriptors and history leases atomically; compaction cannot
+invalidate an admitted view. Otherwise fall back or return an explicit unsupported
+snapshot/staleness outcome.
 
-- source store incarnation and storage-object/schema dependencies;
-- one immutable or otherwise reader-stable representation generation;
-- the contiguous applied CSN frontier, not merely the largest observed CSN;
-- which snapshots remain readable after overwrite or compaction;
-- any complete delta interval needed to reach the query snapshot.
-
-An applied frontier `F` alone does not permit reads at every `X <= F`. A
-latest-only representation supports its exact published snapshot, not arbitrary
-older snapshots. A versioned representation may declare a retained interval
-`[oldest_readable, F]` only if it can resolve each snapshot in that interval
-without exposing later changes. A base at `B` may serve a later `X` only with
-complete transaction-aware deltas `(B, X]`, including updates and deletes.
-Otherwise use authoritative data or an explicitly requested stale-read contract.
-
-Capture the representation descriptor and required delta/history leases as one
-reader-stable view. Validate source identity and schema compatibility before
-use. Compaction/rebuild/GC may not invalidate that captured view. Canonical
-snapshot validation must still enforce row identity, deletions and authorization;
-ANN approximation is a ranking contract, not permission to weaken those checks.
-
-A feature is not automatically derived merely because rebuilding is possible.
-If current-snapshot SQL semantics or a declared constraint requires the structure
-synchronously, make it authoritative or provide an exact delta/fallback path.
-The qualification oracle must exercise update/delete, old snapshots, lag,
-compaction, rebuild replacement and incompatible schema—not just insert-only
-latest-snapshot reads.
-
-Materialize's [read/write frontier distinction](https://materialize.com/docs/sql/explain-timestamp/)
-is independent evidence for separating retained readability from completeness;
-its timestamp representation is not an OmenDB implementation requirement.
+ANN approximates ranking, not identity, predicates, deletion or authorization.
+Canonical validation and necessary refill remain required. Rebuildability does not
+make a constraint index safely asynchronous. Exercise mutations, old readers, lag,
+rebuild replacement, compaction and schema changes, not just insert-only latest reads.
+[Materialize's frontier distinction](https://materialize.com/docs/sql/explain-timestamp/)
+is useful independent evidence, not a required timestamp implementation.
 
 ### 4. Access methods share transaction and page primitives
 
-An access method receives transaction context and storage-object identity and can:
+Provide transaction/object capabilities, guarded page access and immutable-extent
+access, logical dependency/intents, versioned recovery effects, dirty tracking,
+publication/verification/GC and explicit I/O/resource accounting. Access intent
+may include random/sequential access, expected lifetime and prefetchability without
+leaking device policy into SQL semantics.
 
-- pin/allocate pages through frame guards;
-- perform optimistic or exclusive page/node coordination;
-- register logical read/write dependencies and intents;
-- stage redo/recovery information through the transaction log;
-- mark pages dirty without forcing them durable before transaction acknowledgement;
-- expose direct point operations plus resumable **batch-first** scans/selection vectors so vectorization, compressed decode and prefetch are not hidden behind mandatory per-item dispatch;
-- surface access/I/O intent where useful (random/sequential, expected lifetime, prefetchability) without leaking device policy into SQL semantics;
-- participate in checkpoint, verification and physical GC;
-- report memory/I/O/write-amplification metrics.
-
-The exact Rust trait/API is intentionally not fixed by this ADR. The first implementation should use concrete types and the smallest common interfaces required by the first two access methods rather than designing a speculative universal trait hierarchy.
+Expose point operations and native resumable batches/selection vectors. Bound rows,
+bytes and physical work, including invisible versions, overflow traversal and I/O.
+Do not force every batch through per-record dispatch or full-value decode. Guards
+cannot span output suspension; continuations preserve logical position and snapshot.
+Build the smallest concrete interfaces needed by actual callers, not a speculative
+universal trait hierarchy.
 
 ### 5. The first two physical structures are deliberately narrow
 
-The vNext vertical slice implements only enough structure to prove the new boundary:
+Qualify an ordered-tree path and a canonical-record path with secondary/constraint
+indexes and catalog effects under one transaction. Compare compact clustered
+primary-tree records with row/heap pages plus a primary index. The row participant
+must expose real typed access and lifetime/recovery behavior, not merely rename
+an opaque serializer. It may reuse the ordered node implementation; inventing a
+second physical engine to prove the boundary is not a requirement.
 
-1. **Buffered ordered B-tree** for ordered key/range access, scalar primary/secondary indexes and the standalone ordered-KV facade.
-2. **Canonical row-record path** using ADR 0010's schema-driven compact row-family format. The implementation will benchmark clustered primary-B-tree rows against row pages/heap + primary index rather than permanently selecting one from convention.
-
-Vector ANN, inverted/BM25, graph adjacency and analytical chunks come later, after the transaction/log/buffer kernel is qualified. Their future requirements inform the kernel seams now but do not justify speculative code before the core is measured.
+Add analytical and search structures only after the shared kernel earns their
+cost. Their eventual requirements inform interfaces, not speculative infrastructure.
 
 ### 6. MVCC is a kernel service but version layout may be access-method aware
 
-Transaction identity, commit state, visibility rules and snapshot retention are global kernel semantics. The physical location of version information need not be uniform across every storage object.
+Transaction state, logical visibility and retention are common; physical version
+metadata need not have one representation everywhere. Prefer compact current
+metadata and resident recent history with bounded spill/checkpoint support over
+mandatory synchronous per-key history I/O. The complete recoverable-log design in
+ADR 0014 must be qualified before removing the current undo barrier.
 
-For small OLTP row/index mutations, the target should benchmark an Umbra-like memory-optimized path in which common version metadata stays memory-resident and durability comes from the log, against the current persistent per-key undo/version representation. Large transactions and recovery still need a bounded persistent fallback.
-
-Therefore ADR 0002's logical visibility contract remains, but its exact persistent version-store layout is no longer presumed optimal for every access method.
+Snapshot, certification-summary, CDC, backup and checkpoint floors are distinct
+retention consumers. Budget their byte/age pressure; refuse or explicitly expire
+abortable work rather than silently discard correctness evidence. Never pressure-
+abort an already durable decision. Logical limits follow supported semantics and
+progress budgets, not incidental slot widths or an unversioned codec cap.
 
 ### 7. Recovery is one transaction outcome across all authoritative access methods
 
-A transaction's durable decision covers every authoritative mutation regardless of physical access method. The log framing must identify enough information to replay each mutation safely after a crash.
-
-The first implementation should prefer a small set of kernel recovery primitives over arbitrary callback-driven log records. If an access method needs specialized physiological redo, it uses a versioned compile-time record kind owned by that module. Unknown record kinds fail closed.
-
-Derived structures recover by validating their frontier and either replaying committed changes or rebuilding from authoritative state.
+Each durable decision covers every authoritative participant. Versioned concrete
+recovery records provide enough information to reconstruct their effects; unknown
+kinds fail closed. No nested independently committing store or arbitrary callback
+log is introduced. Derived state validates its identity/coverage and replays or
+rebuilds. Whether bytes are a page or an extent does not change this authority.
 
 ### 8. Buffer translation is an explicit measured seam
 
-No single translation strategy is locked in. Recent systems and 2026 work show pointer swizzling, virtual-memory mapping, validated hints, predictive translation, sharded hash tables and direct arrays win in different regimes.
+Start with the sharded translation baseline and correct single-flight Loading
+ownership. An exact frame incarnation prevents reuse errors but does not itself
+prevent an old delayed load from being published after a newer write/eviction.
+Loading, mutation, writeback and eviction must share page freshness authority.
 
-The vNext buffer manager therefore isolates:
+Compare validated hints/predictive translation, swizzling or virtual mapping only
+on the actual workload. Preserve one authoritative lookup/lifetime path behind
+any fast hint. Measure cycles, LLC/TLB misses, page walks, bandwidth and NUMA as
+well as hit rate. Do not permanently encode a translation trick into page formats
+without benefit. Mutable-page, immutable-extent, history and query caches share a
+global budget even when replacement policies differ.
 
-```text
-PageId -> guarded resident frame
-```
-
-from the B-tree and row layout closely enough to benchmark at least:
-
-- sharded/optimistic hash translation baseline;
-- predictive/validated fast path;
-- pointer/hint-assisted tree path where justified;
-- relation/object-local placement for sequential scans;
-- NUMA/tier-aware placement.
-
-The chosen default may vary by deployment profile, but page formats should not be permanently polluted by one translation trick without measured benefit.
-
-Residency correctness precedes choosing a faster translation strategy. Loading
-ownership must serialize publication for a `PageKey` across I/O, mutation,
-writeback and eviction; checking only for a currently resident winner permits
-a delayed obsolete image to reappear. Exact frame incarnation protects frame
-reuse but does not by itself establish logical page-load freshness. The baseline
-now claims an exact Loading frame before device reads and wakes contenders on
-completion or cleanup. Independent read-then-publish duplicate loading is removed;
-the plan owns further residency and persistence qualification.
-
-Translation/residency experiments must measure more than hit rate: LLC misses,
-TLB/page walks, memory bandwidth and NUMA movement can dominate very large DRAM
-caches. Huge pages, object-local arenas and tier-aware placement are therefore
-measured policies rather than permanent format requirements.
+[B-Trees Are Back](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrees-are-back.pdf),
+[Predictive Translation](https://db.in.tum.de/people/sites/zinsmeister/papers/predictive-translation.pdf)
+and [How to Write to SSDs](https://www.vldb.org/pvldb/vol19/p1469-lee.pdf)
+justify layout/translation/placement experiments, not performance claims for SeerDB.
 
 ### 9. Physical row/version references are optional optimization hints
 
-Specialized access methods may benefit from a compact reference that maps a hit
-directly to resident/persisted row state, conceptually something like
-`(PageId, SlotId, generation)` or another access-method-specific locator.
-
-Such a reference is **not** logical row identity and cannot become correctness
-authority by convenience. Before any format commits to it, experiments must
-define row movement, page/slot reuse, ABA protection, split/reorganization,
-MVCC-version lifetime, checkpoint/recovery validation, and GC invalidation.
-Every consumer needs either stable-handle semantics or a logical-identity
-fallback when the hint is stale.
-
-This seam is especially interesting for inverted indexes, graph adjacency and
-secondary-index payloads, but no physical reference is added to the first vNext
-formats merely to anticipate them.
+A locator such as `(PageId, SlotId, generation)` is not logical row identity.
+Any fast reference needs movement, split/reorganization, reuse/ABA, snapshot,
+checkpoint and GC rules, with a stable-handle contract or logical fallback.
+Postings/secondary indexes may benefit, but no format reference is added merely
+in anticipation of them.
 
 ### 10. SeerDB's independent package status is secondary to OmenDB architecture
 
-The Apache-2.0 crate may remain independently publishable if useful, but package independence is not allowed to impose an artificial optimization boundary. Internal APIs may change freely during the alpha rewrite.
-
-If a clean separation later emerges, the generic ordered-KV facade can remain a public SeerDB product over the shared kernel. If not, `seerdb` simply remains OmenDB's reusable storage-kernel crate. The database architecture, not branding or historical package structure, decides the boundary.
+Keep SeerDB independently versioned and Apache-2.0 in the OmenDB workspace.
+Its useful KV API is a facade over the same core, not a separate roadmap or
+physical implementation. OmenDB-specific AGPL dependencies must remain above the
+kernel. Package independence does not freeze an alpha internal interface.
+ADR 0012 owns repository and standalone-product decisions.
 
 ### 11. Snapshot/bootstrap is a retained handoff, not just two numbers
 
-The target `snapshot CSN X + restart LSN Y` contract includes source incarnation,
-a live retained snapshot, the corresponding committed-change suffix and its
-retention ownership. Register the pins under the same authority that establishes
-the cut; copying data and acquiring a lease later can race reclamation.
+Atomically capture source incarnation, snapshot CSN, compatible catalog/layouts,
+consumer start position and leases for snapshot plus change suffix. The current
+`TransactionDatabase::snapshot_export` position pair is not this retained handoff.
+Registration after copying begins can already have lost required history.
 
-The current ordered-KV `TransactionDatabase::snapshot_export` returns a durable
-position only. It does not implement this complete bootstrap handoff. No external
-consumer may infer a pinned snapshot or gap-free stream from that return value.
+Keep logical consumer progress separate from physical recovery/retention floors.
+A logical change stream preserves whole transaction boundaries, stable effects,
+updates/deletes and enough schema/value information for its declared consumers;
+physical page redo is not the public CDC format.
 
-Keep separate:
+A consumer applies effects and progress atomically and idempotently before advancing
+source retention. Splitting transport batches cannot publish half a source transaction
+as complete. A destination unable to provide that atomic unit exposes a weaker
+contract. Independently written destination tables do not inherit source atomicity.
 
-- the snapshot's logical CSN;
-- the consumer cursor after the exported cut;
-- the physical WAL/undo/catalog recovery floors required to reproduce changes;
-- the consumer's last durably applied transaction.
-
-A physical recovery floor may precede the consumer cursor. Names and APIs must
-not imply that one LSN grants all four properties. The eventual logical change
-format carries transaction boundaries, stable effect identity and enough
-historical values/schema information for its declared consumer contract; it does
-not expose physical page redo as the public CDC API.
-
-A consumer applies complete source transactions idempotently and commits its
-progress with the resulting destination effects before acknowledging retention
-advancement. Chunking a large transaction must not publish a partial source
-transaction as fully covered. Replayed delivery is permitted; duplicate effects
-are not. If the destination cannot provide that atomic unit, expose the weaker
-integration contract explicitly instead of calling it shared SQL atomicity.
-
-Pins need observable byte/age pressure and explicit release, advancement and
-invalidation semantics. Lost history or a mismatched source incarnation requires
-an explicit rebootstrap/error, never silent continuation. Exact API and retention
-policy remain implementation choices; they must be qualified before backup,
-CDC or remote projection uses this handoff.
-
-Primary reference: PostgreSQL 18 documents
-[exported snapshots, crash replay and slot retention](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html),
-and distinguishes [physical restart retention from consumer progress](https://www.postgresql.org/docs/18/view-pg-replication-slots.html).
-These support the boundary semantics, not a requirement to copy PostgreSQL's
-slot implementation. References checked 2026-10-11.
+Pins expose pressure and explicit release/advance/invalidation. Lost history or a
+foreign incarnation requires rebootstrap/error. Retained readability and source
+identity also govern optional remote search/analytical workers. PostgreSQL's
+[logical decoding](https://www.postgresql.org/docs/18/logicaldecoding-explanation.html)
+and [replication-slot positions](https://www.postgresql.org/docs/18/view-pg-replication-slots.html)
+are reference semantics, not a requirement to copy its slot implementation.
 
 ## Migration plan
 
-The [vNext roadmap](../plans/storage-kernel-vnext.md) is the sole execution owner.
-Keep the current engine only as a semantic/fault reference until qualified cutover;
-known defects require independent oracles. Canonical records prove a distinct
-access-method lifecycle alongside ordered indexes under one decision and recovery
-protocol, not merely another opaque value codec. No compatibility facade may keep
-the old physical architecture alive. Explicit offline conversion preserves supported
-logical preview data or refuses it; physical-format upgrade stability is not implied.
+The [vNext plan](../plans/storage-kernel-vnext.md) is the sole execution sequence.
+Keep the legacy engine as a fallible semantic/fault reference until qualified
+cutover, then delete it and transitional adapters. Offline preview conversion
+preserves supported logical data or refuses it; no stable physical upgrade or
+permanent compatibility backend is implied.
 
 ## Acceptance gates
 
-Before the replacement becomes mainline it must demonstrate:
-
-- the full current transaction/crash/fault oracle;
-- atomic transactions spanning more than one authoritative storage object/access method;
-- current-snapshot correctness when derived structures lag or are absent;
-- hot-set performance close to an in-memory path;
-- graceful larger-than-memory degradation;
-- measured page-translation overhead;
-- p50/p95/p99 and throughput under 1/4/16+ committers;
-- allocation count/bytes and CPU profile;
-- batch/selection-vector throughput versus row-at-a-time adapters for scan-heavy paths, with compiler/SIMD evidence where relevant;
-- cache/LLC/TLB/page-walk and memory-bandwidth evidence for large-buffer workloads where available;
-- logical, host and flash write amplification;
-- recovery time versus checkpoint/log distance;
-- no global database lock on ordinary reads/writes;
-- any adopted physical record-reference fast path proves stale/reused references cannot change query correctness across movement, recovery or GC;
-- x86-64 Linux/NVMe and AArch64 coverage where practical.
-
-## Consequences
-
-- Current SeerDB is a correctness/reference implementation, **not** the architecture to incrementally polish into permanence.
-- Ordered B-trees remain a central first-class access method, but "everything is ordered KV" is no longer an architectural constraint.
-- Vector, text, graph and HTAP work can share buffer/log/transaction infrastructure without each inventing a sibling database or forcing unnatural KV encodings.
-- We preserve the strongest existing semantics while giving the rewrite freedom to adopt memory-optimized MVCC, modern buffer translation, autonomous/adaptive commit and specialized physical structures where benchmarks justify them.
+Require atomic cross-object/participant outcomes, exact supported snapshots,
+bounded progress under cache/history/allocation pressure, recovery through two
+reopens plus subsequent use, and matched hot/larger-than-memory performance.
+Measure throughput and p50/p95/p99 under single and concurrent committers, allocations,
+translation/latch/certification/frontier waits, host/device write amplification,
+checkpoint pauses, recovery memory/time and unused-feature cost. Batch and optional
+reference fast paths must demonstrate their actual benefit and lifetime safety.
+No research citation or existing component test closes an integration gate.

@@ -1,270 +1,144 @@
 # ADR 0011: HTAP and analytical representations
 
-- **Status:** accepted target architecture; representation strategy remains benchmark-gated
-- **Scope:** analytical scans, hot/cold physical layout, columnar acceleration, and optional scale-out OLAP
-- **Depends on:** [ADR 0006](0006-deployment-storage-and-durability.md),
-  [ADR 0007](0007-runtime-execution-and-contention.md),
-  [ADR 0009](0009-buffered-btree-and-materialization.md), and
-  [ADR 0010](0010-row-layout-and-column-families.md)
+- **Status:** accepted target; reviewed 2026-10-13; physical-format promotion is measured
+- **Scope:** native operational analytics, columnar representations and optional workers
+- **Related owners:** ADR 0007 execution; ADR 0010 rows; ADR 0013 snapshot/lifetime;
+  [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md) products/repositories
 
 ## Context
 
-The earlier architecture assumed that OLTP and OLAP would use separate physical
-engines connected through snapshot export plus a committed-change stream. That
-is a clean isolation boundary, but making it mandatory has costs:
+Mandatory ETL into another engine imposes extra copies, lag and operations even
+when a single node could answer useful analytical queries. Conversely, integrating
+all analytics into the primary does not make CPU, memory, bandwidth and history
+pressure disappear. OmenDB supports local operational analytics and optional isolated
+execution rather than selecting one deployment for every workload.
 
-- fresh analytics require a second copy and change-application pipeline;
-- applications must operate two systems even when one node has enough compute
-  and storage bandwidth for both workloads;
-- resource isolation becomes an operational problem rather than something the
-  database runtime can schedule directly;
-- real-time dashboards, vector/AI enrichment, and agent-generated analytical SQL
-  increasingly mix short transactions with scans over current state.
-
-Modern systems show that the trade-off is no longer binary. CedarDB/Umbra's
-Colibri work demonstrates a single transactional system with hot row-oriented
-data and cold compressed column chunks beyond main memory. AlloyDB demonstrates
-a different point in the design space: one transactional source of truth plus a
-workload-managed columnar representation used by a separate vectorized execution
-path. Both avoid making ETL into another database a prerequisite for useful
-analytics.
-
-OmenDB should preserve the ability to scale analytics out independently, but it
-should not force every deployment to do so.
+[Colibri](https://www.vldb.org/pvldb/vol17/p3290-schmidt.pdf) is a serious counterexample
+to the assumption that HTAP requires duplicate row and column databases. Its hot/cold
+hybrid design motivates an alternative to measure, not adoption of its physical layout
+by reputation. The initial OmenDB acceleration remains derived and rebuildable.
 
 ## Decision
 
 ### 1. One authoritative transaction/log state
 
-OmenDB has one authoritative transaction outcome, MVCC history, catalog, and
-committed-change order. Analytical representations do not define independent
-transaction truth.
-
-A query can execute against row or analytical representations only when they
-resolve the same requested snapshot. Completeness through a newer frontier does
-not prove historical readability. Otherwise the planner falls back to the
-authoritative row path or combines a stable analytical base with complete
-transactional deltas.
+Within OmenDB, analytical execution resolves the same requested snapshot and catalog
+as relational access. A representation can lag only behind explicit coverage/delta/
+fallback logic. It cannot invent a second transaction history. Independently ingested
+OLAP-companion data has a separate authority, as decided in ADR 0012.
 
 ### 2. In-engine analytics is a first-class execution mode
 
-The typed batch executor from ADR 0007 is part of OmenDB itself. It can scan the
-ordinary row store immediately; analytical acceleration may provide more
-scan-friendly representations without changing SQL semantics.
+Build typed, resumable batches over authoritative rows first. Projection, predicates,
+joins and aggregates need bounded work and selective decode, not mandatory conversion
+through row-at-a-time adapters or a second SQL binder. Maintain one semantic plan and
+type/NULL/cast/collation policy across micro-plan and batch execution.
 
-The runtime schedules OLTP and analytical work under explicit resource classes.
-Large scans have bounded memory, I/O and CPU reservations and cannot consume the
-progress reserve required by transactions, WAL/log durability, recovery, or
-reclamation.
-
-This permits HTAP on one machine while preserving predictable OLTP tail latency.
+Use physical statistics and cost estimates for scans, indexes, representation coverage,
+selectivity, bytes read and materialization. JIT and custom SIMD follow profiles.
+Arrow is an interchange/batch boundary; it need not be the only internal encoded form.
+Do not embed a sibling database session merely to claim a native analytical executor.
 
 ### 3. Analytical physical representations are derived and rebuildable first
 
-The initial analytical acceleration is a derived representation that can be
-rebuilt from a consistent snapshot plus the committed-change stream. It is never
-the only copy required to recover the database.
-
-Useful representations include:
-
-- compressed column chunks for stable/cold row ranges;
-- a workload-selected in-memory/SSD column store for frequently scanned columns;
-- materialized expressions used repeatedly by scans;
-- vector/search-specific projections;
-- zone/min-max/bloom metadata for skipping row or column chunks.
-
-Because the representation is derived, its format can evolve faster than the
-transactional row format and corrupt/missing analytical state can be discarded
-and rebuilt rather than making the primary database unavailable.
+Start with authoritative rows plus optional selected column chunks, expressions and
+skipping metadata. Do not copy every column automatically. Derived state can rebuild
+from a retained snapshot/change suffix, allowing its layout to evolve independently
+of primary recovery. Missing/corrupt derived data is never silently trusted or allowed
+to change canonical results.
 
 ### 4. Queryable encoding is distinct from outer compression
 
-Analytical chunks should remain executable in lightweight data-aware encodings
-where practical: dictionary IDs, frame-of-reference/delta forms, bit packing,
-run-length or string-specific encodings such as FSST. Filters, joins and
-aggregations should consume those encodings directly when doing so saves memory
-traffic and decode work.
+Keep useful dictionary, bit-packed, delta, run-length or string encodings executable
+where possible; decompress/materialize only when the operator requires it. Outer zstd
+or other general compression is a separate tier/cost policy. Metadata and dictionaries
+are evictable and accounted for, not assumed permanently resident.
 
-General-purpose compression such as zstd is an **outer storage policy**, not the
-execution representation. Apply it only when the I/O/space savings outweigh the
-extra CPU and materialization cost for that tier/workload. A chunk may therefore
-be queryable-encoded in memory/NVMe and additionally compressed in cold/object
-storage.
-
-Derived chunks, dictionaries and metadata are buffer-managed/evictable. Metadata
-should be loaded lazily when possible; no analytical representation is assumed
-to fit permanently in RAM.
+Evaluate existing encoded-array/scan technology before inventing a format.
+[Vortex's array/compute model](https://docs.vortex.dev/concepts/index.html) and
+[scan interface](https://docs.vortex.dev/concepts/scanning.html) are concrete reuse
+candidates. A library or format does not provide OmenDB snapshots, transactions or
+resource safety. Parquet remains valuable for interchange and immutable cold data;
+no vendor format ratio establishes the internal storage choice.
 
 ### 5. Hot and cold data may converge toward a single hybrid store
 
-A derived columnar cache is the lower-risk first implementation, but the
-architecture explicitly permits a Colibri-like hybrid store if measurements
-show it is superior:
+Compare the row-plus-derived-column baseline with a single-copy hot-row/cold-column
+layout before stable physical-format commitment. Test compact row-ID/PAX/block layouts
+as well as clustered rows; do not assume primary-key clustering is universally best.
+Cold updates must not synchronously rewrite an entire large column chunk. Visibility,
+relocation, history and recovery determine whether hot deltas or rematerialization
+are safe.
 
-```text
-logical row / RowId
-       |
-ordered primary/index structures
-       |
-   +---+-------------------------+
-   |                             |
-hot mutable rows            cold stable ranges
-row-oriented pages          compressed column chunks
-   |                             |
-   +-------------+---------------+
-                 |
-           one MVCC/log state
-```
-
-Cold conversion is online and snapshot-aware. A row/range becomes eligible only
-when its versions and update temperature permit conversion without harming the
-transactional hot path. A later update can materialize a hot row/delta without
-rewriting an entire cold chunk synchronously.
-
-The exact choice between "row source + columnar projection" and "single-copy
-hybrid row/column storage" remains benchmark-gated. OmenDB does not promise one
-before comparing mixed-workload performance, write amplification, cache
-footprint, recovery complexity, and operational behavior.
+Promote a hybrid only when its total storage/memory, point/range/update behavior,
+scan cost, write amplification and recovery are better within declared OLTP budgets.
+Duplicate representations cost maintenance and space; single-copy hybrids cost more
+complex versioning, updates and conversion. Neither is a universal winner.
 
 ### 6. Analytical freshness is explicit
 
-Analytical representations follow the common derived-object publication and
-snapshot-validity contract in
-[ADR 0013](0013-storage-kernel-and-access-methods.md#3-storage-objects-have-explicit-authority-classes).
-An applied CSN frontier is a completeness marker, not a promise that overwritten
-historical values remain available.
-
-The planner may use a representation when its retained view resolves the exact
-query snapshot, or when a complete transaction-aware delta path bridges an older
-base to that snapshot within a configured cost bound. Source incarnation,
-object/schema dependencies and reader retention must also match. All inputs to a
-join/aggregate use the same requested snapshot; taking the minimum of unrelated
-latest-only frontiers does not reconstruct a common view.
-
-No query silently reads stale or future analytical state because it is faster.
-If a requested snapshot is no longer retained, use an authoritative fallback or
-report the unsupported snapshot rather than reinterpret the request.
+Use [ADR 0013's common contract](0013-storage-kernel-and-access-methods.md#3-storage-objects-have-explicit-authority-classes):
+source incarnation, schema dependencies, reader-stable generation, contiguous coverage,
+actual retained readability and complete deltas. All inputs to a join/aggregate must
+resolve the same requested snapshot. The minimum of unrelated latest-only frontiers
+cannot reconstruct it. Wait, fall back or return an explicit unsupported snapshot;
+never silently serve stale/future data.
 
 ### 7. Automatic workload adaptation is a policy, not a correctness mechanism
 
-The database may sample query/column access, update frequency, selectivity,
-compression, and cache pressure to recommend or automatically populate
-analytical representations.
-
-Auto-columnarization or hot/cold conversion must be:
-
-- bounded background work;
-- interruptible and restartable;
-- observable in diagnostics/EXPLAIN;
-- safe to disable;
-- never required for transactional correctness.
-
-A manual policy/override remains available for operators who need deterministic
-layout.
+Column selection, conversion and maintenance are bounded, observable, restartable
+background work, safe to disable with operator overrides. Statistics inform promotion
+and eviction; correctness never depends on an auto-tuner choosing well.
 
 ### 8. Storage tiers map naturally onto hot/cold analytics
 
-Deployment profiles from ADR 0006 can place analytical representations
-according to access pattern and the full memory hierarchy. Hot dictionaries,
-zone metadata and routing/skipping state should occupy faster tiers than bulky
-cold payload when that improves effective cache/memory bandwidth:
+Column/vector/posting extents may use larger I/O and cache units than mutable B-tree
+pages. Share incarnation, publication, retention and aggregate resource accounting,
+not one allocation size or eviction policy. Keep hot routing/dictionaries separate
+from bulky cold payload when beneficial. Object storage belongs on sufficiently large
+immutable reads/checkpoints with measured request cost and local caching, not default
+fine-grained OLTP mutation.
 
-- DRAM: hottest dictionaries, metadata, frequently scanned columns;
-- local NVMe: large column chunks and scan cache;
-- page/cache service NVMe: disaggregated analytical cache;
-- object storage: immutable cold chunks/checkpoints where request size and
-  bandwidth amortize latency.
-
-Object storage is much more suitable for large immutable analytical chunks than
-for OLTP random page updates. This is one of the few places where it may be part
-of the normal query path rather than only backup/archive.
+Reserve memory, CPU, spill and I/O for each query/build/maintenance class while
+protecting log, installation, recovery and essential reclamation. Include retention
+pressure from long snapshots. Measured memory reservations are not necessarily process
+RSS, and cooperative cancellation does not safely kill arbitrary blocking operators.
+Use isolated workers where a hard fault/resource boundary is required.
 
 ### 9. Scale-out analytics remains supported through the same snapshot/change contract
 
-A future `omen-olap` or remote analytical worker pool can bootstrap from:
+A remote OmenDB worker bootstraps with the [retained handoff](0013-storage-kernel-and-access-methods.md#11-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers)
+and applies whole transactions before advertising coverage. It can wait for a requested
+snapshot, use an exact supported view or explicitly expose staleness. Source commit
+success does not imply remote completion. Distributed plans must preserve semantics,
+catalog identity, cancellation and bounded coordinator resources.
 
-```text
-snapshot CSN X + restart LSN Y
-```
-
-and apply committed changes after Y, using the retained handoff in
-[ADR 0013](0013-storage-kernel-and-access-methods.md#11-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers).
-Such a worker is a projection/execution role over OmenDB transaction truth, not
-an independently writable namespace authority.
-
-The optimizer may choose local HTAP execution or remote analytical execution
-based on size, snapshot support, locality, queue pressure and cost. Remote
-progress is explicit: a query may wait for its requested snapshot, fall back, or
-use a separately declared stale-read mode. Source commit success does not imply
-remote projection completion.
-
-This does not settle the standalone OmenDB OLAP product's future. A CDC-fed
-independent analytical database is a different deployment/consistency contract,
-not automatically this remote-worker role. Deployments needing strict OLTP
-isolation may keep heavy analytics off the primary; smaller deployments do not
-have to operate another database.
+The standalone OLAP companion remains a separate product/repository for independently
+ingested analytical data and isolation. A companion consuming OmenDB CDC is not thereby
+a native remote worker or participant in its SQL transactions. Its mutable projection
+contract must handle updates, deletes, schema, durable progress and rebootstrap;
+append-only ingestion is insufficient. ADR 0012 owns this resolved product boundary.
 
 ### 10. Indexing and analytics cooperate instead of duplicating everything
 
-The primary B-tree and secondary indexes remain optimized for point/range OLTP.
-Analytical representations add scan-oriented statistics/chunks only when useful.
-The planner considers both access families and can combine them.
-
-Do not maintain a columnar copy of every column by default. Workload-driven
-selection and cold-range conversion should avoid doubling write amplification
-for tables that never run analytical scans.
+The optimizer chooses among ordered, scan and specialized paths using costs and exact
+coverage. Expose selection vectors and useful statistics, not opaque per-item adapters.
+A table with no analytical workload must not pay a mandatory shadow-copy or background
+maintenance tax.
 
 ### 11. The benchmark is mixed workload, not isolated TPC-H alone
 
-A representation is accepted only if it improves useful mixed workloads without
-silently destroying transaction tail latency. Qualification includes:
-
-- CH-benCHmark / TPC-C + TPC-H style mixtures;
-- current-state dashboards after writes;
-- pure OLTP baseline to measure analytical-maintenance tax;
-- pure analytical baseline to measure scan quality;
-- hot/cold skew and larger-than-memory data;
-- update-heavy tables that should resist columnarization;
-- read-mostly tables that should convert aggressively;
-- local NVMe and object-backed cold chunks where implemented.
-
-Report both analytical throughput/latency and OLTP p50/p95/p99, plus CPU,
-memory, bytes read/query, bytes written, cache occupancy, LLC/TLB/page-walk and
-memory-bandwidth evidence where available, conversion/compaction work, and
-freshness lag.
-
-## Non-goals
-
-- making a second OLAP database mandatory;
-- making every OLTP table columnar;
-- weakening transaction isolation for faster analytics;
-- loading a full columnar shadow copy into RAM by default;
-- requiring full decompression/materialization before every analytical operator;
-- coupling the public CDC format to one analytical physical representation.
-
-## Research inputs
-
-- CedarDB/Umbra Colibri, *Two Birds With One Stone: Designing a Hybrid Cloud
-  Storage Engine for HTAP* (VLDB 2024) — hot row data + cold compressed column
-  chunks with a B+-tree/row-id bridge and modern SSD/object-storage design;
-- AlloyDB columnar engine — workload-managed columnar representation and
-  vectorized planner/executor beside a PostgreSQL-compatible transactional
-  engine;
-- HyPer/Umbra lineage — MVCC snapshots, data-centric/code-generated execution,
-  and morsel-driven parallelism for mixed workloads;
-- CedarDB 2026 encoding/compression work — execute directly on lightweight encodings and treat general compression as a separate storage choice;
-- DuckDB 2026 asynchronous I/O work — decouple I/O concurrency from compute and memory-govern read-ahead, with strongest gains on remote/cold data;
-- Materialize 2026 dictionary-compression work — compact random-access mutable state can reduce memory traffic without becoming a pure column store.
+Compare pure OLTP, pure analytics and mixed TPC-C/TPC-H or CH-benCHmark-shaped work;
+current dashboards after writes; skew/update-heavy and read-mostly tables; long readers;
+larger-than-memory data; ongoing conversion/compaction; and isolated remote execution.
+Report both workload latencies/throughput, OLTP p50/p95/p99, memory/RSS, bandwidth,
+bytes read/written, freshness/retention lag, checkpoint pauses and recovery costs.
+Match durability, semantics and cache state before ranking engines or layouts.
 
 ## Consequences
 
-- The previous statement that OLTP and OLAP **must** use separate physical
-  engines is superseded.
-- OmenDB remains OLTP-first, but useful real-time analytics can run directly on
-  current transactional state.
-- The snapshot/change stream still matters: it powers derived analytical
-  representations and optional scale-out analytics rather than forcing the
-  latter.
-- A future hybrid row/column physical store is allowed, but only after it beats
-  the simpler derived-projection design on measured mixed workloads and passes
-  recovery/fault qualification.
+Useful analytics does not require another database, while heavy or independently
+ingested analytics need not inherit OLTP storage economics. The native batch path and
+optional derived acceleration come first; a better measured single-copy layout can
+replace them without changing SQL/transaction authority. No HTAP performance or strict
+isolation guarantee follows merely from this design or a dependency's API.

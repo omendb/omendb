@@ -1,311 +1,190 @@
 # OmenDB architecture
 
-**Status:** accepted DBNext target, not a description of a completed release.
-The current server uses the existing ordered-KV SeerDB engine. The replacement
-storage kernel is developed under `crates/seerdb/src/vnext` and is not yet a
-restart-safe product backend. [ADR 0013](adr/0013-storage-kernel-and-access-methods.md)
-owns the kernel boundary, [ADR 0014](adr/0014-vnext-installation-and-recovery.md)
-owns installation/recovery, and the [vNext plan](plans/storage-kernel-vnext.md)
-owns implementation order and unfinished gates.
+**Status:** accepted target, reviewed 2026-10-13; not an implemented release.
+The serving backend still uses the generation-COW SeerDB engine. The replacement
+under `crates/seerdb/src/vnext` is not yet a restart-safe product backend.
+The [vNext plan](plans/storage-kernel-vnext.md) owns implementation order and
+open gates; this document is the architectural overview, not another backlog.
 
-OmenDB is a server-first relational database in Rust, optimized first for OLTP
-on RAM and local NVMe. PostgreSQL compatibility belongs at deliberate external
-boundaries: wire protocol, SQL behavior, drivers and tooling. It does not require
-PostgreSQL's internal pages, WAL, executor or process-per-connection model.
-The direct Rust API uses the same transaction semantics; it is not a separate
-storage product.
+## Product and deployment decision
 
-## Current implementation versus target
+Build an integrated, server-first relational database for RAM and local NVMe,
+with an embedded Rust surface using the same semantics. Support native vector
+and text access paths and useful operational analytics over its transactional
+data. Heavy analytics can move to optional workers or a separate OLAP companion.
+Neither a cloud service nor a second database is required for local operation.
 
-| Concern | Current product path | Target |
-| --- | --- | --- |
-| Storage | `src/seer_direct.rs` over transactional ordered KV | Shared transaction/storage kernel with specialized access methods |
-| Physical updates | Generation-COW engine | Buffered pages, logical MVCC, log-authoritative commit, asynchronous out-of-place materialization |
-| Server concurrency | `Arc<RwLock<RelationalDatabase>>`, lock polling and `spawn_blocking` | Concurrent database handle and bounded execution/admission runtime |
-| Rows and execution | Bootstrap row codec and materialized row results | Schema-driven guarded row views, OLTP micro-plans and typed batch pipelines |
-| Planning | SQL classification, executable Describe probes and mixed catalog views remain | One typed binder over a retained catalog view, with current-grant authorization at each statement boundary |
-| Operation failure | Some errors leave committable partial relational state | Private statement deltas and transaction-owned failed state; no partial row/index/catalog commit |
-| Isolation | Legacy certification; vNext fixed snapshots and write intents only | Decision-ordered point/absence/range/catalog/constraint certification |
-| Ordered records | v4 empty-leaf preflight can admit uninstallable decisions | Bounded physical cells, logical key/value overflow and feasibility-first fenced splits |
-| Analytics/search | Future integration | Snapshot-qualified access paths over the same transactional authority |
+The boundary is **one transaction authority for shared authoritative data**, not
+one physical representation, process, or repository for every workload.
+Independently ingested analytical datasets may have their own durable authority;
+they are not silently part of an OmenDB SQL transaction. Repository and product
+ownership are decided in [ADR 0012](adr/0012-unified-modalities-and-rewrite-strategy.md).
 
-The existing engine remains a semantic and crash/fault reference until the
-replacement passes correctness and representative performance gates. Known
-legacy defects in the [gap register](gap-register.md) are not the specification;
-independent PostgreSQL/SQLite semantics and accepted contracts resolve those
-cases. There is no permanent backend matrix. Cutover deletes the superseded physical engine;
-a temporary adapter is qualification machinery, not product extensibility.
+PostgreSQL compatibility concerns wire protocol, SQL behavior, drivers and tools.
+It does not require PostgreSQL's pages, WAL, executor or process model. The
+supported surface remains bounded by the [compatibility matrix](pgwire-compatibility.md)
+and [gap register](gap-register.md).
 
-## Target ownership
+## Ground-up structure
 
 ```text
 PostgreSQL clients / direct Rust API
                   |
-       session / auth / protocol / SQL
+       sessions / authorization / protocol
                   |
-      binder / optimizer / typed plans
+       one binder / catalog / typed plans
                   |
-       micro-plans + batch execution
+     OLTP micro-plans + resumable batch execution
                   |
-       relational catalog + semantics
+        relational meaning and constraints
                   |
-     shared transaction/storage kernel
-       /         |           |       \
- ordered      canonical   specialized  derived
- B-trees      records     access paths representations
-       \         |           |       /
-         MVCC / log / buffer / lifetime
+        SeerDB transaction/storage kernel
+           /          |               \
+    ordered trees   canonical rows   optional access paths
+           \          |               /
+         shared commit / MVCC / lifetime authority
                   |
-       RAM / local NVMe / optional cold tiers
+     mutable buffered pages + immutable extents
+                  |
+            RAM / NVMe / optional cold tiers
 ```
 
-### OmenDB
+### Ownership
 
-OmenDB owns SQL types and NULL behavior, schemas, row-layout versions, primary
-and secondary index meaning, constraints, authorization, DDL, planning and
-execution. It interprets committed changes as relational changes and owns
-metadata for analytical/search representations and future placement.
+OmenDB owns SQL types and NULL behavior, schemas/layout versions, constraints,
+authorization, catalog/name resolution, planning and execution. SeerDB owns
+transaction identities/outcomes, snapshots, conflicts/intents, recoverable logging,
+visibility, resource admission, buffering, materialization and physical lifetime.
+The kernel does not acquire SQL, BM25 or vector-distance semantics.
 
-### SeerDB
+Ordered KV remains a useful API over the ordered access method. It is neither
+a second engine nor the universal physical interface. A transactional KV layer
+can implement relational consistency; the reason to expose a lower internal
+boundary is control over layout, batching and shared lifecycle, not a claim that
+KV systems cannot support transactions or selective access.
 
-SeerDB owns transaction identities and outcomes, snapshots, visibility,
-conflicts/intents, durable logging, recovery, buffering, page translation,
-materialization, physical allocation and retention. These services do not
-acquire SQL, BM25, vector-distance or graph-query semantics.
+Likewise, do not replace a universal KV boundary with a universal small-page
+boundary. Ordered nodes need guarded mutable frames; column chunks, vector
+payloads and postings may need immutable extents, range reads and different cache
+units. They share ownership and budgets, not mandatory page sizes or codecs.
+[ADR 0013](adr/0013-storage-kernel-and-access-methods.md) owns these contracts.
 
-`TreeId + ordered key bytes + opaque value bytes` describes the **current
-facade**, not the universal physical boundary. Ordered B-trees are the first
-access method. Canonical record storage and later specialized structures may
-use different layouts while sharing kernel transaction, log and lifetime
-services. Access methods start as concrete compiled types; no runtime plugin
-ABI or speculative universal trait hierarchy is required.
+## Local storage and commit
 
-The first physical comparison is clustered primary-B-tree rows versus row/heap
-pages plus a primary index. Later vector, text, graph and analytical structures
-must prove both useful specialized performance and transactional composability.
-See [ADR 0013](adr/0013-storage-kernel-and-access-methods.md).
+The local default is a buffered B-link/B+tree family: update hot state in RAM,
+resolve visibility through logical MVCC, and coalesce dirty-page writes before
+out-of-place SSD materialization. Per-transaction whole-tree/generation copying
+is not the target. Node layouts, translation hints, direct I/O, compression,
+large-value separation and FDP/ZNS are measured policies, not prerequisites.
+[ADR 0009](adr/0009-buffered-btree-and-materialization.md) owns ordered layout.
 
-### Packages and sibling engines
+The first row path uses compact schema-driven records and typed guarded access.
+Clustered primary-tree records are the baseline to compare with row/heap pages
+plus a primary index. Prove row/index/catalog atomicity and useful row access;
+do not build a second physical tree implementation merely to demonstrate modularity.
+[ADR 0010](adr/0010-row-layout-and-column-families.md) owns row semantics.
 
-OmenDB is `AGPL-3.0-only`. SeerDB and
-[`durable-fs`](../crates/durable-fs/README.md) are independently versioned
-`Apache-2.0` crates maintained in this workspace. Package independence must not
-force an artificial internal optimization boundary. External `durable-fs`
-consumers pin an OmenDB Git revision until a registry release is available.
-Shared filesystem helpers do not establish shared transaction authority.
-
-DBNext's integrated modalities share one catalog/log/transaction authority.
-The eventual product relationship with standalone OmenDB Vector and OmenDB OLAP
-is **open**: this design does not authorize their archival or wholesale merge.
-Independent deployments have independent transaction outcomes; asynchronous
-integration must expose that boundary rather than claim cross-engine atomicity.
-See [ADR 0012](adr/0012-unified-modalities-and-rewrite-strategy.md).
-
-## Transaction and persistence authority
-
-Keep these identities distinct:
+The target ordinary commit is:
 
 ```text
-TxnId                transaction identity, not commit order
-CSN                  logical committed visibility order
-LSN                  physical durable-log position
-PageId / frame ID    storage/residency identities, not logical row identity
-store incarnation    namespace for persisted identities and recovery state
+private writes + dependencies + protected completion resources
+  -> prepare outside the decision lane
+  -> certify / order / append complete recoverable decision
+  -> establish log durability
+  -> install authoritative effects and finish structural work
+  -> publish a contiguous visible prefix
+  -> acknowledge
+
+page/history materialization and checkpoints follow independently
 ```
 
-One durable decision covers every authoritative mutation in a transaction:
-canonical records, required primary/unique/constraint indexes and catalog state.
-Physical page placement cannot create or revoke that outcome.
+The current coordinator instead synchronizes the WAL and then required undo
+before installation. Those barriers remain mandatory for its existing format.
+The target removes a separate synchronous history flush only after the log,
+retained checkpoints and logical version identities can reconstruct all required
+state. This is a protocol/format change, not deletion of an `fsync`. Large
+external payloads may legitimately require additional dependency barriers.
+[ADR 0014](adr/0014-vnext-installation-and-recovery.md) owns both the baseline and
+the replacement's proof obligations.
 
-The vNext baseline is:
+Use bounded adaptive batching without imposing a fixed wait on an uncontended
+writer. Parallelize preparation and independent installation. Keep encoding,
+page reads and durability waits out of the short certification/ordering lane.
+Autonomous NVMe logging is an experiment, not an assumption that one log authority
+must become one physical writer forever. Measure lane occupancy, barriers and
+ready-to-visible head-of-line waits separately.
 
-```text
-private writes
-  -> freeze dependencies / acquire intents / reserve progress / prepare predecessors
-  -> certify against earlier accepted decisions / append + publish conflict summary
-  -> synchronize decision WAL
-  -> synchronize required undo
-  -> install every authoritative effect with exact page dependencies
-  -> publish status and readiness
-  -> wait for contiguous visibility coverage
-  -> acknowledge success
-```
+## Isolation, lifetime and recovery
 
-A durable decision is irrevocable commit authority; readiness alone is not an
-acknowledgment. A failed or canceled request after possible decision append is
-not safely retryable as an ordinary abort. Recovery resolves the outcome; future
-retry support needs explicit durable request identity or outcome lookup.
+Keep `TxnId`, logical CSN, durable LSN, store incarnation and physical page/frame
+identities distinct. Fixed snapshots and write intents alone are not serializable.
+Initial serializable writers use decision-ordered optimistic certification of
+point, absence, range, catalog and constraint observations, including earlier
+accepted effects not yet installed. Hot-key waiting and other isolation modes
+must preserve their declared semantics rather than silently retry a stale snapshot.
 
-Dirty pages materialize out-of-place. A page image may be written only when WAL
-and undo durability cover its exact dependencies. A maximum page LSN does not
-prove every earlier logical effect is installed. Working spill pages are not
-restart authority without a complete checkpoint containing roots, object and
-allocation metadata, owner outcomes, retention state and a validated page map.
-Recovery loads that checkpoint and applies the synchronized committed WAL suffix
-before exposing the recovered visibility frontier.
+One runtime owns transaction/history leases, admission and commit responsibility.
+An unresolved attempt after possible decision append must fence before unwinding
+releases ownership. Cancellation abandons response delivery, not an irrevocable
+commit. Reserve bounded completion capacity before that boundary, including under
+query, history, cache and allocation pressure.
 
-One runtime owns transaction/history leases, workload reservations, checkpoint
-mutation drain, terminal failure and post-decision completion. Establish attempt
-responsibility before possible append; unwind/cancel/disconnect cannot release
-unresolved ownership without fencing admission and visibility waiters. All real
-entry points and structural/object/allocation mutators use that authority.
-Optional component attachment is not a persistent runtime.
+A complete checkpoint plus retained committed log suffix defines restart state.
+Working spill pages and a maximum page LSN do not prove complete logical replay.
+Checkpoint publication preserves prior valid authority; recovery retries have a
+bounded working-allocation lifecycle. Snapshot, CDC, backup and prior-checkpoint
+retention must participate in reclamation. A snapshot/LSN pair without an atomically
+registered lease is not a safe bootstrap API. See ADRs 0013 and 0014.
 
-SERIALIZABLE uses decision-ordered optimistic certification against earlier
-accepted writers, including effects not yet installed or visible. Register logical
-point/absence/range, catalog/enforcement and mandatory constraint dependencies;
-retain and budget conflict summaries for every snapshot that may still write.
-A validation callback with a gap before append is insufficient. Fixed snapshots
-plus exact write intents do not implement this target.
-[ADR 0014](adr/0014-vnext-installation-and-recovery.md) owns the protocol.
+## Execution and specialized representations
 
-Ordered pages use bounded key/fence/separator/value descriptors and immutable
-logical overflow rather than narrowing logical records to empty-page fit. Actual
-fenced candidates and useful internal fanout determine feasible splits. Reserve
-chain/structural/pin/scratch capacity before decisions and finish parent/root work
-before readiness. Overflow does not bypass future undo, WAL or reader-memory
-limits, select the canonical-row layout, or establish chain GC. See
-[ADR 0009](adr/0009-buffered-btree-and-materialization.md).
+Use one typed binder for Describe and execution; Describe evaluates no user query.
+Retain catalog/layout/enforcement dependencies, enforce current grants at each
+statement boundary, and keep statement deltas private. Explicit-block failure
+makes the transaction rollback-only; catalog, index and constraint work cannot
+escape that lifecycle. [ADR 0007](adr/0007-runtime-execution-and-contention.md)
+owns these semantics and the bounded worker/admission runtime.
 
-## Derived state and snapshot correctness
+Short OLTP operations use direct micro-plans. Scans, joins and searches use typed,
+resumable batches, selection vectors, selective decoding and costed access paths.
+Planning statistics must cover ordinary columns and, where used, filter/vector
+correlation, representation coverage and maintenance cost. Arrow/Parquet are
+interchange boundaries, not mandatory decoding or row-storage formats. JIT and
+custom kernels must improve measured workloads rather than define the architecture.
 
-Rebuildability does not permit stale or future SQL results. A representation
-must identify its source incarnation, object/schema dependencies, publication
-generation, complete applied frontier and retained snapshot validity.
+Operational analytics starts on authoritative rows, with optional snapshot-valid
+columnar acceleration. Benchmark this against a single-copy hot-row/cold-column
+layout before committing the latter as a stable format. Never silently combine
+unrelated latest-only representations as one snapshot. ANN may approximate ranking,
+not row identity, deletion, predicates or authorization. Canonical validation,
+complete delta coverage and refill/exact fallback remain required.
+[ADR 0011](adr/0011-htap-and-analytical-representations.md) owns analytics;
+ADR 0012 owns modality/product boundaries.
 
-An applied frontier `F` is not proof that every snapshot `X <= F` is readable.
-A latest-only representation at 100 cannot answer snapshot 90 after overwriting
-90's values. Use it only at a supported snapshot, reconstruct that snapshot from
-retained versions/deltas, or fall back to authoritative data. Compaction advances
-the oldest readable boundary; it cannot invalidate an admitted reader silently.
-The common contract is in
-[ADR 0013](adr/0013-storage-kernel-and-access-methods.md#3-storage-objects-have-explicit-authority-classes).
+All execution and maintenance share explicit memory, CPU, I/O and history budgets.
+Different caches may use different policies; their totals have one admission owner.
+Progress-critical logging, installation, recovery and reclamation keep protected
+capacity. Telemetry or cooperative cancellation alone is not a hard process-wide
+resource/termination guarantee; isolated workers are appropriate where needed.
 
-ANN may approximate ranking under an explicit recall contract, but not row
-identity, deletion visibility or authorization. Search candidates must be
-validated against the query's canonical snapshot and predicates. Deleted,
-replaced or newly unauthorized rows cannot leak through a stale accelerator.
+## Deployment, qualification and non-goals
 
-## Snapshots and committed changes
+Local mode has no network coordination tax. Regional HA adds a replicated durable
+log and fenced ownership before general distribution. Object storage is appropriate
+for immutable archives, checkpoints and sufficiently large cold reads, not ordinary
+fine-grained OLTP updates. Replication, failover and control-plane availability
+need their own evidence; fast logging proves none of them by itself.
+[ADR 0006](adr/0006-deployment-storage-and-durability.md) owns deployment profiles;
+[ADR 0008](adr/0008-distribution-ranges-and-global-topology.md) owns later distribution.
 
-The target bootstrap boundary remains:
+The architecture selects mechanisms, not a state-of-the-art performance claim.
+Representative benchmarks must match durability, isolation, hardware, cache state,
+transaction size and correctness, and include churn, long snapshots, checkpoints,
+larger-than-memory data and recovery. The [plan](plans/storage-kernel-vnext.md)
+selects experiments before cutover; [alpha gates](alpha-release-gates.md) govern
+release. No doc update closes a code or qualification gate.
 
-```text
-snapshot CSN X + restart position Y + retained source identity/lease
-  -> copy the pinned snapshot
-  -> consume complete committed transactions after the cut
-  -> durably apply effects and consumer progress together
-  -> publish consumer coverage
-  -> advance retention only after durable consumer acknowledgment
-```
-
-The pair `(X,Y)` alone is not a live snapshot handle, a retention lease or a
-transport protocol. The current `TransactionDatabase::snapshot_export` reports
-a durable position; it does not atomically pin a copyable snapshot and change
-suffix. A gap-free exported snapshot/lease handoff remains a target contract.
-Logical consumer progress and physical WAL retention/recovery floors must remain
-distinct, even if a baseline happens to use the same number.
-
-Consumers must tolerate replay after a crash, apply transaction boundaries
-atomically, bind positions to a source incarnation, and fail explicitly if
-required history is gone. Physical WAL framing is not the stable public CDC
-format. The shared bootstrap/retention contract is in
-[ADR 0013](adr/0013-storage-kernel-and-access-methods.md#11-snapshotbootstrap-is-a-retained-handoff-not-just-two-numbers).
-
-## Runtime, planning and data layout
-
-Logical client sessions are not OS workers. Network/protocol tasks submit bound
-operations to a bounded runtime. Short OLTP work benefits from worker locality;
-scans, joins, builds and maintenance expose bounded resumable tasks. Admission
-accounts for memory, spill, CPU and I/O rather than a single abstract cost.
-Durability, recovery and essential reclamation retain progress capacity even
-under foreground or analytical saturation. See
-[ADR 0007](adr/0007-runtime-execution-and-contention.md).
-
-One typed binder supplies parameter/result types, effects, privileges and
-catalog/name/enforcement dependencies to Describe, planning and execution. Data
-and layout interpretation use one retained transaction view; authorization checks
-current grants at each Describe/execution boundary. Cached plans are not grants;
-revocation alone does not cancel authorized work or trigger commit reauthorization.
-A later authorization error still makes an explicit block rollback-only. Describe
-performs zero user-query evaluation.
-
-Private statement deltas include rows, indexes, cascades, constraints and catalog
-state. A fixed statement input view prevents DML from consuming its own output.
-Explicit-block errors leave transaction-owned rollback-only state through direct
-and wire APIs, including bind/auth/result admission. After possible decision
-append, completion is kernel responsibility, not ordinary rollback.
-
-Object-granularity catalog dependencies include table enforcement membership so
-old writers cannot bypass newly added indexes/constraints. Mutation-driven probes
-and authoritative child-side FK lookup replace routine whole-table validation.
-The target checks immediate constraints at their declared mutation/statement
-boundary and explicitly deferred work before decision; current publication-time
-FK behavior is not proof of immediate SQL semantics. ADR 0007 owns these contracts.
-
-Point/range OLTP uses compact micro-plans and short-lived guarded row views.
-Native scan/access-method interfaces expose typed batches and selection vectors;
-row-at-a-time iterators are adapters, not the mandatory hot-path boundary.
-Scans, joins and aggregates decode only needed columns, and analytical execution
-should operate directly on queryable lightweight encodings where useful. The schema-driven row codec includes layout versions,
-NULL metadata and typed payloads; additional families or large-value indirection
-require measured benefit and explicit relocation/retention semantics. JIT, custom
-latches and SIMD refinements follow profiles rather than define semantics.
-See [ADR 0010](adr/0010-row-layout-and-column-families.md).
-
-## Analytics, tiers and distribution
-
-In-engine batch scans over authoritative rows are the first analytical path.
-Optional columnar, search and graph representations are snapshot-qualified
-acceleration, not second transaction histories. A single-copy hybrid row/column
-store remains an experiment requiring mixed-workload and recovery evidence.
-Remote workers are optional and do not silently become the independently
-writable OLAP product. See [ADR 0011](adr/0011-htap-and-analytical-representations.md).
-
-Local mode needs no cloud service or cluster scheduler. RAM plus NVMe is the
-initial hot/durable profile. Object storage suits immutable checkpoints,
-backups, archives and analytical chunks; it is not the default random-write OLTP
-device. Regional HA adds a quorum log only after local recovery qualification;
-future disaggregation changes placement, not transaction meaning. See
-[ADR 0006](adr/0006-deployment-storage-and-durability.md).
-
-Distribution adds stable range/placement-group identities, ownership epochs,
-replica sets and cross-range coordination only where needed. Plans retain
-symbolic routing; execution resolves current placement. Controllers reconcile
-topology but do not grant database commit authority. An outer resource scheduler,
-including Archon, may manage processes and resource allocations; its leases do
-not replace database replication/leadership fencing. See
-[ADR 0008](adr/0008-distribution-ranges-and-global-topology.md).
-
-## Qualification and implementation order
-
-The [vNext plan](plans/storage-kernel-vnext.md) is the sole detailed execution
-sequence. In summary:
-
-Runtime completion responsibility, decision-ordered certification and protected
-resource admission precede checkpoint qualification. Bounded ordered layout and
-structural completion precede persistent graph capture. Relational binder,
-statement-failure and catalog corrections can proceed against the current adapter
-without waiting for canonical rows. Then qualify checkpoint/restart, retention and
-bounded work/recovery; measure the actual vNext path; integrate canonical records
-and pass product semantic/crash/performance gates before cutover and deletion.
-Explicit offline preview conversion preserves supported logical semantics or
-refuses input; it does not imply stable-format upgrades or a permanent dual engine.
-
-Keep fault effects and scheduling explicit enough to support deterministic
-exploration of concurrency and later distributed interleavings. Simulation must
-exercise the same state machines, not a separate mock database. Qualification
-includes two consecutive reopens at persistence boundaries and recovery memory
-versus retained history. Current recovery structures still grow with history;
-there is no bounded-memory large-history claim yet.
-
-Measure the entire memory hierarchy, including LLC/TLB/page walks, bandwidth
-and NUMA placement where applicable, not just buffer hit rate. Huge pages,
-validated translation hints, physical row/version references and large-value
-arenas remain conditional experiments with lifecycle and end-to-end evidence.
-
-No default translation, page size, MVCC layout, autonomous commit policy or
-analytical format is established by another system's benchmark. The
-[alpha gates](alpha-release-gates.md) define release evidence; the
-[benchmark documentation](benchmarks.md) distinguishes product regression smoke
-from replacement-kernel qualification.
+Retain useful existing oracles, but resolve known legacy defects against independent
+semantics. Cutover removes the generation-COW engine, transitional adapters and
+obsolete docs rather than maintaining a runtime backend matrix. Repository history
+is retained; private research and sibling code are not published by implication.
