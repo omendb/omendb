@@ -102,13 +102,14 @@ and shared lifetime, not because a KV layer cannot express relational correctnes
 
 `omendb/omendb` is the canonical implementation workspace for the relational
 server, SeerDB, durable-fs, and integrated access methods. Continue the replacement
-on `storage-kernel-vnext`; do not create a fresh root repository or use a historical
+on `main`; do not create a fresh root repository or use a historical
 coordination repository as the new product tree.
 
 Keep useful differential, lifecycle, crash and workload evidence. Tests of known
 legacy defects are not a specification. Once qualified, replace and delete the
 legacy physical engine and transitional adapters rather than retain a selectable
-backend. Do not merge an unqualified storage branch to publish a design change.
+backend. Development on `main` does not qualify vNext or switch the serving engine;
+product cutover still requires the maintained semantic, recovery and performance gates.
 
 ### OmenDB Vector repository
 

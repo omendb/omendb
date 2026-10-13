@@ -1,6 +1,6 @@
 # Storage-kernel vNext roadmap
 
-**Branch:** `storage-kernel-vnext`
+**Branch:** `main` — vNext remains experimental until qualified product cutover.
 
 **Goal:** replace generation-COW and universal opaque-KV storage with one qualified
 transaction/storage kernel, native ordered/record access, and integrated OmenDB.
