@@ -19,14 +19,12 @@ use super::{
     VersionId, VisibilityError, VisibilityFrontier, WriteIntentError, WriteIntentTable,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Synchronous write-admission and commit coordinator for ordered objects.
 ///
-/// One coordinator is intended to represent one runtime's write-admission
-/// fence. The lower WAL/undo components have their own I/O fences; this higher
-/// fence prevents an unresolved failure from returning control to an ordinary
-/// writer population when recovery/reopen is required.
+/// Coordinators and ordered readers share one mandatory runtime admission
+/// authority. Its terminal fence prevents unresolved attempts from returning
+/// control to an ordinary reader/writer population when recovery is required.
 pub struct OrderedCommitCoordinator<'a> {
     appender: &'a CommitAppender,
     statuses: &'a TransactionStatusTable,
@@ -34,8 +32,7 @@ pub struct OrderedCommitCoordinator<'a> {
     intents: &'a WriteIntentTable,
     undo: &'a UndoStore,
     page_dependencies: Option<&'a PageDependencyTable>,
-    runtime_admission: Option<&'a RuntimeAdmission>,
-    fenced: AtomicBool,
+    runtime_admission: &'a RuntimeAdmission,
 }
 
 impl<'a> OrderedCommitCoordinator<'a> {
@@ -43,6 +40,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// dependency attachment.
     #[must_use]
     pub const fn new(
+        runtime_admission: &'a RuntimeAdmission,
         appender: &'a CommitAppender,
         statuses: &'a TransactionStatusTable,
         frontier: &'a VisibilityFrontier,
@@ -56,8 +54,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: None,
-            runtime_admission: None,
-            fenced: AtomicBool::new(false),
+            runtime_admission,
         }
     }
 
@@ -66,6 +63,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// durability barriers.
     #[must_use]
     pub fn with_page_dependencies(
+        runtime_admission: &'a RuntimeAdmission,
         appender: &'a CommitAppender,
         statuses: &'a TransactionStatusTable,
         frontier: &'a VisibilityFrontier,
@@ -86,21 +84,8 @@ impl<'a> OrderedCommitCoordinator<'a> {
             intents,
             undo,
             page_dependencies: Some(page_dependencies),
-            runtime_admission: None,
-            fenced: AtomicBool::new(false),
+            runtime_admission,
         }
-    }
-
-    /// Attach the runtime admission/drain authority used by checkpoint capture.
-    ///
-    /// Commit admission is acquired at the start of `commit` and held through
-    /// page installation and visibility completion. Checkpoint drain therefore
-    /// cannot establish its capture cut while an admitted commit is still able
-    /// to mutate authoritative state.
-    #[must_use]
-    pub fn with_runtime_admission(mut self, runtime_admission: &'a RuntimeAdmission) -> Self {
-        self.runtime_admission = Some(runtime_admission);
-        self
     }
 
     /// Begin one write transaction at the current contiguous visibility
@@ -146,10 +131,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
         trees: &[&BTreeObject],
     ) -> Result<CommitPosition, OrderedCommitError> {
         self.ensure_open()?;
-        let _runtime_admission = self
-            .runtime_admission
-            .map(RuntimeAdmission::admit_commit)
-            .transpose()?;
+        let _runtime_admission = self.runtime_admission.admit_commit()?;
         if transaction.phase() != TransactionPhase::Active {
             return Err(OrderedCommitError::WrongPhase(transaction.phase()));
         }
@@ -193,41 +175,34 @@ impl<'a> OrderedCommitCoordinator<'a> {
         }
 
         transaction.begin_validation()?;
-        let ticket = match self.appender.append_validated(transaction) {
+        // Declared after intents and drain membership: unresolved Drop fences
+        // and wakes waiters before either of those capabilities is released.
+        let mut responsibility = CommitResponsibility {
+            coordinator: self,
+            transaction,
+            resolved: false,
+        };
+        let ticket = match self.appender.append_validated(responsibility.transaction) {
             Ok(ticket) => ticket,
             Err(error) => {
-                if transaction.phase() == TransactionPhase::RecoveryRequired {
-                    self.fence_after_wal(transaction);
-                } else {
-                    self.cleanup_clean_append_failure(transaction)?;
+                if responsibility.transaction.phase() != TransactionPhase::RecoveryRequired {
+                    self.cleanup_clean_append_failure(responsibility.transaction)?;
+                    responsibility.resolved = true;
                 }
                 return Err(OrderedCommitError::Append(error));
             }
         };
 
-        if let Err(error) = self.appender.sync_through(ticket.decision_lsn()) {
-            self.fence_after_wal(transaction);
-            return Err(OrderedCommitError::Log(error));
-        }
+        self.appender.sync_through(ticket.decision_lsn())?;
         if let Some(dependencies) = self.page_dependencies {
             dependencies.advance_wal(ticket.decision_lsn());
         }
-        let position = match transaction.mark_durable(ticket.decision_lsn()) {
-            Ok(position) => position,
-            Err(error) => {
-                self.fence_after_wal(transaction);
-                return Err(OrderedCommitError::Transaction(error));
-            }
-        };
+        let position = responsibility
+            .transaction
+            .mark_durable(ticket.decision_lsn())?;
 
         if let Some(version) = max_required_undo {
-            let durable = match self.undo.sync_through(version) {
-                Ok(durable) => durable,
-                Err(error) => {
-                    self.fence_after_wal(transaction);
-                    return Err(OrderedCommitError::Undo(error));
-                }
-            };
+            let durable = self.undo.sync_through(version)?;
             if let Some(dependencies) = self.page_dependencies {
                 dependencies.advance_undo(durable);
             }
@@ -245,31 +220,29 @@ impl<'a> OrderedCommitCoordinator<'a> {
             } else {
                 installer.apply_prepared(tree, buffer, &intent_guard, prepared)
             };
-            if let Err(error) = installed {
-                self.fence_after_wal(transaction);
-                return Err(OrderedCommitError::Install(error));
-            }
+            installed?;
         }
 
         // Readiness publication is not completion: a synchronous commit is only
         // acknowledged once the contiguous frontier covers this CSN, so a
         // snapshot taken after the acknowledgement must observe the effect.
-        if let Err(error) =
-            self.frontier
-                .complete_commit(self.statuses, transaction.id(), ticket.csn())
         {
-            self.fence_after_wal(transaction);
-            return Err(OrderedCommitError::Visibility(error));
+            let _publication = self.runtime_admission.admit_visibility()?;
+            self.frontier.publish_commit(
+                self.statuses,
+                responsibility.transaction.id(),
+                ticket.csn(),
+            )?;
         }
-        if let Err(error) = transaction.mark_visible() {
-            self.fence_after_wal(transaction);
-            return Err(OrderedCommitError::Transaction(error));
+        // Drain/failure authority must not be locked while waiting for earlier
+        // installers. A second short admission establishes ACK versus fencing.
+        self.frontier.wait_visible(ticket.csn())?;
+        {
+            let _completion = self.runtime_admission.admit_visibility()?;
+            responsibility.transaction.mark_visible()?;
+            responsibility.transaction.release()?;
+            responsibility.resolved = true;
         }
-        if let Err(error) = transaction.release() {
-            self.fence_after_wal(transaction);
-            return Err(OrderedCommitError::Transaction(error));
-        }
-
         intent_guard.release();
         Ok(position)
     }
@@ -278,7 +251,7 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// admission until recovery/reopen.
     #[must_use]
     pub fn is_fenced(&self) -> bool {
-        self.fenced.load(Ordering::Acquire)
+        self.runtime_admission.ensure_read_admission().is_err()
     }
 
     fn preflight<'b>(
@@ -328,15 +301,9 @@ impl<'a> OrderedCommitCoordinator<'a> {
         &self,
         transaction: &mut Transaction,
     ) -> Result<(), OrderedCommitError> {
-        if let Err(error) = self.statuses.abort(transaction.id()) {
-            self.fence_admission();
-            return Err(OrderedCommitError::Status(error));
-        }
-        if transaction.phase() != TransactionPhase::Aborted
-            && let Err(error) = transaction.abort()
-        {
-            self.fence_admission();
-            return Err(OrderedCommitError::Transaction(error));
+        self.statuses.abort(transaction.id())?;
+        if transaction.phase() != TransactionPhase::Aborted {
+            transaction.abort()?;
         }
         Ok(())
     }
@@ -346,29 +313,41 @@ impl<'a> OrderedCommitCoordinator<'a> {
     /// Every post-decision failure path routes through here so completion
     /// waiters are woken with recovery-required semantics instead of blocking on
     /// a frontier that cannot advance until recovery.
-    fn fence_after_wal(&self, transaction: &mut Transaction) {
+    fn fence_unresolved(&self, transaction: &mut Transaction) {
         self.fence_admission();
         if transaction.phase() != TransactionPhase::RecoveryRequired {
             let _ = transaction.mark_recovery_required();
         }
-        self.frontier.require_recovery();
     }
 
     fn fence_admission(&self) {
-        self.fenced.store(true, Ordering::Release);
-        if let Some(runtime_admission) = self.runtime_admission {
-            runtime_admission.require_recovery();
-        }
+        self.runtime_admission.require_recovery();
+        self.frontier.require_recovery();
     }
 
     fn ensure_open(&self) -> Result<(), OrderedCommitError> {
         if self.is_fenced() {
             return Err(OrderedCommitError::Fenced);
         }
-        if let Some(runtime_admission) = self.runtime_admission {
-            runtime_admission.ensure_read_admission()?;
-        }
+        self.runtime_admission.ensure_read_admission()?;
         Ok(())
+    }
+}
+
+/// Owns an attempt even when append panics before returning a ticket. Returned
+/// errors and unwinds have the same terminal fence; only a proven clean refusal
+/// or completed visible transaction disarms it.
+struct CommitResponsibility<'c, 'runtime> {
+    coordinator: &'c OrderedCommitCoordinator<'runtime>,
+    transaction: &'c mut Transaction,
+    resolved: bool,
+}
+
+impl Drop for CommitResponsibility<'_, '_> {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.coordinator.fence_unresolved(self.transaction);
+        }
     }
 }
 
@@ -432,6 +411,10 @@ pub enum OrderedCommitError {
 }
 
 #[cfg(test)]
+#[path = "ordered_commit_failure_tests.rs"]
+mod failure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::vnext::{
@@ -441,7 +424,7 @@ mod tests {
     };
     use durable_fs::SyncClass;
     use std::io;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
     use std::sync::{Arc, Condvar, Mutex, RwLock};
     use std::time::{Duration, Instant};
@@ -598,8 +581,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
 
         let mut first = coordinator
             .begin_write(TxnId::new(1))
@@ -636,7 +621,7 @@ mod tests {
                 .is_some_and(|version| version.get() >= 2)
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&rows, &buffer, b"row", None, old_snapshot)
@@ -682,7 +667,9 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
+        let admission = RuntimeAdmission::new();
         let coordinator = OrderedCommitCoordinator::with_page_dependencies(
+            &admission,
             &appender,
             &statuses,
             &frontier,
@@ -738,9 +725,9 @@ mod tests {
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
         let admission = RuntimeAdmission::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
-                .with_runtime_admission(&admission);
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
         let mut transaction = coordinator
             .begin_write(TxnId::new(130))
             .expect("transaction begins");
@@ -823,9 +810,9 @@ mod tests {
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
         let admission = RuntimeAdmission::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo)
-                .with_runtime_admission(&admission);
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
 
         let mut transaction = coordinator
             .begin_write(TxnId::new(140))
@@ -872,8 +859,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
         let mut transaction = coordinator
             .begin_write(TxnId::new(120))
             .expect("transaction begins at snapshot zero");
@@ -915,8 +904,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
         let mut transaction = coordinator
             .begin_write(TxnId::new(30))
             .expect("transaction begins");
@@ -957,8 +948,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
         let mut transaction = coordinator
             .begin_write(TxnId::new(10))
             .expect("transaction begins");
@@ -990,8 +983,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
         let mut transaction = coordinator
             .begin_write(TxnId::new(20))
             .expect("transaction begins");
@@ -1048,8 +1043,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
 
         let mut first = coordinator
             .begin_write(TxnId::new(31))
@@ -1128,7 +1125,7 @@ mod tests {
         });
 
         drop(stalled_intents);
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"c", None, frontier.snapshot())
@@ -1154,8 +1151,10 @@ mod tests {
         let statuses = TransactionStatusTable::new();
         let frontier = VisibilityFrontier::default();
         let intents = WriteIntentTable::new();
-        let coordinator =
-            OrderedCommitCoordinator::new(&appender, &statuses, &frontier, &intents, &undo);
+        let admission = RuntimeAdmission::new();
+        let coordinator = OrderedCommitCoordinator::new(
+            &admission, &appender, &statuses, &frontier, &intents, &undo,
+        );
 
         let mut first = coordinator
             .begin_write(TxnId::new(41))
@@ -1208,7 +1207,7 @@ mod tests {
             );
 
             // The stalled transaction fails after its durable decision existed.
-            coordinator.fence_after_wal(&mut stalled);
+            coordinator.fence_unresolved(&mut stalled);
             let result = result_rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("waiting commit wakes");

@@ -27,7 +27,7 @@ with incorrect output. This file is the sole OmenDB implementation sequence.
 | A — identities/frames | Object/PageId and exact-incarnation frames | Integrated lifetime/pressure ownership |
 | B — buffer | Sharded translation, CLOCK, single-flight Loading, dependency-checked spill | Protected progress, complete persistent lifecycle/capture |
 | C — ordered pages | v4 slotted B-link tree, atomic upsert and split dependencies | Bounded cells/overflow, actual fenced feasibility, structural finish |
-| D — decisions | Ordered WAL append, grouped undo, readiness/contiguous completion | Mandatory runtime responsibility, certification, deterministic reservations, complete-log target |
+| D — decisions | Ordered WAL, grouped undo, owned attempts and gated contiguous completion | Persistent runtime integration, certification, deterministic reservations, complete-log target |
 | E — MVCC | Logical owner/history, effect identity, snapshots/private overlay | Registered leases/dependencies, bounded work/history/reclamation |
 | F — persistence | Directory/component exclusion, checksummed images and placement map | Complete checkpoint/manifest, restart, bounded retry-space and crash qualification |
 | G — relational | Existing product adapter/oracles | Binder/statement/catalog correctness, canonical records and qualified cutover |
@@ -38,11 +38,12 @@ undo_store,segment_log}.rs` and `vnext/btree/`.
 
 ### Known blockers, not completed foundations
 
-- `OrderedCommitCoordinator` still optionally attaches runtime admission and page
-  dependencies. Its fixed snapshots/write intents are not the target serializable
-  point/absence/range/catalog certifier.
-- `CommitAdmission::drop` releases drain membership without owning commit outcome.
-  Caught unwind after possible append can therefore escape the required failure fence.
+- Ordered coordinators and MVCC readers require shared runtime admission; armed
+  commit attempts fence unresolved exits before intents/drain membership drop, and
+  publication/ACK order against that fence. A persistent owner joining these
+  services, mandatory page dependencies, snapshot/history leases and structural
+  paths remains unimplemented. Fixed snapshots/write intents are not the target
+  serializable point/absence/range/catalog certifier.
 - Empty-leaf preflight does not prove a record fits future fenced/split pages or
   that an admitted installer has sufficient allocation/pin/scratch capacity.
 - Original WAL batches can exceed segment capacity inside device append. A known
@@ -60,8 +61,8 @@ undo_store,segment_log}.rs` and `vnext/btree/`.
 ### 1. Own lifecycle, certification and resources before checkpoint
 
 Construct one persistent runtime; remove optional-service composition from real entry
-points. Arm commit responsibility before possible append and retain intents, resources
-and drain membership until explicit completion, clean refusal or terminal fencing.
+points. Preserve commit responsibility before possible append and retain intents,
+resources and drain membership until explicit completion, clean refusal or terminal fencing.
 Qualify unwind/cancel/disconnect, visibility gaps and checkpoint drain through the real
 runtime. All read/snapshot/direct/server and structural/GC/allocation paths use its
 failure, history and capture authority.

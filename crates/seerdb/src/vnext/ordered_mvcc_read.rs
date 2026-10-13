@@ -6,8 +6,8 @@
 
 use super::{
     BTreeError, BTreeLookup, BTreeObject, BufferPool, CommitSeq, MvccCodecError, MvccRecord,
-    MvccValue, RangeCursor, RecordVisibility, StatusTableError, TransactionStatusTable, TxnId,
-    UndoStore, UndoStoreError, VersionId,
+    MvccValue, RangeCursor, RecordVisibility, RuntimeAdmission, RuntimeAdmissionError,
+    StatusTableError, TransactionStatusTable, TxnId, UndoStore, UndoStoreError, VersionId,
 };
 
 /// Ordered logical key/value batch produced by a visible MVCC range read.
@@ -52,12 +52,14 @@ impl OrderedMvccRangeCursor {
         buffer: &BufferPool,
         limit: usize,
     ) -> Result<OrderedKeyValueBatch, OrderedMvccReadError> {
+        resolver.ensure_read_admission()?;
         if limit == 0 || self.raw.is_done() {
             return Ok(Vec::new());
         }
 
         let mut visible = Vec::with_capacity(limit);
         while visible.len() < limit && !self.raw.is_done() {
+            resolver.ensure_read_admission()?;
             let remaining = limit - visible.len();
             let rows = self.raw.next_batch(tree, buffer, remaining)?;
             if rows.is_empty() {
@@ -77,14 +79,28 @@ impl OrderedMvccRangeCursor {
 
 /// Ordered reader over the shared status and undo services.
 pub struct OrderedMvccReader<'a> {
+    runtime_admission: &'a RuntimeAdmission,
     statuses: &'a TransactionStatusTable,
     undo: &'a UndoStore,
 }
 
 impl<'a> OrderedMvccReader<'a> {
     #[must_use]
-    pub const fn new(statuses: &'a TransactionStatusTable, undo: &'a UndoStore) -> Self {
-        Self { statuses, undo }
+    pub const fn new(
+        runtime_admission: &'a RuntimeAdmission,
+        statuses: &'a TransactionStatusTable,
+        undo: &'a UndoStore,
+    ) -> Self {
+        Self {
+            runtime_admission,
+            statuses,
+            undo,
+        }
+    }
+
+    pub(super) fn ensure_read_admission(&self) -> Result<(), OrderedMvccReadError> {
+        self.runtime_admission.ensure_read_admission()?;
+        Ok(())
     }
 
     /// Resolve one logical key for `reader` at `snapshot`.
@@ -101,6 +117,7 @@ impl<'a> OrderedMvccReader<'a> {
         reader: Option<TxnId>,
         snapshot: CommitSeq,
     ) -> Result<MvccLookup, OrderedMvccReadError> {
+        self.ensure_read_admission()?;
         self.resolve_lookup(tree.lookup(buffer, key)?, reader, snapshot)
     }
 
@@ -127,6 +144,7 @@ impl<'a> OrderedMvccReader<'a> {
         reader: Option<TxnId>,
         snapshot: CommitSeq,
     ) -> Result<MvccLookup, OrderedMvccReadError> {
+        self.ensure_read_admission()?;
         let current = match lookup {
             BTreeLookup::NotFound => return Ok(MvccLookup::NotFound),
             BTreeLookup::Found(bytes) => MvccRecord::from_bytes(&bytes)?,
@@ -146,6 +164,7 @@ impl<'a> OrderedMvccReader<'a> {
     ) -> Result<MvccLookup, OrderedMvccReadError> {
         let mut containing_undo: Option<VersionId> = None;
         loop {
+            self.ensure_read_admission()?;
             match self.statuses.visibility(record.owner(), reader, snapshot)? {
                 RecordVisibility::Visible => {
                     return Ok(match record.value() {
@@ -174,6 +193,8 @@ impl<'a> OrderedMvccReader<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OrderedMvccReadError {
+    #[error(transparent)]
+    Admission(#[from] RuntimeAdmissionError),
     #[error(transparent)]
     BTree(#[from] BTreeError),
     #[error(transparent)]
@@ -255,7 +276,8 @@ mod tests {
     #[test]
     fn visible_frozen_current_returns_value_and_tombstone() {
         let (buffer, tree, _directory, undo, statuses) = setup();
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         seed(
             &tree,
             &buffer,
@@ -315,7 +337,8 @@ mod tests {
             ),
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"key", None, CommitSeq::new(5))
@@ -353,7 +376,8 @@ mod tests {
             ),
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"key", None, CommitSeq::new(10))
@@ -401,7 +425,8 @@ mod tests {
             &MvccRecord::installed(absent, 0, None, MvccValue::Inline(b"uncommitted".to_vec())),
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"with-history", None, CommitSeq::new(10))
@@ -442,7 +467,8 @@ mod tests {
             ),
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"key", None, CommitSeq::new(3))
@@ -532,7 +558,8 @@ mod tests {
             ),
         );
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         let mut cursor = reader.range_cursor(&tree, b"k0", b"k9", None, CommitSeq::new(3));
         let first = cursor
             .next_batch(&reader, &tree, &buffer, 3)
@@ -568,7 +595,8 @@ mod tests {
                 MvccValue::Inline(b"unknown".to_vec()),
             ),
         );
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert!(matches!(
             reader.lookup(&tree, &buffer, b"key", None, CommitSeq::new(100)),
             Err(OrderedMvccReadError::Status(StatusTableError::UnknownTxn(txn)))

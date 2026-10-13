@@ -40,12 +40,14 @@ impl OrderedTransactionRangeCursor {
         buffer: &BufferPool,
         limit: usize,
     ) -> Result<OrderedKeyValueBatch, OrderedMvccReadError> {
+        resolver.ensure_read_admission()?;
         if limit == 0 || self.is_done() {
             return Ok(Vec::new());
         }
 
         let mut rows = Vec::with_capacity(limit);
         while rows.len() < limit {
+            resolver.ensure_read_admission()?;
             if self.base_pending.is_empty() && !self.base.is_done() {
                 let remaining = limit - rows.len();
                 let prefetch = remaining.max(16);
@@ -101,6 +103,7 @@ impl OrderedMvccReader<'_> {
         transaction: &Transaction,
         key: &[u8],
     ) -> Result<MvccLookup, OrderedMvccReadError> {
+        self.ensure_read_admission()?;
         match transaction.staged_ordered_lookup(tree.descriptor().id(), key) {
             StagedOrderedLookup::Put(value) => Ok(MvccLookup::Found(value.to_vec())),
             StagedOrderedLookup::Delete => Ok(MvccLookup::Deleted),
@@ -208,6 +211,54 @@ mod tests {
     }
 
     #[test]
+    fn recovery_fence_blocks_shared_private_and_buffered_cursor_reads() {
+        let buffer = BufferPool::new(8, 512, Arc::new(MemoryPageIo::default())).expect("buffer");
+        let tree = BTreeObject::create(descriptor(1), &buffer).expect("tree");
+        seed(&tree, &buffer, b"a", b"first", 1);
+        seed(&tree, &buffer, b"b", b"second", 1);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StoreDirectory::create(directory.path()).expect("store");
+        let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
+        let statuses = TransactionStatusTable::new();
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
+        let mut transaction = Transaction::new(TxnId::new(1), CommitSeq::new(1));
+        transaction
+            .stage_ordered_put(descriptor(1), b"c".to_vec(), b"private".to_vec())
+            .expect("stage");
+        let mut cursor = reader.range_cursor_transaction(&tree, &transaction, b"a", b"z");
+        assert_eq!(
+            cursor
+                .next_batch(&reader, &tree, &buffer, 1)
+                .expect("first row"),
+            vec![(b"a".to_vec(), b"first".to_vec())]
+        );
+        // The next row was prefetched and needs no shared-page lookup. Both it
+        // and the private overlay must still obey the same failure boundary.
+        admission.require_recovery();
+        let fenced = |result| {
+            assert!(matches!(
+                result,
+                Err(OrderedMvccReadError::Admission(
+                    crate::vnext::RuntimeAdmissionError::RecoveryRequired
+                ))
+            ))
+        };
+        for key in [b"a", b"c", b"missing".as_slice()] {
+            fenced(reader.lookup_transaction(&tree, &buffer, &transaction, key));
+        }
+        assert!(matches!(
+            cursor.next_batch(&reader, &tree, &buffer, 1),
+            Err(OrderedMvccReadError::Admission(_))
+        ));
+        let mut shared = reader.range_cursor(&tree, b"a", b"z", None, CommitSeq::new(1));
+        assert!(matches!(
+            shared.next_batch(&reader, &tree, &buffer, 1),
+            Err(OrderedMvccReadError::Admission(_))
+        ));
+    }
+
+    #[test]
     fn staged_put_and_delete_override_shared_snapshot_without_installing() {
         let device = Arc::new(MemoryPageIo::default());
         let buffer = BufferPool::new(8, 512, device).expect("buffer");
@@ -218,7 +269,8 @@ mod tests {
         let store = StoreDirectory::create(directory.path()).expect("store");
         let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         let mut transaction = Transaction::new(TxnId::new(7), CommitSeq::new(1));
         transaction
             .stage_ordered_put(descriptor(1), b"existing".to_vec(), b"private".to_vec())
@@ -284,7 +336,8 @@ mod tests {
             .expect("seed current");
 
         let transaction = Transaction::new(TxnId::new(10), CommitSeq::new(1));
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup_transaction(&tree, &buffer, &transaction, b"key")
@@ -306,7 +359,8 @@ mod tests {
         let store = StoreDirectory::create(directory.path()).expect("store");
         let undo = UndoStore::create(&store, SyncClass::KernelBarrier).expect("undo");
         let statuses = TransactionStatusTable::new();
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         let mut transaction = Transaction::new(TxnId::new(12), CommitSeq::new(1));
         transaction
             .stage_ordered_put(descriptor(1), b"k0".to_vec(), b"p0".to_vec())

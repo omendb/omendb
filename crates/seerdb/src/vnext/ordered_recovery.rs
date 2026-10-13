@@ -432,7 +432,8 @@ mod tests {
         assert_eq!(frontier.snapshot(), CommitSeq::new(2));
         assert_eq!(undo.durable_version(), Some(VersionId::new(1)));
 
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&tree, &buffer, b"key", None, CommitSeq::new(1))
@@ -611,7 +612,8 @@ mod tests {
                 1
             )))
         );
-        let reader = OrderedMvccReader::new(&statuses, &undo);
+        let admission = crate::vnext::RuntimeAdmission::new();
+        let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
         assert_eq!(
             reader
                 .lookup(&first, &buffer, b"good", None, frontier.snapshot())

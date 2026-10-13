@@ -88,11 +88,11 @@ impl VisibilityFrontier {
         let mut state = self.state.lock().map_err(|_| VisibilityError::Poisoned)?;
         loop {
             let visible = self.snapshot();
-            if visible >= csn {
-                return Ok(visible);
-            }
             if state.recovery_required {
                 return Err(VisibilityError::RecoveryRequired { visible, csn });
+            }
+            if visible >= csn {
+                return Ok(visible);
             }
             state = self
                 .advanced
@@ -106,10 +106,13 @@ impl VisibilityFrontier {
     /// Waiters must neither block indefinitely nor acknowledge a commit that no
     /// snapshot can yet observe. Recovery re-establishes the frontier.
     pub fn require_recovery(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            // A poisoned frontier already fails waiters instead of blocking them.
-            return;
-        };
+        // Poison does not itself wake a Condvar waiter. Recover the guard only
+        // to establish terminal failure and notify; ordinary operations still
+        // report the poison rather than reuse potentially inconsistent state.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.recovery_required = true;
         drop(state);
         self.advanced.notify_all();
@@ -136,6 +139,12 @@ impl VisibilityFrontier {
         }
 
         let mut state = self.state.lock().map_err(|_| VisibilityError::Poisoned)?;
+        if state.recovery_required {
+            return Err(VisibilityError::RecoveryRequired {
+                visible: self.snapshot(),
+                csn,
+            });
+        }
         state.ready.insert(csn);
         let frontier = self.advance_locked(&mut state)?;
         drop(state);
@@ -182,6 +191,27 @@ pub enum VisibilityError {
 mod tests {
     use super::*;
     use crate::vnext::{RecordOwner, RecordVisibility, TransactionStatus};
+
+    #[test]
+    fn recovery_fence_refuses_publication_and_even_already_covered_completion() {
+        let statuses = TransactionStatusTable::new();
+        let frontier = VisibilityFrontier::default();
+        statuses.begin(TxnId::new(1)).expect("first begins");
+        frontier
+            .complete_commit(&statuses, TxnId::new(1), CommitSeq::new(1))
+            .expect("first completes");
+        frontier.require_recovery();
+        assert!(matches!(
+            frontier.wait_visible(CommitSeq::new(1)),
+            Err(VisibilityError::RecoveryRequired { .. })
+        ));
+        statuses.begin(TxnId::new(2)).expect("second begins");
+        assert!(matches!(
+            frontier.complete_commit(&statuses, TxnId::new(2), CommitSeq::new(2)),
+            Err(VisibilityError::RecoveryRequired { .. })
+        ));
+        assert_eq!(frontier.snapshot(), CommitSeq::new(1));
+    }
 
     #[test]
     fn out_of_order_status_publication_cannot_advance_snapshot_across_a_gap() {

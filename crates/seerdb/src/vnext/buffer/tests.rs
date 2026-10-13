@@ -271,14 +271,14 @@ fn delayed_load_cannot_resurrect_an_acknowledged_version_after_eviction() {
     let dependencies = Arc::new(PageDependencyTable::new());
     let admission = RuntimeAdmission::new();
     let coordinator = OrderedCommitCoordinator::with_page_dependencies(
+        &admission,
         &appender,
         &statuses,
         &frontier,
         &intents,
         &undo,
         &dependencies,
-    )
-    .with_runtime_admission(&admission);
+    );
     let device = Arc::new(PausedReadPageIo::new(key(0)));
     let filler = |page| PageKey::new(StorageObjectId::new(2), PageId::new(page));
     for page in 0..3 {
@@ -310,7 +310,7 @@ fn delayed_load_cannot_resurrect_an_acknowledged_version_after_eviction() {
         .expect("first commit");
     drop(pool.pin(filler(0)).expect("filler"));
     drop(pool.pin(filler(1)).expect("evict root"));
-    let reader = OrderedMvccReader::new(&statuses, &undo);
+    let reader = OrderedMvccReader::new(&admission, &statuses, &undo);
 
     std::thread::scope(|scope| {
         let delayed = scope.spawn(|| reader.lookup(&tree, &pool, b"a", None, CommitSeq::new(1)));

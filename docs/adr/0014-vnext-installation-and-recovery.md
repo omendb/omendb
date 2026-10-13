@@ -95,7 +95,7 @@ intents, prepares predecessor undo, appends a decision, synchronizes WAL, synchr
 required undo, installs effects, then completes contiguous visibility. Until replaced,
 page dependencies must enforce both durability frontiers. Calling `append_validated`
 does not by itself prove read/range certification. Current empty-leaf preflight and
-optional runtime admission do not satisfy the target below.
+separately assembled component services do not satisfy the target below.
 
 ### Complete-log target
 

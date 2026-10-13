@@ -7,14 +7,15 @@
 //!
 //! Reads/snapshots are not drained by checkpoint capture because they do not
 //! mutate the captured page graph. They are, however, refused after the runtime
-//! enters recovery-required state. Existing long-running readers must recheck
-//! admission at their normal cancellation/operation boundaries once the server
-//! runtime is wired to this gate.
+//! enters recovery-required state. Ordered readers recheck at point, batch and
+//! history boundaries; the serving runtime must also use this gate at its own
+//! cancellation/operation boundaries when it integrates vNext.
 //!
 //! There is intentionally no in-process "unfence" operation. Recovery creates a
 //! new runtime after durable state has been revalidated.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// Observable process-local admission state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -29,7 +30,7 @@ pub enum RuntimeAdmissionState {
 
 #[derive(Debug)]
 struct AdmissionState {
-    mode: RuntimeAdmissionState,
+    checkpointing: bool,
     active_commits: usize,
 }
 
@@ -37,6 +38,9 @@ struct AdmissionState {
 pub struct RuntimeAdmission {
     state: Mutex<AdmissionState>,
     changed: Condvar,
+    // Terminal failure is independent of checkpoint membership. Readers check
+    // it without contending on the commit/drain mutex at every row/version.
+    recovery_required: AtomicBool,
 }
 
 impl Default for RuntimeAdmission {
@@ -51,10 +55,11 @@ impl RuntimeAdmission {
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(AdmissionState {
-                mode: RuntimeAdmissionState::Open,
+                checkpointing: false,
                 active_commits: 0,
             }),
             changed: Condvar::new(),
+            recovery_required: AtomicBool::new(false),
         }
     }
 
@@ -68,7 +73,7 @@ impl RuntimeAdmission {
             .state
             .lock()
             .map_err(|_| RuntimeAdmissionError::Poisoned)?;
-        match state.mode {
+        match self.mode(&state) {
             RuntimeAdmissionState::Open => {
                 state.active_commits = state
                     .active_commits
@@ -92,9 +97,12 @@ impl RuntimeAdmission {
     /// mutation, not immutable snapshot traversal. Recovery-required state
     /// fences them until reopen.
     pub fn ensure_read_admission(&self) -> Result<(), RuntimeAdmissionError> {
-        match self.state()? {
-            RuntimeAdmissionState::Open | RuntimeAdmissionState::Checkpointing => Ok(()),
-            RuntimeAdmissionState::RecoveryRequired => Err(RuntimeAdmissionError::RecoveryRequired),
+        if self.recovery_required.load(Ordering::Acquire) {
+            Err(RuntimeAdmissionError::RecoveryRequired)
+        } else if self.state.is_poisoned() {
+            Err(RuntimeAdmissionError::Poisoned)
+        } else {
+            Ok(())
         }
     }
 
@@ -108,9 +116,9 @@ impl RuntimeAdmission {
             .state
             .lock()
             .map_err(|_| RuntimeAdmissionError::Poisoned)?;
-        match state.mode {
+        match self.mode(&state) {
             RuntimeAdmissionState::Open => {
-                state.mode = RuntimeAdmissionState::Checkpointing;
+                state.checkpointing = true;
             }
             RuntimeAdmissionState::Checkpointing => {
                 return Err(RuntimeAdmissionError::CheckpointInProgress);
@@ -125,7 +133,7 @@ impl RuntimeAdmission {
                 .changed
                 .wait(state)
                 .map_err(|_| RuntimeAdmissionError::Poisoned)?;
-            if state.mode == RuntimeAdmissionState::RecoveryRequired {
+            if self.recovery_required.load(Ordering::Acquire) {
                 return Err(RuntimeAdmissionError::RecoveryRequired);
             }
         }
@@ -142,10 +150,14 @@ impl RuntimeAdmission {
     /// checkpoint drain cannot block forever behind a commit that now requires
     /// recovery.
     pub fn require_recovery(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        state.mode = RuntimeAdmissionState::RecoveryRequired;
+        // Publication/acknowledgement and failure share this ordering point.
+        // Recover a poisoned guard only to establish terminal failure and wake
+        // waiters: poison cannot suppress the wake needed by checkpoint drain.
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.recovery_required.store(true, Ordering::Release);
         drop(state);
         self.changed.notify_all();
     }
@@ -154,7 +166,7 @@ impl RuntimeAdmission {
     pub fn state(&self) -> Result<RuntimeAdmissionState, RuntimeAdmissionError> {
         self.state
             .lock()
-            .map(|state| state.mode)
+            .map(|state| self.mode(&state))
             .map_err(|_| RuntimeAdmissionError::Poisoned)
     }
 
@@ -164,6 +176,32 @@ impl RuntimeAdmission {
             .lock()
             .map(|state| state.active_commits)
             .map_err(|_| RuntimeAdmissionError::Poisoned)
+    }
+
+    /// Serialize a short visibility publication or acknowledgement against the
+    /// terminal fence. Never retain this guard over I/O or frontier waiting;
+    /// already-admitted commits must be able to finish during checkpoint drain.
+    pub(super) fn admit_visibility(
+        &self,
+    ) -> Result<VisibilityAdmission<'_>, RuntimeAdmissionError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeAdmissionError::Poisoned)?;
+        if self.recovery_required.load(Ordering::Acquire) {
+            return Err(RuntimeAdmissionError::RecoveryRequired);
+        }
+        Ok(VisibilityAdmission { _state: state })
+    }
+
+    fn mode(&self, state: &AdmissionState) -> RuntimeAdmissionState {
+        if self.recovery_required.load(Ordering::Acquire) {
+            RuntimeAdmissionState::RecoveryRequired
+        } else if state.checkpointing {
+            RuntimeAdmissionState::Checkpointing
+        } else {
+            RuntimeAdmissionState::Open
+        }
     }
 
     fn release_commit(&self) {
@@ -185,12 +223,15 @@ impl RuntimeAdmission {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if state.mode == RuntimeAdmissionState::Checkpointing {
-            state.mode = RuntimeAdmissionState::Open;
-        }
+        state.checkpointing = false;
         drop(state);
         self.changed.notify_all();
     }
+}
+
+/// Held only over nonblocking publication/acknowledgement bookkeeping.
+pub(super) struct VisibilityAdmission<'a> {
+    _state: MutexGuard<'a, AdmissionState>,
 }
 
 /// RAII membership in the set a checkpoint must drain.
