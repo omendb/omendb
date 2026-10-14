@@ -74,6 +74,26 @@ a fake adapter or block an earlier correctness milestone:
 | Filtered retrieval (once supported) | Exact OmenDB scan, PostgreSQL + pgvector/pgvectorscale, and specialist search where equivalent | Exact eligibility/deletion/authorization and recall, restrictive/correlated predicates, churn, mixed-load tail, index-build and storage costs |
 | Embedded/server economics | Relevant SQLite/PostgreSQL/DuckDB deployment profiles | Startup and steady memory, operation/recovery simplicity, device-backed storage footprint and no tax when an access method is unused |
 
+The comparison set must include the **incumbent integrated feature**, not
+just an older extension or an isolated vector kernel: PlanetScale MySQL's
+transactional larger-than-RAM vector indexes, PlanetScale Postgres/Neki's TIN
+full-text index (introduced September 2026), and ClickHouse Managed Postgres
+with WalShadow's physical-WAL analytical projection (announced September 2026,
+managed private preview). WalShadow's cited ~200 ms visibility lag is a
+vendor-specific benchmark, not zero-lag snapshot equality. Report both the
+absolute current-snapshot latency OmenDB can offer and the lag/throughput/cost
+that a composed system offers. Native search indexes must compare synchronous
+transactional maintenance, bounded exact delta overlays and async/fallback
+under inserts/deletes and long snapshots; a full-table fallback is not
+economically acceptable by assertion.
+
+PlanetScale Neki's September 2026 118.5M QPS example is a **512-shard,
+read-only, single-shard point-lookup** scaling experiment, without replication,
+writes or failover during the run. It is not comparable to one node's SeerDB
+durable commits, SQL semantics or throughput. Evaluate Neki's sharding,
+routing/ops and HA design at the later distributed stage, rather than making
+its published aggregate QPS a local-engine gate.
+
 Decide thresholds and concrete dataset/trace before measuring, not after. Do not
 rank competitors from unmatched marketing numbers. In particular, a successful
 unfiltered ANN microbenchmark or isolated analytical query cannot establish a
