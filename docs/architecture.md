@@ -25,6 +25,42 @@ It does not require PostgreSQL's pages, WAL, executor or process model. The
 supported surface remains bounded by the [compatibility matrix](pgwire-compatibility.md)
 and [gap register](gap-register.md).
 
+## Product focus and competitive hypothesis
+
+**OLTP is the engineering foundation, not by itself a convincing adoption wedge.**
+The target opportunity is trustworthy, low-overhead transactional data with fast,
+snapshot-consistent operational analytics and filtered text/vector retrieval in the
+same system, without forcing another database for ordinary workloads. That is a
+hypothesis to disprove with matched whole-system workloads, not a claim that one
+engine always beats dedicated systems.
+
+PostgreSQL and its extensions are the compatibility/transactional baseline;
+CedarDB is a direct integrated-HTAP comparator; PostgreSQL + ClickHouse/CDC is
+the strong composed OLTP/OLAP alternative; PostgreSQL + pgvector/pgvectorscale
+and Turbopuffer are relevant retrieval alternatives. SQLite matters for embedded
+footprint, while DuckDB, ClickHouse and Firebolt are analytical benchmarks, not
+identical OLTP competitors. Their existence means **one binary**, **fast point
+reads** or **vector support** alone is not differentiation. A credible win must
+cover exact semantics and at least one material advantage in mixed-load p99,
+freshness, total resources, durability/recovery, or operations. The
+[vNext plan](plans/storage-kernel-vnext.md) owns evidence and stop/go gates.
+
+Design the foundation against transaction commits **and** concurrent long
+scans, selective aggregations, long-lived snapshots, maintenance, and
+filter/search access even before sophisticated accelerators exist. Do not
+build every modality before cutover, but do not freeze page, record, batch,
+lifetime or admission interfaces based only on point-KV/TPC-C throughput.
+Maintain an exact native path before derived ANN/columnar work. An integrated
+feature must demonstrate no material unused-feature tax and correct fallback
+when the derived representation is stale, missing or expensive.
+
+The independent OLAP companion is a separate potential product with its own
+adoption criterion: durable fresh analytics and predictable tenant isolation,
+not a promise to beat DuckDB/ClickHouse in isolated scans. Its roadmap is not
+blocked on OmenDB becoming a complete PostgreSQL replacement. Product priorities
+may be revisited as usage evidence arrives; the shared storage design does not
+assert a particular commercial winner.
+
 ## Ground-up structure
 
 ```text
