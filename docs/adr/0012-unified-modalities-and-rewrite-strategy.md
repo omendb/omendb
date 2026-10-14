@@ -54,6 +54,32 @@ from relocatable ANN addresses and let posting, vector and analytical block
 sizes follow their own workloads. This is not a mandate to copy Turbopuffer's
 object-storage or search layouts.
 
+Search-index freshness and recovery are **not** settled by making all ANN
+structures asynchronously derived. PlanetScale's [larger-than-RAM native MySQL
+vectors](https://planetscale.com/blog/larger-than-ram-vector-indexes-for-relational-databases)
+demonstrate transactional HNSW/SPANN-style paths with incrementally maintained
+postings, ordinary SQL predicates and immediate commit visibility. Its
+[September 2026 TIN](https://planetscale.com/blog/introducing-tin) also provides
+MVCC-correct BM25 and mixed read/write search inside PostgreSQL. Native vector
+and text indexing under SQL is therefore an incumbent capability, not an
+OmenDB-specific wedge.
+
+Compare three policies where actual queries warrant them: (1) synchronously
+maintained transactional candidate/search indexes, (2) stable index generations
+plus a bounded complete delta/visibility overlay, and (3) asynchronous derived
+indexes with an explicitly costed exact fallback or declared staleness. A
+transactionally maintained index need not become an independently authoritative
+data store, but its visibility and recovery contract must be strong enough for
+its declared SQL behavior. Never call an unbounded full scan a competitive
+fallback; benchmark fresh writes/deletes, long snapshots, high churn, stalled
+maintenance, large indexes and actual filter/vector correlation. Quantify the
+commit-write/maintenance tax of synchronous indexing against lag/fallback costs.
+
+TIN's compressed page/tuple bitmaps and vectorized work elision suggest testing
+generation-safe physical row/version locators for postings, but its PostgreSQL
+`ctid` scheme is not automatically safe for OmenDB page movement, slot reuse,
+recovery or GC. Preserve ADR 0013's logical-ID and lifetime checks.
+
 Resolve candidates against the query's canonical snapshot and trusted predicates,
 suppress replacements/tombstones, then refill or use a declared exact fallback
 when needed. ANN approximates ranking, not deletion, eligibility or authorization.
