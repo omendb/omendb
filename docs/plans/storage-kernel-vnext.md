@@ -55,6 +55,46 @@ undo_store,segment_log}.rs` and `vnext/btree/`.
 - Legacy Describe/auth, statement failure, catalog/constraint and cursor/conversion
   issues remain on the serving path; the [gap register](../gap-register.md) owns them.
 
+## Workload focus and decision gates
+
+**Preserve the dependency order below:** recovery, certification and bounded
+completion are first. OLTP-first does not mean choosing interfaces and physical
+formats using only KV microbenchmarks, nor implementing full OLAP/vector/HA
+before the kernel is qualified.
+
+Use these staged end-to-end probes when the corresponding operation exists;
+a currently missing path is an explicit *unmeasured* item, not a reason to add
+a fake adapter or block an earlier correctness milestone:
+
+| Probe | Compare against | Decisive evidence |
+| --- | --- | --- |
+| Durable OLTP + contention | PostgreSQL (same isolation/ack semantics), SQLite for embedded, and SeerDB legacy for bounded regression | Correct transactions, hot/disjoint writers, aborts/retries, p50/p95/p99, CPU/allocations, sync and recovery |
+| Transactional reads under pressure | PostgreSQL and CedarDB where an equivalent SQL subset/workload is available | Short OLTP p99 while selective scans, joins, aggregates, checkpoints, GC and long snapshots run; query correctness and scan/maintenance debt |
+| Transactionally fresh analytics | Authoritative OmenDB row/batch path versus PostgreSQL + managed/CDC-fed ClickHouse, and standalone analytical choices | Same requested snapshot and result values; freshness/lag, full resource footprint, deployment/maintenance cost; separately label asynchronous or stale contracts |
+| Filtered retrieval (once supported) | Exact OmenDB scan, PostgreSQL + pgvector/pgvectorscale, and specialist search where equivalent | Exact eligibility/deletion/authorization and recall, restrictive/correlated predicates, churn, mixed-load tail, index-build and storage costs |
+| Embedded/server economics | Relevant SQLite/PostgreSQL/DuckDB deployment profiles | Startup and steady memory, operation/recovery simplicity, device-backed storage footprint and no tax when an access method is unused |
+
+Decide thresholds and concrete dataset/trace before measuring, not after. Do not
+rank competitors from unmatched marketing numbers. In particular, a successful
+unfiltered ANN microbenchmark or isolated analytical query cannot establish a
+mixed transactional advantage; a raw-point-reads win cannot compensate for a
+broken SQL transaction or p99 collapse during maintenance.
+
+Use early bounded scans/pressure on the kernel to catch buffer, page/extent,
+snapshot and admission mistakes. Native typed analytical and **exact filtered**
+search paths are product-level probes during/after Milestone G, not reasons to
+delay current commit/recovery gates for ANN, full text, a distributed optimizer,
+a cloud service or a complete second engine. If the selected B-tree/hybrid
+physical design loses the agreed representative workload and a credible
+alternative meets the same correctness contract, replace it before a stable
+format commitment. No inherited ADR is a performance exemption.
+
+Stop/go after the qualified first vertical slice: continue OmenDB product
+expansion only with a measured, defensible whole-system benefit and a credible
+compatibility/operation path. The independent OLAP companion has its own
+adoption and mixed-pressure qualification; do not subordinate it to this kernel
+roadmap or automatically merge its separate durable authority.
+
 ## Immediate sequence
 
 ### 1. Own lifecycle, certification and resources before checkpoint
