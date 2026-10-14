@@ -44,6 +44,16 @@ from selectivity, filter/vector correlation, update rate, recall, memory and I/O
 measurements. An algorithm winning unfiltered in-memory SIFT is not a universal
 backend. NVMe and object-backed search need their own placement/request economics.
 
+Turbopuffer's [September 30, 2026 v3 redesign](https://turbopuffer.com/blog/rip-vector-database)
+is concrete external evidence for this separation: its ANN-address-as-primary
+layout amplified document/index rewrites and forced unrelated scans/aggregates
+to use vector-cluster-sized blocks. Its proposed record-primary design makes
+ANN a secondary index; performance qualification was still in progress when
+published. OmenDB should likewise keep stable canonical row identity distinct
+from relocatable ANN addresses and let posting, vector and analytical block
+sizes follow their own workloads. This is not a mandate to copy Turbopuffer's
+object-storage or search layouts.
+
 Resolve candidates against the query's canonical snapshot and trusted predicates,
 suppress replacements/tombstones, then refill or use a declared exact fallback
 when needed. ANN approximates ranking, not deletion, eligibility or authorization.
