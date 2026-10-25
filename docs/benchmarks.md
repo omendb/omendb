@@ -4,8 +4,9 @@ Historical September 2026 measurements of the legacy DirectSeerStore path on
 Apple Silicon/APFS, including `examples/oltp_bench.rs` and the probes cited below.
 These were recorded under the development `0.1.0-alpha.1` package version, not a
 published release. They are single-process engineering evidence, not current
-vNext qualification or competitive claims. The [vNext roadmap](plans/storage-kernel-vnext.md)
-owns replacement-path budgets and comparisons.
+vNext qualification or competitive claims. The [SeerDB kernel roadmap](../crates/seerdb/docs/roadmap.md) owns
+replacement storage qualification; the [OmenDB roadmap](roadmap.md)
+owns server-level comparisons and release budgets.
 
 ## Historical baseline numbers
 

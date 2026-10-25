@@ -1,7 +1,8 @@
 # OmenDB gap register
 
 Evidence-backed register of open product gaps, ordered by quality dimension.
-The [vNext roadmap](plans/storage-kernel-vnext.md) owns replacement work order;
+The [OmenDB roadmap](roadmap.md) owns relational fixes and integration;
+[SeerDB's roadmap](../crates/seerdb/docs/roadmap.md) owns kernel work;
 [alpha gates](alpha-release-gates.md) own release evidence. This register records
 current defects and unsupported behavior, not a second commitment list. Evidence
 citations refer to tests, source or measured baselines. Source audit: 2026-10-11
@@ -29,8 +30,8 @@ The typed FK publication race and timing mismatch are source-established. The
 other boundaries have out-of-tree direct-API/wire/conversion reproductions; these are not a complete
 locked-dependency CI run. Qualification must exercise the repaired real entry
 points and independent semantics, not add tests that bless current output.
-The [vNext plan](plans/storage-kernel-vnext.md) separately owns load-publication,
-split-aware record admission, runtime failure and checkpoint/restart gates.
+The [SeerDB roadmap](../crates/seerdb/docs/roadmap.md) separately owns
+load-publication, split-aware admission, runtime failure and recovery gates.
 
 ## Type system — LANDED 2026-08-30
 
