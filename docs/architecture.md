@@ -2,9 +2,10 @@
 
 **Design target, 2026-10-25. Not an implementation or performance claim.**
 This is the maintained product and engine map. Detailed contracts live in
-[SeerDB](design/storage-kernel.md), [relational execution](design/relational-engine.md),
-and [specialized engines and scaling](design/engines-and-scale.md).
-The [roadmap](roadmap.md) alone owns delivery sequence and qualification.
+[SeerDB](../crates/seerdb/docs/architecture.md), [relational execution](design/relational-engine.md),
+[specialized engines](design/extensions.md) and [distribution](design/distribution.md).
+The [SeerDB roadmap](../crates/seerdb/docs/roadmap.md) owns kernel work; the
+[OmenDB roadmap](roadmap.md) owns product/SQL integration and release gates.
 [ADRs](adr/README.md) preserve historical decisions and alternatives, not parallel specs.
 
 ## Product

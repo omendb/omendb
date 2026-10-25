@@ -3,7 +3,9 @@
 **Maintained target, 2026-10-25.** OmenDB is intended to replace common
 PostgreSQL/MySQL workloads, not implement their process model or guarantee
 complete protocol/dialect compatibility. [Architecture](../architecture.md);
-[SeerDB transaction kernel](storage-kernel.md); [roadmap](../roadmap.md).
+[SeerDB transaction kernel](../../crates/seerdb/docs/architecture.md);
+[SeerDB roadmap](../../crates/seerdb/docs/roadmap.md) and
+[OmenDB roadmap](../roadmap.md).
 
 ## Scope and correctness
 

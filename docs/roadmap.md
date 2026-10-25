@@ -1,149 +1,140 @@
-# OmenDB and SeerDB implementation roadmap
+# OmenDB relational roadmap
 
-**Sole maintained execution sequence, 2026-10-25.**
-Targets live in [architecture](architecture.md) and [design contracts](design/).
-The [ADR archive](adr/README.md) records historical rationale; private research
-belongs in the owner's knowledge repository. This is a delivery sequence, not
-a claim that any milestone passed. Source baseline for the last code audit:
-`1590011` (2026-10-13); subsequent changes through 2026-10-25 are documentation.
+**Sole maintained OmenDB product/integration sequence, 2026-10-25.**
+This document owns the native SQL/server and relational product gates.
+The separately maintained [SeerDB kernel roadmap](../crates/seerdb/docs/roadmap.md)
+owns its transaction, buffer, page, WAL, history, checkpoint and reusable KV
+implementation. [Architecture](architecture.md) and
+[relational design](design/relational-engine.md) specify target behavior;
+[specialized engines](design/extensions.md) and
+[distribution](design/distribution.md) are later capabilities.
+Old [ADRs](adr/README.md) and [vNext plan](plans/storage-kernel-vnext.md)
+are historical, not competing backlogs.
 
-## Delivery principles
+The last code audit underlying these targets was performed against
+`1590011` (2026-10-13). Current repository documentation is newer than
+the implementation. This plan does not assert a passing integration, release
+or performance gate.
 
-- One server-first native relational database, one SeerDB transaction/log/catalog
-  authority. OmenDB and the separately usable KV facade share the *same*
-  runtime. PostgreSQL compatibility is optional; correctness and usability
-  of declared native SQL are mandatory.
-- A heavy refactor/rewrite is allowed. Reuse already proven logic, not obsolete
-  interfaces. Implement a **vertical end-to-end relational transaction**
-  before adding speculative traits, second engines or isolated benchmarks.
-- Keep the current generation-COW path as a **fallible** semantic/crash reference
-  until qualified cutover. When new behavior is accepted, delete obsolete
-  engines/adapters/tests/flags; no permanent vNext backend matrix.
-- Qualify under real Linux NVMe and a documented durability class. Have
-  independent semantic oracles, failure injection, process crashes, double
-  reopens, subsequent mutations, held old snapshots and bounded resource
-  conditions. Performance claims require workloads, hardware, isolation,
-  sync, sample distributions and old/new raw results.
+## O1. Repair present SQL integrity and authorization
 
-## Stages and release gates
+In the *current maintained serving path*, close security and correctness
+defects independent of SeerDB's eventual physical replacement. Use one
+non-executing binder for parameter/result types and resolved catalog views;
+enforce grants on Describe as well as Execute. Every statement stages a
+private atomic row/index/catalog delta; errors in explicit transactions
+follow a coherent rollback-only lifecycle. FK creation/timing,
+constraint-index maintenance, schema publication, cursor continuation,
+parameter-batch shape and dump/restore behavior must have exact semantics.
 
-### A. Transaction authority + relational correctness
+**Gate:** independent restricted-role, PostgreSQL-overlap and native SQL
+oracles reproduce protected outcomes on real direct and wire entry points.
+No partial committable row/index changes, unauthorized Describe execution,
+catalog mixed-generation reads or duplicated scan boundaries. Do not
+treat incorrect legacy output as the reference contract.
 
-**Build:** one persistent SeerDB runtime owning store incarnation, transaction
-outcomes, certification, WAL, MVCC/history, buffer/page/extent services, resource
-and lifecycle admission, checkpoint/recovery and GC. Eliminate persistent
-optional-component assembly. A single transaction can change a typed base row,
-a unique/secondary index and catalog state under one outcome.
+## O2. Define and integrate native relational access
 
-**In parallel, fix serving integrity:** non-executing typed binder; auth on
-Describe and Execute; statement-private atomic deltas; rollback-only explicit
-blocks; coherent versioned catalog/constraint enforcement; exact FK timing;
-cursor continuation; parameter batch validation and dump/restore parity.
+Implement schema-versioned compact rows, stable row identity for both
+primary-key and heap-style SQL tables, logical secondary/unique/FK indexes,
+transactional catalog/layout snapshots and an access path directly using
+SeerDB's compiled object/record/ordered primitives. No mandatory
+serialize-all-rows-into-generic-KV round trip. A real SQL transaction must
+update canonical row, secondary/constraint indexes and catalog under
+**one SeerDB decision**; application rollback and DDL dependencies use
+the same owner.
 
-**Gate:** real direct and network transactions, concurrent sessions,
-rollbacks/constraints and failed/cancelled writes cannot expose partial
-row/index/catalog effects. No query-global `RwLock<RelationalDatabase>`.
-Independent oracles and restricted-role security checks pass.
+This depends on [SeerDB stages S1–S3](../crates/seerdb/docs/roadmap.md),
+but API boundaries and row codecs can be prototyped in parallel.
+Do not create permanent adapters for multiple old/new engines merely
+to preserve a developer-preview interface. Preserve useful independent
+SQL semantic and crash probes through migration.
 
-### B. Commit, versions and index/page representations
+**Gate:** transactionally correct inserts, updates, deletes, constraint
+violations and schema changes work on the recovered replacement runtime.
+Long readers and older catalog versions retain their declared view.
+Offline preview data conversion preserves supported logical semantics
+or refuses explicitly.
 
-**Build:** decision-ordered serializable dependency certification against
-accepted/uninstalled writers; safe hot-key policy; complete recoverable WAL
-record/history model with pre-decision admission; bounded actual fenced B-link
-splits and logical overflow; schema-driven clustered rows and mandatory indexes;
-bounded private overlays and snapshot-stable streaming cursors.
+## O3. Replace the executor and remove global contention
 
-**Gate:** fixed snapshots and point/absence/range/constraint/catalog conflicts
-are correct under pressure. Every admitted durable effect can install and
-replay; large keys/records, deletes, long readers and indexes survive faults.
-The old two-barrier undo protocol remains until complete-log recoverability
-passes independent tests.
+One parser → non-executing binder → typed IR/planner → specialized OLTP
+micro-plan or selection-vector/typed-batch pipeline. Share NULL, collation,
+coercion, privilege, statement error and parameter semantics. Replace
+`Vec<Vec<Value>>`/row-by-row hot paths with borrowed typed record views;
+bound all scan work including invisible versions and I/O. Cursor yields
+must not retain locks, repeat OFFSET prefix scans or duplicate boundaries.
 
-### C. Persistent checkpoint, streaming recovery and lifetime
+Replace `Arc<RwLock<RelationalDatabase>>` with a concurrent database
+handle, versioned catalog and explicit transaction admission. Short OLTP
+and maintenance-critical commit/reclaim work retain protected worker/IO
+capacity under scans. Support cancellation, timeout, disconnect and
+ambiguous durable decisions without data loss or unsafe automatic retries.
+The native SQL server is primary; optional PostgreSQL-wire adapters share
+the same engine without determining its semantics.
 
-**Build:** complete, validated checkpoint reference closure and retained WAL
-suffix; exact snapshot/history/CDC/backup leases; bounded streaming recovery,
-version/status cleanup, space reclamation, abandoned retry-space policy;
-short page-image capture before async writeback, scalable page maps and
-incremental/epoch checkpoint once size/pause evidence requires it.
+**Gate:** independent clients execute real concurrent SQL with no
+database-wide execution/write serialization, starvation, memory-growth
+or unbounded long-scan work. Explain plans correspond to physical
+execution; row/index/constraint effects and snapshot isolation remain
+correct at every yield and commit boundary.
 
-**Gate:** crash after decision before page/history sync, during manifest/GC
-and repeatedly during recovery; two independent reopens plus subsequent
-mutations; no acknowledged loss, foreign-reference adoption or unbounded
-memory/space leakage. Test under real checkpoint, large dataset, long readers
-and ENOSPC. Preview conversion preserves supported *logical* state or refuses.
+## O4. Choose product defaults and qualify a server release
 
-### D. Native SQL engine and production-shaped concurrency
+Compare OmenDB against PostgreSQL/MySQL at overlapping indexed SQL and
+durability/isolation semantics, and SQLite for relevant embedded
+trade-offs. Use device-backed Linux NVMe, concurrency 1/4/16+, mixed
+hot and cold rows, larger-than-memory scans, long snapshots,
+schema/index churn and ongoing checkpoint/GC. Measure p50/p95/p99,
+throughput, aborts/retries, allocation/CPU/RSS, write amplification,
+checkpoint pauses, recovery time, error/operational behavior and
+real client latency. Declare budgets before measurement, not after.
 
-**Build:** one typed binder/catalog/IR and optimizer, allocation-light OLTP
-micro-plans plus selective typed batch pipeline, an indexed cursor with bounded
-physical work and exclusive continuation, cloneable database handle and
-bounded/lazy worker/admission pools. Current PG-wire adapter remains optional;
-it does not own semantic typing or transaction policy.
+SERIALIZABLE with complete dependencies is the reference correctness
+isolation, but the default must be selected from measured retry
+ergonomics versus READ COMMITTED. Do not describe SNAPSHOT/REPEATABLE
+READ as automatically serializable. Decide SQL dialect, driver/protocol
+and ergonomic priorities based on supported native use, not full
+PostgreSQL extension or system-catalog compatibility.
 
-**Gate:** direct/server workload with multiple writers, SQL joins/indexes,
-DDL concurrency, cancellation, client disconnects, auth and statement failures;
-no known production-path data integrity gap, cursor duplication or
-offset-rescan. Open transactions have declared retry/ambiguous commit outcomes.
-Choose default isolation using real contention/retry/p99 evidence,
-not preference alone.
+**Gate:** [alpha-release criteria](alpha-release-gates.md) met at the
+actual code revision, including failures/recovery, auth, bounded
+resource use, usability and a defined performance bar. Never equate
+a legacy-engine microbenchmark, a documentation change or an optional
+Pgwire differential with native product qualification.
 
-### E. Matched performance and first release
+## O5. Extend the engine and prepare distribution deliberately
 
-**Baseline:** same machines/isolation/durable ACK, schema, key/row sizes and
-client concurrency: PostgreSQL/MySQL for SQL; SQLite for appropriate
-embedded/useful crossover; RocksDB, Fjall and SurrealKV for comparable KV.
-Profile own index/OCC/commit lane, WAL barriers, cache/translation,
-LLC/TLB misses, row allocation, write/space amplification, GC/checkpoint
-p99, recovery time and sustained history pressure. Include hot and cold,
-uniform and skewed, 1/4/16+ writers, long snapshots and bigger-than-RAM data.
+After the relational serving path earns its reliability and cost,
+integrate text/BM25, vector/ANN and selected analytical representations
+where transactional snapshot correctness and a measured query workload
+justify them. Keep independent Vector/OLAP products independently
+deployable for separately ingested data; share algorithms/operators
+with one maintained source owner, not a second WAL inside SQL.
+Cross-engine projections require atomic snapshot/CDC leases, complete
+transaction change application, precise visibility/freshness and GC.
 
-**Decisions after measurement:** safe optimistic page reads, BBTree/SIMD
-layouts and batched probes, page size, clustered vs heap/PAX, copy/placement,
-autonomous NVMe commit, speculative *invisible* installation, JIT,
-io_uring/FDP/ZNS and LSM alternatives. Never assume they win from
-isolated paper/microbench numbers.
+Coordinate later SeerDB S5 secondary object storage and regional HA
+with OmenDB's [distribution plan](design/distribution.md): one-node
+fast path first, then fenced replicated ranges, placement groups,
+online migration, query routing and eventually explicitly correct
+cross-range transactions. Neki-class scale is a multi-node workload
+goal, **not** a single-node throughput claim.
 
-**Gate:** choose budget thresholds *before* running; require matched
-whole-product correctness, durability, tail latency and maintenance/recovery
-results, not only a microbenchmark lead. Release readiness uses
-[alpha gates](alpha-release-gates.md); no release/tag is authorized
-by this roadmap.
+**Gate:** no tax for unused extensions, exact/declared approximate
+and stale behavior, bounded rebuild and maintenance debt, safe failover
+and online movement with topology fencing. A design document does
+not authorize a new release, private product merge or public source
+publication.
 
-### F. Specialized engines, storage tiers and distributed serving
+## Current blockers and information ownership
 
-**After core gates:** optional S3-compatible backup/restore, immutable
-checkpoint/log archive and cold extents with full lifetime/recovery checks;
-snapshot-qualified native text/vector/columnar engines and independent
-ingestion projections with complete retained CDC; separately qualified
-regional HA; then placement groups, routing, online movement, distributed
-SQL and atomic cross-partition transactions.
-
-**Gate:** each feature proves exact/declared approximate semantics, no
-material tax when unused, isolation/freshness under updates, failure
-containment, p99 and total cost. Neki-class scale means measured
-shard-local growth, HA and zero-gap resharding at explicit topology and
-durability, not replication of a 512-shard read-only QPS headline.
-
-## Currently known blockers (source audit, not test rerun)
-
-- `vnext` is **not** one restart-safe runtime; certification lacks full
-  serializable point/gap/catalog coverage.
-- Current page admission proves only an empty leaf, not future fully fenced
-  split/internal/root feasibility. The current WAL batch has a fixed
-  one-segment representability restriction.
-- Undo is separately synchronized; current commit append still encodes
-  within its sequencing mutex; the physical log/history replacement
-  and checkpoint closure remain unqualified.
-- Page writeback retains a read byte lock across I/O; history reads
-  share a file mutex; WAL replay materializes records in memory;
-  page-map duplicate detection is quadratic.
-- Existing SQL Describe/auth/statement integrity, catalog/constraint,
-  cursor and conversion issues remain registered in
-  [gap register](gap-register.md).
-
-The source repository owns implementation/release checks, the private
-coordination tracker owns genuine cross-session task state if used, and
-research/experiment measurements belong with their dated evidence.
-No milestone closes by editing documentation.
+The [SQL gap register](gap-register.md) tracks implemented product
+defects. SeerDB's [kernel roadmap](../crates/seerdb/docs/roadmap.md)
+owns WAL, history, buffer, page feasibility, checkpoint and recovery
+gates. The historical [benchmarks](benchmarks.md), [compatibility
+matrix](pgwire-compatibility.md) and [research/ADRs](adr/README.md)
+remain bounded evidence rather than a second release checklist.
+Reuse or delete legacy adapters, tests and formats only after
+the appropriate independent regression protections survive cutover.
 

@@ -7,9 +7,10 @@ conflict with current design, these are historical records rather than
 requirements to preserve.
 
 **Living authority:** [product architecture](../architecture.md),
-[SeerDB contract](../design/storage-kernel.md),
+[SeerDB contract](../../crates/seerdb/docs/architecture.md),
 [relational engine](../design/relational-engine.md),
-[specialized engines and distribution](../design/engines-and-scale.md),
+[specialized engines](../design/extensions.md),
+[distribution](../design/distribution.md),
 and the **one** [roadmap](../roadmap.md).
 
 - 0001–0006: historical SeerDB transaction/recovery/group-commit and early

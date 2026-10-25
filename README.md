@@ -6,8 +6,9 @@ alternative to PostgreSQL/MySQL rather than a PostgreSQL implementation. The
 current developer preview exposes a bounded PostgreSQL-wire adapter and Rust
 API; these do not define the native engine's long-term SQL or storage semantics.
 Specialized search/analytics and Neki-class horizontal scale are later goals.
-See the [architecture](docs/architecture.md), [design contracts](docs/design/)
-and [roadmap](docs/roadmap.md) for targets, not implementation claims.
+See the [OmenDB architecture](docs/architecture.md), [relational plan](docs/roadmap.md)
+and [SeerDB kernel architecture](crates/seerdb/docs/architecture.md) and
+[plan](crates/seerdb/docs/roadmap.md) for targets, not implementation claims.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.

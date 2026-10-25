@@ -2,9 +2,10 @@
 
 **Decision:** accepted direction, 2026-10-25. **Qualification:** not proven.
 **Living contracts:** [architecture](../architecture.md),
-[SeerDB](../design/storage-kernel.md),
+[SeerDB](../../crates/seerdb/docs/architecture.md),
 [relational](../design/relational-engine.md),
-[engines/distribution](../design/engines-and-scale.md).
+[extensions](../design/extensions.md),
+[distribution](../design/distribution.md).
 **Execution:** [roadmap](../roadmap.md).
 
 ## Context
