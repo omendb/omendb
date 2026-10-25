@@ -1,6 +1,6 @@
 # ADR 0001: SeerDB transaction and durability contract
 
-- **Status:** accepted transaction semantics; physical boundary refined by ADR 0013 and vNext commit protocol by ADR 0014
+- **Status:** historical design record. Current SeerDB/transaction contract: [living storage specification](../design/storage-kernel.md). Keep this record for rationale and prior implementation evidence, not as a competing design.
 - **Scope:** OmenDB ↔ SeerDB boundary
 - **Supersedes:** the global expected-`CommitId` CAS batch as the final
   production transaction API

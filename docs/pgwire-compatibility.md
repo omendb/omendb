@@ -11,9 +11,10 @@ cargo test --features pgwire --test project_pgwire_server
 
 Known negative-path defects in the [gap register](gap-register.md) qualify the
 ordinary evidence below: executable/unauthorized Describe, restricted transaction
-controls and committable result-admission errors remain open. Target binder,
-authorization and statement-failure rules are in [ADR 0007](adr/0007-runtime-execution-and-contention.md),
-not claims that the serving path already implements them.
+controls and committable result-admission errors remain open. Maintained binder,
+authorization and statement-failure rules are in the [relational engine
+specification](design/relational-engine.md), not claims that the serving path
+already implements them.
 
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
 representative documented subset against PostgreSQL. It is ignored in ordinary

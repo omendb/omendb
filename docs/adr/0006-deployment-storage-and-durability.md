@@ -1,6 +1,6 @@
 # ADR 0006: Deployment-aware storage and durability
 
-- **Status:** accepted target architecture; implementation staged
+- **Status:** historical design record. Current SeerDB/transaction contract: [living storage specification](../design/storage-kernel.md). Keep this record for rationale and prior implementation evidence, not as a competing design.
 - **Scope:** SeerDB physical storage, durability, caching, and deployment shapes
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md),
   [ADR 0002](0002-seerdb-mvcc-version-storage.md), and

@@ -1,6 +1,8 @@
 # OmenDB relational alpha gates
 
-This is the release contract for the relational OmenDB line. It is a gate, not
+This is the currently planned **native relational** release gate. PostgreSQL
+wire compatibility is optional (see the [current design](architecture.md)).
+It is a gate, not
 an announcement: the current tree is **not alpha-ready** until every required
 gate has evidence attached to a release commit. The 2026-10-11 audit reopened
 product correctness gates in the [gap register](gap-register.md). Checked items
@@ -41,18 +43,20 @@ overwritten; a bad prerelease can be yanked but remains part of public history.
 is an internal development preview and does not satisfy this contract merely
 because its direct Rust API and bounded SQL tests pass.
 
-A releasable alpha has two surfaces sharing one transaction implementation:
+A releasable native relational alpha has **two deployment surfaces sharing
+one transaction implementation**:
 
-- a persistent single-node OmenDB server with multiple sessions, an explicitly
-  documented PostgreSQL protocol subset, authentication, clean lifecycle, and
-  operational diagnostics;
-- a secondary typed Rust API for integration, testing, and embedded use.
+- a persistent single-node native OmenDB SQL server with multiple sessions,
+  documented supported dialect/semantics, authentication, lifecycle and diagnostics;
+- a secondary typed Rust API for integration, testing and embedded use.
 
-The supported wire and SQL surface is deliberately bounded rather than
-PostgreSQL-complete. Unsupported syntax must return `DbError::SqlUnsupported`
-rather than silently doing something else. PostgreSQL compatibility claims are
-limited to the overlap catalogued in `docs/pgwire-compatibility.md` and backed
-by negative tests plus a live PostgreSQL differential oracle.
+A PostgreSQL-wire adapter remains a useful, optional interoperability surface,
+not a requirement shaping native SQL, catalog or storage. **If shipped**, its
+advertised subset must retain honest unsupported-syntax behavior, negative tests,
+and matched live PostgreSQL differential evidence documented in
+[the adapter matrix](pgwire-compatibility.md). The current preview includes
+this adapter; existing checked tests below are historical evidence for it,
+not a mandatory dependency of every future native SQL deployment.
 
 The alpha does not promise production safety, stable storage-format upgrades,
 or competitive OLTP performance until the corresponding storage, server,
@@ -101,7 +105,8 @@ matrix provides the storage-side crash coverage below.
       sessions with clean startup, shutdown, cancellation, and reopen;
 - [x] authentication, authorization, resource limits, and operational
       diagnostics have an explicit documented baseline;
-- [x] the supported PostgreSQL protocol/SQL subset has differential and
+- [x] the **current optional adapter's** supported PostgreSQL protocol/SQL
+      subset has differential and
       negative compatibility tests; unsupported behavior fails explicitly.
       Current evidence is catalogued in
       [`docs/pgwire-compatibility.md`](pgwire-compatibility.md), including the

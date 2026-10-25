@@ -1,6 +1,6 @@
 # ADR 0005: Delete the storage-kernel seam; DirectSeerStore becomes the backend
 
-- **Status:** accepted and implemented for the pre-vNext relational integration; target physical boundary revised by ADR 0013
+- **Status:** historical design record. Current SeerDB/transaction contract: [living storage specification](../design/storage-kernel.md). Keep this record for rationale and prior implementation evidence, not as a competing design.
 - **Scope:** OmenDB relational facade, SQL integration, kernel modules
 - **Depends on:** [ADR 0004](0004-group-commit-publication-lane.md)
 

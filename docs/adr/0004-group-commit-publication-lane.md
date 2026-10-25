@@ -1,7 +1,6 @@
 # ADR 0004: Group-commit publication lane
 
-- **Status:** accepted and implemented as the current transactional baseline;
-  hardware-specific commit scheduling remains benchmark-gated
+- **Status:** historical design record. Current SeerDB/transaction contract: [living storage specification](../design/storage-kernel.md). Keep this record for rationale and prior implementation evidence, not as a competing design.
 - **Scope:** SeerDB `TransactionDatabase` commit pipeline and the `DB`
   group-publication primitive
 - **Depends on:** [ADR 0003](0003-seerdb-commit-recovery-state-machine.md)

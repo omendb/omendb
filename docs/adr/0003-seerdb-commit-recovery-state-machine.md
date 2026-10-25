@@ -1,6 +1,6 @@
 # ADR 0003: SeerDB commit outcome and recovery ownership
 
-- **Status:** accepted outcome/failure contract; vNext ordering is owned by ADR 0014
+- **Status:** historical design record. Current SeerDB/transaction contract: [living storage specification](../design/storage-kernel.md). Keep this record for rationale and prior implementation evidence, not as a competing design.
 - **Scope:** durable transaction outcome, recovery ownership and ambiguous I/O
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md) and
   [ADR 0002](0002-seerdb-mvcc-version-storage.md)
