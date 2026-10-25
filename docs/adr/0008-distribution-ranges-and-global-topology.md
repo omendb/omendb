@@ -314,7 +314,7 @@ Before a global mode is trusted, deterministic tests must explore:
 - Distribution metadata becomes part of the relational optimizer/catalog, not
   a transparent proxy trick.
 - Co-location is a first-class schema/placement concept.
-- The `{CSN, restart LSN}` abstraction gains a second major use: resharding.
+- The atomically leased snapshot/bootstrap handoff (incarnation, catalog, snapshot CSN, restart LSN, retained history/change coverage) also governs resharding; a bare `{CSN, LSN}` pair is insufficient.
 - Object storage is useful for elasticity and recovery without becoming the
   random-write engine.
 - The design remains free to choose the best distributed transaction protocol
