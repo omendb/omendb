@@ -1,0 +1,118 @@
+# OmenDB: native relational engine
+
+**Maintained target, 2026-10-25.** OmenDB is intended to replace common
+PostgreSQL/MySQL workloads, not implement their process model or guarantee
+complete protocol/dialect compatibility. [Architecture](../architecture.md);
+[SeerDB transaction kernel](storage-kernel.md); [roadmap](../roadmap.md).
+
+## Scope and correctness
+
+Server-first, concurrent SQL database with typed tables and expressions,
+multi-row transactions, primary/secondary indexes, unique/FK/check constraints,
+schema evolution, authorization, query plans, backup and operations. Start from
+OLTP but ensure selective scans, joins, aggregates and maintained views are not
+architecturally excluded. Embedded Rust clients use the same core and opt into
+a small/lazy serverless runtime.
+
+Native SQL/type/catalog semantics are authoritative; a PostgreSQL protocol
+adapter is an optional bounded interoperability layer. Reuse mature parser,
+wire, type/encoding and optimizer/operator libraries when compatible; do not
+copy PostgreSQL's storage engine, extension ABI, process-per-connection,
+catalog OIDs or source-text heuristics into the native engine.
+
+## Binder, plan and execution
+
+One path: SQL parser → **non-executing typed binder** → retained catalog view
+and dependency set → logical plan → costed physical plan → micro-plan or
+typed vectorized pipeline → cursor/row/index interfaces.
+
+- Bound statements have parameter/result types, typed coercions, effects,
+  resolved IDs, schema/namespace/constraint dependencies and privileges.
+  `Describe` must neither execute a user query nor infer types from observed
+  data. Cached plans are never cached authorization grants.
+- Optimizer includes cardinalities, predicate/index statistics, covering
+  indexes, storage locality, scan/decode/aggregation costs, and later
+  snapshot-qualified derived paths; compare plans through EXPLAIN and
+  representative regression workloads. Don't build a large custom JIT before
+  a stable typed IR and measured bottleneck.
+- Point lookups/updates use allocation-light **micro-plans**. Scans/joins/
+  aggregates use typed batches and selection vectors, selective decode and
+  bounded morsel work. Both share NULL/three-valued logic, collation,
+  casting, expressions and error semantics.
+- Resumable cursors preserve snapshot, catalog and private overlay identity.
+  An exclusive last-key continuation may redescend; do not rescan prefixes
+  through OFFSET, duplicate boundary rows or hold page latches across
+  yield/network suspension. Budgets cover invisible slots, version walks,
+  overflow, I/O and output bytes as well as visible row counts.
+
+## Row, index and catalog representation
+
+Use schema-versioned compact rows (NULL bitmap, fixed typed fields, compact
+variable-offset directory, inline payload and logical cold/large-value refs).
+Borrow typed page-resident fields for short queries; only selected fields
+are decoded/copied into output batches. Do not allocate generic `Vec<Value>`
+for every stored row or duplicate primary-key identity without demonstrated
+benefit. One clustered primary-row layout is the initial physical path;
+heap/PAX/column-family alternatives are workload experiments.
+
+Primary/unique/required foreign-key indexes and catalog mutations are
+**authoritative** and share the same SeerDB commit. Secondary entries carry
+logical row identity and optional covering payload. Physical locator hints
+need generation/reuse validation and logical fallback. Unique/FK checks must
+be selective indexed probes, not whole-table rescans.
+
+Catalog, schema version, layout and enforcement membership are versioned
+objects. Transactions and plans hold consistent views and dependencies,
+including names *not found*, range gaps and newly installed constraints.
+DDL validation and publication form a **single schema transaction**, not
+validate-in-one/commit-in-another. Online schema rewrite can later use
+retained snapshot plus complete transaction change catch-up.
+
+## Transaction and SQL session behavior
+
+The SeerDB kernel owns commit/isolation and failure authority. OmenDB owns
+statement semantics and exact effects. One statement builds a private atomic
+row/index/catalog/cascade delta; failed statements cannot leave committable
+partial index or base-row changes. Explicit transactions obey a declared
+rollback-only policy after bind/auth/execute/result-admission failures;
+post-durable delivery failure cannot fabricate an abort.
+
+SERIALIZABLE is the reference correctness mode but **not a locked product
+default**. READ COMMITTED must use statement snapshots and wait/recheck
+correctly; mixed isolation and constraint enforcement need independent
+testing. Automatic retries of closures are safe only if external side effects
+are controlled; arbitrary multi-statement network sessions cannot be
+replayed by the server. Make retryability, ambiguous outcomes and
+transaction IDs accessible to clients.
+
+Each session owns protocol state, not a dedicated OS thread. A cloneable
+database handle replaces the current outer `Arc<RwLock<RelationalDatabase>>`;
+synchronization belongs to transactions, catalog objects and page guards.
+Bound workers and resource admission protect commit/WAL/GC progress while
+enabling parallel independent reads and writes. Cancellation/deadlines
+never release an unresolved decided transaction.
+
+## Server operation and path to parity
+
+A general-purpose database needs mature behavior beyond SQL throughput:
+concurrent clients and connection admission, auth/TLS deployment,
+observable query/transaction latency and errors, EXPLAIN/statistics,
+backup/restore and CDC, safe startup/recovery, checks/repair boundaries,
+resource/tenant isolation and online maintenance. Do not call the preview
+production-ready while known auth or failed-statement integrity gaps persist.
+
+First target a trustworthy SQL server and Rust API with clear supported
+syntax, migrations and transactional semantics, not instant feature parity
+with every PostgreSQL/MySQL extension. Against PostgreSQL/MySQL, test
+the same isolation, durability, schemas, FK/unique/DDL behavior, concurrent
+writers and real SQL plans; compare throughput and p50/p95/p99, CPU/RSS,
+index write amplification, large-than-RAM scans, checkpoint pauses and
+recovery. PostgreSQL protocol tests remain valuable **only** for explicitly
+advertised overlap.
+
+The current `src/sql*.rs` row-oriented result paths, execute-to-describe
+logic, `src/morsel.rs` offset-rescans and Pgwire global relational RwLock
+are transition code, not contracts to preserve. [Current gaps](../gap-register.md)
+and [alpha gates](../alpha-release-gates.md) remain evidence; neither is
+a second architectural owner.
+

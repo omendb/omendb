@@ -1,208 +1,105 @@
 # OmenDB architecture
 
-**Status:** native relational/server-first target refined 2026-10-25; not an implemented release. [ADR 0015](adr/0015-native-relational-engine.md) owns the latest architecture and intentional departures from the earlier ADRs.
-The serving backend still uses the generation-COW SeerDB engine. The replacement
-under `crates/seerdb/src/vnext` is not yet a restart-safe product backend.
-The [vNext plan](plans/storage-kernel-vnext.md) owns implementation order and
-open gates; this document is the architectural overview, not another backlog.
+**Design target, 2026-10-25. Not an implementation or performance claim.**
+This is the maintained product and engine map. Detailed contracts live in
+[SeerDB](design/storage-kernel.md), [relational execution](design/relational-engine.md),
+and [specialized engines and scaling](design/engines-and-scale.md).
+The [roadmap](roadmap.md) alone owns delivery sequence and qualification.
+[ADRs](adr/README.md) preserve historical decisions and alternatives, not parallel specs.
 
-## Product and deployment decision
+## Product
 
-Build a **server-first native relational database** for RAM and local NVMe,
-with a lightweight embedded Rust surface using the same semantics. Server
-concurrency, reliability and performance set the initial acceptance criteria;
-embedded packaging remains useful but secondary. Support native vector
-and text access paths and useful operational analytics over its transactional
-data. Heavy analytics can move to optional workers or a separate OLAP companion.
-Neither a cloud service nor a second database is required for local operation.
-S3-compatible object storage is a **secondary** backup/checkpoint/archive and
-immutable cold-extent tier; it is not in the ordinary local commit path. A
-remote-primary/disaggregated engine requires its own durability and cost proof.
+OmenDB is a **native, server-first, general-purpose relational database**. It aims
+to compete with PostgreSQL and MySQL in relational functionality, correctness,
+operability and performance, and later with Neki/Vitess-style systems in *horizontal*
+scale, availability and online reconfiguration. The native SQL/type/catalog contract
+is OmenDB's; a PostgreSQL wire/dialect adapter is optional and only as compatible
+as explicitly tested. Do not design the core around PostgreSQL physical formats,
+processes or catalog IDs. Embedded Rust usage shares the engine, with a smaller
+deployment footprint, but is not the primary performance target.
 
-The boundary is **one transaction authority for shared authoritative data**, not
-one physical representation, process, or repository for every workload.
-Independently ingested analytical datasets may have their own durable authority;
-they are not silently part of an OmenDB SQL transaction. Repository and product
-ownership are decided in [ADR 0012](adr/0012-unified-modalities-and-rewrite-strategy.md).
+Initial authoritative writes and hot pages live on local RAM/NVMe. S3-compatible
+object storage is a secondary, optional tier for backups, immutable checkpoints,
+archived WAL and cold extents. Remote-primary/disaggregated storage needs a separate
+durability, latency and recovery decision. No cloud control plane is required for
+local serving.
 
-PostgreSQL compatibility is an optional client/dialect adapter, not the target
-engine design or a required completeness contract. OmenDB's native relational
-behavior must stand independently of PostgreSQL wire/catalog/type choices. The
-supported surface remains bounded by the [compatibility matrix](pgwire-compatibility.md)
-and [gap register](gap-register.md).
+## Engine boundaries
 
-## Ground-up structure
+| Owner | Owns | Does not own |
+| --- | --- | --- |
+| **OmenDB** | SQL/types/NULL semantics, catalog and constraints, binder, planner, execution, authorization, client/server protocols | Its own independent WAL or transaction status database |
+| **SeerDB** (workspace `crates/seerdb`) | Transactions, visibility/MVCC, conflicts/certification, one durable decision log, buffer/page/extent services, checkpoint, recovery, retention and admission | SQL types, query plans, BM25/ANN ranking or a universal byte-KV physical contract |
+| **Specialized access engines** | Physical indexing/computation for ordered rows, text/postings, vector/ANN, columnar analytics and later modalities | Independent commit authority over canonical rows inside one OmenDB transaction |
+| **Standalone Vector / OLAP products** | Their own datasets, APIs and qualified persistence when independently ingested/deployed | Automatic atomicity with an OmenDB SQL transaction |
+| **durable-fs** | Generic filesystem durability utilities | Database commit or snapshot semantics |
 
-```text
-native/server SQL + direct Rust API (optional PostgreSQL wire)
-                  |
-       sessions / authorization / protocol
-                  |
-       one binder / catalog / typed plans
-                  |
-     OLTP micro-plans + resumable batch execution
-                  |
-        relational meaning and constraints
-                  |
-        SeerDB transaction/storage kernel
-           /          |               \
-    ordered trees   canonical rows   optional access paths
-           \          |               /
-         shared commit / MVCC / lifetime authority
-                  |
-     mutable buffered pages + immutable extents
-                  |
-            RAM / NVMe / optional cold tiers
-```
+SeerDB should remain usable by other Rust projects through a transactional ordered-KV
+facade and useful kernel services, if that does not constrain OmenDB. Its internal
+contract is typed object/page/extent/transaction capabilities, **not** a requirement
+to wrap every row, posting or column group as bytes in one universal KV tree.
+Its independently useful interface and packaging must share the same runtime and
+recovery code as OmenDB. No permanent backend switch or duplicate storage engines.
 
-### Ownership
+## End-to-end shape
 
-OmenDB owns SQL types and NULL behavior, schemas/layout versions, constraints,
-authorization, catalog/name resolution, planning and execution. SeerDB owns
-transaction identities/outcomes, snapshots, conflicts/intents, recoverable logging,
-visibility, resource admission, buffering, materialization and physical lifetime.
-A standalone SeerDB transactional ordered-KV API can remain useful to other
-projects; OmenDB drives the internal kernel's design and does not need to route
-typed rows through that facade.
-The kernel does not acquire SQL, BM25 or vector-distance semantics.
+~~~text
+native SQL/API clients    optional PostgreSQL protocol adapter
+          \                      /
+            sessions / security
+                     |
+          typed binder + catalog
+                     |
+           optimizer / plan IR
+              /            \
+       OLTP micro-plans   typed batch pipelines
+              \            /
+         relational rows + constraints
+                     |
+          SeerDB transaction runtime
+     MVCC / certification / WAL / retention
+                     |
+         authoritative access methods
+         /                         \
+  clustered ordered rows       indexes / catalog
+                     |
+           buffers + extents
+                     |
+      local NVMe WAL + checkpoint + GC
+                     |
+   optional object-tier archive / backup
 
-Ordered KV remains a useful API over the ordered access method. It is neither
-a second engine nor the universal physical interface. A transactional KV layer
-can implement relational consistency; the reason to expose a lower internal
-boundary is control over layout, batching and shared lifecycle, not a claim that
-KV systems cannot support transactions or selective access.
+  later: native text / ANN / columnar access engines
+  later: per-shard replication, routing, online resharding
+~~~
 
-Likewise, do not replace a universal KV boundary with a universal small-page
-boundary. Ordered nodes need guarded mutable frames; column chunks, vector
-payloads and postings may need immutable extents, range reads and different cache
-units. They share ownership and budgets, not mandatory page sizes or codecs.
-[ADR 0013](adr/0013-storage-kernel-and-access-methods.md) owns these contracts.
+Canonical rows and required primary/unique/FK indexes, plus catalog metadata,
+share **one durable transaction outcome**. Derived structures are admitted only
+with explicit source identity, schema dependency, retained snapshot coverage and
+complete change intervals or a correct fallback/staleness contract. Their separate
+cache and encoding units do not entail separate SQL durability.
 
-## Local storage and commit
+## Reliability and performance bar
 
-The local default is a buffered B-link/B+tree family: update hot state in RAM,
-resolve visibility through logical MVCC, and coalesce dirty-page writes before
-out-of-place SSD materialization. Per-transaction whole-tree/generation copying
-is not the target. Node layouts, translation hints, direct I/O, compression,
-large-value separation and FDP/ZNS are measured policies, not prerequisites.
-[ADR 0009](adr/0009-buffered-btree-and-materialization.md) owns ordered layout.
+A durable commit is irreversible even after cancellation/disconnection; an
+acknowledgement additionally requires visibility through the contiguous published
+commit frontier. No unresolved decision can silently become an abort. Snapshot,
+CDC, backup, GC, and checkpoints share exact identity/retention authority.
+Recovery from a complete checkpoint and committed log must restore all required
+authoritative state and retained history; a spilled page or max page LSN alone
+is not restart authority.
 
-The first row path uses compact schema-driven records and typed guarded access.
-Clustered primary-tree records are the baseline to compare with row/heap pages
-plus a primary index. Prove row/index/catalog atomicity and useful row access;
-do not build a second physical tree implementation merely to demonstrate modularity.
-[ADR 0010](adr/0010-row-layout-and-column-families.md) owns row semantics.
+Measure **whole-engine** indexed OLTP, mixed read/write/scan loads, contention,
+large-than-RAM workloads, long snapshots, checkpoints, failures and recovery,
+not just in-memory KV operations or synthetic throughput. Compare SQL semantics
+with PostgreSQL/MySQL/SQLite, standalone KV semantics with RocksDB/Fjall/SurrealKV,
+and later shard-local throughput, HA and resharding with Neki/Vitess-style systems
+under matched conditions. Treat vendor results as hypotheses, not OmenDB results.
 
-The target ordinary commit is:
+The currently serving code still uses a generation-COW SeerDB path; `vnext` is a
+component-level replacement, **not** a qualified persistent product runtime.
+The [gap register](gap-register.md), [release gates](alpha-release-gates.md) and
+[Pgwire compatibility matrix](pgwire-compatibility.md) describe current limitations,
+not targets imposed on the native engine. Do not serve untrusted/irreplaceable
+data on the preview while known integrity and authorization gaps remain.
 
-```text
-private writes + dependencies + protected completion resources
-  -> prepare outside the decision lane
-  -> certify / order / append complete recoverable decision
-  -> establish log durability
-  -> install authoritative effects and finish structural work
-  -> publish a contiguous visible prefix
-  -> acknowledge
-
-page/history materialization and checkpoints follow independently
-```
-
-The current coordinator instead synchronizes the WAL and then required undo
-before installation. Those barriers remain mandatory for its existing format.
-The target removes a separate synchronous history flush only after the log,
-retained checkpoints and logical version identities can reconstruct all required
-state. This is a protocol/format change, not deletion of an `fsync`. Large
-external payloads may legitimately require additional dependency barriers.
-[ADR 0014](adr/0014-vnext-installation-and-recovery.md) owns both the baseline and
-the replacement's proof obligations.
-
-Use bounded adaptive batching without imposing a fixed wait on an uncontended
-writer. Parallelize preparation and independent installation. Keep encoding,
-page reads and durability waits out of the short certification/ordering lane.
-Autonomous NVMe logging is an experiment, not an assumption that one log authority
-must become one physical writer forever. Measure lane occupancy, barriers and
-ready-to-visible head-of-line waits separately.
-
-## Isolation, lifetime and recovery
-
-Keep `TxnId`, logical CSN, durable LSN, store incarnation and physical page/frame
-identities distinct. Fixed snapshots and write intents alone are not serializable.
-Initial serializable writers use decision-ordered optimistic certification of
-point, absence, range, catalog and constraint observations, including earlier
-accepted effects not yet installed. **SERIALIZABLE is provisionally favored as
-the default**, with safe transparent retry only for replayable operations. A
-separate READ COMMITTED mode must provide fresh statement snapshots and correct
-wait/recheck semantics; repeatable snapshot isolation is not serializability.
-Benchmark retry/abort p99 and realistic client-side transaction behavior before
-locking the default. Mixed isolation cannot silently weaken constraint or
-SERIALIZABLE guarantees. Hot-key waiting must not refresh a fixed snapshot.
-
-One runtime owns transaction/history leases, admission and commit responsibility.
-An unresolved attempt after possible decision append must fence before unwinding
-releases ownership. Cancellation abandons response delivery, not an irrevocable
-commit. Reserve bounded completion capacity before that boundary, including under
-query, history, cache and allocation pressure.
-
-A complete checkpoint plus retained committed log suffix defines restart state.
-Working spill pages and a maximum page LSN do not prove complete logical replay.
-Checkpoint publication preserves prior valid authority; recovery retries have a
-bounded working-allocation lifecycle. Snapshot, CDC, backup and prior-checkpoint
-retention must participate in reclamation. A snapshot/LSN pair without an atomically
-registered lease is not a safe bootstrap API. See ADRs 0013 and 0014.
-
-## Execution and specialized representations
-
-Use one typed binder for Describe and execution; Describe evaluates no user query.
-Retain catalog/layout/enforcement dependencies, enforce current grants at each
-statement boundary, and keep statement deltas private. Explicit-block failure
-makes the transaction rollback-only; catalog, index and constraint work cannot
-escape that lifecycle. [ADR 0007](adr/0007-runtime-execution-and-contention.md)
-owns these semantics and the bounded worker/admission runtime.
-
-Short OLTP operations use direct micro-plans. Scans, joins and searches use typed,
-resumable batches, selection vectors, selective decoding and costed access paths.
-Planning statistics must cover ordinary columns and, where used, filter/vector
-correlation, representation coverage and maintenance cost. Arrow/Parquet are
-interchange boundaries, not mandatory decoding or row-storage formats. JIT and
-custom kernels must improve measured workloads rather than define the architecture.
-
-Operational analytics starts on authoritative rows, with optional snapshot-valid
-columnar acceleration. Benchmark this against a single-copy hot-row/cold-column
-layout before committing the latter as a stable format. Never silently combine
-unrelated latest-only representations as one snapshot. ANN may approximate ranking,
-not row identity, deletion, predicates or authorization. Canonical validation,
-complete delta coverage and refill/exact fallback remain required.
-[ADR 0011](adr/0011-htap-and-analytical-representations.md) owns analytics;
-ADR 0012 owns modality/product boundaries.
-
-All execution and maintenance share explicit memory, CPU, I/O and history budgets.
-Different caches may use different policies; their totals have one admission owner.
-Progress-critical logging, installation, recovery and reclamation keep protected
-capacity. Telemetry or cooperative cancellation alone is not a hard process-wide
-resource/termination guarantee; isolated workers are appropriate where needed.
-
-## Deployment, qualification and non-goals
-
-Local mode has no network coordination tax. Regional HA adds a replicated durable
-log and fenced ownership before general distribution. Neki's 2026 architecture
-suggests query-driven shard groups, declarative topology and snapshot/change
-catch-up for online moves. Its routers/sidecars/control-plane are not required
-on the single-node hot path; OmenDB must not silently accept non-atomic
-cross-range commits while distributed transactions remain unsupported. Object storage is appropriate
-for immutable archives, checkpoints and sufficiently large cold reads, not ordinary
-fine-grained OLTP updates. Replication, failover and control-plane availability
-need their own evidence; fast logging proves none of them by itself.
-[ADR 0006](adr/0006-deployment-storage-and-durability.md) owns deployment profiles;
-[ADR 0008](adr/0008-distribution-ranges-and-global-topology.md) owns later distribution.
-
-The architecture selects mechanisms, not a state-of-the-art performance claim.
-Representative benchmarks must match durability, isolation, hardware, cache state,
-transaction size and correctness, and include churn, long snapshots, checkpoints,
-larger-than-memory data and recovery. The [plan](plans/storage-kernel-vnext.md)
-selects experiments before cutover; [alpha gates](alpha-release-gates.md) govern
-release. No doc update closes a code or qualification gate.
-
-Retain useful existing oracles, but resolve known legacy defects against independent
-semantics. Cutover removes the generation-COW engine, transitional adapters and
-obsolete docs rather than maintaining a runtime backend matrix. Repository history
-is retained; private research and sibling code are not published by implication.
