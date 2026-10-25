@@ -1,7 +1,8 @@
 # ADR 0008: Distribution, ranges, and global topology
 
-- **Status:** accepted target architecture; not an immediate implementation milestone
+- **Status:** deferred target architecture, reconciled with ADR 0015 and Neki research 2026-10-25; not an immediate implementation milestone
 - **Scope:** horizontal scale, replication placement, resharding, distributed SQL, and global deployments
+- **Current product authority:** [ADR 0015](0015-native-relational-engine.md); distributed design must remain compatible with the native relational model, not a universal ordered-KV substrate.
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md),
   [ADR 0006](0006-deployment-storage-and-durability.md), and
   [ADR 0007](0007-runtime-execution-and-contention.md)
@@ -35,23 +36,31 @@ PostgreSQL architecture or requiring distributed consensus for a local DB.
 
 ## Decision
 
-### 1. Distribution is a range layer over SeerDB's ordered keyspace
+### 1. Distribution is logical placement, not SeerDB's universal ordered keyspace
 
-The fundamental movement and replication unit is an ordered **range**:
+The movement and replication unit is a **logical placement range** over a
+catalog-declared routing key (hash, ordered value, or another validated mapping):
 
 ```text
 RangeId
-TreeId / placement group
-[start_key, end_key)
-epoch
-replica set / leader
+PlacementGroupId / routing-key expression + codec version
+[start_route, end_route)
+ownership epoch
+replica set / leader / declared durability policy
 ```
 
-A range is logical ownership, not a physical B-tree page range. Splits and
-merges therefore do not expose page layout or require stable page boundaries.
+Routing keys are selected from the **relational workload and co-location needs**,
+not automatically the primary B-tree key, physical PageId or a mandatory encoded
+KV universe. Primary/secondary indexes, heap candidates, posting and analytical
+representations may use different physical formats. A range is logical
+ownership, never a physical page slice. Resharding does not require page-stable
+boundaries. The exact future range/log/quorum implementation remains unselected
+until local correctness, actual workload and a distributed transaction protocol
+earn it.
 
 Local single-node mode may represent the whole database as one local placement
-without running a distributed topology service.
+without running a distributed topology service. Do not impose router hops,
+consensus calls or per-request shard bookkeeping on the server-first local path.
 
 ### 2. Placement groups express intentional co-location
 
@@ -71,6 +80,13 @@ A placement group records:
 
 This is conceptually similar to Neki shard groups / Multigres table groups, but
 it is OmenDB catalog state feeding OmenDB's own planner and storage engine.
+Neki's 2026-10-23 study shows the critical design criterion: choose the key by
+common **joins and transactions**, not independently by each table's primary
+key. A customer row and its order/line tables should normally be local together.
+Treat reference-table replication and global secondary indexes as distinct
+cross-range synchronization/uniqueness problems, not free routing metadata.
+Neki currently documents non-atomic/no-shared-snapshot cross-shard writes; this
+is a boundary OmenDB must not emulate implicitly.
 
 No table must be sharded. The default database remains unpartitioned until
 measured scale or locality requires otherwise.
@@ -283,6 +299,13 @@ Before a global mode is trusted, deterministic tests must explore:
   dominate when the schema is co-located intentionally;
 - global/WAN benchmarks publish p50/p95/p99 latency by locality rather than one
   misleading aggregate number.
+
+## Research provenance
+
+- [Neki's architecture (2026-09-18)](https://planetscale.com/blog/the-architecture-of-neki): shard groups, topology/router, pooled session scopes and online migration workflows; the PostgresManager/Sidecar/Operator stack is a stock-Postgres constraint, not a mandatory native-engine design.
+- [Query-first shard groups (2026-10-23)](https://planetscale.com/blog/shard-groups-the-unit-of-co-location): co-location, reference tables, routing expressions/global indexes and the current cross-shard atomicity limitation.
+- [Lazy Neki routing (2026-10-01)](https://planetscale.com/blog/designing-neki-for-performance): don't decode untouched results/parameters, and don't require the local OmenDB server to introduce a remote routing tier.
+- [Neki 118.5M QPS experiment (2026-09-11)](https://planetscale.com/blog/118-million-queries-per-second-on-neki): 512 primary-only shards, single-shard point reads, no writes/failover; not one-node durable OLTP evidence.
 
 ## Consequences
 
