@@ -1,6 +1,6 @@
 # OmenDB architecture
 
-**Status:** accepted target, reviewed 2026-10-13; not an implemented release.
+**Status:** native relational/server-first target refined 2026-10-25; not an implemented release. [ADR 0015](adr/0015-native-relational-engine.md) owns the latest architecture and intentional departures from the earlier ADRs.
 The serving backend still uses the generation-COW SeerDB engine. The replacement
 under `crates/seerdb/src/vnext` is not yet a restart-safe product backend.
 The [vNext plan](plans/storage-kernel-vnext.md) owns implementation order and
@@ -8,11 +8,16 @@ open gates; this document is the architectural overview, not another backlog.
 
 ## Product and deployment decision
 
-Build an integrated, server-first relational database for RAM and local NVMe,
-with an embedded Rust surface using the same semantics. Support native vector
+Build a **server-first native relational database** for RAM and local NVMe,
+with a lightweight embedded Rust surface using the same semantics. Server
+concurrency, reliability and performance set the initial acceptance criteria;
+embedded packaging remains useful but secondary. Support native vector
 and text access paths and useful operational analytics over its transactional
 data. Heavy analytics can move to optional workers or a separate OLAP companion.
 Neither a cloud service nor a second database is required for local operation.
+S3-compatible object storage is a **secondary** backup/checkpoint/archive and
+immutable cold-extent tier; it is not in the ordinary local commit path. A
+remote-primary/disaggregated engine requires its own durability and cost proof.
 
 The boundary is **one transaction authority for shared authoritative data**, not
 one physical representation, process, or repository for every workload.
@@ -20,15 +25,16 @@ Independently ingested analytical datasets may have their own durable authority;
 they are not silently part of an OmenDB SQL transaction. Repository and product
 ownership are decided in [ADR 0012](adr/0012-unified-modalities-and-rewrite-strategy.md).
 
-PostgreSQL compatibility concerns wire protocol, SQL behavior, drivers and tools.
-It does not require PostgreSQL's pages, WAL, executor or process model. The
+PostgreSQL compatibility is an optional client/dialect adapter, not the target
+engine design or a required completeness contract. OmenDB's native relational
+behavior must stand independently of PostgreSQL wire/catalog/type choices. The
 supported surface remains bounded by the [compatibility matrix](pgwire-compatibility.md)
 and [gap register](gap-register.md).
 
 ## Ground-up structure
 
 ```text
-PostgreSQL clients / direct Rust API
+native/server SQL + direct Rust API (optional PostgreSQL wire)
                   |
        sessions / authorization / protocol
                   |
@@ -55,6 +61,9 @@ OmenDB owns SQL types and NULL behavior, schemas/layout versions, constraints,
 authorization, catalog/name resolution, planning and execution. SeerDB owns
 transaction identities/outcomes, snapshots, conflicts/intents, recoverable logging,
 visibility, resource admission, buffering, materialization and physical lifetime.
+A standalone SeerDB transactional ordered-KV API can remain useful to other
+projects; OmenDB drives the internal kernel's design and does not need to route
+typed rows through that facade.
 The kernel does not acquire SQL, BM25 or vector-distance semantics.
 
 Ordered KV remains a useful API over the ordered access method. It is neither
@@ -120,8 +129,13 @@ Keep `TxnId`, logical CSN, durable LSN, store incarnation and physical page/fram
 identities distinct. Fixed snapshots and write intents alone are not serializable.
 Initial serializable writers use decision-ordered optimistic certification of
 point, absence, range, catalog and constraint observations, including earlier
-accepted effects not yet installed. Hot-key waiting and other isolation modes
-must preserve their declared semantics rather than silently retry a stale snapshot.
+accepted effects not yet installed. **SERIALIZABLE is provisionally favored as
+the default**, with safe transparent retry only for replayable operations. A
+separate READ COMMITTED mode must provide fresh statement snapshots and correct
+wait/recheck semantics; repeatable snapshot isolation is not serializability.
+Benchmark retry/abort p99 and realistic client-side transaction behavior before
+locking the default. Mixed isolation cannot silently weaken constraint or
+SERIALIZABLE guarantees. Hot-key waiting must not refresh a fixed snapshot.
 
 One runtime owns transaction/history leases, admission and commit responsibility.
 An unresolved attempt after possible decision append must fence before unwinding
@@ -170,7 +184,11 @@ resource/termination guarantee; isolated workers are appropriate where needed.
 ## Deployment, qualification and non-goals
 
 Local mode has no network coordination tax. Regional HA adds a replicated durable
-log and fenced ownership before general distribution. Object storage is appropriate
+log and fenced ownership before general distribution. Neki's 2026 architecture
+suggests query-driven shard groups, declarative topology and snapshot/change
+catch-up for online moves. Its routers/sidecars/control-plane are not required
+on the single-node hot path; OmenDB must not silently accept non-atomic
+cross-range commits while distributed transactions remain unsupported. Object storage is appropriate
 for immutable archives, checkpoints and sufficiently large cold reads, not ordinary
 fine-grained OLTP updates. Replication, failover and control-plane availability
 need their own evidence; fast logging proves none of them by itself.
