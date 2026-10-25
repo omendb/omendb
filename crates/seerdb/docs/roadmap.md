@@ -31,9 +31,10 @@ A cancellation, caught panic or uncertain I/O cannot lose installer resources
 or silently abort an appended decision.
 
 **Gate:** create, open, commit, crash, reopen and continue one multi-object
-transaction on real storage through one runtime, including conflicting
-writers and ambiguous acknowledgement resolution. Preserve exact previous
-authority when checkpoint publication is interrupted.
+transaction on real storage through one runtime, initially replaying the
+complete WAL from a safe genesis state without checkpoint truncation. Exercise
+conflicting writers and ambiguous acknowledgements. Full checkpoint publication,
+retained-history closure and reclamation belong to **S3**, not this early gate.
 
 ## S2. Correct concurrent MVCC and complete record representability
 

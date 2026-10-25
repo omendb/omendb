@@ -2,7 +2,9 @@
 
 This document keeps the existing development-harness commands and dated
 legacy-engine evidence out of the API README. It has **not** been rerun for the
-new persistent runtime. The maintained [roadmap](roadmap.md) owns required
+new persistent runtime. Run the commands below from **`crates/seerdb/`**,
+where the `tools/` scripts and crate examples live, unless a command specifies
+the OmenDB workspace root. The maintained [roadmap](roadmap.md) owns required
 gates and [architecture](architecture.md) owns the target contract. Historical
 results are specific to the engine version and operating system stated.
 
