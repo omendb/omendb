@@ -1,7 +1,6 @@
 # ADR 0012: Unified modalities and rewrite strategy
 
-- **Status:** accepted target; product and repository boundary decided 2026-10-13;
-  integration and migration are not implemented by this decision
+- **Status:** historical design record; maintained target now in [living specification](../design/engines-and-scale.md). This document retains rationale, not an independent current contract.
 - **Scope:** integrated modalities, standalone products, repository ownership and reuse
 - **Depends on:** ADRs 0006 through 0011; [ADR 0013](0013-storage-kernel-and-access-methods.md)
   owns the common storage/snapshot boundary
@@ -175,6 +174,6 @@ or standalone deployment must additionally expose its consistency and recovery
 boundary. Benchmark local integration against isolation rather than assuming
 one process always wins or a network hop is always necessary.
 
-The [vNext plan](../plans/storage-kernel-vnext.md) owns implementation order.
+The [vNext plan](../roadmap.md) owns implementation order.
 Current standalone contracts remain in their own repositories until migrated;
 this ADR is not evidence that a port, release or consolidation has happened.

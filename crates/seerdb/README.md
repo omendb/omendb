@@ -85,19 +85,20 @@ open as a complete integrity audit.
 
 ## Direction
 
-The current implementation is a correctness-oriented out-of-place B+tree
-kernel with WAL, immutable root generations, snapshots, blobs, and
-reclamation. Its one-writer/root-generation contract is a transitional
-prototype, not the target OmenDB transaction architecture.
+SeerDB's **maintained target** is a reusable concurrent storage and transaction
+kernel, with native page/extent/object capabilities and one WAL/MVCC/recovery
+authority shared by OmenDB. A standalone ordered-KV facade remains useful, but
+need not define the physical representation of typed relational rows, text
+postings, vector indexes or immutable columnar extents. The existing
+`DB`/`TransactionDatabase` generation-publisher path is a development reference,
+not a permanent second runtime. OmenDB is the priority consumer and server-scale
+workload; library reuse must not impose avoidable performance/ownership costs.
 
-The target SeerDB design is a generic OLTP-oriented transactional ordered-KV
-engine with physical multi-writer snapshot MVCC, ordered cursors, atomic
-multi-tree mutation, recoverable WAL, and a restartable committed-change
-stream. The current `TransactionDatabase` is the first semantic vertical slice;
-its physical publication lane is intentionally not presented as the final
-architecture. SeerDB remains SQL-agnostic: OmenDB owns row/index codecs and
-relational meaning. See [`../../docs/architecture.md`](../../docs/architecture.md)
-for the cross-project boundary and roadmap.
+See the [maintained kernel contract](../../docs/design/storage-kernel.md),
+[engine architecture](../../docs/architecture.md) and
+[implementation roadmap](../../docs/roadmap.md). Older ADRs and historical
+benchmarks are research evidence, not alternate implementation specifications.
+
 
 ## Status
 

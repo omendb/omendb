@@ -1,6 +1,6 @@
 # ADR 0009: Buffered B-tree state and asynchronous physical materialization
 
-- **Status:** accepted target architecture, including bounded ordered cells and logical overflow; overflow format/progress not yet implemented or qualified
+- **Status:** historical design record; maintained target now in [living specification](../design/storage-kernel.md). This document retains rationale, not an independent current contract.
 - **Refined by:** [ADR 0014](0014-vnext-installation-and-recovery.md) supersedes pre-decision shared installation for vNext; the buffer/materialization separation remains
 - **Scope:** SeerDB B-tree concurrency, buffer residency, dirty-page handling,
   page mapping, and checkpoint materialization
@@ -238,7 +238,7 @@ plus optional archival backups.
 
 ## Migration strategy
 
-The [vNext plan](../plans/storage-kernel-vnext.md) owns the replacement sequence.
+The [vNext plan](../roadmap.md) owns the replacement sequence.
 Keep the legacy engine only as a semantic/fault reference until qualified cutover;
 known legacy defects are not expected behavior. New experimental layouts use new
 versions and fail closed on old bytes, with explicit offline conversion where

@@ -1,7 +1,6 @@
 # ADR 0013: Storage kernel and access-method boundary
 
-- **Status:** accepted target; ordered component baseline exists, persistent
-  recovery and product cutover remain unqualified
+- **Status:** historical design record; maintained target now in [living specification](../design/storage-kernel.md). This document retains rationale, not an independent current contract.
 - **Scope:** shared transaction/storage services, physical access methods and lifetime
 - **Revises:** the universal ordered-KV boundary in earlier ADRs; reviewed 2026-10-13
 - **Related owners:** [ADR 0014](0014-vnext-installation-and-recovery.md) for commit/recovery,
@@ -184,7 +183,7 @@ are reference semantics, not a requirement to copy its slot implementation.
 
 ## Migration plan
 
-The [vNext plan](../plans/storage-kernel-vnext.md) is the sole execution sequence.
+The [vNext plan](../roadmap.md) is the sole execution sequence.
 Keep the legacy engine as a fallible semantic/fault reference until qualified
 cutover, then delete it and transitional adapters. Offline preview conversion
 preserves supported logical data or refuses it; no stable physical upgrade or

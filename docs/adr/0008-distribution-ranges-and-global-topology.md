@@ -1,6 +1,6 @@
 # ADR 0008: Distribution, ranges, and global topology
 
-- **Status:** deferred target architecture, reconciled with ADR 0015 and Neki research 2026-10-25; not an immediate implementation milestone
+- **Status:** historical design record; maintained target now in [living specification](../design/engines-and-scale.md). This document retains rationale, not an independent current contract.
 - **Scope:** horizontal scale, replication placement, resharding, distributed SQL, and global deployments
 - **Current product authority:** [ADR 0015](0015-native-relational-engine.md); distributed design must remain compatible with the native relational model, not a universal ordered-KV substrate.
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md),

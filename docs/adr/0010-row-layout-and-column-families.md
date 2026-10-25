@@ -1,6 +1,6 @@
 # ADR 0010: Compact row layout and optional column families
 
-- **Status:** accepted target architecture; physical encoding not yet stable
+- **Status:** historical design record; maintained target now in [living specification](../design/relational-engine.md). This document retains rationale, not an independent current contract.
 - **Scope:** OmenDB relational row representation, primary-tree values, wide/cold
   column placement, and decode into the execution engine
 - **Depends on:** [ADR 0007](0007-runtime-execution-and-contention.md) and

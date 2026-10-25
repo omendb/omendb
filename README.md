@@ -1,10 +1,13 @@
 # OmenDB
 
-Relational database server in Rust, built on the shared transaction/storage
-kernel in [SeerDB](crates/seerdb). OmenDB targets single-node OLTP first, with
-PostgreSQL ecosystem integration through an experimental PostgreSQL wire
-interface and a path to integrated search, analytics, HA, and distribution. A
-direct Rust API is also available.
+Native, server-first relational database in Rust, built on a shared
+[SeerDB](crates/seerdb) transaction/storage kernel. The goal is a general-purpose
+alternative to PostgreSQL/MySQL rather than a PostgreSQL implementation. The
+current developer preview exposes a bounded PostgreSQL-wire adapter and Rust
+API; these do not define the native engine's long-term SQL or storage semantics.
+Specialized search/analytics and Neki-class horizontal scale are later goals.
+See the [architecture](docs/architecture.md), [design contracts](docs/design/)
+and [roadmap](docs/roadmap.md) for targets, not implementation claims.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.

@@ -7,7 +7,7 @@ description: Use when changing or reviewing vNext decisions/certification, commi
 
 Run from the repository root. This procedure does not grant implementation or publication authority.
 
-1. Inspect the current branch, working tree and source. Read [the plan](../../../docs/plans/storage-kernel-vnext.md) for open gates and [ADR 0014](../../../docs/adr/0014-vnext-installation-and-recovery.md) for the protocol. Distinguish implemented behavior from intended behavior; do not inherit a handoff's green status or closed finding without checking.
+1. Inspect the current branch, working tree and source. Read [the plan](../../../docs/roadmap.md) for open gates and [the maintained SeerDB spec](../../../docs/design/storage-kernel.md) for the protocol. ADR 0014 retains historical reasoning. Distinguish implemented behavior from intended behavior; do not inherit a handoff's green status or closed finding without checking.
 2. Identify which boundary changes: pre-decision refusal, WAL/undo durability, guarded page installation, ready publication, contiguous visibility, checkpoint authority or reclamation. State the failure outcome and ownership at that boundary before changing it.
 3. Exercise the changed boundary through the real coordinator/runtime. Choose the schedule for its risk:
    - **Certification:** pause an earlier accepted decision before install; later point/absence/range/catalog/constraint observations must certify against its effects, not only visible pages. Pressure cannot discard evidence and permit success.

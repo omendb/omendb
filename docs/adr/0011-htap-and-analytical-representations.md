@@ -1,6 +1,6 @@
 # ADR 0011: HTAP and analytical representations
 
-- **Status:** accepted target; reviewed 2026-10-13; physical-format promotion is measured
+- **Status:** historical design record; maintained target now in [living specification](../design/engines-and-scale.md). This document retains rationale, not an independent current contract.
 - **Scope:** native operational analytics, columnar representations and optional workers
 - **Related owners:** ADR 0007 execution; ADR 0010 rows; ADR 0013 snapshot/lifetime;
   [ADR 0012](0012-unified-modalities-and-rewrite-strategy.md) products/repositories

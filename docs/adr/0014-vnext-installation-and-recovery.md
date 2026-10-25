@@ -1,7 +1,6 @@
 # ADR 0014: vNext decisions, installation and checkpoint recovery
 
-- **Status:** accepted target protocol, revised 2026-10-13; the current component
-  baseline is not an integrated, restart-safe runtime
+- **Status:** historical design record; maintained target now in [living specification](../design/storage-kernel.md). This document retains rationale, not an independent current contract.
 - **Scope:** storage-kernel vNext, not the legacy production format
 - **Depends on:** [ADR 0013](0013-storage-kernel-and-access-methods.md)
 - **Refines:** ADRs 0003, 0006 and 0009. Durable-decision-first installation replaces
@@ -22,7 +21,7 @@ That is a real dependency of the existing format, not a desirable permanent
 latency floor. The target uses one recoverable log boundary for ordinary mutations,
 with recent history resident and history/page materialization off the ACK path.
 This requires new recoverability and retention evidence before any barrier is removed.
-The [plan](../plans/storage-kernel-vnext.md) owns status and implementation order.
+The [plan](../roadmap.md) owns status and implementation order.
 
 ## 1. Runtime-owned transaction and completion capabilities
 
@@ -239,5 +238,5 @@ Bound recovery memory as well as payload reads: indexes, owner tables, replay ou
 and retained history can still grow with log length. Measure serial-lane service,
 barrier count, ready-to-visible waits and checkpoint pauses before claiming modern
 OLTP performance. The [qualification skill](../../.agents/skills/vnext-qualification/SKILL.md)
-owns procedures; the [plan](../plans/storage-kernel-vnext.md#immediate-sequence) owns
+owns procedures; the [plan](../roadmap.md#immediate-sequence) owns
 sequence and open evidence. Documentation changes close no implementation gate.

@@ -1,6 +1,6 @@
 # ADR 0007: Runtime, execution, and contention architecture
 
-- **Status:** accepted target architecture; implementation staged
+- **Status:** historical design record; maintained target now in [living specification](../design/relational-engine.md). This document retains rationale, not an independent current contract.
 - **Scope:** OmenDB server runtime, SQL execution, scheduling, and transaction contention
 - **Depends on:** [ADR 0001](0001-seerdb-transaction-contract.md) and
   [ADR 0006](0006-deployment-storage-and-durability.md)
