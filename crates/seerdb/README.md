@@ -83,167 +83,22 @@ bound to a published historical generation. Call `verify`, `check`, and
 `durability_status` in operational tooling rather than treating a successful
 open as a complete integrity audit.
 
-## Direction
+## Architecture and implementation state
 
-SeerDB's **maintained target** is a reusable concurrent storage and transaction
-kernel, with native page/extent/object capabilities and one WAL/MVCC/recovery
-authority shared by OmenDB. A standalone ordered-KV facade remains useful, but
-need not define the physical representation of typed relational rows, text
-postings, vector indexes or immutable columnar extents. The existing
-`DB`/`TransactionDatabase` generation-publisher path is a development reference,
-not a permanent second runtime. OmenDB is the priority consumer and server-scale
-workload; library reuse must not impose avoidable performance/ownership costs.
+SeerDB currently exposes the generation-based ordered-KV development API above.
+The future general-purpose transaction/storage runtime is experimental and is
+not a qualified multi-writer or restart-safe production engine. It should be
+usable independently of OmenDB without forcing typed rows or specialized
+vector/columnar extents through opaque byte-KV storage. OmenDB is the primary
+integration/performance consumer, not a required dependency of standalone KV.
 
-See the [maintained kernel contract](../../docs/design/storage-kernel.md),
-[engine architecture](../../docs/architecture.md) and
-[implementation roadmap](../../docs/roadmap.md). Older ADRs and historical
-benchmarks are research evidence, not alternate implementation specifications.
-
-
-## Status
-
-The current Rust development lane is a single-writer durable kernel with
-concurrent reads, root-generation retention, WAL recovery, crash-safe
-reclamation, and retryable capacity refusal. `TransactionDatabase` now stores
-committed per-key version chains, returns explicit `{CSN, LSN}` commit
-positions, and supplies first-class trees, fixed-snapshot reads, atomic
-multi-tree mutations, and reopen-persistent write-conflict records above that
-kernel. It is still not the target physical multi-writer
-engine or a releasable `0.1.0-alpha.*` crate. Status-table freezing,
-durable retained-snapshot/change-consumer leases, concurrent page/WAL publication,
-broader filesystem/block-layer fault qualification, OmenDB direct integration,
-and measured device-backed performance remain open. OmenDB integration and the
-alpha release gates are the authoritative cross-project qualification
-surfaces.
-
-On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
-it fails each observed `fsync`, `fdatasync`, rename, and `write` call once both
-before and after completion during a whole-image and segmented durable
-mutation, then requires the old or complete-new root after two fresh reopens.
-This does not emulate torn writes, block-layer cache loss, or machine power
-loss; the privileged
-`tools/linux_power_loss.sh` gate remains separate.
-The current page-write path uses `write` after seeking, so it is included in
-this matrix; a future positional `pwrite` path would need a separate external
-interposer.
-
-`tools/linux_syscall_crashes.sh` uses the same interposer to hold a selected
-libc call and lets the parent send `SIGKILL` either before the call or after
-the real call succeeds but before it returns. The ARM64 Linux matrix covers
-138 whole-image/segmented cases with two-reopen old-or-complete-new checks.
-This is process-termination evidence at the libc boundary, not block-layer
-power-loss, torn-write, or general filesystem-race evidence.
-
-The same seeded mutation contract is available for the common-KV comparison:
-`tools/common_kv_syscall_faults.sh` passed 210 external sync/rename cases over
-SeerDB, Fjall, and RocksDB on ARM64 Linux: every observed call was tested both
-before and after completion, with complete batch-prefix and two-reopen
-verification. Its manifest classifies process refusal/completion, complete or
-shorter-prefix recovery, stable two-reopen verification, and uncollected
-resource equivalence separately. It is diagnostic recovery evidence, not
-incumbent performance or block-layer power-loss equivalence.
-
-## Portable qualification
-
-The repository's `tools/` directory contains development-only qualification
-and comparison harnesses. It is not a workspace member, runtime dependency, or
-published crate content. The comparison scripts may invoke other engines as
-measurement controls; SeerDB does not ship adapters for them.
-
-Run the deterministic mixed workload and emit a JSON qualification artifact:
-
-```bash
-cargo run --release --all-features --example seerdb_qualification -- \
-  --keys 128 --operations 512 --output /tmp/seerdb-qualification.json
-```
-
-The harness checks a reference model, retained-root reads, bounded compaction,
-periodic close/reopen verification, vacuum, history pruning, offline
-`DB::check()`, and final close/reopen.
-It reports p50/p95/p99 operation latencies, page-write and space-amplification
-observations, separates user-commit work from maintenance/restart work in its
-physical counters, and records the final digest. These are portable
-qualification measurements, not cross-engine or device-backed performance
-claims; the ext4/XFS power-loss runner remains a separate privileged gate.
-
-For the matched ordered-KV comparison harness, use Linux and retain the raw
-runs plus aggregate manifest:
-
-```bash
-tools/common_kv_qualification.sh \
-  --output-dir /tmp/seerdb-common-kv-qualification \
-  --engines seerdb,fjall,rocksdb \
-  --workloads batch-put,mixed,point-read,range-read \
-  --repetitions 2 --warmups 1
-```
-
-The comparison uses durable mode, a shared deterministic trace, an in-memory
-oracle, close/reopen verification, latency quantiles, process resources, and
-SeerDB publication counters. It leaves the filesystem cache intact and does
-not substitute for external recovery testing or NVMe measurements.
-
-For the portable process-termination recovery gate, run the independent
-ordered-KV adapters through deterministic old-state and complete-new-state
-batch boundaries:
-
-```bash
-tools/common_kv_faults.sh \
-  --output-dir /tmp/seerdb-common-kv-faults
-```
-
-This writes a `seerdb-common-kv-process-crash-manifest-v1` with six Linux
-cases, SIGKILL status, two reopen checks, and the accepted prefix digest for
-SeerDB, Fjall, and RocksDB. It does not claim recovery from a kill during
-fsync/page write or from block-layer power loss; those remain separate gates.
-Each accepted case also records normalized execution, recovery, reopen, and
-resource outcomes so process termination, old/complete-new recovery, stable
-two-reopen verification, and uncollected resource equivalence remain distinct.
-On a non-Linux host, set `SEERDB_COMMON_KV_RECORD_UNSUPPORTED=1` to write an
-explicit `status: unsupported`, `accepted: false` manifest instead of silently
-turning the missing Linux capability into a completed result. The default
-remains a fail-closed exit status 2.
-
-## Verification
-
-Routine CI runs the fast repository gate:
-
-```bash
-cargo check --all-features --all-targets
-cargo test --all-features --all-targets
-cargo fmt --all -- --check
-cargo clippy --all-features --all-targets -- -D warnings
-```
-
-Extended validation is available through manual dispatch of the `Extended
-validation` GitHub Actions workflow and runs automatically for `v*` release
-tags. Run the same release, documentation, dependency, and dedicated
-filesystem gates locally with:
-
-```bash
-cargo test --release --all-features --all-targets
-RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
-cargo deny check all
-SEERDB_ENOSPC_ROOT=/path/to/size-limited-filesystem \
-  cargo test --all-features --test real_enospc -- --ignored
-```
-
-`deny.toml` is the repository dependency policy. It denies unknown registries
-and Git sources, rejects wildcard requirements, allows only the reviewed
-license set, and requires a crate-specific exception for the transitive
-`r-efi` license expression. `cargo audit` is a complementary local RustSec
-check; neither result replaces GitHub's default-branch advisory state or a
-release review.
-
-The privileged `tools/linux_power_loss.sh` runner is separate and requires a
-Linux host with loop devices, `dm-log-writes`, and `replay-log`. It records an
-explicit `not-run` manifest when those prerequisites are unavailable.
-
-## References
-
-- LeanStore (VLDB 2024, 2026) — out-of-place B-tree, SSD-aware buffer management
-- "How to Write to SSDs" (VLDB 2026) — DB-SSD co-optimization, NoWA pattern
-- WiscKey (FAST 2016) — key-value separation for reduced write amplification
-- ZLeanStore (GitHub) — C++ implementation of out-of-place B-tree with blob storage
+Read the maintained [SeerDB architecture](docs/architecture.md),
+[SeerDB roadmap](docs/roadmap.md), and [qualification procedures](docs/qualification.md).
+The OmenDB [product architecture](../../docs/architecture.md) and
+[relational roadmap](../../docs/roadmap.md) describe the consumer's requirements.
+Older ADRs and benchmarks are evidence, not accepted replacements for these
+contracts. No storage format, API stability or competitive performance claim is
+implied by these documents.
 
 ## License
 
