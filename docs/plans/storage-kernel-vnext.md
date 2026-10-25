@@ -2,9 +2,12 @@
 
 **Branch:** `main` — vNext remains experimental until qualified product cutover.
 
-**Goal:** replace the generation-COW serving path with a qualified, concurrent
-native relational OLTP engine over one SeerDB transaction/storage authority.
-PostgreSQL compatibility is optional; useful embedded and server SQL behavior is not.
+**Goal:** replace the generation-COW serving path with a qualified, concurrent,
+**server-first** native relational OLTP engine over one SeerDB transaction/storage
+authority. Embedded use is secondary and shares the same engine. PostgreSQL
+compatibility is an optional surface, not a storage/SQL architecture constraint.
+Object storage is a secondary tier for backups, archived WAL, snapshots and
+immutable cold extents; local RAM/NVMe remains the primary transaction path.
 
 **Current design:** [ADR 0015](../adr/0015-native-relational-engine.md)
 (native relational target and rejected alternatives). Supporting owners: [ADR 0013](../adr/0013-storage-kernel-and-access-methods.md)
@@ -20,7 +23,11 @@ PostgreSQL compatibility is optional; useful embedded and server SQL behavior is
 
 The 2026-10-25 design review used current main at 1590011, selected the
 native relational-first direction in ADR 0015, and performed no implementation
-tests or performance qualification. The prior 2026-10-13 review inspected source at `92e2ac8eed6af89d164af4b44189146a68ce9864`.
+tests or performance qualification. Subsequent October 25 scope clarification
+makes server concurrency primary, retains SeerDB's separately useful KV façade
+without letting it dictate OmenDB internals, and provisionally favors SERIALIZABLE
+for native SQL while READ COMMITTED remains a required distinct supported mode.
+Do not finalize that default without matched retry/latency/client-UX evidence. The prior 2026-10-13 review inspected source at `92e2ac8eed6af89d164af4b44189146a68ce9864`.
 It is a design/targeted source audit, not a new test run or benchmark. No milestone
 is closed by the resulting documentation. Historical tests remain evidence at their
 recorded revision; known legacy defects require independent semantics, not parity
@@ -71,7 +78,8 @@ on main; keep the legacy path only as a *fallible* comparison/oracle until cutov
 
 Build one persistent SeerDB owner spanning buffer, ordered objects, transaction and
 status registry, catalog retention, resource admission, WAL, redo/history, recovery,
-commit/visibility, checkpoint and GC. No persistent optional coordinator assembly,
+commit/visibility, checkpoint and GC. The native server and concurrent SQL sessions
+are the main qualification path; embedded remains an optional deployment surface. No persistent optional coordinator assembly,
 independent failure boundaries or nested commits. Keep the exact-incarnation
 single-flight Loading repair and owned commit-attempt guard; qualify them through
 the actual runtime. Preserve responsibility from before possible append through
@@ -109,7 +117,10 @@ obsolete layout.
 
 Implement decision-ordered serializable certification against accepted (including
 uninstalled) earlier point, absence, gap/range, namespace, catalog/enforcement and
-constraint effects. Retain full evidence under pressure; provide explicit refusal
+constraint effects. It is the initial correctness reference and provisional
+server default. Provide explicit READ COMMITTED statement snapshots and safe
+wait/recheck rather than an alias for weaker write-write conflict checks; test
+mixed-isolation histories, not only homogeneous isolation. Retain full evidence under pressure; provide explicit refusal
 when resources are exhausted. Introduce queued hot-key waiting only after the
 low-contention path is correct, and separately model statement-refreshing isolation.
 
@@ -214,7 +225,25 @@ selects the architecture. Vendor/paper speedups suggest candidates only.
 or unbounded maintenance pressure. Promote a fancier algorithm only after a
 representative matched improvement and equivalent failure proofs.
 
-### 6. Introduce other physical/query engines when earned
+### 6. Qualify optional object storage and introduce other engines when earned
+
+After the server's primary local durable runtime works, support S3-compatible
+snapshot/backup export, manifest verification and restore, archived complete WAL
+segments and selectively cold immutable extents. Keep per-commit WAL sync and
+mutable OLTP pages local; object-store primary/disaggregated persistence is a
+separate later design with its own measured and fault-qualified recovery protocol.
+Test interrupted multi-object uploads, manifest publish, snapshot leases, missing
+objects, caching, egress/request cost and safe eventual GC. Do not mistake strong
+single-key read-after-write for an atomic multi-object database commit.
+
+Future regional replication/distribution should learn from PlanetScale Neki's
+**query-driven shard groups**, staged snapshot + transactional change-stream
+catch-up, topology epochs, and lazy routing. Never add mandatory router/control
+plane overhead to the single-node fast path. Do not ship non-atomic cross-range
+SQL transactions as ordinary commits merely because Neki's current preview has
+that limitation.
+
+### Native extensions
 
 After relational core qualification, expose snapshot-correct native typed
 batch/selection access and source-complete transactional change streams to
