@@ -106,7 +106,7 @@ syntax, migrations and transactional semantics, not instant feature parity
 with every PostgreSQL/MySQL extension. Against PostgreSQL/MySQL, test
 the same isolation, durability, schemas, FK/unique/DDL behavior, concurrent
 writers and real SQL plans; compare throughput and p50/p95/p99, CPU/RSS,
-index write amplification, large-than-RAM scans, checkpoint pauses and
+index write amplification, larger-than-memory scans, checkpoint pauses and
 recovery. PostgreSQL protocol tests remain valuable **only** for explicitly
 advertised overlap.
 

@@ -90,7 +90,7 @@ authoritative state and retained history; a spilled page or max page LSN alone
 is not restart authority.
 
 Measure **whole-engine** indexed OLTP, mixed read/write/scan loads, contention,
-large-than-RAM workloads, long snapshots, checkpoints, failures and recovery,
+larger-than-memory workloads, long snapshots, checkpoints, failures and recovery,
 not just in-memory KV operations or synthetic throughput. Compare SQL semantics
 with PostgreSQL/MySQL/SQLite, standalone KV semantics with RocksDB/Fjall/SurrealKV,
 and later shard-local throughput, HA and resharding with Neki/Vitess-style systems
