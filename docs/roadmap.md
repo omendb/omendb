@@ -67,9 +67,9 @@ views, then preserve bounded typed batches and selection masks end-to-end
 through filter, join, aggregate and projection, with late materialization.
 Compare fused scalar and batch paths at realistic selectivity, width and
 cache states; prove SQL NULL/collation/snapshot equivalence and measure
-copy/decode bytes, allocations, p99 and batch-size crossover. Bound scan
-work including invisible versions and I/O. Cursor yields
-must not retain locks, repeat OFFSET prefix scans or duplicate boundaries.
+copy/decode bytes, allocations, p99 and batch-size crossover.
+Bound scan work including invisible versions and I/O. Cursor yields must
+not retain locks, repeat OFFSET prefix scans or duplicate boundaries.
 
 Replace `Arc<RwLock<RelationalDatabase>>` with a concurrent database
 handle, versioned catalog and explicit transaction admission. Short OLTP
