@@ -40,6 +40,26 @@ through SeerDB's row B-tree or publish/merge private code merely to
 make the product diagram tidy. A projection across engines/processes
 advertises its own durability, lag and exactness.
 
+## Batched composition across specialized engines
+
+Text/posting, vector/ANN, columnar, filter, rank, top-k, aggregation and
+projection access paths should compose through an **OmenDB-owned typed
+batch/selection interface** when they share canonical relational data.
+Keep logical candidate identity, score, validity, snapshot, index generation,
+deletion and eligibility intact between operators. Evaluate selective
+predicates before wide payload materialization. Query-dependent thresholds
+may prune ranked candidates only with safe upper bounds on the *complete*
+score expression and correct top-k refill.
+
+This does not mandate one physical index, batch size, generic plugin ABI or
+pipeline for cheap OLTP point queries. Block-max WAND versus vectorized
+MAXSCORE and HNSW versus cluster-scanning ANN are locality/pruning
+alternatives to test under realistic filtered, correlated, long-query and
+storage-backed workloads. SeerDB owns reusable storage batches; BM25,
+ANN, SQL, fusion and authorization stay with their respective engine
+owners. Standalone Vector/OLAP may reuse algorithms without sharing
+OmenDB's commit authority.
+
 ## CDC and projection contract
 
 Atomically retain source incarnation, compatible schema, snapshot CSN,
@@ -50,7 +70,9 @@ and idempotently. Consumer advancement releases source history only
 when safe. A remote projection without coverage cannot silently serve
 the exact current SQL snapshot; wait, fall back, rebootstrap or return
 declared staleness. Reuse this mechanism for online index rebuild and
-schema rewrite where it matches actual semantics.## Qualification and ownership
+schema rewrite where it matches actual semantics.
+
+## Qualification and ownership
 
 The first SQL server must work correctly without these extensions. Add one
 physical engine or operator only when a concrete product workload requires

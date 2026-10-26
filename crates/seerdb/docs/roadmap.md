@@ -90,6 +90,13 @@ Measure p50/p95/p99, throughput, allocations, CPU, cache/TLB misses,
 WAL barriers, write/space amplification, read I/O, recovery time and
 full memory/retention overhead.
 
+After core qualification, compare physical batch reads with per-key
+operations and current cursors: exclusive key continuation, repeat prefix
+descent, owned-value decoding/copying, snapshot/guard lifetimes, selection,
+read bytes, cache locality and parallel writers. Only expose reusable
+encoded-block metadata when a concrete independent storage consumer benefits;
+SQL, BM25 and ANN operations must remain outside SeerDB.
+
 Only then benchmark optimistic guards, inline/SIMD and BBTree-inspired search,
 node/page sizing, batched seeks, predictive translation, placement hints,
 autonomous NVMe writes, preconstructed invisible installation, LSM/PAX/heap

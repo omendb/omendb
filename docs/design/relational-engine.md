@@ -65,6 +65,34 @@ typed vectorized pipeline → cursor/row/index interfaces.
   yield/network suspension. Budgets cover invisible slots, version walks,
   overflow, I/O and output bytes as well as visible row counts.
 
+## Batch execution and representation-aware access
+
+For scans, joins, aggregates, ranking and selective projections, operators
+should exchange **bounded typed batches**, not one owned SQL row per call.
+Carry logical row IDs/positions, schema and snapshot identity, NULL validity
+and a selection vector/bitmap through the pipeline. Apply predicates and
+eligibility before decoding wide or unrequested columns; fetch them only for
+surviving rows or final top-k output. Native index scans should yield bounded
+candidate batches with exclusive logical continuations instead of an ever-
+growing OFFSET. Retain or copy values before page guards expire; never hold
+a latch across executor/network suspension.
+
+Where semantics allow, compare compute-on-encoded blocks (constant, dictionary,
+RLE, bitpacked and other measured representations) to full decoding. Some
+equality or grouping work may operate on encoded values; SQL NULL, collation,
+cast, overflow, comparison, row ordering and retained-snapshot contracts
+still govern results. Physical codecs belong to the access method or
+analytical representation, not to generic SeerDB query semantics. Short OLTP
+point/update micro-plans remain a distinct low-overhead path; do not impose
+a fixed batch allocation for a single key.
+
+Use the existing typed IR rather than inventing a second vectorized executor.
+Compare scalar/fused and vectorized pipelines, existing Arrow/DataFusion
+capabilities, batch sizes, record width, predicate selectivity, cache
+residency, allocations/bytes decoded, branches, CPU and p99 under concurrent
+transactions. The [Turbopuffer October 26, 2026 design](https://turbopuffer.com/blog/fully-vectorized-search-engine)
+motivates an experiment, not an assumed OmenDB performance result.
+
 ## Row, index and catalog representation
 
 Use schema-versioned compact rows (NULL bitmap, fixed typed fields, compact

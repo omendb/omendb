@@ -78,6 +78,29 @@ when an operation crosses the boundary. Shared code does not imply
 shared source identity, WAL or transactional authority across separately
 ingested standalone Vector/OLAP stores.
 
+## Batched physical access without query-language coupling
+
+Where a real consumer needs them, offer efficient **resumable batches**
+for ordered key/value, record and immutable-extent reads. Preserve logical
+key or stable object-local identity, version/snapshot information,
+bounded row/byte/I/O/work budgets, short-lived guarded byte access and
+exclusive continuation across splits, eviction and physical movement.
+Do not decode/copy every whole value merely to deliver a batch, rescan
+ever-growing prefixes, or hold mutable page latches across executor
+suspension. Read selected byte ranges or fields only where the format
+supports it.
+
+Expose useful *generic* encoded-block metadata only with proven consumers:
+constant/dictionary/bitpacked/RLE-like byte layouts, block summaries or
+safe numeric bounds may help upstream operations avoid decoding. SQL
+NULL/collation/aggregate semantics, BM25 scoring, ANN ranking and operator
+pipelines remain OmenDB or specialized-engine responsibilities; not all
+blocks need share B-tree page layout. Compare batch vs direct point operations,
+different batch sizes, selectivity, memory/copy/CPU/p99 and larger-than-RAM
+I/O before locking interfaces. This is a transferable idea from
+[Turbopuffer's October 26, 2026 design](https://turbopuffer.com/blog/fully-vectorized-search-engine),
+not a universal storage policy or measured SeerDB speedup.
+
 ## Authority, objects, and versions
 
 - Explicit store incarnation and exclusive writer ownership bind all containers,
