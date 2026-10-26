@@ -32,7 +32,7 @@
 //! ```text
 //!        OmenDB      standalone KV      other Rust consumers
 //!           \              |              /
- //!              SeerDB transaction/storage runtime
+//!              SeerDB transaction/storage runtime
 //!                           |
 //!                 buffer / log / MVCC
 //!                           |
