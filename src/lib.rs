@@ -1,10 +1,14 @@
-//! First vertical slice of OmenDB's append-first buffered MVCC range store.
+//! OmenDB — native relational database built on SeerDB.
 //!
-//! This crate exposes a typed relational API and a deliberately bounded
-//! embedded SQL tier. It proves atomic logical WAL, Commit-ID-tagged
-//! fragments, retained snapshot reads, packed checkpoint recovery, and
-//! deterministic corruption behavior without claiming PostgreSQL protocol or
-//! SQL compatibility.
+//! This crate owns relational types, SQL row/index codecs, schemas, constraints,
+//! the catalog, planner, executor, query scheduling, server and optional client
+//! protocol adapters. SeerDB owns the reusable storage engine: transactions,
+//! MVCC, WAL, buffered indexes/pages/extents, checkpoint and recovery.
+//! SQL-specific semantics and codecs must not migrate into the SeerDB crate.
+//!
+//! The current developer preview still includes a generation-based SeerDB
+//! backend and a bounded SQL/wire implementation. It is not yet the target
+//! concurrent, restart-safe native relational engine.
 
 mod fault;
 mod model;

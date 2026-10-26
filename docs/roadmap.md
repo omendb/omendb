@@ -35,8 +35,9 @@ treat incorrect legacy output as the reference contract.
 
 ## O2. Define and integrate native relational access
 
-Implement schema-versioned compact rows, stable row identity for both
-primary-key and heap-style SQL tables, logical secondary/unique/FK indexes,
+Implement **OmenDB-owned** schema-versioned compact rows, stable row
+identity for both primary-key and heap-style SQL tables, relational
+secondary/unique/FK index codecs and maintenance,
 transactional catalog/layout snapshots and an access path directly using
 SeerDB's compiled object/record/ordered primitives. No mandatory
 serialize-all-rows-into-generic-KV round trip. A real SQL transaction must

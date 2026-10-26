@@ -7,6 +7,19 @@ kernel sequence. [Qualification](docs/qualification.md) has real fault and
 workload harnesses. OmenDB's [consumer design](../../docs/design/relational-engine.md)
 and [roadmap](../../docs/roadmap.md) own SQL/server integration.
 
+## Code placement
+
+**SeerDB:** reusable transaction, MVCC, WAL, recovery, page/extent, buffer,
+index algorithms, storage I/O, retention and ordered-KV primitives.
+
+**OmenDB:** schema/SQL/row and relational index codecs, catalog/constraints,
+binder, optimizer, executor, query scheduling, server and wire adapters.
+OmenDB-specific code must never enter SeerDB for convenience; evaluate whether
+an independent non-SQL storage consumer can use the proposed type/behavior.
+The [kernel ownership table](docs/architecture.md#source-ownership-and-dependency-direction)
+is authoritative for ambiguous cases. `durable-fs` retains generic
+filesystem helpers rather than SQL or SeerDB transaction semantics.
+
 Keep one store incarnation, log/decision authority, visibility and failure
 lifecycle across compiled ordered/typed access paths. A standalone KV facade
 is desirable, but not a universal page/opaque-KV contract imposed on OmenDB

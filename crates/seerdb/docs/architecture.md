@@ -36,6 +36,48 @@ The public Rust API and exact resource/retention limits remain experimental;
 stabilize them only after a real OmenDB integration and a separate KV-consumer
 qualification. A durable object must not require a table schema to be valid.
 
+## Source ownership and dependency direction
+
+Put code in SeerDB **when its contract is meaningful to a Rust storage client
+without importing OmenDB, SQL or a relational schema**. That includes storage
+algorithms and utilities only when they have a real storage-level consumer,
+not speculative general-purpose abstractions. OmenDB may depend on SeerDB;
+SeerDB must never depend on OmenDB. Physical format and visibility decisions
+belong to the owner of their durable authority.
+
+| SeerDB owns | OmenDB or a specialized engine owns |
+| --- | --- |
+| Store and storage-object identities, lifetime and leases; transaction IDs, MVCC snapshots, commit decisions, conflict/intents and generic predicate/range-dependency mechanisms | SQL transaction and statement semantics, type/coercion/NULL rules, constraint timing, key and row identity derived from schema |
+| WAL/framing, checkpoints, recovery, retention/GC, bounded resource admission for storage operations | SQL catalog/layout versions, table/index definitions and DDL, including when/how to register generic storage dependencies |
+| General ordered trees and KV APIs; buffer pool, page/extent allocators, mapping, overflow, compaction and storage-tier I/O | Clustered SQL-row codecs, covering/unique/FK index key codecs and maintenance obligations, relational access-path adapters |
+| Reusable transactional snapshots/change streams, storage-level batch/cursor APIs and fault/durability machinery | SQL binder/optimizer/executor, query batches/operators, authorization, sessions, wire protocols and workload-specific scheduling |
+| Reusable low-level index or compression primitives **only if** they provide a true cross-workload capability | BM25 tokenization/ranking, ANN/vector semantics, columnar query semantics and proprietary/independent specialized storage layouts |
+
+For example, OmenDB's current `src/seer_direct.rs` is a **relational
+adapter**, not a candidate SeerDB module. The `src/row_identity.rs`,
+`src/sql_types.rs` and `src/relational.rs` depend on OmenDB's
+`TableId`, `ColumnId` and `Value` semantics and remain outside SeerDB.
+The current `src/packed.rs` uses OmenDB's fixed-width `Key` and error/fault
+contracts; do **not** move it into SeerDB merely because it contains a page
+codec. Conversely, any future generic page codec, append/extent I/O or
+versioned storage primitive should have a SeerDB-owned implementation,
+with OmenDB-specific wrappers and codecs left in OmenDB.
+
+Likewise, the root `src/runtime.rs` schedules **OmenDB work classes**
+(schema/scan/client work). SeerDB owns its internal storage admission and
+progress resources; it does not need SQL scheduling policy or session types.
+Existing `crates/durable-fs` remains the low-level reusable filesystem
+durability helper below SeerDB, without owning WAL/transaction policy.
+
+Use the smallest cohesive Rust modules inside existing crates. Do not add a
+new workspace crate or dependency on a full database product solely to
+share one helper; promote concrete primitives only when an independent
+consumer and lifetime/error contract justify them. Test the public SeerDB
+Rust library **without OmenDB as a dependency**, plus OmenDB integration
+when an operation crosses the boundary. Shared code does not imply
+shared source identity, WAL or transactional authority across separately
+ingested standalone Vector/OLAP stores.
+
 ## Authority, objects, and versions
 
 - Explicit store incarnation and exclusive writer ownership bind all containers,

@@ -1,12 +1,12 @@
-//! seerdb — OmenDB's transaction and storage kernel for modern hardware
+//! seerdb — reusable durable transaction and storage engine for Rust
 //!
-//! SeerDB is being redesigned as the shared kernel beneath OmenDB's physical
-//! access methods. It owns transaction ordering, durability, recovery, buffer
-//! residency, page/object lifetime, and physical storage services. An ordered
-//! transactional KV API remains an important standalone/compatibility facade,
-//! but `TreeId + key bytes + opaque value bytes` is no longer the universal
-//! internal boundary for canonical rows, search indexes, graph/analytical
-//! representations, or future access methods.
+//! SeerDB can serve independent Rust consumers through an ordered transactional
+//! KV library and, as the kernel evolves, reusable storage object, buffer,
+//! page/extent, MVCC, logging and recovery primitives. OmenDB is its primary
+//! integration and performance consumer, **not** a dependency. OmenDB owns
+//! relational row codecs, SQL catalog/constraint semantics and query execution.
+//! An ordered byte-KV API is useful, but it must not force all storage objects
+//! into one opaque byte-key/value layout.
 //!
 //! The current implementation remains available while the replacement is
 //! qualified. It combines:
@@ -30,23 +30,21 @@
 //! vNext moves the narrow waist below ordered KV:
 //!
 //! ```text
-//!                         OmenDB
-//!                           |
-//!                transaction/storage kernel
-//!             /        |        |          \
-//!        ordered     canonical  search/    analytical
-//!        B-tree       rows       graph     representations
-//!             \        |        |          /
-//!              +-------+--------+---------+
+//!        OmenDB      standalone KV      other Rust consumers
+//!           \              |              /
+ //!              SeerDB transaction/storage runtime
 //!                           |
 //!                 buffer / log / MVCC
+//!                           |
+//!               ordered trees / page / extents
 //! ```
 //!
-//! The first replacement slice is a shared buffered B-tree over guarded frames,
-//! followed by log-authoritative transactions and compact canonical row storage.
+//! The first replacement slice is a buffered B-tree over guarded frames,
+//! followed by log-authoritative transactions and generic record/extent
+//! facilities. OmenDB's SQL-row layouts and index meanings remain in OmenDB.
 //! Physical page materialization becomes asynchronous relative to a durable
-//! transaction decision. Specialized access methods then share the same
-//! transaction/log/buffer substrate instead of inventing sibling databases.
+//! transaction decision. Integrated consumers may share the same runtime
+//! without imposing a universal byte-KV representation.
 //!
 //! The current group-publication lane and generation-COW storage remain a
 //! qualified baseline only. They are deleted after vNext passes the existing

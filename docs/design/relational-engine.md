@@ -22,6 +22,24 @@ wire, type/encoding and optimizer/operator libraries when compatible; do not
 copy PostgreSQL's storage engine, extension ABI, process-per-connection,
 catalog OIDs or source-text heuristics into the native engine.
 
+## Relational source ownership
+
+SQL schemas, `TableId`/`ColumnId` and SQL `Value`, nullability and
+coercions, relational primary/secondary index key layouts, row codecs,
+constraint obligations, catalog mutations, authorization, the query
+scheduler and all client/server protocol adapters are **OmenDB concerns**.
+OmenDB owns its integration adapter into SeerDB's generic ordered or
+record-access mechanisms. The current `src/seer_direct.rs` stays here
+during migration; a replacement should eliminate obsolete adapters,
+not push SQL semantics into the reusable storage crate.
+
+SeerDB supplies versioned storage objects, buffered ordered/index and
+extent primitives, atomic transactions, generic dependency registration,
+snapshot/change streams, WAL/recovery and storage resource accounting.
+OmenDB chooses which objects participate and registers SQL-specific
+dependencies and constraints. `crates/durable-fs` retains filesystem
+durability helpers. Do not introduce a SeerDB dependency on this crate.
+
 ## Binder, plan and execution
 
 One path: SQL parser → **non-executing typed binder** → retained catalog view

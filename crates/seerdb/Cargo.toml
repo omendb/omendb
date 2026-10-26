@@ -4,11 +4,11 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["seerdb contributors"]
-description = "High-performance out-of-place B-tree storage engine for NVMe SSDs"
+description = "Durable transactional storage engine and ordered KV library for Rust"
 repository = "https://github.com/omendb/omendb"
 readme = "README.md"
 exclude = ["tools/**"]
-keywords = ["database", "btree", "storage", "nvme", "oltp"]
+keywords = ["database", "storage", "kv", "transactions", "nvme"]
 categories = ["database-implementations", "data-structures"]
 
 [dependencies]

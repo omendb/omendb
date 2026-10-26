@@ -35,6 +35,15 @@ local serving.
 | **Standalone Vector / OLAP products** | Their own datasets, APIs and qualified persistence when independently ingested/deployed | Automatic atomicity with an OmenDB SQL transaction |
 | **durable-fs** | Generic filesystem durability utilities | Database commit or snapshot semantics |
 
+The dependency direction is **OmenDB → SeerDB**. OmenDB-specific schemas,
+typed record/secondary-index encodings, SQL constraints and catalog behavior
+remain in the OmenDB crate, including its SeerDB relational adapter. General
+storage algorithms, transactional capabilities, WAL/MVCC/recovery,
+buffer/page/extent management and reusable storage I/O belong to SeerDB
+when a non-SQL consumer can use them. A generic filesystem durability
+helper belongs in `durable-fs`, not in the SQL server. See the
+[explicit code-placement policy](../crates/seerdb/docs/architecture.md#source-ownership-and-dependency-direction).
+
 SeerDB should remain usable by other Rust projects through a transactional ordered-KV
 facade and useful kernel services, if that does not constrain OmenDB. Its internal
 contract is typed object/page/extent/transaction capabilities, **not** a requirement

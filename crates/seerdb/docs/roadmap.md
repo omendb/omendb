@@ -96,6 +96,12 @@ autonomous NVMe writes, preconstructed invisible installation, LSM/PAX/heap
 alternatives and special SSD features. Choose workload-specific mechanisms
 with equivalent failure/lifetime proofs, not a blanket SOTA claim.
 
+The kernel must compile and function as an independent Rust dependency,
+without OmenDB types, schemas, SQL or server features. Accept generic
+physical/storage primitives here; leave relational codecs, constraints,
+catalog and query scheduling with OmenDB. Test standalone SeerDB and the
+OmenDB integration surface independently.
+
 A standalone Rust ordered transactional KV interface should be practical for
 other projects, support explicitly documented transaction/snapshot outcomes,
 batch/range access, durable backup/change APIs and useful resource settings,
