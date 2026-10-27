@@ -79,13 +79,17 @@ PostgreSQL-class comparison where the supported workload overlaps.
       resource/history pressure cannot discard evidence and permit success;
 - [ ] runtime-owned completion fences before unresolved ownership release, and
       protected reservations cover original WAL, future undo and structural/overflow
-      work before possible decision append;
+      work before possible decision append; pre-decision pressure refusal is recovery-free,
+      and accepted decisions have protected installation capacity rather than pressure-driven
+      refusal. Device/corruption failure fences and reports unresolved/recovery-required,
+      not a clean abort;
 - [ ] every supported ordered record has actual fenced split/internal/root and
       replay representation; overflow, retention and retry-space are qualified;
 - [ ] committed changes are restartable without reconstructing history by
       rescanning relational tables;
 - [ ] crash/recovery tests cover commit, WAL, page-map, checkpoint, GC, and
-      retained-snapshot boundaries.
+      retained-snapshot boundaries, including non-reusable identity/resume high-water
+      marks and reachable owner/history/outcome closure before log reclamation;
 
 ### Server and protocol
 
@@ -126,9 +130,17 @@ matrix provides the storage-side crash coverage below.
       user-query execution, and restricted roles can roll back without DDL grants;
 - [ ] explicit-block errors include binding, authorization and precommit result
       admission, while post-decision delivery errors do not fabricate an abort;
-- [ ] current-grant checks at Describe/execution prevent cached-plan grant reuse;
+- [ ] current-grant checks on bound principal/object incarnations at Describe/execution
+      prevent cached-plan grant reuse and rename/recreate privilege transfer;
       revocation alone does not cancel prior work or reauthorize commit, while a
       later authorization error makes an explicit block rollback-only;
+- [ ] prepared statements preserve advertised parameter/result signatures across
+      DDL/replanning; incompatible rebinding fails before execution, and parameter
+      shapes are validated without fallback decoding or truncation;
+- [ ] parser-driven wire statement lists preserve the advertised implicit/explicit
+      transaction boundaries, including semicolons in strings/comments;
+- [ ] durable retry/outcome handles distinguish refused/aborted, committed, unresolved
+      and expired/foreign requests without duplicate execution across reconnect/reopen;
 - [ ] concurrent direct/wire execution has bounded workers and transaction-grain
       admission, with protected completion capacity and byte/work-bounded batches.
 
@@ -141,9 +153,11 @@ matrix provides the storage-side crash coverage below.
       transaction/catalog view; enforcement/name/lifecycle dependencies prevent old
       writers bypassing newly activated indexes or constraints;
 - [ ] immediate constraints enforce their declared mutation/statement boundary;
-      deferred semantics are explicit and timing-preserving conversion is qualified;
-- [ ] index cursor continuation returns each matching row once at batch
-      boundaries, and parameterized batches reject mismatched inputs before work;
+      FK index bindings preserve ordered column pairs, CHECK/NULL and index equality
+      semantics agree, deferred semantics are explicit, and conversion preserves timing;
+- [x] direct exact-index traversal does not duplicate continuation-boundary rows,
+      and direct parameterized batches reject unequal statement/parameter-list
+      lengths before work (`tests/project_api.rs`);
 - [x] typed and SQL tests pass on the direct SeerDB backend (the
       storage-kernel seam and temporary backend were deleted per
       [ADR 0005](adr/0005-delete-storage-kernel-seam.md));

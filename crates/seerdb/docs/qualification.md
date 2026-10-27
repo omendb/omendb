@@ -113,19 +113,15 @@ remains a fail-closed exit status 2.
 
 ## Verification
 
-Routine CI runs the fast repository gate:
+The workspace [CI configuration](../../../.github/workflows/ci.yml) owns the
+current platform/MSRV, test, Clippy, package-list, live PostgreSQL and perf-smoke
+matrix. Follow [crate instructions](../AGENTS.md#seerdb-kernel) from the workspace
+root for routine gates; the historical standalone `Extended validation` workflow
+is not present here. The [qualification skill](../../../.agents/skills/vnext-qualification/SKILL.md)
+owns changed-boundary schedules, not a claim that the new runtime has passed them.
 
-```bash
-cargo check --all-features --all-targets
-cargo test --all-features --all-targets
-cargo fmt --all -- --check
-cargo clippy --all-features --all-targets -- -D warnings
-```
-
-Extended validation is available through manual dispatch of the `Extended
-validation` GitHub Actions workflow and runs automatically for `v*` release
-tags. Run the same release, documentation, dependency, and dedicated
-filesystem gates locally with:
+Additional local release, documentation, dependency and dedicated filesystem
+checks can be run from this crate with:
 
 ```bash
 cargo test --release --all-features --all-targets

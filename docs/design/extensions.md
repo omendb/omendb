@@ -72,6 +72,22 @@ the exact current SQL snapshot; wait, fall back, rebootstrap or return
 declared staleness. Reuse this mechanism for online index rebuild and
 schema rewrite where it matches actual semantics.
 
+Capture a representation's generation, exact snapshot coverage and required
+history/delta leases atomically. Rebuild/compaction replacement cannot invalidate
+an admitted view. Joins and fused searches need one supported snapshot across all
+inputs; taking the minimum of unrelated latest-only frontiers does not create it.
+Canonical validation removes wrong candidates but cannot alone supply omitted
+updates/deletes or missing coverage. Refill, complete delta application or exact
+fallback must satisfy the declared query contract; ANN recall/ranking approximation
+is separate from predicate, deletion and authorization correctness.
+
+Keep logical consumer progress separate from physical recovery/retention floors.
+Transport may split a large transaction, but consumers expose it as complete only
+after atomic application of all its effects and progress, with bounded staging/spill.
+Logical changes carry the schema/value information their consumers require; raw
+page redo is not a public CDC format. Foreign source incarnation, expired leases or
+lost suffix coverage requires explicit rebootstrap/error, not best-effort resume.
+
 ## Qualification and ownership
 
 The first SQL server must work correctly without these extensions. Add one

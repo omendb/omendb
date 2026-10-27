@@ -66,12 +66,24 @@ committed reads through the public SeerDB KV facade. Refuse deterministic
 record/log/space infeasibility before irreversible device append, and own every
 attempt from before possible append through completion or terminal fencing.
 A cancellation, caught panic or uncertain I/O cannot lose installer resources
-or silently abort an appended decision.
+or silently abort an appended decision. Runtime-owned transaction handles also
+clean up pre-decision status/snapshot/resource registrations on refusal or drop.
+Allocate non-reusable identities and expose definite refusal/abort versus
+committed/unresolved outcomes with a retained resolution handle; opt-in retry
+tokens cannot create a second attempt while the first may decide.
+
+Genesis recovery rebuilds logical objects and values into disposable working
+epochs from the complete authoritative log. Do not adopt surviving spill/undo
+images or accumulate another permanent history copy on each reopen. Keep all
+required lifecycle/effect frames; no log truncation is qualified in S1.
 
 **Gate:** create, open, commit, crash, reopen and continue one multi-object
 transaction on real storage through one runtime, initially replaying the
 complete WAL from a safe genesis state without checkpoint truncation. Exercise
-conflicting writers and ambiguous acknowledgements. Full checkpoint publication,
+conflicting writers, drop/unwind/shutdown, repeated genesis recovery, request-token
+retries and ambiguous acknowledgements without identity reuse or duplicate effects.
+Do not advertise SERIALIZABLE from this stage's write intents alone; S2 owns its
+read/predicate certifier. Full checkpoint publication,
 retained-history closure and reclamation belong to **S3**, not this early gate.
 
 ## S2. Correct concurrent MVCC and complete record representability
@@ -79,21 +91,32 @@ retained-history closure and reclamation belong to **S3**, not this early gate.
 Build a bounded current-version/history model with logical version identities
 and explicit leases. Decision-ordered serializable certification must cover
 point/absence/gap/range and external caller-supplied catalog/constraint
-dependencies against *accepted, not-yet-installed* writers. Retention pressure
-cannot discard certification evidence and permit success. A distinct
+dependencies against *accepted, not-yet-installed* writers. Register observations
+at read boundaries and publish accepted-write summaries atomically with ordering.
+Separate the live-writer/validator summary floor from read-only/history/CDC leases;
+no late read-only-to-writer upgrade may bypass it. Retention pressure cannot discard
+certification evidence and permit success. Prove the homogeneous reference writer
+domain first; mixed-isolation guarantees and read-only exemptions require their
+own protocol, not only an isolation label. A distinct
 READ COMMITTED statement-snapshot/wait-and-recheck mode is a later required
 API, not a name for fixed-snapshot write conflict checking.
 
 Implement bounded fully fenced B-link leaves/internal/root page layouts and
 logical overflow so every admitted supported record can be installed and
 replayed, including updates, deletes, long/common-prefix keys and history.
-Prepare bodies outside the sequencer; keep ordered decision/append short.
+Reserve a practical bounded structural/overflow/pin/scratch completion envelope
+before acceptance despite competing tree growth; use a protected installer slow
+path, not unlimited NoVictim retries. Bind overflow chunks to exact chain identities
+so same-object splices fail closed. Prepare bodies outside the sequencer; keep
+ordered decision/append short.
 Replace the two-barrier WAL+undo format only after checkpoint plus the complete
 committed log can reconstruct retained predecessor history.
 
 **Gate:** multi-writer isolation and mixed snapshot histories pass independent
-serializability/constraint oracles; real post-decision failures cannot strand
-uninstallable records or permanently lose an acknowledged version.
+serializability/constraint oracles. Healthy admitted decisions finish under
+resource/pin pressure without deterministic install refusal; injected device or
+corruption failures fence before ownership release, never become clean aborts.
+No acknowledged version is permanently lost.
 
 ## S3. Bounded materialization, checkpoint, recovery and GC
 
@@ -107,6 +130,11 @@ Remove known unbounded paths: copy short stable frame images before device I/O,
 avoid frame byte latches during writeback, bound/incrementalize page mapping,
 stream WAL replay with spill-capable bookkeeping, bound historical version
 indexes and positional reads, and account for abandoned recovery allocations.
+Persist allocation/resume high-water marks for all identity namespaces and resolve
+every reachable current/history owner through checkpoint outcomes or safe freezing
+before deleting its decisions. Retain independent retry-token outcomes and every
+frame needed by a suffix decision. Older checkpoints are usable only with their
+complete required log/history suffix, not as silent corruption rollback.
 Respect active snapshot, CDC, backup and prior checkpoint floors. Use a
 quiesced correct checkpoint as an initial proof but qualify incremental/epoch
 capture against declared pause/size budgets before scale claims.
@@ -135,11 +163,14 @@ read bytes, cache locality and parallel writers. Only expose reusable
 encoded-block metadata when a concrete independent storage consumer benefits;
 SQL, BM25 and ANN operations must remain outside SeerDB.
 
-Only then benchmark optimistic guards, inline/SIMD and BBTree-inspired search,
-node/page sizing, batched seeks, predictive translation, placement hints,
-autonomous NVMe writes, preconstructed invisible installation, LSM/PAX/heap
-alternatives and special SSD features. Choose workload-specific mechanisms
-with equivalent failure/lifetime proofs, not a blanket SOTA claim.
+Use the early commit/history/row experiments above before freezing their formats;
+do not postpone those decisions until S4 or rerun unchanged experiments without a
+new question. Broader hot-path tuning follows the qualified baseline: optimistic
+guards, inline/SIMD and BBTree-inspired search, node/page sizing, batched seeks,
+predictive translation, placement and special SSD features. Advance autonomous
+logging or invisible-install challengers only where measured costs justify them.
+Choose workload-specific mechanisms with equivalent failure/lifetime proofs, not
+a blanket SOTA claim.
 
 The kernel must compile and function as an independent Rust dependency,
 without OmenDB types, schemas, SQL or server features. Accept generic

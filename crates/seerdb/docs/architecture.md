@@ -36,6 +36,13 @@ The public Rust API and exact resource/retention limits remain experimental;
 stabilize them only after a real OmenDB integration and a separate KV-consumer
 qualification. A durable object must not require a table schema to be valid.
 
+Authoritative mutation uses runtime-enrolled, versioned storage effects, not an
+unlogged mutable-page escape hatch. OmenDB translates row/index/catalog meaning
+into those effects; SeerDB can replay them without invoking a SQL binder or an
+application callback. Record/page/extent access may be richer than ordered KV,
+but each adopted physical operation must have concrete recovery, dependency and
+lifetime semantics before it can participate in a durable decision.
+
 ## Source ownership and dependency direction
 
 Put code in SeerDB **when its contract is meaningful to a Rust storage client
@@ -143,9 +150,9 @@ whole commit timeline with these contracts intact.
 3. Acquire ordered logical intents and reserve full original WAL, predecessor
    versions, structural splits/root work, overflow, pins, bookkeeping, recovery
    and installer completion capacity **before an irrevocable decision**.
-   Deterministic impossible size/space refusal belongs before device entry.
+   Deterministic impossible size/space refusal precedes submission of decision bytes.
 4. Prepare effects and recoverable history outside the short decision lane.
-   Certify, assign CSN and append one authenticated complete transaction
+   Certify, assign CSN and append one integrity-checked complete transaction
    decision in a known order. Durably synchronize it with bounded adaptive
    batching (no fixed sleep for an uncontended writer).
 5. Install all authoritative effects and structural closure safely; publish
@@ -157,6 +164,54 @@ whole commit timeline with these contracts intact.
    disconnection and unwind. Before dropping unresolved intents, admission
    or checkpoint membership, complete or fence the runtime. Unknown outcomes
    need durable request identity and explicit resolution, not blind retry.
+
+### Identity, transaction ownership and retry outcomes
+
+The runtime allocates transaction identities; ordinary callers do not choose or
+reuse `TxnId`s. Reserve durable identity ranges or use a durable allocation epoch
+so restart, aborted work and pruned outcomes cannot alias a previously issued
+handle. Store/object incarnations distinguish replacement from name reuse.
+A transaction handle owns its status, snapshot/certification registrations,
+private effects and resource leases. Clean pre-decision drop/abort releases them
+exactly once; possibly appended work transfers to completion ownership or fences
+before release. An early refusal must not leave a permanently Active status.
+
+Expose distinct pre-decision refusal, definite abort, committed position and
+unresolved outcome classes. A generic error/timeout does not mean rollback.
+OmenDB owns client request naming and authentication; SeerDB owns its atomic
+association with transaction identity, decision and durable outcome. For an
+opt-in retry token, bind its namespace and operation fingerprint before possible
+append. Concurrent/retried attempts must resolve the same attempt, not execute a
+second transaction; incompatible reuse is an error. The complete recoverable
+decision stores token/namespace, fingerprint and transaction/outcome association
+atomically with its effects, not in a separately losable index. An absence lookup
+is final only with complete retained evidence for that token's domain and no
+outstanding append that can still decide it. A clean pre-append refusal needs no
+durable negative record; if its in-process proof is lost, absence alone does not
+recreate it. Return unresolved/expired unless recovery can prove non-commit.
+
+Retain token/outcome evidence through checkpoint and log reclamation for a declared
+retry horizon, independently of row-owner freezing. Lookup distinguishes unresolved,
+definitely uncommitted, committed, and expired/foreign handles. Expiration never
+turns an old token into permission to execute again. Clients without retained
+identity receive honest ambiguous outcomes, not a transparent exactly-once claim.
+
+### Admission, failure and shutdown
+
+Keep transaction workload admission separate from commit/checkpoint membership.
+Resource escalation while holding intents/snapshots must either use already
+protected capacity or refuse abortable work without waiting in a resource cycle.
+Installers have a bounded reserved slow path under foreground, reader-pin, cache
+and space pressure; ordinary resource exhaustion after admission is not an
+acceptable reason to strand a healthy durable decision. Device/corruption failures
+can still require recovery. No byte latch or arbitrary reader pin spans a barrier.
+Structural, allocation, freezing and GC mutations join checkpoint capture authority.
+
+The store keeps exclusive ownership until all old runtime/device work is quiescent.
+Fencing stops admission and wakes waiters; it is not permission to release the store
+lock while a detached worker can still write. Close drains/resolves owned attempts,
+or reports recovery-required without claiming a clean close. Snapshot/read entry
+points and bounded continuations share the terminal failure boundary.
 
 **Design candidate, not established optimum:** durable-decision-first installation
 is the initial proof path. A safe invisible/preconstructed installation path
@@ -237,16 +292,37 @@ read/predicate dependencies and false-positive abort trade-offs.
 demonstrates a high-throughput in-memory optimistic serializable approach,
 but its logging, page faults and snapshot history assumptions differ.
 
-Keep a compact accepted-write dependency horizon so readers do not miss
-durable-but-not-yet-installed effects. Prune conflict evidence only when no
-active/retained snapshot, outstanding validator or checkpoint can refer to
-it. Predicate spans should be based on logically evaluated index ranges,
-including absence and schema/catalog membership, not solely physical
-leaf/slot boundaries. If conservative range tracking expands to an
-entire tree, record the false-positive cost; memory exhaustion must
-refuse safely or transparently force a correct retry, not silently
-weaken SERIALIZABLE. Test mixed isolation and constraint enforcement
-independently of the nominal SQL default.
+Register observations at the storage read boundary, including absence and
+partial-range continuation, rather than trusting a later installer to recreate
+reads. The kernel owns logical intent waiting, wakeup and deadlock policy;
+OmenDB owns statement snapshot refresh and row/predicate re-evaluation. Waiting
+never silently refreshes a fixed-snapshot transaction. Write predecessors and
+mandatory catalog/constraint observations also require validation.
+
+Keep indexed CSN-ordered summaries of accepted writes, including uninstalled
+ones. Preparation may inspect old summaries outside the sequencer; acceptance
+rechecks the remaining tail and publishes evidence without a validation gap.
+Prune against the oldest live snapshot still allowed to write and outstanding
+validators, not unrelated read-only, CDC or backup leases. A read-only capability
+cannot upgrade to a writer after its certification history has been reclaimed.
+Old live transactions end at restart, so process-local conflict indexes need not
+be persisted merely to serve recovered read-only snapshots. Outcomes and row
+history have separate retention obligations.
+
+Predicate spans describe logically evaluated index ranges, including absence
+and schema/enforcement membership, not physical leaf boundaries. Conservative
+coarsening/spill is allowed; measure false positives. Pressure can refuse or
+explicitly expire abortable work, never discard evidence and certify success or
+abort an accepted unresolved decision. Do not replay arbitrary client work as a
+hidden response to pressure.
+
+The first proof uses a homogeneous serializable writer domain. A read-only
+snapshot can serialize at its prefix without validation only when that prefix
+was produced by appropriately certified writers. Before enabling mixed weaker
+writers, define the guarantee for interacting transactions and prove it; merely
+certifying the SERIALIZABLE transactions does not make a mixed history globally
+serializable. Constraint/catalog integrity remains mandatory in every supported
+mode. Default isolation remains a separate measured product decision.
 
 ## Physical access and hot-path policy
 
@@ -256,7 +332,15 @@ independently of the nominal SQL default.
 - Variable-size records need bounded *physical* cell descriptors and logical
   overflow for oversized keys, separators, fences and values. Admission proves
   fully fenced actual leaf/internal/root split candidates and replay/history
-  representability; an empty-leaf fit check is insufficient.
+  representability; an empty-leaf fit check is insufficient. Derive bounds from
+  the actual codec, including fences, tags, slots, alignment and useful internal
+  fanout. Finish parent/root obligations before readiness.
+- Immutable overflow binds each chunk to its chain identity/incarnation, object,
+  total length and position, with exact successor/termination validation. A valid
+  same-object chunk from another chain must not satisfy a spliced reference.
+  Resolve ambiguous logical key prefixes outside byte latches, then revalidate
+  the guarded descriptor/version. Acquire chain liveness before releasing the
+  descriptor guard; bound traversal, I/O and decode memory.
 - Page sizes (4/8/16 KiB), slot layout, shortened separators, abbreviated/
   SIMD key comparisons, node searches and BBTree-inspired batched probes are
   measured options, not immutable format requirements. A heap+primary-index,
@@ -328,14 +412,32 @@ current implementation is required until this complete-log replacement actually
 passes history/crash qualification. Large external payloads can require distinct
 durable dependencies; do not promise a universal one-fsync transaction.
 
+The runtime owns one materialization-requirements/durability authority shared by
+coordinator, buffer and page store, distinct from certification dependencies.
+Attach requirements while the exact image remains writer-owned and pinned, before
+it can be dirtied/evicted; split copies, parents, roots and extents inherit them.
+Post-hoc attachment by logical page key is not safe. Open re-establishes the owned
+WAL/history durability frontiers before writeback is enabled; a caller cannot
+accidentally append on one log and authorize materialization against another.
+
 - Versioned framed WAL identifies original effects, transaction boundaries,
-  counts and digests, and store incarnation. Support large transactions
-  through bounded framing/spill or deliberate pre-append refusal; do not let
-  the current one-segment implementation become a product limit by accident.
+  counts and digests, and store incarnation. Checksums detect accidental
+  corruption, not malicious modification; cryptographic authentication is not
+  implied. Support large transactions through bounded framing/spill or deliberate
+  pre-append refusal; do not let the current one-segment implementation become a
+  product limit by accident. Fragmented effects need one complete final decision
+  and retention back to every frame it requires, even with interleaved writers.
+  A checkpoint/consumer LSN cannot cut away the beginning of a retained decision.
 - Checkpoint capture binds an exact visible CSN/decision LSN, root/catalog/
   object graph, B-link/fences, overflow/extent closure, allocation/page maps,
   status/history and all leases. Publish checksummed manifest *only after*
   dependent bytes are durable; preserve prior valid authority on failures.
+  Persist/resume every relevant allocation namespace, not only page IDs: object,
+  transaction, logical version, map/epoch and WAL identity. Resume CSNs above both
+  the checkpoint prefix and validated suffix. Exhaustion refuses without wrapping.
+  Every reachable current/history owner must have a recoverable outcome or safe
+  frozen CSN before its decision can be reclaimed; freezing does not erase replay
+  identity still needed by the retained suffix.
 - A conservative quiesced capture is the first correctness proof. Design and
   qualify an **incremental/epoch capture** with bounded pause and temporary
   resource use for multi-TB databases before treating local checkpointing as
@@ -343,9 +445,15 @@ durable dependencies; do not promise a universal one-fsync transaction.
 - Recovery validates checkpoint and committed suffix, streams effects with
   bounded memory, refuses complete corruption/foreign references, resolves
   incomplete trailing frames only when provably safe, and replays complete
-  transactions through the same logical reducer/installation identity as live
-  commits. Crash during recovery, two reopens and subsequent ordinary write
-  must work. Repeated failed retries cannot accumulate unbounded orphan pages.
+  transactions through the same logical reducer as live commits. Validate original
+  count/digest/ordinals before reducing to final effects. Retain `(TxnId, final
+  ordinal)` within each logical object/key: identical replay is allocation-free,
+  conflicting content is corruption, and a newer page LSN is not proof an older
+  independent effect was applied. Logical idempotence does not finish a split.
+  Logical history identities survive relocation/segment GC and never alias a new
+  before-image; validate owner/key/chain binding, not just decreasing offsets.
+  Crash during recovery, two reopens and subsequent ordinary write must work.
+  Repeated failed retries cannot accumulate unbounded orphan pages.
 - Physical page map publication and duplicate validation must scale
   subquadratically and preferably incrementally with changed pages; avoid
   writing/validating a complete map on every small checkpoint or mutation.
@@ -354,6 +462,29 @@ durable dependencies; do not promise a universal one-fsync transaction.
 - Snapshot/bootstrap is an atomically retained handoff of source incarnation,
   catalog/layout, snapshot CSN, change restart LSN and history/delta leases.
   The current `{CSN, LSN}` exported pair is insufficient on its own.
+
+### Genesis replay and selection of restart authority
+
+S1 has one explicit authority mode: store-bound genesis plus the complete retained
+logical log, including object lifecycle. Surviving working page/undo/map files are
+not adopted as a newer database. Rebuild in disposable working epochs under store
+exclusion; retries reclaim abandoned epochs without touching authoritative log or
+retained checkpoints. Repeated opens must not append another permanent copy of
+reconstructed history. Physical undo offsets cannot escape as restart-stable IDs.
+
+S3 switches authority only through complete manifest publication. For the quiesced
+C0 baseline, drain accepted decisions through visibility before choosing the cut;
+no partially installed transaction belongs to its checkpoint prefix. A later
+incremental scheme must prove coherent images/history despite concurrent mutation,
+not substitute per-page maximum LSNs for that proof. Lease registration and retention
+capture share authority. Capture uses bounded stable images rather than waiting
+indefinitely for arbitrary reader pins.
+
+An older checkpoint is usable only with the complete validated log/history suffix
+needed to recover all required decisions. Do not interpret "prior-root fallback"
+as permission to skip complete corruption or lose acknowledged work after log GC.
+Outcome, history, allocation, object/overflow and prior-checkpoint closure must all
+hold before deleting their recovery inputs.
 
 ## Storage tiers and supported IO
 

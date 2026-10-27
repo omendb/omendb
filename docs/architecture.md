@@ -17,7 +17,9 @@ scale, availability and online reconfiguration. The native SQL/type/catalog cont
 is OmenDB's; a PostgreSQL wire/dialect adapter is optional and only as compatible
 as explicitly tested. Do not design the core around PostgreSQL physical formats,
 processes or catalog IDs. Embedded Rust usage shares the engine, with a smaller
-deployment footprint, but is not the primary performance target.
+deployment footprint, but is not the primary performance target. "Native" describes
+OmenDB's engine and semantics, not a requirement to invent a proprietary wire
+protocol; the first server can use its documented PostgreSQL-wire subset.
 
 Initial authoritative writes and hot pages live on local RAM/NVMe. S3-compatible
 object storage is a secondary, optional tier for backups, immutable checkpoints,
@@ -84,8 +86,13 @@ native SQL/API clients    optional PostgreSQL protocol adapter
 ~~~
 
 Canonical rows and required primary/unique/FK indexes, plus catalog metadata,
-share **one durable transaction outcome**. Derived structures are admitted only
-with explicit source identity, schema dependency, retained snapshot coverage and
+share **one durable transaction outcome within a local transaction domain**.
+Later cross-partition transactions must coordinate multiple such domains through
+the explicit distributed protocol; one logical SQL outcome does not require one
+physical WAL for the entire distributed database. Unsupported multi-domain work
+is refused before effects; a multi-domain statement also needs one proved consistent
+read cut and catalog/topology view, not independent latest reads. Derived structures
+are admitted only with explicit source identity, schema dependency, retained snapshot coverage and
 complete change intervals or a correct fallback/staleness contract. Their separate
 cache and encoding units do not entail separate SQL durability.
 

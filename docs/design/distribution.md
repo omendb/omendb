@@ -71,6 +71,33 @@ distributed profile can reject unsupported cross-shard changes before
 any partial effect; prepare/recover/coordinator ownership for
 fully atomic distributed transactions remains a later explicit gate.
 
+## Ownership transfer and cross-partition semantics
+
+Each local SeerDB runtime has its own incarnation, CSN/LSN domains and durable
+outcome authority. Equal integers from different ranges are not a common snapshot.
+A multi-range statement needs a proved consistent read cut and catalog/topology
+view, or must be rejected until that contract exists; independent latest reads
+cannot masquerade as one ordinary SQL snapshot. The unsharded fast path does not
+pay for a speculative global timestamp/coordinator service.
+
+Before accepting a write, establish its full authoritative participant/constraint
+closure, including unique/FK checks, cascades, index routes and placement-key
+updates. A shard-local-only profile admits constraints whose enforcement is local
+and rejects unsupported remote obligations before any effect or decision. A row
+move is not an independent delete and insert; it needs the qualified atomic
+cross-domain protocol or is refused. Global/reference indexes do not waive this rule.
+
+Online movement transfers retained source identity, complete transaction state,
+retry/outcome evidence, catalog/constraint obligations and required history, not
+only row bytes. Fence old ownership through the durable replication/epoch authority,
+drain or explicitly transfer in-flight decisions, prove contiguous catch-up and
+publish the new route only at that cut. A stale router cannot make an old owner
+accept more work, and a reconnect/retry through the new route cannot execute the
+same decided request twice. The old copy remains protected until admitted readers
+and rollback/recovery obligations no longer need it. Remote fragments carry the
+admitted identity/catalog/snapshot and authorization context, with bounded output
+and cancellation propagation; a fresh plan cannot silently mix ownership epochs.
+
 ## Distribution acceptance gates
 
 1. An unsharded server uses its original local SeerDB commit and query path

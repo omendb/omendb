@@ -5,11 +5,13 @@ The [OmenDB roadmap](roadmap.md) owns relational fixes and integration;
 [SeerDB's roadmap](../crates/seerdb/docs/roadmap.md) owns kernel work;
 [alpha gates](alpha-release-gates.md) own release evidence. This register records
 current defects and unsupported behavior, not a second commitment list. Evidence
-citations refer to tests, source or measured baselines. Source audit: 2026-10-11
-at `fc98820`, with the constraint-timing follow-up at `0783097`. "Landed" records implementation history, not whole-contract
-qualification; the reopened gates below supersede broader earlier claims.
+citations refer to tests, source or measured baselines. The initial source audits
+were at `fc98820` (2026-10-11), with the constraint-timing follow-up at `0783097`;
+later source checks and reproductions extend this register. "Landed" records
+implementation history, not whole-contract qualification; the reopened gates below
+supersede broader earlier claims.
 
-## Correctness gates reopened — 2026-10-11
+## Reopened correctness gates
 
 These defects are in the existing relational product path, not just pending
 vNext integration. Fix and qualify them independently of storage-kernel cutover;
@@ -17,19 +19,20 @@ incorrect legacy outputs must not become the replacement's oracle.
 
 | Boundary | Open defect | Source |
 | --- | --- | --- |
-| Authorization | Describe executes protected queries without grant enforcement; expression errors can reveal data. Transaction controls are incorrectly classified as schema administration. | `src/pgwire_server/handler.rs`, `src/sql.rs::statement_access` |
+| Authorization | Describe executes protected queries without grant enforcement; expression errors can reveal data. Name-keyed grants can transfer access across rename/recreate, and text-based privilege collection is not a complete binder authority. Transaction controls are incorrectly classified as schema administration. | `src/pgwire_server/{auth,handler}.rs`, `src/sql.rs::statement_access` |
+| Prepared binding | Describe/Execute re-infer parameter/result types from live catalog/probes without a frozen advertised signature; token-based cache invalidation misses direct-API DDL. | `src/pgwire_server/handler.rs::{resolved_parameter_types,describe_schema}` |
 | Operation failure | A unique insert can return an error while leaving a base row committable without its index entry. Explicit-block result-admission errors can leave writes committable. | `src/seer_direct.rs::DirectTransaction`, `src/relational_database.rs`, `src/pgwire_server/handler.rs` |
 | Schema publication | Typed FK creation validates in one transaction and publishes in another, unlike the unified schema-mutation path. | `src/seer_direct.rs::create_foreign_key_with_name` |
 | Catalog snapshots | Storage uses a captured catalog while binding/identity paths consult the live catalog; an old transaction can fail after a concurrent column append. | `src/sql_query.rs`, `src/relational_database.rs`, `src/seer_direct.rs` |
-| Cursor progress | An inclusive secondary-index restart duplicates the boundary row: 256 matching rows return 257. | `src/seer_direct.rs::index_get` |
-| Batch input | Separate statement/parameter slices are zipped without length validation, silently omitting statements. | `src/relational_database.rs::execute_sql_batch_with_params` |
+| Index equality | Parameterized insertion of typed `Float64(-0.0)` can coexist with `+0.0` in a unique index, while an indexed equality lookup misses the equal negative-zero row. Key encoding preserves zero signs/NaN payloads although scalar equality normalizes them; persisted indexes need an explicit repair/conversion policy. | `src/relational.rs::Value::encode_for_key`, `src/sql_types.rs::F64` |
+| Wire statement lists | Simple Query splits raw SQL at semicolons and autocommits fragments, breaking quoted/commented semicolons and the message's implicit transaction boundary. | `src/pgwire_server/handler.rs::do_query` |
 | Logical conversion | Dump/restore omits supported FK delete actions; a typed Cascade constraint becomes Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |
 | Constraint timing | Typed `Immediate` and `DeferredToPublication` both validate FKs at publication, while SQL calls supported FKs immediate; statement-time compatibility and timing-preserving conversion are unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity`, `src/sql_schema.rs` |
 
-The typed FK publication race and timing mismatch are source-established. The
-other boundaries have out-of-tree direct-API/wire/conversion reproductions; these are not a complete
-locked-dependency CI run. Qualification must exercise the repaired real entry
-points and independent semantics, not add tests that bless current output.
+Source audits and out-of-tree direct-API/wire/conversion reproductions establish
+these open boundaries; they are not whole-contract qualification. Exercise repairs
+through the real entry points and independent semantics, not tests that bless
+current output.
 The [SeerDB roadmap](../crates/seerdb/docs/roadmap.md) separately owns
 load-publication, split-aware admission, runtime failure and recovery gates.
 
@@ -91,7 +94,8 @@ primitive.
   of alternative isolation modes remains outside the current surface.
 - This evidence applies to the legacy transactional path. vNext has fixed
   snapshots/write intents without the required read/range/catalog certification.
-  ADR 0014 owns its decision-ordered replacement; no legacy pass closes that gate.
+  The [SeerDB design](../crates/seerdb/docs/architecture.md#serializable-control-and-contentious-writers)
+  owns its decision-ordered replacement; no legacy pass closes that gate.
 
 ## SQL breadth — supported legacy subset (2026-09-06)
 
@@ -125,7 +129,8 @@ by the correctness or maintenance tests.
 ## Server UX and operations — medium severity
 
 - Implemented: persistent `omendbd`, SCRAM-SHA-256, table grants,
-  cancellation (57014), statement deadlines, result bounds, SIGKILL/reopen,
+  cancellation (57014), statement deadlines, post-materialization result-payload
+  checks (not execution-memory quotas), SIGKILL/reopen,
   `EXPLAIN` (the executor's own access-path decision), slow-statement
   logging (`--slow-statement-ms`, one structured stderr line). Describe still
   contains executable sample probes; static result typing is an open binder gate.

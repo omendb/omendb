@@ -26,16 +26,24 @@ on legacy binder/page/cursor abstractions slated for replacement.
 Prototype the clean SQL semantics and transactional row/index boundary
 alongside SeerDB S1 rather than sequentially polishing the old engine. Use one
 non-executing binder for parameter/result types and resolved catalog views;
-enforce grants on Describe as well as Execute. Every statement stages a
+enforce current object/principal-incarnation grants on Describe as well as Execute.
+Rename/name reuse cannot transfer access, and missing grant state cannot reopen
+bootstrap privileges. Freeze prepared parameter/result signatures across replanning;
+reject incompatible rebind before execution. Every statement stages a
 private atomic row/index/catalog delta; errors in explicit transactions
 follow a coherent rollback-only lifecycle. FK creation/timing,
-constraint-index maintenance, schema publication, cursor continuation,
-parameter-batch shape and dump/restore behavior must have exact semantics.
+constraint-index column mappings and timing, schema publication, cursor continuation,
+parameter-batch shape, parser-driven wire statement-list transaction boundaries,
+and dump/restore behavior must have exact semantics. Repair float index equality
+with an explicit legacy-index rebuild/refusal policy; normalization must not
+silently make existing keys unreachable or choose among duplicate logical keys.
 
 **Gate:** independent restricted-role, PostgreSQL-overlap and native SQL
 oracles reproduce protected outcomes on real direct and wire entry points.
 No partial committable row/index changes, unauthorized Describe execution,
-catalog mixed-generation reads or duplicated scan boundaries. Do not
+rename/recreate grant transfer, prepared signature drift, wrongly paired composite
+FKs, equal values admitted by a unique index, catalog mixed-generation reads or
+duplicated scan boundaries. Do not
 treat incorrect legacy output as the reference contract.
 
 ## O2. Define and integrate native relational access
@@ -91,14 +99,20 @@ through filter, join, aggregate and projection, with late materialization.
 Compare fused scalar and batch paths at realistic selectivity, width and
 cache states; prove SQL NULL/collation/snapshot equivalence and measure
 copy/decode bytes, allocations, p99 and batch-size crossover.
-Bound scan work including invisible versions and I/O. Cursor yields must
+Reserve/account sort, hash-join, aggregate and result memory as it grows; spill
+within bounded storage or refuse, rather than applying only a post-materialization
+payload check. Bound scan work including invisible versions and I/O. Cursor yields must
 not retain locks, repeat OFFSET prefix scans or duplicate boundaries.
 
 Replace `Arc<RwLock<RelationalDatabase>>` with a concurrent database
 handle, versioned catalog and explicit transaction admission. Short OLTP
 and maintenance-critical commit/reclaim work retain protected worker/IO
 capacity under scans. Support cancellation, timeout, disconnect and
-ambiguous durable decisions without data loss or unsafe automatic retries.
+ambiguous durable decisions without data loss or unsafe automatic retries. Retain
+client retry identity and explicit committed/refused/unresolved resolution through
+reconnect and the declared outcome horizon; session names are not durable tokens.
+Account for idle transaction/portal leases and coordinate query/storage budgets
+without queueing a resource-holder behind work that needs those same resources.
 The native SQL server is primary; optional PostgreSQL-wire adapters share
 the same engine without determining its semantics.
 
