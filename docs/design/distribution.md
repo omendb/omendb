@@ -53,7 +53,9 @@ not mandatory OmenDB components. For a native engine, favor fewer
 process layers, bounded lazy routing/decoding and a single plan IR,
 provided correctness and failover semantics remain explicit.
 See [Neki architecture](https://planetscale.com/blog/the-architecture-of-neki)
-and [data topology](https://planetscale.com/blog/what-is-a-data-topology).## Placement and transaction authority must remain distinct
+and [data topology](https://planetscale.com/blog/what-is-a-data-topology).
+
+## Placement and transaction authority must remain distinct
 
 Neki's [October 23, 2026 shard-group analysis](https://planetscale.com/blog/shard-groups-the-unit-of-co-location)
 shows how common tenant/customer-key placement can keep joins and
