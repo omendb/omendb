@@ -1,6 +1,6 @@
 # OmenDB architecture
 
-**Design target, 2026-10-25. Not an implementation or performance claim.**
+**Design target, 2026-10-27. Not an implementation or performance claim.**
 This is the maintained product and engine map. Detailed contracts live in
 [SeerDB](../crates/seerdb/docs/architecture.md), [relational execution](design/relational-engine.md),
 [specialized engines](design/extensions.md) and [distribution](design/distribution.md).
@@ -20,6 +20,16 @@ processes or catalog IDs. Embedded Rust usage shares the engine, with a smaller
 deployment footprint, but is not the primary performance target. "Native" describes
 OmenDB's engine and semantics, not a requirement to invent a proprietary wire
 protocol; the first server can use its documented PostgreSQL-wire subset.
+
+The first qualification profile is **local durable indexed OLTP under mixed SQL
+and maintenance load**: short single-/multi-row transactions, primary and secondary
+lookups, constraint checks, selective ranges/joins/aggregates, and concurrent
+history/checkpoint/GC work. Larger-than-RAM data and long snapshots belong in that
+profile, not a later robustness phase. Embedded use shares the core with a lighter
+wrapper; it does not make the first server optimize for minimum binary size.
+Distributed and specialized-engine ambitions do not add a router, remote authority
+or generic operator framework to this first path. The roadmaps own its experiments;
+absolute product latency/resource budgets remain to be declared before qualification.
 
 Initial authoritative writes and hot pages live on local RAM/NVMe. S3-compatible
 object storage is a secondary, optional tier for backups, immutable checkpoints,

@@ -1,6 +1,6 @@
 # SeerDB implementation roadmap
 
-**Maintained storage-kernel execution plan, 2026-10-25.** This plan owns
+**Maintained storage-kernel execution plan, 2026-10-27.** This plan owns
 SeerDB's transaction, physical-storage and reusable-library work. It does
 not duplicate the [OmenDB relational roadmap](../../../docs/roadmap.md),
 which owns binder, SQL, catalog semantics and product cutover. The target
@@ -16,34 +16,41 @@ by this document.
 
 ## Critical experiments before freezing formats or protocol
 
-These **run alongside** the first integrated vertical slice; they do not
-require three permanent engines. C0 is the single executable correctness
-reference; C1/C2 may start as bounded in-memory protocol simulations or
-instrumented variants before any durable implementation. Define the
-same transaction/read-snapshot semantics, log durability and exact
-checkpoint/recovery expectations for every competitor.
+Build **one coupled reference** alongside the relational slice: C0 ordered durable
+decision/install/visibility, compact current records, H1 seekable full-image history,
+and the OmenDB-owned row/index codec. This is the S1–S3 destination, not a claim
+that the first S1 cut already provides certification or scalable checkpoints.
+Do not independently optimize a tree, undo file and page map, or build the Cartesian
+product of all alternatives. Use this decision order:
 
-- **Commit:** isolate CSN validation, encoding, WAL append, sync queue,
-  device barrier, undo/history work, physical index install, visible-prefix
-  wait and ACK at p50/p95/p99. Test 1/4/16/64 writers with hot and disjoint
-  keys; introduce a delayed earlier installer and a crash at every stage.
-  C1/C2 advance only if they improve whole durable-transaction latency
-  or throughput without unbounded retained work or additional failure risk.
-- **History:** compare H0 version links/immutable history and H1 keyed
-  history store with short/long readers, repeated overwrites,
-  range scans and constrained buffer sizes. Snapshot age, read
-  amplification, bytes retained per overwritten row, recovery and
-  GC progress are selection metrics.
-- **Physical rows:** OmenDB runs a matched single-runtime comparison of
-  clustered PK-keyed records, independent logical RowId/heap storage,
-  and a direct schema-aware row view versus a transactional ordered-KV
-  encoding. Neither extra adapter complexity nor direct access is
-  presumed faster in end-to-end indexed SQL.
-- **Checkpoint and recovery:** WAL-only genesis replay is the S1
-  correctness bootstrap but not a production scaling strategy.
-  S3 must qualify a bounded-pause incremental/epoch checkpoint,
-  prior-root fallback and streaming history replay under continued
-  foreground writers.
+1. **Integrate and attribute.** Prove the S1 recovery/ownership boundary and
+   OmenDB's smallest bound-plan transaction. Separate encoding, certification/lane
+   wait, append, sync queue/barrier, history, own installation, earlier-prefix wait
+   and ACK. Then compare correct isolation modes at S2. Record disjoint and hot-key
+   load at 1/4/16 writers, warm and constrained cache, with the same durability class.
+2. **Prove affordable completion.** Race tree growth/splits with reader pressure,
+   constrain free frames/space, and delay an earlier installer. Record reservation
+   occupancy, refused/unfinished attempts and complete query latency, not only
+   successful ACKs. One deterministic post-decision resource refusal falsifies the
+   admitted shape's completion plan; a huge idle reserve falsifies its economics.
+3. **Challenge the measured cost.** Test one boundary at a time against the complete
+   reference, including coupled costs it changes. Sync queueing motivates scheduling
+   and coalescing trials; installation/prefix latency motivates C1 or C2; history
+   directory/image amplification motivates H0 or bounded fragments. C1/C2 may begin
+   as simulations, but production selection needs real read/recovery/resource proof.
+   The [OmenDB roadmap](../../../docs/roadmap.md#physical-layout-challenger-before-format-stabilization)
+   owns row-identity and owned/borrowed payload comparisons, not a second kernel.
+4. **Close lifecycle costs before freeze.** Repeat the discriminating cases through
+   checkpoint/history relocation/GC and recovery, with long snapshots and continued
+   writers. Include old-key range coverage, total write/space amplification and
+   retained debt. Genesis replay and a quiesced checkpoint are correctness proofs;
+   bounded-pause incremental capture remains required for a scalable product.
+
+No candidate wins from an isolated microbenchmark, a vendor number or an invented
+percentage threshold. Predeclare workload/resource budgets, count retries and
+backpressure, and prefer the simpler qualified mechanism when no material advantage
+is established. Use the supported filesystem/device baseline; raw-device experiments
+are optional deployment research, not a requirement to weaken durability.
 
 Source-level baselines: `src/vnext/commit_append.rs` currently encodes the
 batch inside the CSN lane; `src/vnext/log_io.rs` holds an append/sync
@@ -70,7 +77,9 @@ or silently abort an appended decision. Runtime-owned transaction handles also
 clean up pre-decision status/snapshot/resource registrations on refusal or drop.
 Allocate non-reusable identities and expose definite refusal/abort versus
 committed/unresolved outcomes with a retained resolution handle; opt-in retry
-tokens cannot create a second attempt while the first may decide.
+tokens cannot create a second attempt while the first may decide. Specify the
+completion resource ledger for S1's admitted record/object shapes now; broader
+S2 overflow/layout support may wait, deterministic post-decision refusal may not.
 
 Genesis recovery rebuilds logical objects and values into disposable working
 epochs from the complete authoritative log. Do not adopt surviving spill/undo
@@ -121,7 +130,8 @@ No acknowledged version is permanently lost.
 ## S3. Bounded materialization, checkpoint, recovery and GC
 
 Complete the durable, checksummed checkpoint graph (object roots, right links,
-fences, overflow, page map, allocation high-water marks, outcomes and history).
+fences, overflow, page map, allocation high-water marks, outcomes, retained key
+anchors and the history directory/images).
 A validated complete manifest plus committed logical WAL suffix is the sole
 restart authority. Working spills/max page LSN alone do not prove replay
 completeness. Preserve prior complete checkpoints on failed publication.
@@ -142,8 +152,11 @@ capture against declared pause/size budgets before scale claims.
 **Gate:** arbitrary cuts around log, history, image, checkpoint, recovery and
 GC; two reopens and a new ordinary mutation; no foreign reference adoption,
 stale resurrection, permanent lost versions, unbounded memory or space leak
-under long readers, churn and ENOSPC. Complete snapshot/change bootstrap
-has an atomically retained handoff, not just CSN/LSN numbers.
+under long readers, churn and ENOSPC. Old point/range reads survive delete/reinsert
+and PK moves with the required anchor/history coverage. Bounded-pause incremental
+capture meets predeclared pause/memory/space budgets with continued writers and
+larger-than-RAM data; the quiesced proof alone does not close S3. Complete
+snapshot/change bootstrap has an atomically retained handoff, not just CSN/LSN numbers.
 
 ## S4. Performance and general-purpose library interface
 

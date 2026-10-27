@@ -1,6 +1,6 @@
 # OmenDB relational roadmap
 
-**Sole maintained OmenDB product/integration sequence, 2026-10-25.**
+**Sole maintained OmenDB product/integration sequence, 2026-10-27.**
 This document owns the native SQL/server and relational product gates.
 The separately maintained [SeerDB kernel roadmap](../crates/seerdb/docs/roadmap.md)
 owns its transaction, buffer, page, WAL, history, checkpoint and reusable KV
@@ -11,10 +11,9 @@ implementation. [Architecture](architecture.md) and
 Old [ADRs](adr/README.md) and [vNext plan](plans/storage-kernel-vnext.md)
 are historical, not competing backlogs.
 
-The last code audit underlying these targets was performed against
-`1590011` (2026-10-13). Current repository documentation is newer than
-the implementation. This plan does not assert a passing integration, release
-or performance gate.
+Source checks through `e89f45c` (2026-10-27) still show a serving AST/row-oriented
+engine and component-level replacement kernel. These targets are ahead of the
+implementation; this plan asserts no passing integration, release or performance gate.
 
 ## O1. Repair present SQL integrity and authorization
 
@@ -24,7 +23,9 @@ eventual physical replacement. Preserve independent regression oracles
 and protect existing users, but do **not** spend an extended refactor
 on legacy binder/page/cursor abstractions slated for replacement.
 Prototype the clean SQL semantics and transactional row/index boundary
-alongside SeerDB S1 rather than sequentially polishing the old engine. Use one
+alongside SeerDB S1 rather than sequentially polishing the old engine. Introduce
+the minimum shared bound representation here; do not assume today's AST and
+ad-hoc plans already constitute a typed IR, or defer all binding work to O3. Use one
 non-executing binder for parameter/result types and resolved catalog views;
 enforce current object/principal-incarnation grants on Describe as well as Execute.
 Rename/name reuse cannot transfer access, and missing grant state cannot reopen
@@ -48,10 +49,9 @@ treat incorrect legacy output as the reference contract.
 
 ## O2. Define and integrate native relational access
 
-Implement **OmenDB-owned** schema-versioned compact rows, stable row
-identity for both primary-key and heap-style SQL tables, relational
-secondary/unique/FK index codecs and maintenance,
-transactional catalog/layout snapshots and an access path directly using
+Implement **OmenDB-owned** schema-versioned compact rows, explicit PK lookup
+identity or non-reusable heap RowIds, relational secondary/unique/FK index codecs
+and maintenance, transactional catalog/layout snapshots and an access path using
 SeerDB's compiled object/record/ordered primitives. No mandatory
 serialize-all-rows-into-generic-KV round trip. A real SQL transaction must
 update canonical row, secondary/constraint indexes and catalog under
@@ -59,13 +59,16 @@ update canonical row, secondary/constraint indexes and catalog under
 the same owner.
 
 Begin an **integrated relational vertical slice in parallel with SeerDB S1**:
-one schema, one PK + one unique secondary index, multi-row updates,
-delete, rollback, concurrent writers and close/reopen through the public
-native API. Initially rely on complete-log replay, then use S2/S3 to
-qualify full serializable predicates, older snapshots, true checkpoint
-and history retention. Prototype OmenDB row codecs and access boundaries
-without waiting for every optional KV optimization. No release gate
-closes until [SeerDB stages S1–S3](../crates/seerdb/docs/roadmap.md)
+one schema, one PK + one unique secondary index, bound point/range plans, multi-row
+insert/update/delete, rollback, concurrent writers and close/reopen through the
+native API. Describe derives its result without execution, and EXPLAIN names the
+actual bound access path. Add a parent/child FK and a no-PK table as the first
+obligation/identity extensions, not a general optimizer or access-method framework.
+Use the [reference row/history bundle](design/relational-engine.md#row-index-and-catalog-representation)
+and C0 on that same runtime. Initially rely on complete-log replay, then use S2/S3
+to qualify full certification, older key/range visibility, checkpoint and retention.
+Do not claim SERIALIZABLE or compare weaker S1 behavior as equivalent SQL.
+No release gate closes until [SeerDB stages S1–S3](../crates/seerdb/docs/roadmap.md)
 and OmenDB semantic/security gates agree on one real runtime.
 Do not create permanent adapters for multiple old/new engines merely
 to preserve a developer-preview interface. Preserve useful independent
@@ -79,20 +82,37 @@ or refuses explicitly.
 
 ## Physical-layout challenger before format stabilization
 
-Compare, on that same SeerDB transaction engine and on equivalent schema
-and consistency, PK-clustered rows + secondary PK references, stable RowId/
-heap-like base rows + secondary RowId references, and a transactional
-ordered-KV facade versus direct typed row access. Quantify write/index/
-history amplification, PK changes, point/range and covering-index reads,
-cold payload projection, concurrent DDL and p99. Keep one selected physical
-path in production once measured; do not build an abstract backend matrix
-or rely on an incumbent's benchmark as OmenDB's evidence.
+Use the [first qualification profile](architecture.md#product) and one complete
+reference, not separate row/history/commit winners or a factorial benchmark matrix:
+
+1. **Access-surface control:** keep layout, history and commit identical; compare
+   compact row codecs over owned ordered-record results with guarded/selected-field
+   payload access. Charge copies, allocations, pins and decode work. A typed API
+   does not win merely by bypassing a deliberately inefficient KV adapter.
+2. **Identity challenger:** retain C0 and H1; compare PK clustering/secondary PK
+   references with RowId clustering, a unique PK index and secondary RowId refs.
+   Use narrow-PK point operations, wide/changing PKs with several indexes, and
+   non-covering ranges. Charge extra probes, covering payload and ordered gather.
+3. **Coupled lifecycle:** repeat the cases that distinguish them with constrained
+   cache, long snapshots, checkpoint/GC and recovery. Include total WAL/index/
+   history/page-map bytes and maintenance debt, not just foreground throughput.
+   Only then trial fragments, column splitting or another history mechanism where
+   attribution identifies a cost worth its additional proof/maintenance burden.
+
+Match semantics, isolation, durability and resource limits; predeclare offered load
+and budgets and count retries, refusals and unfinished work. Full SQL comparisons
+use logically equivalent PostgreSQL/MySQL operations; mature KV comparisons at the
+kernel layer are not SQL performance evidence. Retain one measured production
+layout, not a second engine/adapter hierarchy. Keep the simpler reference unless a
+challenger demonstrates a material whole-engine benefit within the declared budgets.
 
 ## O3. Replace the executor and remove global contention
 
-One parser → non-executing binder → typed IR/planner → specialized OLTP
-micro-plan or selection-vector/typed-batch pipeline. Share NULL, collation,
-coercion, privilege, statement error and parameter semantics. Replace
+Extend O1/O2's shared binding into one logical/physical planner and specialized
+OLTP micro-plans or selection-vector/typed-batch pipelines. Keep non-executing
+Describe and actual EXPLAIN coverage as the supported operator set grows; no
+parallel semantic executor. Share NULL, collation, coercion, privilege, statement
+error and parameter semantics. Replace
 `Vec<Vec<Value>>`/row-by-row hot paths with borrowed typed record
 views, then preserve bounded typed batches and selection masks end-to-end
 through filter, join, aggregate and projection, with late materialization.

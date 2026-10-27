@@ -1,6 +1,6 @@
 # SeerDB architecture: reusable transaction and storage kernel
 
-**Maintained target contract, 2026-10-25; not yet implemented or qualified.**
+**Maintained target contract, 2026-10-27; not yet implemented or qualified.**
 SeerDB owns this maintained contract in its own crate. See the [kernel roadmap](roadmap.md),
 [OmenDB architecture](../../../docs/architecture.md), and [relational consumer](../../../docs/design/relational-engine.md).
 [Older storage ADRs](../../../docs/adr/README.md) retain historical rationale, not a parallel specification.
@@ -42,6 +42,12 @@ into those effects; SeerDB can replay them without invoking a SQL binder or an
 application callback. Record/page/extent access may be richer than ordered KV,
 but each adopted physical operation must have concrete recovery, dependency and
 lifetime semantics before it can participate in a durable decision.
+
+The first integration uses concrete ordered objects, current/history records and
+one recovery path. Its independent KV facade exercises those same operations;
+guarded payload access is an optional surface, not a second physical engine.
+Do not implement every prospective record/extent capability or freeze a generic
+access-method interface before those consumers demonstrate a need.
 
 ## Source ownership and dependency direction
 
@@ -207,6 +213,15 @@ acceptable reason to strand a healthy durable decision. Device/corruption failur
 can still require recovery. No byte latch or arbitrary reader pin spans a barrier.
 Structural, allocation, freezing and GC mutations join checkpoint capture authority.
 
+Back pre-decision completion ownership with a concrete resource ledger: decision
+bytes, status/history entries, structural/overflow allocation, frame/scratch and
+worker/IO capacity, including transfer to recovery/completion ownership. Bound
+competing structural growth and specify resource acquisition/release order. An
+emergency pool is not a proof unless every supported install can progress from it;
+overflow solves cell representability, not a shortage of frames or disk space.
+Prove an affordable slow path before broadening admitted transaction shapes, not
+an unbounded victim retry or a silent switch to another storage algorithm.
+
 The store keeps exclusive ownership until all old runtime/device work is quiescent.
 Fencing stops admission and wakes waiters; it is not permission to release the store
 lock while a detached worker can still write. Close drains/resolves owned attempts,
@@ -265,18 +280,22 @@ durability frontier, physical installation and read visibility are
 *different* states. An error or timeout after a durable decision is
 unresolved/success-after-recovery, not a clean abort.
 
-**Current prototype bottlenecks to challenge:** `src/vnext/commit_append.rs`
-builds `PreparedLogBatch` while holding its CSN lane, and
-`src/vnext/log_io.rs::DurableLog::sync_through` takes the same
-device-operation mutex used by append. Both block unrelated log append
-while an NVMe sync is in flight. Pre-encode effects outside the lane,
-then evaluate safe ordered reservation/positional append, durable-prefix
-tracking and adaptive batching versus autonomous per-worker persistence.
-The [SIGMOD 2025 autonomous-commit paper](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/latency.pdf)
-shows that group commit is not uniformly optimal on modern NVMe; its
-benchmark is not a SeerDB measurement. Parallel log writes must still
-prove record-framing, ordering, torn-tail recovery, completed barriers
-and dependency-aware acknowledgements.
+**First remove incidental serialization:** `src/vnext/commit_append.rs` builds
+`PreparedLogBatch` inside the CSN lane; `src/vnext/log_io.rs` excludes append during
+sync with one device-operation mutex. Prepare variable-size bodies outside ordering;
+keep the ordered portion to final validation, sequence assignment and atomic
+acceptance/evidence publication. A serialized append is acceptable for the first
+recovery proof, not a selected multi-writer performance architecture. Positional
+reservation/append must first prove framing, abandoned reservations, torn tails,
+barrier coverage and absence of acknowledged effects beyond an unrecoverable hole.
+
+Measure own installation separately from waiting for an earlier installer's prefix.
+Advance C1/C2 only for a demonstrated end-to-end cost, including their extra read,
+abort, recovery and memory work; neither is required to prove certification.
+Compare sync/coalescing policies on the supported filesystem/device and durability
+class. The [SIGMOD 2025 autonomous-commit paper](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/latency.pdf)
+challenges group-commit queueing in its NVMe setup, not the need for filesystem
+barriers or the value of batching on every device. It is not a SeerDB measurement.
 
 ### Serializable control and contentious writers
 
@@ -305,9 +324,12 @@ rechecks the remaining tail and publishes evidence without a validation gap.
 Prune against the oldest live snapshot still allowed to write and outstanding
 validators, not unrelated read-only, CDC or backup leases. A read-only capability
 cannot upgrade to a writer after its certification history has been reclaimed.
-Old live transactions end at restart, so process-local conflict indexes need not
-be persisted merely to serve recovered read-only snapshots. Outcomes and row
-history have separate retention obligations.
+Old live transactions end at restart, so their read dependencies and certification
+indexes need not be logged for recovery. Persist effects/outcomes and retained
+history, not every read set merely to avoid a second in-memory publication step.
+An immutable accepted-write summary is published with ordering; auxiliary indexes
+may build outside the lane only if validation also covers every unindexed tail
+entry. Persistent prepared transactions would require a separate recovery protocol.
 
 Predicate spans describe logically evaluated index ranges, including absence
 and schema/enforcement membership, not physical leaf boundaries. Conservative
@@ -327,8 +349,9 @@ mode. Default isolation remains a separate measured product decision.
 ## Physical access and hot-path policy
 
 - Initial ordered structure: mutable buffered B+/B-link tree with fine-grained
-  guards, high fences/right siblings, schema-driven clustered rows and separate
-  authoritative secondary indexes. An ordered KV facade uses the same tree.
+  guards, high fences/right siblings and generic current records carrying visibility
+  metadata. Older versions use the history service below. OmenDB layers its row/index
+  codecs over it; the independent KV facade uses the same tree.
 - Variable-size records need bounded *physical* cell descriptors and logical
   overflow for oversized keys, separators, fences and values. Admission proves
   fully fenced actual leaf/internal/root split candidates and replay/history
@@ -364,17 +387,43 @@ mode. Default isolation remains a separate measured product decision.
 
 Treat the **latest readable version, older snapshot history, committed log,
 checkpoint coverage, and retained CDC/backup/replication history as one
-lifetime system**. The baseline is a compact latest-value/current-record
-representation plus a bounded recent version cache. Older immutable versions
-must be addressable without linear scanning of every overwritten value.
-Compare two coherent historical layouts: (H0) reverse version links backed
-by indexed immutable history segments with time- and key-aware lookup,
-and (H1) a keyed history store ordered by `(object, logical key, commit
-interval)` for seekable old snapshots. Consider hybrid inline versions
-only when bounds keep leaf/page amplification and churn acceptable.
+lifetime system**. The reference is compact current records and a bounded recent
+version cache, with older complete immutable before-images addressed by an H1
+history directory keyed by `(object incarnation, encoded logical key, begin CSN)`.
+Its logical-key identity/order matches the current tree; values carry exclusive
+end CSN and a complete value or absence marker. Each retained key has a birth CSN
+and a current head's commit identity/put-or-delete kind in its anchor or owned
+version metadata. Birth means the first insertion for the retained anchor's lifetime,
+not the latest reinsertion; it survives delete/reinsert and may reset only after the
+old anchor can be reclaimed. Before birth the key is absent; afterwards the current,
+recent and historical views provide complete interval coverage within the readable horizon,
+including absence intervals across delete/reinsert. After checking current/recent
+versions, seek the greatest historical begin CSN not exceeding the snapshot and
+check its end/visibility. Missing required coverage or payload is corruption, not
+an empty result. This selects a seekable path, not physical byte layout or a proven
+performance winner. SQL key/RowId semantics remain in OmenDB; current/index/catalog
+objects share these storage obligations.
+
+Kernel MVCC owns anchor lifetime under readable-snapshot leases. Range reads
+enumerate retained anchors and resolve the same version as a point read; they do
+not mistake the newest head for visibility at an older CSN. Retain anchors for
+deleted/moved keys while supported snapshots can need them. A history point seek
+alone is not old range completeness; early anchor removal would require a complete
+historical-key merge path. Charge retained anchors and invisible-key scan work.
+
+The history directory indexes immutable version records. Its own physical
+maintenance/GC joins WAL/checkpoint authority, not recursive user-MVCC updates
+that generate history-of-history.
+
+Accept the directory's write/space cost in the first reference and measure it
+with checkpoint and relocation metadata. Reverse links with indexed immutable
+segments (H0) are a challenger if they reduce that total cost without linear
+old-version lookup. Start with full images; bounded deltas or inline recent
+versions earn their reconstruction, GC and replay complexity through sparse-update
+measurements. No separate history durability authority is implied.
 WiredTiger's [history store](https://source.wiredtiger.com/develop/arch-hs.html)
 and [checkpoint coordination](https://source.wiredtiger.com/develop/arch-checkpoint.html)
-are useful lifecycle references, not storage-format prescriptions.
+illustrate current/history separation and closure, not an OmenDB format prescription.
 
 Compare recent hot reads, a one-hour pinned reader under churn, historical
 random lookups, version lookup I/O, index and status memory, write
@@ -384,8 +433,9 @@ offsets is not sufficient if recovery reads an unbounded WAL or every
 history lookup takes a shared file mutex.
 
 Never collapse different retention units into a single numerical floor:
-**CSN snapshots**, **LSN log replay**, history-version references and
-external lease epochs have separate authority. An eviction may flush a
+**reader snapshot CSNs**, **writer/validator certification-summary CSN bases**,
+**LSN log replay**, history-version references and external lease epochs have
+separate authority. An eviction may flush a
 version to history only after its identity, log and checkpoint dependencies
 are satisfied. A checkpoint's published manifest must identify a logically
 closed, replayable state and all history needed by retained readers; old
@@ -394,14 +444,19 @@ replica, consumer and backup lease is released.
 
 **Concurrent structural admission:** checking whether one mutation fits
 today's leaf is not proof it will install after other accepted transactions
-split or grow that tree. Before any irrevocable commit, provision a
-bounded worst-case structural/overflow envelope or ensure a guaranteed
-fallback representation; account for pinned writers, emergency install
-capacity and changes to split shape. If a post-decision space failure can
-still happen, the transaction remains durable and recovery-required (or
-readable through a fully qualified overlay), never reported as aborted.
+split or grow that tree. Before any irrevocable commit, prove an affordable
+protected completion plan for every admitted shape, including concurrent growth,
+pins, structural/overflow allocation and scratch. Bounded reservations or a slow
+path are mechanisms within that proof, not an unspecified fallback escape. An
+unexpected post-decision device/allocation failure preserves the durable outcome
+and may require fencing/recovery, never a clean abort. Only a separately selected
+and fully qualified C2 overlay may continue serving complete logical effects
+without finishing the page installation first.
 Do not reserve an impractically large worst-case buffer for every ordinary
-point write without measuring memory efficiency.
+point write without measuring memory efficiency. Treat tree, immutable history,
+page mapping and out-of-place checkpoints as one maintenance system: choosing a
+B-tree does not eliminate rewrite/GC debt or establish lower amplification than
+an LSM. Count steady-state total bytes, reserve occupancy and tail latency.
 
 ## WAL, checkpoint, recovery, and reclamation
 

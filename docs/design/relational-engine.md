@@ -1,6 +1,6 @@
 # OmenDB: native relational engine
 
-**Maintained target, 2026-10-25.** OmenDB is intended to replace common
+**Maintained target, 2026-10-27.** OmenDB is intended to replace common
 PostgreSQL/MySQL workloads, not implement their process model or guarantee
 complete protocol/dialect compatibility. [Architecture](../architecture.md);
 [SeerDB transaction kernel](../../crates/seerdb/docs/architecture.md);
@@ -45,6 +45,14 @@ durability helpers. Do not introduce a SeerDB dependency on this crate.
 One path: SQL parser → **non-executing typed binder** → retained catalog view
 and dependency set → logical plan → costed physical plan → micro-plan or
 typed vectorized pipeline → cursor/row/index interfaces.
+
+Build the smallest shared bound representation with the first relational slice,
+not a second executor after storage cutover. It carries resolved objects, typed
+expressions/coercions, parameter/result signatures, privileges and effects;
+Describe, EXPLAIN and execution consume that same binding. Current
+`src/sql_query.rs::{PredicatePlan,ProjectionPlan}` and SQL AST evaluation are
+transition machinery, not an existing general typed IR. Reuse their valid scalar
+semantics and tests, not their scattered binding authority.
 
 - Bound statements have parameter/result types, typed coercions, effects,
   resolved IDs, schema/namespace/constraint dependencies and privileges.
@@ -137,40 +145,59 @@ analytical representation, not to generic SeerDB query semantics. Short OLTP
 point/update micro-plans remain a distinct low-overhead path; do not impose
 a fixed batch allocation for a single key.
 
-Use the existing typed IR rather than inventing a second vectorized executor.
-Compare scalar/fused and vectorized pipelines, existing Arrow/DataFusion
-capabilities, batch sizes, record width, predicate selectivity, cache
-residency, allocations/bytes decoded, branches, CPU and p99 under concurrent
-transactions. The [Turbopuffer October 26, 2026 design](https://turbopuffer.com/blog/fully-vectorized-search-engine)
-motivates an experiment, not an assumed OmenDB performance result.
+Initially interpret compact micro-plans from the shared bound representation;
+add batch lowering without a second type/error/privilege system. Evaluate reusable
+[DataFusion planning components](https://datafusion.apache.org/library-user-guide/building-logical-plans.html)
+and Arrow/operator libraries before writing replacements, but retain OmenDB's
+transaction/catalog authority and qualify any adapter's semantic and conversion
+costs. No library choice or JIT is a prerequisite for the first slice.
+[Adaptive query execution](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)
+illustrates why compilation startup belongs in total latency, not outside it.
+
+Compare scalar/fused and typed-batch paths on identical bound queries, including
+planning, allocation, conversion and concurrent-writer cost. Borrow encoded forms
+where useful: [DuckDB's vectors](https://duckdb.org/docs/2.0/internals/vector.html)
+show flat/constant/dictionary representations without making its batch size or
+execution model an OmenDB requirement. The [Turbopuffer design](https://turbopuffer.com/blog/fully-vectorized-search-engine)
+is another experiment source, not an assumed OmenDB speedup.
 
 ## Row, index and catalog representation
 
-Use schema-versioned compact rows (NULL bitmap, fixed typed fields, compact
-variable-offset directory, inline payload and logical cold/large-value refs).
-Borrow typed page-resident fields for short queries; only selected fields
-are decoded/copied into output batches. Do not allocate generic `Vec<Value>`
-for every stored row or duplicate primary-key identity without demonstrated
-benefit. Clustered primary-key rows are the initial physical baseline, not a
-settled universal SQL row layout. Independently test **primary-key-keyed
-clustered rows** against a **stable internal RowId plus heap/row table**
-and an optional hot-row/cold-column split. A table without an explicit
-primary key still needs durable logical row identity. If secondary
-indexes reference an immutable RowId, a PK update may avoid rewriting
-unrelated index keys but adds a base-row lookup and storage overhead;
-if secondary entries reference the PK directly, most reads save that
-indirection but PK changes, wide keys and repeated key copies cost
-more. Physical page/slot identity is never a permanent logical RowId.
+**Initial reference, not a frozen format:** compact PK-clustered records,
+secondary entries carrying the PK, and C0 commitment with the kernel's
+[seekable history reference](../../crates/seerdb/docs/architecture.md#mvcc-history-and-checkpoint-economics).
+This gives a direct base lookup and PK-range locality without a separate PK-to-row
+mapping. Accept and measure the cost of copying wide PKs into indexes and rewriting
+secondary references on PK changes. Tables without a PK use a runtime-allocated
+immutable RowId as the clustering key. Physical page/slot identity is never RowId.
 
-Keep schema-aware record access and generic transaction/KV access
-**equally reachable** from one SeerDB runtime until a real comparison.
+A PK change is an atomic old-key delete/new-key insert with index maintenance;
+both keys retain their required snapshot history. It does not inherently break
+MVCC or require a permanent RowId. A PK lookup key is not an immutable row handle.
+The first layout challenger gives every row a stable RowId, makes the declared PK
+a unique secondary index, and carries RowIds in other indexes, while keeping the
+same commit/history services. It trades an extra non-covering PK probe and poorer
+PK-range base locality for smaller references and less PK-change maintenance.
+Neither layout wins by definition; do not hide its lookup cost by duplicating the
+whole row into a covering PK index.
+
+Use an OmenDB-owned schema-versioned row codec (NULL bitmap, typed fixed fields,
+variable offsets and kernel-managed overflow for oversized payloads) over concrete
+SeerDB ordered-record operations first. Owned KV results and guarded payload views
+are access surfaces over that same representation, not two storage engines.
+Measure borrowed/selected-field access against the owned-result control before
+requiring a richer storage interface; SQL types never move into SeerDB. Avoid
+per-row `Vec<Value>` construction and repeated key copies where the measured path
+can eliminate them. Specialized cold-column placement and bounded update fragments
+are later candidates, not prerequisites for the first row codec.
+
 [FoundationDB Record Layer](https://foundationdb.github.io/fdb-record-layer/index.html)
-demonstrates native-style indexes and SQL above transactional KV, while
-[InnoDB's clustered rows](https://dev.mysql.com/doc/refman/8.4/en/innodb-row-format.html)
-are a production physical baseline. Direct typed access only earns its
-complexity if it measurably reduces CPU/allocations, decode/copying,
-index maintenance or I/O in **equal SQL semantics**. No permanent pair
-of storage backends or generic table-specific code inside SeerDB.
+and [DocDB packed rows](https://docs.yugabyte.com/stable/architecture/docdb/packed-rows/)
+show that KV storage need not imply one allocation/record per SQL column or an
+inefficient whole-engine boundary. DocDB's sparse-update fragments also introduce
+read reconstruction and compaction costs. Compare those costs before adopting a
+second representation. [InnoDB](https://dev.mysql.com/doc/refman/8.4/en/innodb-row-format.html)
+is a PK-clustered reference, not evidence it beats RowId for our workload.
 
 Primary/unique/required foreign-key indexes and catalog mutations are
 **authoritative** and share the same SeerDB commit. Secondary entries carry
@@ -212,18 +239,21 @@ publication; a scan followed by an unprotected metadata update is insufficient.
 
 ## Row and index workload used to select the physical layout
 
-The initial experiment includes narrow/large/wide variable-length rows,
-composite and changing PKs, an implicit RowId table, 0/1/4 secondary
-indexes, composite unique/FK checks, covered versus uncovered queries,
-uniform/skewed insert/update/delete, range and point reads, joins, and
-mixed writers. Compare database size/RSS, index amplification per
-mutation, bytes read per projected field, snapshot-version growth,
-page split rates, cold reads and p99. Verify each case against
-independent SQL results and identical isolation/durability. OmenDB
-owns row/index codecs; SeerDB owns the transaction, page and index
-primitives. Keep the simplest representation that meets the workload
-bar; optional physical structures can be introduced later without
-violating the logical row/catalog contract.
+Use targeted cases, not a Cartesian product of every layout/commit/history option:
+narrow stable-PK point reads/updates; wide or changing PKs with several indexes;
+and non-covering PK/secondary ranges. Include a no-PK table and unique/FK checks.
+Run warm and constrained-cache cases, then repeat the discriminating cases with
+long snapshots and checkpoint/GC progress. Sparse wide-row updates trigger the
+full-image-versus-fragment comparison only if amplification warrants it.
+
+Measure complete transaction/query latency including retries, probes/base fetches,
+CPU/allocations/RSS, and total WAL/index/history/page-map/checkpoint/GC bytes and debt.
+Batched RowId fetches must restore required SQL ordering and account for buffering;
+covering payload is charged as storage and update work. Match correctness,
+durability, resource limits and offered load; run long enough to include recurring
+maintenance. The [OmenDB roadmap](../roadmap.md#physical-layout-challenger-before-format-stabilization)
+owns experiment order and selection. No paper result, arbitrary percentage threshold
+or faster isolated lookup freezes the production layout.
 
 ## Transaction and SQL session behavior
 
