@@ -44,14 +44,17 @@ impl PageIo for FailWritesPageIo {
     }
 
     fn write_page(&self, key: PageKey, source: &[u8]) -> io::Result<()> {
-        if self
-            .failures_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(io::Error::other("injected write failure"));
+        let mut remaining = self.failures_remaining.load(Ordering::Acquire);
+        while remaining > 0 {
+            match self.failures_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Err(io::Error::other("injected write failure")),
+                Err(observed) => remaining = observed,
+            }
         }
         self.pages
             .write()

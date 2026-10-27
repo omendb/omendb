@@ -2931,11 +2931,16 @@ fn decode_tree_key(tree: TreeId, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn allocate_id(counter: &AtomicU64, label: &str) -> Result<u64> {
-    counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| Error::Wal(format!("{label} exhausted")))
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| Error::Wal(format!("{label} exhausted")))?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(allocated) => return Ok(allocated),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> Result<&'a [u8]> {

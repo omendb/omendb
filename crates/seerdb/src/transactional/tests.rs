@@ -1,6 +1,20 @@
 use super::*;
 use tempfile::tempdir;
 
+#[test]
+fn id_allocation_refuses_exhaustion_without_wrapping() {
+    let counter = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(
+        allocate_id(&counter, "test ID").expect("last ID"),
+        u64::MAX - 1
+    );
+    assert!(matches!(
+        allocate_id(&counter, "test ID"),
+        Err(Error::Wal(_))
+    ));
+    assert_eq!(counter.load(Ordering::Acquire), u64::MAX);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BeginPause {
     CheckedOpen,
