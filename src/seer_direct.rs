@@ -965,27 +965,11 @@ impl DirectTransaction {
         let prefix = index_entry_prefix(value_key);
         let end = prefix_successor(&prefix);
         let tree = self.index_tree(index)?;
-        let mut identities: Vec<Vec<u8>> = Vec::new();
-        const PAGE: usize = 256;
-        loop {
-            let start: Vec<u8> = match identities.last() {
-                Some(last) => encode_index_entry(value_key, last)?,
-                None => prefix.clone(),
-            };
-            let batch = self
-                .transaction
-                .scan(tree, &start, end.as_deref(), PAGE)
-                .map_err(map_seer_error)?;
-            let mut advanced = false;
-            let batch_count = batch.len();
-            for (_entry, row_identity) in batch {
-                identities.push(row_identity);
-                advanced = true;
-            }
-            if !advanced || batch_count < PAGE {
-                return Ok(identities);
-            }
-        }
+        self.transaction
+            .cursor(tree, &prefix, end.as_deref())
+            .map_err(map_seer_error)?
+            .map(|entry| entry.map(|(_, identity)| identity).map_err(map_seer_error))
+            .collect()
     }
 
     /// Stage a row insert plus its derived index entries; uniqueness is
@@ -1254,6 +1238,7 @@ struct ForeignKeyParts {
     child_definition: TableDefinition,
     referenced_definition: TableDefinition,
     referenced_index: IndexDefinition,
+    indexed_child_columns: Vec<ColumnId>,
 }
 
 fn resolve_foreign_key_parts(
@@ -1262,30 +1247,12 @@ fn resolve_foreign_key_parts(
 ) -> Result<ForeignKeyParts> {
     let child_definition = catalog.table(foreign_key.table)?.clone();
     let referenced_definition = catalog.table(foreign_key.referenced_table)?.clone();
-    let referenced_index = catalog
-        .indexes_for(foreign_key.referenced_table)
-        .find(|index| {
-            index.unique
-                && index.predicate.is_none()
-                && index.parts.len() == foreign_key.referenced_columns.len()
-                && index.parts.iter().all(|part| match part {
-                    crate::IndexKeyPart::Column(column) => {
-                        foreign_key.referenced_columns.contains(column)
-                    }
-                    crate::IndexKeyPart::Expression(_) => false,
-                })
-        })
-        .cloned()
-        .ok_or_else(|| {
-            DbError::InvalidState(format!(
-                "foreign key {} has no unique referenced index",
-                foreign_key.id.0
-            ))
-        })?;
+    let (referenced_index, indexed_child_columns) = catalog.foreign_key_index(foreign_key)?;
     Ok(ForeignKeyParts {
         child_definition,
         referenced_definition,
-        referenced_index,
+        referenced_index: referenced_index.clone(),
+        indexed_child_columns,
     })
 }
 
@@ -1316,7 +1283,8 @@ fn validate_child_references(
     for (identity_bytes, bytes) in child_entries {
         let row =
             row_from_storage_identity(catalog, &parts.child_definition, identity_bytes, bytes)?;
-        let values = foreign_key_values(&row, &parts.child_definition, &foreign_key.columns)?;
+        let values =
+            foreign_key_values(&row, &parts.child_definition, &parts.indexed_child_columns)?;
         if values.iter().any(|value| matches!(value, Value::Null)) {
             continue;
         }

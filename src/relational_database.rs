@@ -625,6 +625,13 @@ impl RelationalDatabase {
         statements: &[&str],
         params: &[Vec<Value>],
     ) -> Result<Vec<crate::SqlResult>> {
+        if statements.len() != params.len() {
+            return Err(DbError::SqlParameter(format!(
+                "SQL batch has {} statements but {} parameter sets",
+                statements.len(),
+                params.len()
+            )));
+        }
         if statements.len() > RELATIONAL_SQL_BATCH_LIMIT {
             return Err(DbError::ResourceLimitExceeded(format!(
                 "SQL batch has {} statements; limit is {}",

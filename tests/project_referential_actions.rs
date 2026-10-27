@@ -1,7 +1,7 @@
 //! Legacy direct-adapter referential-action evidence: Restrict, Cascade and
 //! SetNull, with bounded cascade staging and publication-time FK validation.
-//! Target timing and schema-transaction rules are owned by ADR 0007; these tests
-//! do not establish immediate-statement semantics or qualify the vNext path.
+//! Target timing and schema-transaction rules are owned by the relational design;
+//! these tests do not establish immediate-statement semantics or qualify vNext.
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
@@ -103,6 +103,95 @@ fn seed(database: &mut RelationalDatabase) {
     database
         .insert(GRANDCHILDREN, row(GRANDCHILDREN, 21, Some(11)))
         .expect("grandchild");
+}
+
+#[test]
+fn composite_foreign_key_maps_values_into_supporting_index_order() {
+    // Existing coverage uses the same column order on both sides. Exercise
+    // reversed references during both constraint creation and later DML.
+    for seed_before_constraint in [false, true] {
+        let directory = tempdir().expect("tempdir");
+        let config = RelationalBackendConfig::new(directory.path().join("db"));
+        let mut database = RelationalDatabase::create(config.clone()).expect("create");
+        database
+            .execute_sql("CREATE TABLE parents (a BIGINT, b BIGINT, PRIMARY KEY (a, b))")
+            .expect("parents");
+        database
+            .execute_sql("CREATE TABLE children (id BIGINT PRIMARY KEY, x BIGINT, y BIGINT)")
+            .expect("children");
+        database
+            .execute_sql("INSERT INTO parents VALUES (1, 2)")
+            .expect("parent");
+        if seed_before_constraint {
+            database
+                .execute_sql("INSERT INTO children VALUES (1, 2, 1)")
+                .expect("unconstrained child");
+        }
+        database
+            .execute_sql(
+                "ALTER TABLE children ADD CONSTRAINT reversed_parent \
+                 FOREIGN KEY (x, y) REFERENCES parents (b, a)",
+            )
+            .expect("valid reversed reference");
+        if !seed_before_constraint {
+            database
+                .execute_sql("INSERT INTO children VALUES (1, 2, 1)")
+                .expect("matching parent in referenced-column order");
+        }
+        assert!(matches!(
+            database.execute_sql("INSERT INTO children VALUES (2, 1, 2)"),
+            Err(omendb::DbError::ForeignKeyViolation { .. })
+        ));
+        database.close().expect("close");
+        let mut reopened = RelationalDatabase::open(config).expect("reopen");
+        assert_eq!(
+            reopened
+                .execute_sql("SELECT id, x, y FROM children")
+                .expect("retained valid child")
+                .rows,
+            vec![vec![Value::I64(1), Value::I64(2), Value::I64(1)]]
+        );
+        assert!(matches!(
+            reopened.execute_sql("INSERT INTO children VALUES (2, 1, 2)"),
+            Err(omendb::DbError::ForeignKeyViolation { .. })
+        ));
+        reopened.close().expect("close reopened");
+    }
+}
+
+#[test]
+fn dropping_the_last_fk_supporting_index_is_refused_atomically() {
+    let directory = tempdir().expect("tempdir");
+    let config = RelationalBackendConfig::new(directory.path().join("db"));
+    let mut database = RelationalDatabase::create(config.clone()).expect("create");
+    for sql in [
+        "CREATE TABLE parents (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+        "CREATE UNIQUE INDEX parent_key ON parents (a, b)",
+        "CREATE UNIQUE INDEX parent_backup ON parents (b, a)",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, x BIGINT, y BIGINT, \
+         FOREIGN KEY (x, y) REFERENCES parents (b, a))",
+        "INSERT INTO parents VALUES (1, 1, 2)",
+        "INSERT INTO children VALUES (1, 2, 1)",
+        "DROP INDEX parent_key",
+    ] {
+        database.execute_sql(sql).expect(sql);
+    }
+    let before = database.commit_id();
+    assert!(database.execute_sql("DROP INDEX parent_backup").is_err());
+    assert_eq!(database.commit_id(), before);
+    database.close().expect("close");
+    let mut reopened = RelationalDatabase::open(config).expect("reopen");
+    reopened
+        .execute_sql("INSERT INTO parents VALUES (2, 5, 6)")
+        .expect("parent insert after refused drop");
+    reopened
+        .execute_sql("INSERT INTO children VALUES (2, 6, 5)")
+        .expect("remaining supporting index enforces valid references");
+    assert!(matches!(
+        reopened.execute_sql("INSERT INTO children VALUES (3, 5, 6)"),
+        Err(omendb::DbError::ForeignKeyViolation { .. })
+    ));
+    reopened.close().expect("close reopened");
 }
 
 #[test]

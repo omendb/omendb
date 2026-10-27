@@ -691,22 +691,53 @@ impl Catalog {
                 )));
             }
         }
-        if !self.indexes.values().any(|index| {
-            index.table == foreign_key.referenced_table
-                && index.unique
-                && index.predicate.is_none()
-                && index.parts.len() == foreign_key.referenced_columns.len()
-                && index.parts.iter().all(|part| match part {
-                    IndexKeyPart::Column(column) => foreign_key.referenced_columns.contains(column),
-                    IndexKeyPart::Expression(_) => false,
-                })
-        }) {
-            return Err(DbError::InvalidState(format!(
+        self.foreign_key_index(foreign_key)?;
+        Ok(())
+    }
+
+    /// Bind the referenced unique index and child columns in its physical key
+    /// order. FK column pairs retain their declared order, which need not match
+    /// the supporting index's order.
+    pub(crate) fn foreign_key_index<'a>(
+        &'a self,
+        foreign_key: &'a ForeignKeyDefinition,
+    ) -> Result<(&'a IndexDefinition, Vec<ColumnId>)> {
+        self.foreign_key_indexes(foreign_key).next().ok_or_else(|| {
+            DbError::InvalidState(format!(
                 "foreign key {} requires a unique index on referenced columns",
                 foreign_key.id.0
-            )));
-        }
-        Ok(())
+            ))
+        })
+    }
+
+    fn foreign_key_indexes<'a>(
+        &'a self,
+        foreign_key: &'a ForeignKeyDefinition,
+    ) -> impl Iterator<Item = (&'a IndexDefinition, Vec<ColumnId>)> + 'a {
+        self.indexes_for(foreign_key.referenced_table)
+            .filter_map(move |index| {
+                if !index.unique
+                    || index.predicate.is_some()
+                    || index.parts.len() != foreign_key.referenced_columns.len()
+                {
+                    return None;
+                }
+                let child_columns = index
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        IndexKeyPart::Column(parent) => foreign_key
+                            .referenced_columns
+                            .iter()
+                            .zip(&foreign_key.columns)
+                            .find_map(|(referenced, child)| {
+                                (referenced == parent).then_some(*child)
+                            }),
+                        IndexKeyPart::Expression(_) => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some((index, child_columns))
+            })
     }
 
     pub fn table(&self, table: TableId) -> Result<&TableDefinition> {
@@ -928,12 +959,29 @@ impl Catalog {
     }
 
     /// Remove one secondary index and its durable name from the catalog.
-    /// The owning store drops the physical index tree in the same
-    /// publication.
+    /// Refuse removal of the last supporting unique index for a foreign key.
+    /// The owning store drops the physical tree in the same publication.
     pub fn drop_index(&mut self, index: IndexId) -> Result<()> {
-        self.indexes
-            .remove(&index)
-            .ok_or_else(|| DbError::InvalidState(format!("index {} does not exist", index.0)))?;
+        let table = self
+            .indexes
+            .get(&index)
+            .ok_or_else(|| DbError::InvalidState(format!("index {} does not exist", index.0)))?
+            .table;
+        for foreign_key in self
+            .foreign_keys()
+            .filter(|foreign_key| foreign_key.referenced_table == table)
+        {
+            if !self
+                .foreign_key_indexes(foreign_key)
+                .any(|(supporting, _)| supporting.id != index)
+            {
+                return Err(DbError::InvalidState(format!(
+                    "index {} is required by foreign key {}",
+                    index.0, foreign_key.id.0
+                )));
+            }
+        }
+        self.indexes.remove(&index);
         self.index_names.remove(&index);
         self.generation += 1;
         Ok(())

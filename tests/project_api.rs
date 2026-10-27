@@ -159,6 +159,105 @@ fn exercise_project_api(directory: &Path) {
 }
 
 #[test]
+fn exact_index_lookup_returns_each_row_once_across_cursor_boundaries() {
+    let directory = tempdir().expect("tempdir");
+    let mut database =
+        RelationalDatabase::create(config(&directory.path().join("db"))).expect("create");
+    database.create_table(users_table()).expect("users");
+    database
+        .create_index(IndexDefinition {
+            id: USER_EMAIL_INDEX,
+            table: USERS,
+            parts: vec![IndexKeyPart::Column(ColumnId(2))],
+            predicate: None,
+            unique: false,
+        })
+        .expect("nonunique index");
+    let mut next_id = 1;
+    let groups: Vec<_> = [255, 256, 257]
+        .into_iter()
+        .map(|count| {
+            let label = format!("group-{count}");
+            let rows: Vec<_> = (0..count)
+                .map(|_| {
+                    let row = user(next_id, &label);
+                    next_id += 1;
+                    row
+                })
+                .collect();
+            (label, rows)
+        })
+        .collect();
+    database
+        .transaction(|database, transaction| {
+            for (_, rows) in &groups {
+                for row in rows {
+                    transaction.insert(database, USERS, row.clone())?;
+                }
+            }
+            for (label, rows) in &groups {
+                assert_eq!(
+                    transaction.index_get(
+                        database,
+                        USERS,
+                        USER_EMAIL_INDEX,
+                        &[Value::Text(label.clone())],
+                    )?,
+                    *rows
+                );
+            }
+            Ok(())
+        })
+        .expect("staged lookup");
+    for (label, rows) in groups {
+        assert_eq!(
+            database
+                .index_get(USERS, USER_EMAIL_INDEX, &[Value::Text(label)])
+                .expect("committed lookup"),
+            rows
+        );
+    }
+    database.close().expect("close");
+}
+
+#[test]
+fn parameterized_batch_rejects_mismatched_shapes_before_any_effect() {
+    let directory = tempdir().expect("tempdir");
+    let mut database =
+        RelationalDatabase::create(config(&directory.path().join("db"))).expect("create");
+    database
+        .execute_sql("CREATE TABLE counters (id BIGINT PRIMARY KEY, amount BIGINT)")
+        .expect("table");
+    database
+        .execute_sql("INSERT INTO counters VALUES (1, 0)")
+        .expect("seed");
+    let statements = [
+        "UPDATE counters SET amount = $1 WHERE id = 1",
+        "SELECT amount FROM counters",
+    ];
+    for params in [
+        vec![vec![Value::I64(10)]],
+        vec![vec![Value::I64(10)], vec![], vec![]],
+    ] {
+        let before = database.commit_id();
+        assert!(matches!(
+            database.execute_sql_batch_with_params(&statements, &params),
+            Err(omendb::DbError::SqlParameter(_))
+        ));
+        assert_eq!(database.commit_id(), before);
+        assert_eq!(
+            database.execute_sql(statements[1]).expect("unchanged").rows,
+            vec![vec![Value::I64(0)]]
+        );
+    }
+    let results = database
+        .execute_sql_batch_with_params(&statements, &[vec![Value::I64(10)], vec![]])
+        .expect("matching shape");
+    assert_eq!(results[1].rows, vec![vec![Value::I64(10)]]);
+    database.close().expect("close");
+}
+
+#[test]
 fn project_facing_api_supports_an_ordinary_transactional_lifecycle() {
     let temporary = tempdir().expect("temporary directory");
     exercise_project_api(&temporary.path().join("temporary"));
