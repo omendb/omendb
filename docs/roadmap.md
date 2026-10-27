@@ -18,8 +18,13 @@ or performance gate.
 
 ## O1. Repair present SQL integrity and authorization
 
-In the *current maintained serving path*, close security and correctness
-defects independent of SeerDB's eventual physical replacement. Use one
+In the *current maintained serving path*, close **exposed authorization,
+partial-commit and data integrity defects**, independently of SeerDB's
+eventual physical replacement. Preserve independent regression oracles
+and protect existing users, but do **not** spend an extended refactor
+on legacy binder/page/cursor abstractions slated for replacement.
+Prototype the clean SQL semantics and transactional row/index boundary
+alongside SeerDB S1 rather than sequentially polishing the old engine. Use one
 non-executing binder for parameter/result types and resolved catalog views;
 enforce grants on Describe as well as Execute. Every statement stages a
 private atomic row/index/catalog delta; errors in explicit transactions
@@ -45,8 +50,15 @@ update canonical row, secondary/constraint indexes and catalog under
 **one SeerDB decision**; application rollback and DDL dependencies use
 the same owner.
 
-This depends on [SeerDB stages S1–S3](../crates/seerdb/docs/roadmap.md),
-but API boundaries and row codecs can be prototyped in parallel.
+Begin an **integrated relational vertical slice in parallel with SeerDB S1**:
+one schema, one PK + one unique secondary index, multi-row updates,
+delete, rollback, concurrent writers and close/reopen through the public
+native API. Initially rely on complete-log replay, then use S2/S3 to
+qualify full serializable predicates, older snapshots, true checkpoint
+and history retention. Prototype OmenDB row codecs and access boundaries
+without waiting for every optional KV optimization. No release gate
+closes until [SeerDB stages S1–S3](../crates/seerdb/docs/roadmap.md)
+and OmenDB semantic/security gates agree on one real runtime.
 Do not create permanent adapters for multiple old/new engines merely
 to preserve a developer-preview interface. Preserve useful independent
 SQL semantic and crash probes through migration.
@@ -56,6 +68,17 @@ violations and schema changes work on the recovered replacement runtime.
 Long readers and older catalog versions retain their declared view.
 Offline preview data conversion preserves supported logical semantics
 or refuses explicitly.
+
+## Physical-layout challenger before format stabilization
+
+Compare, on that same SeerDB transaction engine and on equivalent schema
+and consistency, PK-clustered rows + secondary PK references, stable RowId/
+heap-like base rows + secondary RowId references, and a transactional
+ordered-KV facade versus direct typed row access. Quantify write/index/
+history amplification, PK changes, point/range and covering-index reads,
+cold payload projection, concurrent DDL and p99. Keep one selected physical
+path in production once measured; do not build an abstract backend matrix
+or rely on an incumbent's benchmark as OmenDB's evidence.
 
 ## O3. Replace the executor and remove global contention
 

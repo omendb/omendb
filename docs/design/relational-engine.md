@@ -100,8 +100,26 @@ variable-offset directory, inline payload and logical cold/large-value refs).
 Borrow typed page-resident fields for short queries; only selected fields
 are decoded/copied into output batches. Do not allocate generic `Vec<Value>`
 for every stored row or duplicate primary-key identity without demonstrated
-benefit. One clustered primary-row layout is the initial physical path;
-heap/PAX/column-family alternatives are workload experiments.
+benefit. Clustered primary-key rows are the initial physical baseline, not a
+settled universal SQL row layout. Independently test **primary-key-keyed
+clustered rows** against a **stable internal RowId plus heap/row table**
+and an optional hot-row/cold-column split. A table without an explicit
+primary key still needs durable logical row identity. If secondary
+indexes reference an immutable RowId, a PK update may avoid rewriting
+unrelated index keys but adds a base-row lookup and storage overhead;
+if secondary entries reference the PK directly, most reads save that
+indirection but PK changes, wide keys and repeated key copies cost
+more. Physical page/slot identity is never a permanent logical RowId.
+
+Keep schema-aware record access and generic transaction/KV access
+**equally reachable** from one SeerDB runtime until a real comparison.
+[FoundationDB Record Layer](https://foundationdb.github.io/fdb-record-layer/index.html)
+demonstrates native-style indexes and SQL above transactional KV, while
+[InnoDB's clustered rows](https://dev.mysql.com/doc/refman/26.10/en/innodb-row-format.html)
+are a production physical baseline. Direct typed access only earns its
+complexity if it measurably reduces CPU/allocations, decode/copying,
+index maintenance or I/O in **equal SQL semantics**. No permanent pair
+of storage backends or generic table-specific code inside SeerDB.
 
 Primary/unique/required foreign-key indexes and catalog mutations are
 **authoritative** and share the same SeerDB commit. Secondary entries carry
@@ -115,6 +133,21 @@ including names *not found*, range gaps and newly installed constraints.
 DDL validation and publication form a **single schema transaction**, not
 validate-in-one/commit-in-another. Online schema rewrite can later use
 retained snapshot plus complete transaction change catch-up.
+
+## Row and index workload used to select the physical layout
+
+The initial experiment includes narrow/large/wide variable-length rows,
+composite and changing PKs, an implicit RowId table, 0/1/4 secondary
+indexes, composite unique/FK checks, covered versus uncovered queries,
+uniform/skewed insert/update/delete, range and point reads, joins, and
+mixed writers. Compare database size/RSS, index amplification per
+mutation, bytes read per projected field, snapshot-version growth,
+page split rates, cold reads and p99. Verify each case against
+independent SQL results and identical isolation/durability. OmenDB
+owns row/index codecs; SeerDB owns the transaction, page and index
+primitives. Keep the simplest representation that meets the workload
+bar; optional physical structures can be introduced later without
+violating the logical row/catalog contract.
 
 ## Transaction and SQL session behavior
 

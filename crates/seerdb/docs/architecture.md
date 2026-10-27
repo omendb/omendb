@@ -121,6 +121,16 @@ not a universal storage policy or measured SeerDB speedup.
 
 ## Transaction and serializability protocol
 
+**Required behavior versus implementation choice:** one durable, atomic
+multi-object commit outcome; strict acknowledgement/visibility ordering;
+read-your-writes; correctly scoped isolation and conflict detection; preserved
+history and crash recovery; and bounded resource/failure ownership are
+contracts. A globally serialized CSN *append* or lock coupling, a second
+undo sync, a particular MVCC representation, and post-sync page installation
+are implementation candidates, not user-level requirements. Optimize the
+whole commit timeline with these contracts intact.
+
+
 1. Admit transaction-grain memory/CPU/I/O/retention resources before acquiring
    locks/intents or long-lived snapshots. Stage mutations privately, with an
    adaptive indexed write overlay for large transactions; no global shared
@@ -162,6 +172,82 @@ The *user-visible default remains unresolved*: measure hot-row conflicts,
 long transactions, retry UX and mixed-isolation histories first. A server
 cannot generally replay arbitrary multi-statement client work transparently.
 
+### Commit pipeline: three coherent candidates
+
+**First proof path (C0): durable WAL first, then synchronous authoritative
+installation, then contiguous visibility/ACK.** This minimizes the amount
+of shared uncommitted data the reader has to understand. It is a correctness
+baseline, not the desired final latency contract: index/overflow work on the
+post-sync path and head-of-line waiting for earlier installers can dominate
+an otherwise fast NVMe fsync.
+
+**Challenger (C1): construct/install invisible versions before or concurrently
+with the durability barrier.** All reader/index paths must check transaction
+status and handle an uncommitted page split, eviction, abort and checkpoint
+without leaking a version or invalidating the previous root. Publishing a
+commit decision remains dependent on durable original effects, and success
+still waits for a readable contiguous committed prefix. RocksDB's
+[WritePrepared design](https://github.com/facebook/rocksdb/wiki/WritePrepared-Transactions)
+is evidence that preparation/visibility indirection is possible, *not* that
+its transaction protocols apply without modification here.
+
+**Challenger (C2): publish a bounded, transaction-complete read overlay over
+the durable logical log and install page/index structures asynchronously.**
+An acknowledged transaction must be immediately visible to *all* point,
+range, secondary-index, catalog and constraint reads at its promised
+snapshot. The overlay must participate in the same read/write and predicate
+certification, account for memory and rebuild/GC, and block or throttle before
+it becomes unbounded. A log offset alone is not an index; no success may
+rely on a missing index entry or incomplete replay. This is an optional
+experiment **after** C0 proves a persistent end-to-end contract, not a
+required second runtime or an excuse for weaker indexes.
+
+**Committed-prefix rule:** the CSN provides a single read/ack ordering for
+this initial single-node store. Speculative install may run in parallel,
+but do not acknowledge a later CSN while an earlier durable transaction
+is logically absent from its read view. Log sequence, commit acceptance,
+durability frontier, physical installation and read visibility are
+*different* states. An error or timeout after a durable decision is
+unresolved/success-after-recovery, not a clean abort.
+
+**Current prototype bottlenecks to challenge:** `src/vnext/commit_append.rs`
+builds `PreparedLogBatch` while holding its CSN lane, and
+`src/vnext/log_io.rs::DurableLog::sync_through` takes the same
+device-operation mutex used by append. Both block unrelated log append
+while an NVMe sync is in flight. Pre-encode effects outside the lane,
+then evaluate safe ordered reservation/positional append, durable-prefix
+tracking and adaptive batching versus autonomous per-worker persistence.
+The [SIGMOD 2025 autonomous-commit paper](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/latency.pdf)
+shows that group commit is not uniformly optimal on modern NVMe; its
+benchmark is not a SeerDB measurement. Parallel log writes must still
+prove record-framing, ordering, torn-tail recovery, completed barriers
+and dependency-aware acknowledgements.
+
+### Serializable control and contentious writers
+
+The initial executable reference uses decision-ordered optimistic
+certification with a finite, exact read/absence/range dependency set and
+atomic publication of accepted-uninstalled writes. It is **not** selected
+as the only viable high-contention protocol. Compare against SSI-style
+read/write dependency tracking (including read-only/safe snapshots) and
+fine-grained lock or wait/recheck policies for hot-key cases. PostgreSQL's
+[SSI design](https://wiki.postgresql.org/wiki/Serializable) documents
+read/predicate dependencies and false-positive abort trade-offs.
+[Silo](https://dspace.mit.edu/entities/publication/17029f9a-6379-4673-9f9f-1c36d23feb1b)
+demonstrates a high-throughput in-memory optimistic serializable approach,
+but its logging, page faults and snapshot history assumptions differ.
+
+Keep a compact accepted-write dependency horizon so readers do not miss
+durable-but-not-yet-installed effects. Prune conflict evidence only when no
+active/retained snapshot, outstanding validator or checkpoint can refer to
+it. Predicate spans should be based on logically evaluated index ranges,
+including absence and schema/catalog membership, not solely physical
+leaf/slot boundaries. If conservative range tracking expands to an
+entire tree, record the false-positive cost; memory exhaustion must
+refuse safely or transparently force a correct retry, not silently
+weaken SERIALIZABLE. Test mixed isolation and constraint enforcement
+independently of the nominal SQL default.
+
 ## Physical access and hot-path policy
 
 - Initial ordered structure: mutable buffered B+/B-link tree with fine-grained
@@ -189,6 +275,49 @@ cannot generally replay arbitrary multi-statement client work transparently.
   images, prefetch and compaction; fixed frame count alone is not an RSS bound.
   Preserve protected WAL/installer/reclaim capacity under foreground or
   analytical saturation.
+
+## MVCC, history, and checkpoint economics
+
+Treat the **latest readable version, older snapshot history, committed log,
+checkpoint coverage, and retained CDC/backup/replication history as one
+lifetime system**. The baseline is a compact latest-value/current-record
+representation plus a bounded recent version cache. Older immutable versions
+must be addressable without linear scanning of every overwritten value.
+Compare two coherent historical layouts: (H0) reverse version links backed
+by indexed immutable history segments with time- and key-aware lookup,
+and (H1) a keyed history store ordered by `(object, logical key, commit
+interval)` for seekable old snapshots. Consider hybrid inline versions
+only when bounds keep leaf/page amplification and churn acceptable.
+WiredTiger's [history store](https://source.wiredtiger.com/develop/arch-hs.html)
+and [checkpoint coordination](https://source.wiredtiger.com/develop/arch-checkpoint.html)
+are useful lifecycle references, not storage-format prescriptions.
+
+Compare recent hot reads, a one-hour pinned reader under churn, historical
+random lookups, version lookup I/O, index and status memory, write
+amplification, retained disk growth, GC debt, checkpoint interruption,
+recovery time and constrained RAM. A bounded count of in-memory version
+offsets is not sufficient if recovery reads an unbounded WAL or every
+history lookup takes a shared file mutex.
+
+Never collapse different retention units into a single numerical floor:
+**CSN snapshots**, **LSN log replay**, history-version references and
+external lease epochs have separate authority. An eviction may flush a
+version to history only after its identity, log and checkpoint dependencies
+are satisfied. A checkpoint's published manifest must identify a logically
+closed, replayable state and all history needed by retained readers; old
+manifest roots and log/history extents survive until every reader,
+replica, consumer and backup lease is released.
+
+**Concurrent structural admission:** checking whether one mutation fits
+today's leaf is not proof it will install after other accepted transactions
+split or grow that tree. Before any irrevocable commit, provision a
+bounded worst-case structural/overflow envelope or ensure a guaranteed
+fallback representation; account for pinned writers, emergency install
+capacity and changes to split shape. If a post-decision space failure can
+still happen, the transaction remains durable and recovery-required (or
+readable through a fully qualified overlay), never reported as aborted.
+Do not reserve an impractically large worst-case buffer for every ordinary
+point write without measuring memory efficiency.
 
 ## WAL, checkpoint, recovery, and reclamation
 

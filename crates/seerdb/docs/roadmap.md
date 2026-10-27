@@ -14,6 +14,44 @@ qualified, then remove superseded code and APIs rather than keeping a
 permanent backend matrix. No test, benchmark or milestone is claimed complete
 by this document.
 
+## Critical experiments before freezing formats or protocol
+
+These **run alongside** the first integrated vertical slice; they do not
+require three permanent engines. C0 is the single executable correctness
+reference; C1/C2 may start as bounded in-memory protocol simulations or
+instrumented variants before any durable implementation. Define the
+same transaction/read-snapshot semantics, log durability and exact
+checkpoint/recovery expectations for every competitor.
+
+- **Commit:** isolate CSN validation, encoding, WAL append, sync queue,
+  device barrier, undo/history work, physical index install, visible-prefix
+  wait and ACK at p50/p95/p99. Test 1/4/16/64 writers with hot and disjoint
+  keys; introduce a delayed earlier installer and a crash at every stage.
+  C1/C2 advance only if they improve whole durable-transaction latency
+  or throughput without unbounded retained work or additional failure risk.
+- **History:** compare H0 version links/immutable history and H1 keyed
+  history store with short/long readers, repeated overwrites,
+  range scans and constrained buffer sizes. Snapshot age, read
+  amplification, bytes retained per overwritten row, recovery and
+  GC progress are selection metrics.
+- **Physical rows:** OmenDB runs a matched single-runtime comparison of
+  clustered PK-keyed records, independent logical RowId/heap storage,
+  and a direct schema-aware row view versus a transactional ordered-KV
+  encoding. Neither extra adapter complexity nor direct access is
+  presumed faster in end-to-end indexed SQL.
+- **Checkpoint and recovery:** WAL-only genesis replay is the S1
+  correctness bootstrap but not a production scaling strategy.
+  S3 must qualify a bounded-pause incremental/epoch checkpoint,
+  prior-root fallback and streaming history replay under continued
+  foreground writers.
+
+Source-level baselines: `src/vnext/commit_append.rs` currently encodes the
+batch inside the CSN lane; `src/vnext/log_io.rs` holds an append/sync
+mutex through device sync; `src/vnext/undo_store.rs` shares file
+state and reads behind one lock; `src/vnext/runtime_admission.rs`
+requires writer drain to checkpoint. These are deliberate experimental
+mechanisms, **not** release targets or measured bottleneck magnitudes.
+
 ## S1. One owned persistent runtime and recoverable decision
 
 Integrate store incarnation/ownership, WAL append and durability, transaction

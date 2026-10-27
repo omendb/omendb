@@ -53,7 +53,23 @@ not mandatory OmenDB components. For a native engine, favor fewer
 process layers, bounded lazy routing/decoding and a single plan IR,
 provided correctness and failover semantics remain explicit.
 See [Neki architecture](https://planetscale.com/blog/the-architecture-of-neki)
-and [data topology](https://planetscale.com/blog/what-is-a-data-topology).## Distribution acceptance gates
+and [data topology](https://planetscale.com/blog/what-is-a-data-topology).## Placement and transaction authority must remain distinct
+
+Neki's [October 23, 2026 shard-group analysis](https://planetscale.com/blog/shard-groups-the-unit-of-co-location)
+shows how common tenant/customer-key placement can keep joins and
+transactions local even when those columns differ from each table's PK.
+This supports a logical OmenDB placement/catalog tier **above SeerDB**,
+not a required physical B-tree range prefix or shared multishard WAL.
+Reference/lookup tables and global secondary index routes are useful
+candidates, but independently updated reference copies and GSIs can
+create cross-shard anomalies without a declared atomic/freshness
+protocol; do not adopt Neki's currently non-atomic cross-shard write
+semantics as a guarantee of one OmenDB SQL transaction. The first
+distributed profile can reject unsupported cross-shard changes before
+any partial effect; prepare/recover/coordinator ownership for
+fully atomic distributed transactions remains a later explicit gate.
+
+## Distribution acceptance gates
 
 1. An unsharded server uses its original local SeerDB commit and query path
    without router, quorum, membership or per-request topology overhead.
