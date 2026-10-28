@@ -6,15 +6,15 @@ alternative to PostgreSQL/MySQL rather than a PostgreSQL implementation. The
 current developer preview exposes a bounded PostgreSQL-wire adapter and Rust
 API; these do not define the native engine's long-term SQL or storage semantics.
 Specialized search/analytics and Neki-class horizontal scale are later goals.
-See the [OmenDB architecture](docs/architecture.md), [relational plan](docs/roadmap.md)
-and [SeerDB kernel architecture](crates/seerdb/docs/architecture.md) and
-[plan](crates/seerdb/docs/roadmap.md) for targets, not implementation claims.
+See the [OmenDB architecture](docs/architecture.md) and
+[SeerDB kernel boundaries](crates/seerdb/docs/architecture.md) for product direction,
+not implementation claims.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.
 Known authorization and failed-statement integrity gaps make the current preview
 unsuitable for untrusted clients or irreplaceable data. See the
-[gap register](docs/gap-register.md) and [release gates](docs/alpha-release-gates.md).
+[known limitations](docs/gap-register.md).
 
 ## Run the server
 
@@ -81,8 +81,8 @@ cargo run --bin omendb-tool -- restore --path ./fresh-db --input backup.sql
 ```
 
 See the [architecture](docs/architecture.md), [operational runbook](docs/runbook.md),
-and [benchmark documentation](docs/benchmarks.md) for design, recovery, and
-measurement details.
+and [kernel qualification procedures](crates/seerdb/docs/qualification.md) for
+design, recovery and available checks.
 
 ## Development
 

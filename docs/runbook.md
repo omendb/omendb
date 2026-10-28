@@ -87,12 +87,15 @@ state. The reconciliation procedure is:
 1. Stop issuing operations on the handle; close it (a close error still
    consumes the handle).
 2. Reopen with the same `RelationalBackendConfig`.
-3. Inspect application-visible state (for example, re-read the rows the
-   transaction would have written) and reapply only if absent.
+3. Reconcile using application-owned idempotency evidence written atomically
+   with the operation. Re-reading ordinary rows is not generally proof of the
+   outcome: later updates/deletes can hide a committed effect. Do not retry an
+   unresolved operation merely because an expected row is absent.
 
-Transactions publish atomically through SeerDB's group-commit lane, so an
-ambiguous outcome is exactly "committed" or "not committed"; application-level
-idempotency keys are the caller's reconciliation tool.
+Transactions publish atomically through SeerDB's group-commit lane, but a lost
+acknowledgement does not tell the caller which outcome occurred. The preview has
+no general reconnect-safe outcome token; application-level idempotency and
+explicit reconciliation remain the caller's responsibility.
 
 ## Backups
 

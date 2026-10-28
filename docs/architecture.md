@@ -1,132 +1,105 @@
 # OmenDB architecture
 
-**Design target, 2026-10-27. Not an implementation or performance claim.**
-This is the maintained product and engine map. Detailed contracts live in
-[SeerDB](../crates/seerdb/docs/architecture.md), [relational execution](design/relational-engine.md),
-[specialized engines](design/extensions.md) and [distribution](design/distribution.md).
-The [SeerDB roadmap](../crates/seerdb/docs/roadmap.md) owns kernel work; the
-[OmenDB roadmap](roadmap.md) owns product/SQL integration and release gates.
-[ADRs](adr/README.md) preserve historical decisions and alternatives, not parallel specs.
+**Product direction, 2026-10-28—not an implementation or performance claim.**
+The [README](../README.md), [known limitations](gap-register.md),
+[wire compatibility matrix](pgwire-compatibility.md) and [operator runbook](runbook.md)
+describe the development preview. This page explains the intended product and
+engine boundaries, not an implementation schedule.
 
 ## Product
 
-OmenDB is a **native, server-first, general-purpose relational database**. It aims
-to compete with PostgreSQL and MySQL in relational functionality, correctness,
-operability and performance, and later with Neki/Vitess-style systems in *horizontal*
-scale, availability and online reconfiguration. The native SQL/type/catalog contract
-is OmenDB's; a PostgreSQL wire/dialect adapter is optional and only as compatible
-as explicitly tested. Do not design the core around PostgreSQL physical formats,
-processes or catalog IDs. Embedded Rust usage shares the engine, with a smaller
-deployment footprint, but is not the primary performance target. "Native" describes
-OmenDB's engine and semantics, not a requirement to invent a proprietary wire
-protocol; the first server can use its documented PostgreSQL-wire subset.
+OmenDB is a native, server-first, general-purpose relational database in Rust.
+It aims to compete with PostgreSQL and MySQL in relational functionality,
+correctness, operability and performance, and eventually support horizontal
+scale, high availability and online movement. Embedded Rust clients share the
+engine but are not its primary performance target.
 
-The first qualification profile is **local durable indexed OLTP under mixed SQL
-and maintenance load**: short single-/multi-row transactions, primary and secondary
-lookups, constraint checks, selective ranges/joins/aggregates, and concurrent
-history/checkpoint/GC work. Larger-than-RAM data and long snapshots belong in that
-profile, not a later robustness phase. Embedded use shares the core with a lighter
-wrapper; it does not make the first server optimize for minimum binary size.
-Distributed and specialized-engine ambitions do not add a router, remote authority
-or generic operator framework to this first path. The roadmaps own its experiments;
-absolute product latency/resource budgets remain to be declared before qualification.
+OmenDB owns its SQL, type and catalog semantics. PostgreSQL wire/dialect support
+is an interoperability surface, compatible only where explicitly tested; it does
+not require PostgreSQL's physical formats, process model, catalog IDs or extension
+ABI. A native engine does not require a proprietary wire protocol.
 
-Initial authoritative writes and hot pages live on local RAM/NVMe. S3-compatible
-object storage is a secondary, optional tier for backups, immutable checkpoints,
-archived WAL and cold extents. Remote-primary/disaggregated storage needs a separate
-durability, latency and recovery decision. No cloud control plane is required for
-local serving.
+The first qualification profile is local durable indexed OLTP with concurrent
+reads, writes, selective scans/joins/aggregates and history/checkpoint/GC work.
+Larger-than-RAM data, skew, long snapshots and maintenance interference belong in
+that profile. No competitive performance or resource budget has been qualified.
 
 ## Engine boundaries
 
-| Owner | Owns | Does not own |
-| --- | --- | --- |
-| **OmenDB** | SQL/types/NULL semantics, catalog and constraints, binder, planner, execution, authorization, client/server protocols | Its own independent WAL or transaction status database |
-| **SeerDB** (workspace `crates/seerdb`) | Transactions, visibility/MVCC, conflicts/certification, one durable decision log, buffer/page/extent services, checkpoint, recovery, retention and admission | SQL types, query plans, BM25/ANN ranking or a universal byte-KV physical contract |
-| **Specialized access engines** | Physical indexing/computation for ordered rows, text/postings, vector/ANN, columnar analytics and later modalities | Independent commit authority over canonical rows inside one OmenDB transaction |
-| **Standalone Vector / OLAP products** | Their own datasets, APIs and qualified persistence when independently ingested/deployed | Automatic atomicity with an OmenDB SQL transaction |
-| **durable-fs** | Generic filesystem durability utilities | Database commit or snapshot semantics |
+| Owner | Responsibility |
+| --- | --- |
+| **OmenDB** | SQL/types/NULL semantics, schemas/catalog, constraints, relational row/index codecs, binding, planning, execution, authorization, process budgets, query scheduling and protocols |
+| **SeerDB** | Reusable transactions, MVCC/visibility, conflict evidence, durable decisions, ordered access, buffers/pages/extents, checkpoint, recovery, retention and storage admission |
+| **Specialized access engines** | Physical text/postings, vector/ANN or analytical representations when an integrated workload justifies them |
+| **Standalone Vector/OLAP products** | Independently ingested datasets and their own qualified durability; code sharing does not confer SQL atomicity |
+| **durable-fs** | Filesystem durability utilities, not database transaction decisions |
 
-The dependency direction is **OmenDB → SeerDB**. OmenDB-specific schemas,
-typed record/secondary-index encodings, SQL constraints and catalog behavior
-remain in the OmenDB crate, including its SeerDB relational adapter. General
-storage algorithms, transactional capabilities, WAL/MVCC/recovery,
-buffer/page/extent management and reusable storage I/O belong to SeerDB
-when a non-SQL consumer can use them. A generic filesystem durability
-helper belongs in `durable-fs`, not in the SQL server. See the
-[explicit code-placement policy](../crates/seerdb/docs/architecture.md#source-ownership-and-dependency-direction).
+The dependency direction is **OmenDB → SeerDB → durable-fs**. SeerDB can serve an
+independent Rust ordered-KV consumer without SQL or server dependencies. Its
+reusability must not force every row, posting or column group through one opaque
+KV representation. See the [SeerDB architecture](../crates/seerdb/docs/architecture.md).
 
-SeerDB should remain usable by other Rust projects through a transactional ordered-KV
-facade and useful kernel services, if that does not constrain OmenDB. Its internal
-contract is typed object/page/extent/transaction capabilities, **not** a requirement
-to wrap every row, posting or column group as bytes in one universal KV tree.
-Its independently useful interface and packaging must share the same runtime and
-recovery code as OmenDB. No permanent backend switch or duplicate storage engines.
+## Intended serving path
 
-## End-to-end shape
+```text
+SQL / Rust API / optional PostgreSQL-wire clients
+                         |
+             sessions and authorization
+                         |
+              typed binding and catalog
+                         |
+                  costed query plans
+                   /            \
+          OLTP micro-plans   bounded batch pipelines
+                   \            /
+               rows, indexes, constraints
+                         |
+             SeerDB transaction runtime
+          MVCC / conflicts / WAL / retention
+                         |
+               ordered access / buffers
+                         |
+          local NVMe / checkpoint / history / GC
+                         |
+           optional immutable object-storage tier
+```
 
-~~~text
-native SQL/API clients    optional PostgreSQL protocol adapter
-          \                      /
-            sessions / security
-                     |
-          typed binder + catalog
-                     |
-           optimizer / plan IR
-              /            \
-       OLTP micro-plans   typed batch pipelines
-              \            /
-         relational rows + constraints
-                     |
-          SeerDB transaction runtime
-     MVCC / certification / WAL / retention
-                     |
-         authoritative access methods
-         /                         \
-  clustered ordered rows       indexes / catalog
-                     |
-           buffers + extents
-                     |
-      local NVMe WAL + checkpoint + GC
-                     |
-   optional object-tier archive / backup
+Canonical rows, required indexes and catalog share one durable outcome within a
+local transaction domain. OmenDB does not maintain a second SQL WAL or independent
+transaction-status authority. Later distributed transactions must coordinate local
+domains explicitly; unsupported cross-domain work must be refused before partial
+effects. Independent latest reads do not constitute one distributed SQL snapshot.
 
-  later: native text / ANN / columnar access engines
-  later: per-shard replication, routing, online resharding
-~~~
+Derived representations need exact source/schema identity and retained snapshot
+coverage, complete changes, or an explicit freshness/approximation contract.
+Approximate ranking does not permit approximate authorization, deletion or predicate
+eligibility. Separate encoding and cache units do not imply separate SQL durability.
 
-Canonical rows and required primary/unique/FK indexes, plus catalog metadata,
-share **one durable transaction outcome within a local transaction domain**.
-Later cross-partition transactions must coordinate multiple such domains through
-the explicit distributed protocol; one logical SQL outcome does not require one
-physical WAL for the entire distributed database. Unsupported multi-domain work
-is refused before effects; a multi-domain statement also needs one proved consistent
-read cut and catalog/topology view, not independent latest reads. Derived structures
-are admitted only with explicit source identity, schema dependency, retained snapshot coverage and
-complete change intervals or a correct fallback/staleness contract. Their separate
-cache and encoding units do not entail separate SQL durability.
+## Reliability, resources and storage
 
-## Reliability and performance bar
+A durable decision is irreversible after cancellation or disconnect. Success also
+requires complete authoritative effects to be readable through the contiguous
+committed prefix; an unresolved outcome cannot silently become an abort.
+Recovery uses a structurally complete checkpoint plus required committed log and
+history, not a surviving spill or maximum page LSN.
 
-A durable commit is irreversible even after cancellation/disconnection; an
-acknowledgement additionally requires visibility through the contiguous published
-commit frontier. No unresolved decision can silently become an abort. Snapshot,
-CDC, backup, GC, and checkpoints share exact identity/retention authority.
-Recovery from a complete checkpoint and committed log must restore all required
-authoritative state and retained history; a spilled page or max page LSN alone
-is not restart authority.
+Execution, results, sessions, caches and storage maintenance share bounded process
+resources with protected completion capacity. Cancellation is not proof that a
+worker stopped, and cooperative checks are not a security or hard RSS boundary.
+SERIALIZABLE is the reference correctness mode; the default SQL isolation remains
+an open product choice, including READ COMMITTED and retry ergonomics.
 
-Measure **whole-engine** indexed OLTP, mixed read/write/scan loads, contention,
-larger-than-memory workloads, long snapshots, checkpoints, failures and recovery,
-not just in-memory KV operations or synthetic throughput. Compare SQL semantics
-with PostgreSQL/MySQL/SQLite, standalone KV semantics with RocksDB/Fjall/SurrealKV,
-and later shard-local throughput, HA and resharding with Neki/Vitess-style systems
-under matched conditions. Treat vendor results as hypotheses, not OmenDB results.
+Local RAM/NVMe is the initial authoritative serving tier. S3-compatible storage is
+initially optional for immutable checkpoints, backup, archived log and cold data.
+Remote-primary storage, replication and sharding require their own durability,
+latency, ownership and recovery protocols, without imposing network authority on
+the local fast path.
 
-The currently serving code still uses a generation-COW SeerDB path; `vnext` is a
-component-level replacement, **not** a qualified persistent product runtime.
-The [gap register](gap-register.md), [release gates](alpha-release-gates.md) and
-[Pgwire compatibility matrix](pgwire-compatibility.md) describe current limitations,
-not targets imposed on the native engine. Do not serve untrusted/irreplaceable
-data on the preview while known integrity and authorization gaps remain.
+Storage layout, row identity, compression and execution mechanisms remain measured
+choices—not claims that a B-tree, LSM or particular runtime wins universally.
+Whole-engine qualification must include matched semantics/durability, offered load,
+retries, memory, total device/log/history traffic, recurring maintenance and recovery.
 
+The serving preview still uses generation-COW SeerDB; the experimental replacement
+is not a qualified persistent product runtime. Do not serve untrusted clients or
+irreplaceable data while the documented integrity and authorization gaps remain.

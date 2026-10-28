@@ -33,7 +33,7 @@ All notable changes to OmenDB are documented here. Format follows
 - Development PostgreSQL wire compatibility matrix
   (`docs/pgwire-compatibility.md`) listing tested protocol/authentication/
   authorization behavior and explicit compatibility gaps.
-- Release contract and gates: `docs/alpha-release-gates.md`.
+- Internal relational release-qualification checklist.
 - Reproducible single-client OLTP baseline `examples/alpha_oltp.rs` with
   workload metadata, latency percentiles, peak RSS, and SQLite comparison.
 - Peak-RSS reporting in the benchmark JSON output.
@@ -74,4 +74,4 @@ All notable changes to OmenDB are documented here. Format follows
 ## [0.1.0-alpha.1] - Unreleased
 
 Reserved relational alpha line. It is not yet published or release-ready;
-see `docs/alpha-release-gates.md` for the server-first release contract.
+see the README and known limitations for the current preview status.

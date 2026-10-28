@@ -261,8 +261,8 @@ impl OmenDbHandler {
                 // is free while this commit publishes.
                 //
                 // No outer write guard: the engine's group-commit lane
-                // (ADR 0004) already serializes publication and stages
-                // concurrently under its own prepare mutex, and schema
+                // already serializes publication and stages concurrently
+                // under its own prepare mutex, and schema
                 // changes are fenced by the catalog-marker range every
                 // transaction registers at begin. Holding the exclusive
                 // guard across commit() serializes staging too, collapsing

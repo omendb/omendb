@@ -1,9 +1,8 @@
 //! Attribute single-client commit cost across CPU, allocations, WAL bytes,
 //! and durability barriers.
 //!
-//! This is the profiling half of the performance gate in
-//! `docs/alpha-release-gates.md`: before an optimization is accepted, a
-//! reproducible profile must identify the measured bottleneck. The probe
+//! A reproducible profile must identify the measured bottleneck before a
+//! performance optimization is accepted. The probe
 //! wraps a counting global allocator (allocation count and bytes per run),
 //! samples `getrusage` CPU time, and diffs SeerDB's cumulative
 //! publication-phase timings and byte counters over the same TPC-B-shaped

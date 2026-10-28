@@ -1,45 +1,31 @@
 # OmenDB workspace
 
-## Maintained ownership
+## Navigation
 
-- [Product architecture](docs/architecture.md) describes OmenDB goals
-  and boundaries. [Relational design](docs/design/relational-engine.md)
-  specifies SQL/catalog/execution; [extensions](docs/design/extensions.md)
-  and [distribution](docs/design/distribution.md) specify later interfaces.
-- The [OmenDB roadmap](docs/roadmap.md) owns product integration and
-  release work. **SeerDB has its own** [architecture](crates/seerdb/docs/architecture.md),
-  [roadmap](crates/seerdb/docs/roadmap.md), and nested
-  [AGENTS.md](crates/seerdb/AGENTS.md) for kernel work. Neither roadmap
-  duplicates the other's implementation sequence.
-- [ADRs](docs/adr/README.md) retain dated decisions only; previous vNext
-  handoffs and `docs/plans/` are not active targets. README/source expose
-  current behavior, while [gap register](docs/gap-register.md),
-  [release gates](docs/alpha-release-gates.md) and
-  [optional Pgwire matrix](docs/pgwire-compatibility.md) retain evidence.
+[Architecture](docs/architecture.md) describes product boundaries;
+[known gaps](docs/gap-register.md) describe serving-path limitations.
+Implementation plans, detailed target contracts and research live in project
+knowledge, not the public docs. Consult them when planning or changing a contract;
+inspect source for current behavior. Kernel work follows
+[`crates/seerdb/AGENTS.md`](crates/seerdb/AGENTS.md).
 
-## Non-obvious invariants
+## Non-obvious constraints
 
-OmenDB is a native server-first relational engine, not PostgreSQL's storage/
-catalog implementation. Keep one SeerDB transaction/log/recovery authority
-for canonical records, required indexes and OmenDB catalog. OmenDB owns
-the *meaning* of catalog, types, constraints and query plans. Standalone
-Vector/OLAP products do not inherit SQL atomicity by sharing code.
-Durable decision ≠ publication/ACK: complete authoritative effects must be
-visible in the contiguous committed prefix before successful return.
-Checkpoint plus committed-log history, not a spill or max page LSN,
-determines recovery. Unsupported exact snapshots may not silently use
-stale derived projections.
-
-SERIALIZABLE is the reference correctness protocol, but SQL default isolation
-is not final; evaluate READ COMMITTED, retry UX and p99 under real workloads.
-Replace obsolete development interfaces after qualified cutover rather
-than retaining a backend matrix.
+- Dependency: OmenDB → SeerDB → durable-fs. SQL semantics, relational codecs,
+  catalog, constraints and query scheduling stay in OmenDB; reusable storage,
+  transactions and recovery stay in SeerDB.
+- Canonical rows, required indexes and catalog share one SeerDB decision.
+  Durable decision is not ACK: complete effects must be readable through the
+  contiguous committed prefix. Restart authority is a complete checkpoint plus
+  required committed log/history, not a spill or maximum page LSN.
+- SERIALIZABLE is the reference correctness protocol, not a selected SQL default.
+  Exact queries cannot silently use stale projections. Shared algorithms do not
+  give standalone Vector/OLAP products SQL atomicity.
 
 ## Verification
 
-Follow the **affected subtree's** instructions and
-[CI](.github/workflows/ci.yml); for kernel persistence changes load
-[qualification skill](.agents/skills/vnext-qualification/SKILL.md).
+Follow the affected subtree and [CI](.github/workflows/ci.yml). Kernel persistence
+changes use [qualification](.agents/skills/vnext-qualification/SKILL.md).
 From the workspace root:
 
 ~~~sh
@@ -49,7 +35,5 @@ cargo test --workspace --all-targets
 cargo test --workspace --all-features --all-targets
 ~~~
 
-Security/SQL live-oracle checks, platform/durability and performance
-qualification require their separate environments. Do not call a
-component test or preview benchmark an integrated server guarantee.
-
+Live SQL/security oracles, device durability and performance qualification need
+separate environments; component or preview results do not qualify the server.

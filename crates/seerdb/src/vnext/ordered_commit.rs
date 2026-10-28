@@ -1,6 +1,6 @@
 //! Durable-WAL-first commit orchestration for ordered MVCC objects.
 //!
-//! The coordinator integrates ADR 0014's transaction order. Write intents are
+//! The coordinator uses durable-decision-first ordering. Write intents are
 //! acquired before predecessor validation, so write conflicts and current-record
 //! corruption are discovered before commit authority enters the WAL. Required
 //! before-images may be appended during this pre-WAL validation phase but remain

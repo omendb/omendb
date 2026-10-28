@@ -31,8 +31,8 @@ foundation beneath a database server:
   active snapshots, which also freezes resolved commit sequences into current
   records and prunes status entries nothing references anymore. Its durable
   conflict records and version history survive
-  reopen. Commits pipeline through a group-commit lane (ADR 0004 in the
-  repository docs): staging and validation run concurrently, and each publish
+  reopen. Commits pipeline through a group-commit lane: staging and
+  validation run concurrently, and each publish
   wave installs many logical commits under one authority frame with a single
   sync pair.
 - **Committed-change stream**: every commit sequence number has exactly one
@@ -92,13 +92,11 @@ usable independently of OmenDB without forcing typed rows or specialized
 vector/columnar extents through opaque byte-KV storage. OmenDB is the primary
 integration/performance consumer, not a required dependency of standalone KV.
 
-Read the maintained [SeerDB architecture](docs/architecture.md),
-[SeerDB roadmap](docs/roadmap.md), and [qualification procedures](docs/qualification.md).
-The OmenDB [product architecture](../../docs/architecture.md) and
-[relational roadmap](../../docs/roadmap.md) describe the consumer's requirements.
-Older ADRs and benchmarks are evidence, not accepted replacements for these
-contracts. No storage format, API stability or competitive performance claim is
-implied by these documents.
+Read the [kernel boundaries](docs/architecture.md),
+[qualification procedures](docs/qualification.md) and OmenDB
+[product architecture](../../docs/architecture.md).
+These targets do not imply storage-format/API stability or competitive
+performance of the current development API.
 
 ## License
 

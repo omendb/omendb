@@ -1,55 +1,24 @@
-# SeerDB qualification and historical evidence
+# SeerDB qualification procedures
 
-This document keeps the existing development-harness commands and dated
-legacy-engine evidence out of the API README. It has **not** been rerun for the
-new persistent runtime. Run the commands below from **`crates/seerdb/`**,
-where the `tools/` scripts and crate examples live, unless a command specifies
-the OmenDB workspace root. The maintained [roadmap](roadmap.md) owns required
-gates and [architecture](architecture.md) owns the target contract. Historical
-results are specific to the engine version and operating system stated.
+These development harnesses exercise the current generation-based engine unless
+explicitly stated otherwise; their existence does not qualify the experimental
+replacement. [Architecture](architecture.md) describes the boundary. Run commands
+from **`crates/seerdb/`**, where `tools/` and examples live, unless they specify the
+workspace root. Record revision, runtime, platform, invocation and actual outcomes.
 
-## Status
+## External failure boundaries
 
-The current Rust development lane is a single-writer durable kernel with
-concurrent reads, root-generation retention, WAL recovery, crash-safe
-reclamation, and retryable capacity refusal. `TransactionDatabase` now stores
-committed per-key version chains, returns explicit `{CSN, LSN}` commit
-positions, and supplies first-class trees, fixed-snapshot reads, atomic
-multi-tree mutations, and reopen-persistent write-conflict records above that
-kernel. It is still not the target physical multi-writer
-engine or a releasable `0.1.0-alpha.*` crate. Status-table freezing,
-durable retained-snapshot/change-consumer leases, concurrent page/WAL publication,
-broader filesystem/block-layer fault qualification, OmenDB direct integration,
-and measured device-backed performance remain open. OmenDB integration and the
-alpha release gates are the authoritative cross-project qualification
-surfaces.
+- `tools/linux_syscall_faults.sh` injects failures before/after observed libc
+  write/sync/rename calls, then checks old-or-complete-new state through two reopens.
+- `tools/linux_syscall_crashes.sh` pauses at libc calls for parent-driven SIGKILL.
+- `tools/common_kv_syscall_faults.sh` applies matched recovery probes to the selected
+  KV engines; recovery/resource equivalence must be reported separately.
+- `tools/linux_power_loss.sh` requires privileged Linux loop devices,
+  `dm-log-writes` and `replay-log`. Missing prerequisites produce `not-run`, not a pass.
 
-On Linux, `tools/linux_syscall_faults.sh` adds an external libc-boundary gate:
-it fails each observed `fsync`, `fdatasync`, rename, and `write` call once both
-before and after completion during a whole-image and segmented durable
-mutation, then requires the old or complete-new root after two fresh reopens.
-This does not emulate torn writes, block-layer cache loss, or machine power
-loss; the privileged
-`tools/linux_power_loss.sh` gate remains separate.
-The current page-write path uses `write` after seeking, so it is included in
-this matrix; a future positional `pwrite` path would need a separate external
-interposer.
-
-`tools/linux_syscall_crashes.sh` uses the same interposer to hold a selected
-libc call and lets the parent send `SIGKILL` either before the call or after
-the real call succeeds but before it returns. The ARM64 Linux matrix covers
-138 whole-image/segmented cases with two-reopen old-or-complete-new checks.
-This is process-termination evidence at the libc boundary, not block-layer
-power-loss, torn-write, or general filesystem-race evidence.
-
-The same seeded mutation contract is available for the common-KV comparison:
-`tools/common_kv_syscall_faults.sh` passed 210 external sync/rename cases over
-SeerDB, Fjall, and RocksDB on ARM64 Linux: every observed call was tested both
-before and after completion, with complete batch-prefix and two-reopen
-verification. Its manifest classifies process refusal/completion, complete or
-shorter-prefix recovery, stable two-reopen verification, and uncollected
-resource equivalence separately. It is diagnostic recovery evidence, not
-incumbent performance or block-layer power-loss equivalence.
+Libc/process probes do not establish torn-write, block-cache-loss or machine
+power-loss safety. Interposers must cover the syscalls the tested implementation
+actually uses; positional I/O changes may require a different interposer.
 
 ## Portable qualification
 
@@ -137,14 +106,3 @@ license set, and requires a crate-specific exception for the transitive
 `r-efi` license expression. `cargo audit` is a complementary local RustSec
 check; neither result replaces GitHub's default-branch advisory state or a
 release review.
-
-The privileged `tools/linux_power_loss.sh` runner is separate and requires a
-Linux host with loop devices, `dm-log-writes`, and `replay-log`. It records an
-explicit `not-run` manifest when those prerequisites are unavailable.
-
-## References
-
-- LeanStore (VLDB 2024, 2026) — out-of-place B-tree, SSD-aware buffer management
-- "How to Write to SSDs" (VLDB 2026) — DB-SSD co-optimization, NoWA pattern
-- WiscKey (FAST 2016) — key-value separation for reduced write amplification
-- ZLeanStore (GitHub) — C++ implementation of out-of-place B-tree with blob storage

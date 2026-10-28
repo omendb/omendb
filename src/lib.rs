@@ -18,9 +18,8 @@ mod relational;
 mod relational_database;
 mod row_identity;
 mod runtime;
-// The direct SeerDB backend: the only backend behind RelationalDatabase
-// (ADR 0005). Historical retention and durability-position results that
-// motivated the transitional facade landed; the facade is the API surface.
+// The only storage backend behind RelationalDatabase; relational codecs and
+// catalog meaning remain in OmenDB rather than the reusable SeerDB crate.
 #[allow(dead_code, clippy::type_complexity)]
 mod seer_direct;
 mod session;

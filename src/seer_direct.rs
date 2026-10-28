@@ -1,9 +1,7 @@
 //! Direct storage backend mapping OmenDB's relational model onto SeerDB.
 //!
-//! One catalog tree, one tree per table, one tree per index ([ADR
-//! 0005](../../docs/adr/0005-delete-storage-kernel-seam.md)): the storage-
-//! kernel seam, attempt machinery, and temporary backend were deleted; this
-//! is the only backend behind `RelationalDatabase`. Schema mutations and
+//! One catalog tree, one tree per table, one tree per index. This is the only
+//! backend behind `RelationalDatabase`. Schema mutations and
 //! row writes publish atomically through the same SeerDB transaction as the
 //! catalog marker put.
 
