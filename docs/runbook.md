@@ -40,10 +40,14 @@ Call `RunningServer::shutdown` instead of dropping the handle when embedding the
 server and the close result must be observed. A dropped running handle still
 signals shutdown but cannot report a close error.
 
-Empty `pgwire_auth` catalogs enable trust authentication only on loopback. A
-provisioned user switches startup to SCRAM-SHA-256; provision users while the
-database is closed, then restart the daemon. `--max-connections` bounds
-connection tasks; rejected sockets are counted in `RunningServer::status()`.
+New databases store an explicit loopback-only bootstrap capability. Creating the
+first native principal disables it permanently: removing the last user or
+credential does not restore trust. Each new connection selects its authentication
+mode from the current committed catalog. Existing bootstrap connections lose
+permission for later queries when bootstrap is disabled.
+
+`--max-connections` bounds connection tasks; rejected sockets are counted in
+`RunningServer::status()`.
 `--statement-timeout-ms` applies a cooperative deadline to each statement and
 `Describe`; zero rejects execution immediately. `--max-result-bytes` rejects
 an estimated materialized result payload above its bound with SQLSTATE `54000`;
@@ -53,6 +57,56 @@ synchronous query work runs in server-tracked blocking workers so awaited
 shutdown drains it before closing the database. Schema publication remains a
 non-interruptible operation and checks cancellation and the statement deadline
 before it starts.
+
+## Principals and grants
+
+The native catalog owns principals, opaque credentials, table grants and an
+explicit database-administration capability. A new principal has no privileges.
+Write access includes reads, but does not permit DDL. A table named `*` is not an
+administration grant. SQL `CREATE ROLE` and `GRANT` are not implemented; use the
+trusted Rust API. There is no provisioning CLI.
+
+For a persistent database, stop the daemon and open its existing path from a
+trusted Rust program built with the `pgwire` feature. For example, provision an
+operator with explicit administration:
+
+```rust
+use omendb::{RelationalBackendConfig, RelationalDatabase, pgwire_server};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut database =
+        RelationalDatabase::open(RelationalBackendConfig::new("./omendb-data"))?;
+    let password = std::env::var("OMENDB_PASSWORD")?;
+    pgwire_server::provision_wire_user(&mut database, "operator", &password)?;
+    pgwire_server::provision_wire_admin(&mut database, "operator", true)?;
+    database.close()?;
+    Ok(())
+}
+```
+
+For table-only access, use
+`provision_wire_grant(&mut database, "app", "accounts", true, false)` after creating
+that principal and table. Password rotation preserves the principal's identity
+and grants. The transaction APIs can publish principal, credential, grant and row
+changes together. Direct native database access is a privileged host interface;
+do not expose arbitrary native operations to untrusted callers.
+
+Grants follow principal and table incarnations: rename preserves them, but
+reusing a dropped principal name or table name/ID does not transfer access.
+Describe and execution check current committed authorization even inside an
+older data transaction. Revocation does not cancel already-admitted work or
+reauthorize its commit. A later authorization error aborts the block's staged
+changes; rollback and failed-block cleanup remain available.
+
+Histories created before native authorization remain readable through the
+trusted native API, but serving refuses missing authorization state. The old
+`pgwire_auth` and `pgwire_grants` tables are not imported: their name-based grants
+cannot identify the intended object incarnations safely. Inspect the intended
+policy, explicitly remove those legacy tables through `apply_schema_mutations`,
+then call `initialize_authorization()` on an uninitialized history and reprovision
+credentials and grants. Initialization refuses existing or malformed state and
+never silently deletes legacy tables. Close the native handle before restarting
+the daemon. Keep the database on loopback until provisioning is complete.
 
 ## Health checks
 
@@ -111,7 +165,9 @@ inline primary keys, data as multi-row INSERTs in scan order, secondary
 indexes after data, foreign keys last as `ALTER TABLE ADD CONSTRAINT`.
 It restores into OmenDB and into PostgreSQL (within the documented
 divergences in `docs/gap-register.md`), so the same tool verifies a
-backup by differential restore. Restore is not resumable: it stops at
+backup by differential restore. Native principals, credentials and grants are
+not included in logical dumps; explicitly reprovision authorization on a restored
+database before serving it. Restore is not resumable: it stops at
 the first error and earlier committed chunks remain — drop and re-run
 into a fresh directory after correcting the script. U64 columns dump as
 `NUMERIC(20,0)` (PostgreSQL has no unsigned 64-bit integer).

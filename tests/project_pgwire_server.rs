@@ -815,8 +815,8 @@ async fn omendbd_logs_slow_statements_when_threshold_set() {
         "slow-statement log includes a duration: {logged:?}"
     );
     assert!(
-        logged.contains("user\":\"trust\""),
-        "trust connections log as the trust user: {logged:?}"
+        logged.contains("user\":\"bootstrap\""),
+        "explicit bootstrap connections log their authority: {logged:?}"
     );
 
     let pid = i32::try_from(child.0.as_ref().expect("daemon child").id()).expect("daemon pid");
@@ -1423,6 +1423,14 @@ async fn wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password() {
         "wonderland",
     )
     .expect("provision user");
+    omendb::pgwire_server::provision_wire_grant(
+        &mut database.write().expect("lock"),
+        "alice",
+        "users",
+        true,
+        false,
+    )
+    .expect("grant users read");
 
     let (addr, _server) =
         pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
@@ -1767,12 +1775,11 @@ fn facade_sequential_autocommit_inserts_all_visible() {
         omendb::Value::U64(10),
         "all 10 rows visible"
     );
-    // Now publish a second schema change, like serve() bootstrapping
-    // pgwire_auth after user data exists.
+    // Publish an unrelated schema change after user data exists.
     database
         .create_table(TableDefinition {
-            id: TableId(u64::MAX - 1),
-            name: "pgwire_auth".to_owned(),
+            id: TableId(8),
+            name: "unrelated".to_owned(),
             columns: vec![
                 ColumnDefinition {
                     id: ColumnId(u16::MAX - 1),
@@ -1788,7 +1795,7 @@ fn facade_sequential_autocommit_inserts_all_visible() {
                 },
             ],
         })
-        .expect("create auth table");
+        .expect("create unrelated table");
     let result = database
         .execute_sql("SELECT count(*) FROM users")
         .expect("count after DDL");
@@ -3547,7 +3554,7 @@ async fn wire_update_from_returning_post_update_values() {
 async fn wire_trust_mode_refuses_non_loopback_listener() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
-    // No users provisioned -> trust mode -> non-loopback bind must refuse.
+    // A fresh database has explicit bootstrap eligibility, loopback only.
     // spawn() binds successfully; the refusal surfaces when serve runs.
     let (_addr, handle) =
         pgwire_server::spawn(database.clone(), "0.0.0.0:0".parse().expect("addr"))
@@ -3637,6 +3644,69 @@ async fn wire_auth_failure_delays_repeat_attempts() {
 }
 
 #[tokio::test]
+async fn wire_live_bootstrap_transition_uses_native_default_deny() {
+    let directory = tempdir().unwrap();
+    let database = seed_database(directory.path());
+    let (address, server) = pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let dsn = format!("host=127.0.0.1 port={} user=alice", address.port());
+    let (bootstrap, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let bootstrap_task = tokio::spawn(connection);
+    let prepared = bootstrap.prepare("SELECT email FROM users").await.unwrap();
+    bootstrap
+        .batch_execute("BEGIN; INSERT INTO users VALUES (2, 'staged@example.com')")
+        .await
+        .unwrap();
+
+    pgwire_server::provision_wire_user(&mut database.write().unwrap(), "alice", "password")
+        .unwrap();
+    // Already-authorized writes can commit after bootstrap is disabled.
+    bootstrap.batch_execute("COMMIT").await.unwrap();
+    let denied = bootstrap.query(&prepared, &[]).await.unwrap_err();
+    assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    let denied = bootstrap.simple_query("SELECT 1").await.unwrap_err();
+    assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+
+    // A fresh connection switches to SCRAM without restarting the listener.
+    let (principal, connection) =
+        tokio_postgres::connect(&format!("{dsn} password=password"), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let principal_task = tokio::spawn(connection);
+    principal.query_one("SELECT 1", &[]).await.unwrap();
+    let denied = principal
+        .query("SELECT email FROM users", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    pgwire_server::provision_wire_grant(
+        &mut database.write().unwrap(),
+        "alice",
+        "users",
+        true,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        principal
+            .query("SELECT email FROM users", &[])
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(bootstrap);
+    drop(principal);
+    bootstrap_task.await.unwrap().unwrap();
+    principal_task.await.unwrap().unwrap();
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn wire_grant_enforcement_reader_writer_admin() {
     let directory = tempdir().expect("tempdir");
     let database = seed_database(directory.path());
@@ -3646,6 +3716,8 @@ async fn wire_grant_enforcement_reader_writer_admin() {
             .expect("provision reader");
         omendb::pgwire_server::provision_wire_user(&mut db, "writer", "wpass")
             .expect("provision writer");
+        omendb::pgwire_server::provision_wire_user(&mut db, "admin", "apass")
+            .expect("provision admin");
         db.create_table(TableDefinition {
             id: TableId(8),
             name: "notes".to_owned(),
@@ -3670,8 +3742,10 @@ async fn wire_grant_enforcement_reader_writer_admin() {
 
         omendb::pgwire_server::provision_wire_grant(&mut db, "reader", "notes", true, false)
             .expect("grant reader read");
-        omendb::pgwire_server::provision_wire_grant(&mut db, "writer", "*", false, true)
-            .expect("grant writer admin");
+        omendb::pgwire_server::provision_wire_grant(&mut db, "writer", "notes", false, true)
+            .expect("grant writer write");
+        omendb::pgwire_server::provision_wire_admin(&mut db, "admin", true)
+            .expect("grant explicit admin");
     }
 
     let (addr, _server) =
@@ -3744,7 +3818,7 @@ async fn wire_grant_enforcement_reader_writer_admin() {
             .expect("restricted cleanup");
     }
 
-    // Writer-admin: INSERT allowed, DDL allowed.
+    // Table writer: write implies read but not schema administration.
     let writer = connect("writer", "wpass").await.expect("writer connect");
     writer
         .execute(
@@ -3753,10 +3827,27 @@ async fn wire_grant_enforcement_reader_writer_admin() {
         )
         .await
         .expect("writer insert granted");
-    writer
+    assert_eq!(
+        writer
+            .query("SELECT body FROM notes", &[])
+            .await
+            .unwrap()
+            .len(),
+        2,
+    );
+    let denied = writer
         .batch_execute("CREATE TABLE scratch (id INT PRIMARY KEY)")
         .await
-        .expect("writer admin DDL");
+        .expect_err("table writer is not an admin");
+    assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+
+    // Administration is explicit and includes all current data and DDL.
+    let admin = connect("admin", "apass").await.expect("admin connect");
+    admin.query("SELECT email FROM users", &[]).await.unwrap();
+    admin
+        .batch_execute("CREATE TABLE scratch (id INT PRIMARY KEY)")
+        .await
+        .expect("explicit admin DDL");
 
     // Describe must authorize before exposing protected metadata, and its
     // failure must retain the enclosing rollback-only boundary.

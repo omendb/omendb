@@ -31,7 +31,7 @@ use super::encoding::{
 };
 use super::lifecycle::{QueryWorkers, read_lock_with_control, write_lock_with_control};
 use super::shared::TX_IDLE_TIMEOUT;
-use super::shared::{IdentityMap, ParsedStatement, TransactionBlock};
+use super::shared::{IdentityMap, ParsedStatement, SessionAuthority, TransactionBlock};
 use super::{CancellationToken, OperationControl, SharedDatabase, Value, map_db_error, pg_error};
 
 #[derive(Clone)]
@@ -39,9 +39,8 @@ pub(super) struct OmenDbHandler {
     pub(super) database: SharedDatabase,
     pub(super) transactions: Arc<Mutex<HashMap<std::net::SocketAddr, TransactionBlock>>>,
     pub(super) cancellations: Arc<CancellationRegistry>,
-    /// Authenticated role per connection pid, recorded by the startup
-    /// handler after a successful exchange and read per statement for
-    /// grant enforcement.
+    /// Explicit authority per connection, installed only after successful
+    /// startup. Absence or registry poisoning never confers bootstrap access.
     pub(super) identities: Arc<IdentityMap>,
     pub(super) query_workers: Arc<QueryWorkers>,
     pub(super) statement_timeout: Option<Duration>,
@@ -179,7 +178,11 @@ impl OmenDbHandler {
                     .lock()
                     .ok()
                     .and_then(|identities| identities.get(&client_addr).cloned())
-                    .unwrap_or_else(|| "trust".to_owned());
+                    .map(|authority| match authority {
+                        SessionAuthority::Bootstrap => "bootstrap".to_owned(),
+                        SessionAuthority::Principal { login, .. } => login,
+                    })
+                    .unwrap_or_else(|| "unauthenticated".to_owned());
                 eprintln!(
                     "omendbd: slow statement: {{\"duration_ms\":{:.3},\"user\":\"{}\",\"statement\":\"{}\"}}",
                     elapsed.as_secs_f64() * 1000.0,
@@ -310,7 +313,8 @@ impl OmenDbHandler {
                 // shared access.
                 let response = (|| {
                     let database = read_lock_with_control(&self.database, control)?;
-                    self.validate_access(client_addr, &database, statement, control)?;
+                    let _authorization =
+                        self.validate_access(client_addr, &database, statement, control)?;
                     let result = transaction
                         .execute_bound_sql(&database, &statement.bound, params)
                         .map_err(map_db_error)?;
@@ -326,116 +330,46 @@ impl OmenDbHandler {
         }
     }
 
-    /// Enforce current committed wire grants. A missing pgwire_grants table
-    /// retains bootstrap access; once it exists, ungranted objects default to
-    /// deny. The wildcard "*" write grant authorizes schema administration.
-    /// Trust-mode connections carry no identity and are loopback-only.
-    fn enforce_grants(
+    /// Read current committed native authorization independently of any open
+    /// data transaction. Keep the owned view alive for the authorized operation;
+    /// execution uses the binder's TableIds, never a second name lookup.
+    fn authorize(
         &self,
         client_addr: std::net::SocketAddr,
         database: &crate::RelationalDatabase,
         access: &StatementAccess,
         control: &OperationControl,
-    ) -> PgWireResult<()> {
-        let Some(role) = self
+    ) -> PgWireResult<crate::AuthorizationView> {
+        let authority = self
             .identities
             .lock()
             .map_err(|_| pg_error("XX000", "identity registry poisoned".to_owned()))?
             .get(&client_addr)
             .cloned()
-        else {
-            return Ok(());
-        };
-
-        if !database
-            .catalog()
-            .tables()
-            .any(|table| table.name == "pgwire_grants")
-        {
-            return Ok(());
+            .ok_or_else(|| pg_error("42501", "session has no authorization identity".to_owned()))?;
+        let authorization = match authority {
+            SessionAuthority::Bootstrap => database.bootstrap_authorization(),
+            SessionAuthority::Principal { id, .. } => database.authorization(id),
         }
-        let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
-        let result = transaction.execute_sql_with_params(
-            database,
-            "SELECT table_name, can_read, can_write FROM pgwire_grants WHERE role = $1",
-            &[Value::Text(role.clone())],
-        );
-        drop(transaction);
-        let result = result.map_err(map_db_error)?;
+        .map_err(map_db_error)?;
         control.check().map_err(map_db_error)?;
-
-        // No rows at all means grants exist only for other roles; this
-        // role still defaults to deny.
-        let mut admin = false;
-        let mut table_grants: HashMap<String, (bool, bool)> = HashMap::new();
-        for row in &result.rows {
-            control.check().map_err(map_db_error)?;
-            let Some(Value::Text(table_name)) = row.first() else {
-                continue;
-            };
-            let can_read = matches!(row.get(1), Some(Value::Bool(true)));
-            let can_write = matches!(row.get(2), Some(Value::Bool(true)));
-            if table_name == "*" && can_write {
-                admin = true;
-            }
-            table_grants.insert(table_name.clone(), (can_read, can_write));
+        if access.requires_admin {
+            authorization
+                .require_administration(database)
+                .map_err(map_db_error)?;
         }
-
-        let StatementAccess {
-            read: read_tables,
-            write: write_tables,
-            requires_admin,
-        } = access;
-        // Admin grant must be consulted BEFORE refusing DDL.
-        if admin {
-            return Ok(());
+        for table in &access.write {
+            authorization
+                .require_write(database, *table)
+                .map_err(map_db_error)?;
         }
-        if *requires_admin {
-            return Err(pg_error(
-                "42501",
-                format!("permission denied: role {role} lacks schema administration grant"),
-            ));
+        for table in &access.read {
+            authorization
+                .require_read(database, *table)
+                .map_err(map_db_error)?;
         }
-        for table_id in write_tables {
-            let table = &database
-                .catalog()
-                .table(*table_id)
-                .map_err(map_db_error)?
-                .name;
-            match table_grants.get(table) {
-                Some((_, true)) => {}
-                _ => {
-                    return Err(pg_error(
-                        "42501",
-                        format!(
-                            "permission denied for table {table}: role {role} lacks write grant"
-                        ),
-                    ));
-                }
-            }
-        }
-        for table_id in read_tables {
-            if write_tables.contains(table_id) {
-                continue;
-            }
-            let table = &database
-                .catalog()
-                .table(*table_id)
-                .map_err(map_db_error)?
-                .name;
-            match table_grants.get(table) {
-                Some((true, _)) | Some((_, true)) => {}
-                _ => {
-                    return Err(pg_error(
-                        "42501",
-                        format!(
-                            "permission denied for table {table}: role {role} lacks read grant"
-                        ),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        control.check().map_err(map_db_error)?;
+        Ok(authorization)
     }
 
     /// Autocommit path: no transaction block exists for this connection.
@@ -451,7 +385,8 @@ impl OmenDbHandler {
         match statement.bound.effect {
             StatementEffect::Schema => {
                 let mut database = write_lock_with_control(&self.database, control)?;
-                self.validate_access(client_addr, &database, statement, control)?;
+                let _authorization =
+                    self.validate_access(client_addr, &database, statement, control)?;
                 encode_response_with_format(
                     crate::sql::execute_bound(&mut database, &statement.bound, params)
                         .map_err(map_db_error)?,
@@ -461,7 +396,8 @@ impl OmenDbHandler {
             }
             StatementEffect::Read => {
                 let database = read_lock_with_control(&self.database, control)?;
-                self.validate_access(client_addr, &database, statement, control)?;
+                let _authorization =
+                    self.validate_access(client_addr, &database, statement, control)?;
                 let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
                 let result = transaction.execute_bound_sql(&database, &statement.bound, params);
                 drop(transaction);
@@ -473,7 +409,8 @@ impl OmenDbHandler {
             }
             StatementEffect::Write => {
                 let mut database = write_lock_with_control(&self.database, control)?;
-                self.validate_access(client_addr, &database, statement, control)?;
+                let _authorization =
+                    self.validate_access(client_addr, &database, statement, control)?;
                 let (result, _) = database
                     .transaction_with_control(control, |database, transaction| {
                         let result =
@@ -728,7 +665,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
                 &*portal.state.lock().await,
                 pgwire::api::portal::PortalExecutionState::Initial
             );
-            if !initial {
+            let _authorization = if !initial {
                 let (cancellation, _lease) = self.begin_query(client);
                 let handler = self.clone();
                 let address = client.socket_addr();
@@ -738,10 +675,10 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
                         handler.validate_statement(address, &portal.statement.statement, &control)
                     })
                     .await
-                    .map_err(|error| {
-                        pg_error("XX000", format!("query worker failed: {error}"))
-                    })??;
-            }
+                    .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??
+            } else {
+                None
+            };
             self._on_execute(client, message).await
         }
         .await;
@@ -806,7 +743,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let control = handler.operation_control(&cancellation);
-                handler.validate_statement(address, &statement, &control)?;
+                let _authorization = handler.validate_statement(address, &statement, &control)?;
                 let fields = fields_from_columns(
                     &statement.bound.columns,
                     &pgwire::api::portal::Format::UnifiedText,
@@ -836,7 +773,7 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let control = handler.operation_control(&cancellation);
-                handler.validate_statement(address, &statement, &control)?;
+                let _authorization = handler.validate_statement(address, &statement, &control)?;
                 Ok(pgwire::api::results::DescribePortalResponse::new(
                     fields_from_columns(&statement.bound.columns, &format)?,
                 ))

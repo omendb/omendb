@@ -28,14 +28,6 @@ pub(crate) fn read_lock(
         .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
 }
 
-pub(crate) fn write_lock(
-    database: &SharedDatabase,
-) -> PgWireResult<std::sync::RwLockWriteGuard<'_, RelationalDatabase>> {
-    database
-        .write()
-        .map_err(|_| pg_error("XX000", "database lock poisoned".to_owned()))
-}
-
 pub(crate) fn read_lock_with_control<'a>(
     database: &'a SharedDatabase,
     control: &OperationControl,
@@ -529,8 +521,8 @@ fn close_shared_database(shared: SharedDatabase) -> Result<(), ServerError> {
 }
 
 /// Serve PostgreSQL wire clients on an already-bound listener until the
-/// listener errors. The listener's startup auth policy is derived from the
-/// durable auth catalog; empty credentials are trust-only on loopback.
+/// listener errors. Native authorization state is validated before serving;
+/// each connection selects current bootstrap (loopback only) or SCRAM mode.
 pub async fn serve(database: SharedDatabase, listener: TcpListener) -> std::io::Result<()> {
     let state = Arc::new(ServerState::new(Semaphore::MAX_PERMITS));
     let factory = build_factory(

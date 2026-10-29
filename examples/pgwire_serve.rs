@@ -43,8 +43,9 @@ fn main() -> anyhow::Result<()> {
     if let Ok(user) = std::env::var("PGWIRE_USER")
         && let Ok(password) = std::env::var("PGWIRE_PASSWORD")
     {
-        omendb::pgwire_server::provision_wire_user(&mut database, &user, &password)?;
-        println!("provisioned user {user}");
+        pgwire_server::provision_wire_user(&mut database, &user, &password)?;
+        pgwire_server::provision_wire_grant(&mut database, &user, "users", true, true)?;
+        println!("provisioned user {user} with users read/write access");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

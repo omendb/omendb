@@ -18,6 +18,8 @@ pub use crate::seer_direct::SchemaMutation;
 use crate::seer_direct::{DirectSeerStore, DirectTransaction};
 use crate::{CommitId, DbError, Key, Result, RowIdentity, SyncClass, TableId, Value};
 
+mod authorization;
+
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum statements accepted in one atomic SQL batch.

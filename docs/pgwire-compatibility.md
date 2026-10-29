@@ -9,8 +9,8 @@ in `tests/project_pgwire_server.rs` and `tests/project_transaction_controls.rs`:
 cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls
 ```
 
-The [gap register](gap-register.md) qualifies this evidence. Name-keyed grants
-and other serving-path boundaries remain open; the intended
+The [gap register](gap-register.md) qualifies this evidence. Integrity and
+resource-boundary limitations remain open; the intended
 [product architecture](architecture.md) is not a compatibility claim.
 
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
@@ -32,9 +32,9 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Connection admission | `ServerConfig::max_connections` is a hard bound; excess sockets are rejected and counted. | `persistent_server_rejects_connections_over_bound` |
 | Statement deadline | `ServerConfig::statement_timeout` and `--statement-timeout-ms` apply a cooperative deadline to each statement and describe; expiry maps to `57014`. Schema publication remains non-interruptible after its preflight. | `persistent_server_statement_timeout_cancels_before_execution` |
 | Result payload bound | `ServerConfig::max_result_bytes` and `--max-result-bytes` reject an estimated materialized result payload above the configured bound with `54000`. This limits response payload admission, not execution memory. | `persistent_server_rejects_result_over_byte_bound` |
-| Trust startup | Empty auth catalogs use trust only on loopback. | `wire_trust_mode_refuses_non_loopback_listener` |
-| SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
-| Authorization | Preparation, Describe, and execution check current committed read, write, and schema-admin grants, including nested access. Prepared bindings and older transaction snapshots do not retain revoked grants. Transaction controls require no schema-admin grant. Name-keyed grant and bootstrap limitations remain in the gap register. | `wire_grant_enforcement_reader_writer_admin` |
+| Bootstrap startup | Fresh databases explicitly enable loopback-only bootstrap. Creating the first principal disables it; later connections use current native state and existing bootstrap connections lose future query permission. | `wire_trust_mode_refuses_non_loopback_listener`, `wire_live_bootstrap_transition_uses_native_default_deny` |
+| SCRAM startup | Native credentials authenticate with SCRAM-SHA-256 and pin the principal incarnation used for proof. Startup errors are fatal; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts`, `tests/project_pgwire_authorization.rs` |
+| Authorization | Native grants bind principal and table incarnations; administration is explicit. Preparation, Describe, and every Execute check current committed authority, including nested access. Older data snapshots do not retain revoked grants; already-authorized commit and cleanup do not reauthorize. Missing authority fails closed. | `wire_grant_enforcement_reader_writer_admin`, `retained_describe_checks_revocation_and_aborts_staged_writes`, `tests/project_authorization.rs` |
 | Diagnostics | `RunningServer::status()` reports connection admission and tracked query/describe worker outcomes. | `persistent_server_reopens_durable_database_after_shutdown`, `query_worker_tracker_records_terminal_operation_outcomes` (unit) |
 | Slow statement log | `ServerConfig::slow_statement_threshold` / `--slow-statement-ms N` log statements (execution plus commit publication) above the threshold to stderr as one structured line: duration, authenticated user, single-line statement. Default off. | `omendbd_logs_slow_statements_when_threshold_set` |
 | EXPLAIN | `EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` reports the same access path the executor takes: primary-key lookup, index scan, NULL short-circuit, or seq scan. `EXPLAIN ANALYZE` is refused. Grant analysis recurses into the explained statement. | `explain_names_the_access_path_execution_takes`, `explain_reports_access_path_through_wire` |
@@ -46,7 +46,7 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 
 | Surface | Current behavior | Evidence |
 | --- | --- | --- |
-| Startup and authentication | PostgreSQL startup packets use trust or SCRAM according to the durable auth catalog. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `pgwire_sasl_initial_response_decode_probe` |
+| Startup and authentication | PostgreSQL startup packets use explicit bootstrap or SCRAM according to the native authorization catalog. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `pgwire_sasl_initial_response_decode_probe` |
 | Simple queries | Statement splitting respects literals, identifiers and comments. Multiple statements outside explicit blocks still commit individually, not as one implicit transaction. | `plain_controls_and_lexical_boundaries_are_preserved`, `wire_transaction_block_rollback_discards_writes` |
 | Extended queries | Parse binds supported SQL without execution. Describe and execution share fixed parameter/result signatures. Catalog changes, including direct-API DDL, require reprepare (`0A000`). Incremental Execute row limits are refused (`0A000`). | `describe_binds_without_evaluating_rows_or_benign_parameter_values`, `prepared_signature_cannot_drift_after_direct_api_ddl`, `wire_portal_execute_checks_failed_blocks_and_refuses_incremental_fetch`, `wire_hot_statement_repeats_across_params` |
 | Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; all supported result signatures come from binding, not observed rows. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |

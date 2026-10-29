@@ -1,6 +1,6 @@
 //! PostgreSQL wire-protocol serving for the bounded embedded SQL tier.
 //!
-//! V1 scope: loopback trust or catalog-backed SCRAM authentication, simple and
+//! V1 scope: explicit loopback bootstrap or native-principal SCRAM authentication, simple and
 //! extended query protocols with parameterized execution, cooperative query
 //! cancellation, and wire transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`)
 //! mapped to the typed transaction API with PostgreSQL aborted-state semantics.
@@ -8,7 +8,7 @@
 //! documentation.
 //!
 //! The implementation is split by lifecycle concern: `auth`
-//! (trust/SCRAM/grants/startup), `lifecycle` (configuration, admission,
+//! (bootstrap/SCRAM/native provisioning/startup), `lifecycle` (configuration, admission,
 //! worker accounting, shutdown), `cancellation` (cancel-request routing),
 //! `encoding` (typed wire formats), and `handler` (statement execution and
 //! protocol dispatch). Shared shapes live in `shared`.
@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::{CancellationToken, OperationControl, RelationalDatabase, Value};
 
-pub use auth::{provision_wire_grant, provision_wire_user};
+pub use auth::{provision_wire_admin, provision_wire_grant, provision_wire_user};
 pub use lifecycle::{
     RunningServer, ServerConfig, ServerError, ServerShutdownHandle, ServerStatus, serve, spawn,
 };
@@ -54,6 +54,7 @@ pub(super) fn map_db_error(error: crate::DbError) -> PgWireError {
             "57014",
             "canceling statement due to user request".to_owned(),
         ),
+        crate::DbError::PermissionDenied(_) => ("42501", error.to_string()),
         crate::DbError::TransactionAborted => ("25P02", error.to_string()),
         crate::DbError::SqlPreparedStatementInvalidated => ("0A000", error.to_string()),
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
@@ -133,6 +134,7 @@ mod tests {
                 DbError::SqlParameter("missing parameter".to_owned()),
                 "08P01",
             ),
+            (DbError::PermissionDenied("denied".to_owned()), "42501"),
             (DbError::TransactionAborted, "25P02"),
             (DbError::SqlPreparedStatementInvalidated, "0A000"),
             (DbError::SqlIndeterminateParameter { index: 1 }, "42P18"),

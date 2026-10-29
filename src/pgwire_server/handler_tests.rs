@@ -2,6 +2,62 @@ use super::*;
 use pgwire::api::DefaultClient;
 
 #[test]
+fn missing_or_poisoned_identity_never_confers_bootstrap_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Arc::new(std::sync::RwLock::new(
+        crate::RelationalDatabase::create(crate::RelationalBackendConfig::new(
+            directory.path().join("db"),
+        ))
+        .unwrap(),
+    ));
+    let address = "127.0.0.1:6543".parse().unwrap();
+    let factory = super::super::auth::build_factory(
+        &database,
+        address,
+        Arc::new(QueryWorkers::new()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let handler = &factory.handler;
+    let control = OperationControl::default();
+    let run = |sql| {
+        handler.run_statement(
+            address,
+            sql,
+            &[],
+            &pgwire::api::portal::Format::UnifiedText,
+            &control,
+        )
+    };
+    run("BEGIN").unwrap();
+    let PgWireError::UserError(error) = run("SELECT 1").unwrap_err() else {
+        panic!("expected authorization error");
+    };
+    assert_eq!(error.code, "42501");
+    assert!(
+        handler.lock_transactions().unwrap()[&address]
+            .transaction
+            .is_none()
+    );
+    run("ROLLBACK").unwrap();
+    handler
+        .identities
+        .lock()
+        .unwrap()
+        .insert(address, SessionAuthority::Bootstrap);
+    run("SELECT 1").unwrap();
+    let identities = handler.identities.clone();
+    let _ = std::panic::catch_unwind(move || {
+        let _guard = identities.lock().unwrap();
+        panic!("poison registry");
+    });
+    assert!(run("SELECT 1").is_err());
+    run("ROLLBACK").unwrap();
+}
+
+#[test]
 fn idle_expiry_releases_transactions_without_restoring_autocommit() {
     let directory = tempfile::tempdir().unwrap();
     let mut database = crate::RelationalDatabase::create(crate::RelationalBackendConfig::new(
@@ -23,6 +79,11 @@ fn idle_expiry_releases_transactions_without_restoring_autocommit() {
     )
     .unwrap();
     let handler = &factory.handler;
+    handler
+        .identities
+        .lock()
+        .unwrap()
+        .insert(address, SessionAuthority::Bootstrap);
     let control = OperationControl::with_cancellation(CancellationToken::new());
     let run = |sql| {
         handler.run_statement(

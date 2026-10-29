@@ -27,5 +27,15 @@ pub(super) struct TransactionBlock {
     pub(super) last_used: Instant,
 }
 
-pub(super) type IdentityMap = Mutex<HashMap<std::net::SocketAddr, String>>;
+/// Mandatory, explicit authority installed only by successful startup.
+#[derive(Clone, Debug)]
+pub(super) enum SessionAuthority {
+    Bootstrap,
+    Principal {
+        id: crate::PrincipalId,
+        login: String,
+    },
+}
+
+pub(super) type IdentityMap = Mutex<HashMap<std::net::SocketAddr, SessionAuthority>>;
 pub(super) type FailureDelays = Mutex<std::collections::HashMap<std::net::IpAddr, u32>>;

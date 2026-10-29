@@ -10,6 +10,7 @@
 //! backend and a bounded SQL/wire implementation. It is not yet the target
 //! concurrent, restart-safe native relational engine.
 
+mod authorization;
 mod fault;
 mod model;
 mod morsel;
@@ -27,6 +28,7 @@ mod sql;
 mod sql_dump;
 mod sql_types;
 
+pub use authorization::{AuthorizationView, Principal, PrincipalId};
 pub use fault::{FailOnce, FaultInjector, FaultPoint, NoFaults};
 pub use model::{CommitId, IndexId, Key, Mutation, StorageIdentity};
 pub use morsel::{
@@ -138,6 +140,8 @@ pub enum DbError {
     WriteWriteConflict { table: u64, writer: usize },
     #[error("resource limit exceeded: {0}")]
     ResourceLimitExceeded(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("invalid database state: {0}")]
     InvalidState(String),
     #[error("transaction is aborted; begin a new transaction to continue")]
@@ -263,6 +267,7 @@ impl DbError {
                 TransactionErrorClass::SnapshotUnavailable
             }
             Self::InvalidState(_)
+            | Self::PermissionDenied(_)
             | Self::TransactionAborted
             | Self::SqlPreparedStatementInvalidated
             | Self::SqlIndeterminateParameter { .. }

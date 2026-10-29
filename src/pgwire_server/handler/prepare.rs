@@ -109,7 +109,7 @@ impl OmenDbHandler {
                     })
             })
             .collect::<PgWireResult<Vec<_>>>()?;
-        self.enforce_grants(address, &database, &bound.access, control)?;
+        let _authorization = self.authorize(address, &database, &bound.access, control)?;
         control.check().map_err(map_db_error)?;
         Ok(ParsedStatement {
             sql: source.to_owned(),
@@ -123,7 +123,7 @@ impl OmenDbHandler {
         address: std::net::SocketAddr,
         statement: &ParsedStatement,
         control: &OperationControl,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<Option<crate::AuthorizationView>> {
         control.check().map_err(map_db_error)?;
         let transaction_control = match statement.bound.effect {
             StatementEffect::Control(control) => Some(control),
@@ -132,11 +132,12 @@ impl OmenDbHandler {
         self.check_boundary(address, transaction_control)?;
         // Cleanup owns no catalog dependencies and must always remain usable.
         if transaction_control.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let database = read_lock_with_control(&self.database, control)?;
-        self.validate_access(address, &database, statement, control)?;
-        self.check_transaction_catalog(address, &database)
+        let authorization = self.validate_access(address, &database, statement, control)?;
+        self.check_transaction_catalog(address, &database)?;
+        Ok(Some(authorization))
     }
 
     // Execution calls this while holding the same catalog guard it uses for
@@ -147,10 +148,9 @@ impl OmenDbHandler {
         database: &crate::RelationalDatabase,
         statement: &ParsedStatement,
         control: &OperationControl,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<crate::AuthorizationView> {
         crate::sql::validate_bound(database, &statement.bound).map_err(map_db_error)?;
-        self.enforce_grants(address, database, &statement.bound.access, control)?;
-        control.check().map_err(map_db_error)
+        self.authorize(address, database, &statement.bound.access, control)
     }
 }
 

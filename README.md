@@ -12,7 +12,7 @@ not implementation claims.
 
 **Developer preview.** The server alpha is still in development. SQL coverage,
 APIs, persistence formats, and supported platforms are subject to change.
-Known authorization and failed-statement integrity gaps make the current preview
+Known integrity and resource-boundary gaps make the current preview
 unsuitable for untrusted clients or irreplaceable data. See the
 [known limitations](docs/gap-register.md).
 
@@ -25,9 +25,11 @@ cargo run --features pgwire --bin omendbd -- \
   --path ./omendb-data --bind 127.0.0.1:5432
 ```
 
-The daemon opens or creates the database and closes it on Ctrl-C. An empty
-authentication catalog permits trust authentication on loopback only. Provision
-SCRAM users before enabling authenticated access; see the [runbook](docs/runbook.md).
+The daemon opens or creates the database and closes it on Ctrl-C. New databases
+have an explicit loopback-only bootstrap capability. Creating the first native
+principal disables bootstrap; deleting users does not restore it. SCRAM users
+need explicit table grants or database administration. See the
+[runbook](docs/runbook.md) for provisioning and legacy-database initialization.
 The server does not terminate TLS.
 
 The current interface supports a bounded SQL subset, transaction blocks,

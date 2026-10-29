@@ -17,6 +17,8 @@ use crate::relational::{
 };
 use crate::{DbError, IndexId, Key, Result};
 
+mod authorization;
+
 const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC1";
 const DIRECT_CATALOG_MARKER: &[u8] = b"\x00omendb/direct/catalog/v1";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -48,6 +50,7 @@ impl DirectSeerStore {
         transaction
             .put(catalog_tree, DIRECT_CATALOG_MARKER, &state)
             .map_err(map_seer_error)?;
+        authorization::initialize_new(&mut transaction, catalog_tree)?;
         let catalog_version = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         Ok(Self {
@@ -96,6 +99,7 @@ impl DirectSeerStore {
             &table_trees,
             &index_trees,
         )?;
+        authorization::validate_existing(&mut transaction, catalog_tree, &table_trees)?;
         transaction.abort().map_err(map_seer_error)?;
         drop(transaction);
         // Prepared bindings never survive this handle. Subsequent schema
@@ -498,6 +502,15 @@ impl DirectSeerStore {
             }
         }
 
+        // Grants to dropped incarnations disappear in the schema decision,
+        // never by a later name-based cleanup transaction.
+        if mutations
+            .iter()
+            .any(|mutation| matches!(mutation, SchemaMutation::DropTable { .. }))
+        {
+            self.prune_authorization(&mut transaction, &table_trees)?;
+        }
+
         // Phase 2: publish the candidate catalog in the same transaction.
         let state = encode_catalog_state(&candidate, &table_trees, &index_trees)?;
         transaction
@@ -771,6 +784,8 @@ pub(crate) struct DirectTransaction {
     table_trees: BTreeMap<TableId, TreeId>,
     index_trees: BTreeMap<IndexId, TreeId>,
     transaction: Transaction,
+    catalog_tree: TreeId,
+    rows_changed: bool,
     /// Heap (primary-key-less) inserts this transaction has staged. The
     /// engine-allocated identity is derived from the durable transaction
     /// ID so identities are unique without a durable counter: TxnIds
@@ -804,6 +819,8 @@ impl DirectTransaction {
             table_trees: store.table_trees.clone(),
             index_trees: store.index_trees.clone(),
             transaction,
+            catalog_tree: store.catalog_tree,
+            rows_changed: false,
             heap_inserts: 0,
         })
     }
@@ -975,6 +992,7 @@ impl DirectTransaction {
                 identity, table.0
             )));
         }
+        self.rows_changed = true;
         self.transaction
             .put(tree, &identity, &encode_row(&row)?)
             .map_err(map_seer_error)?;
@@ -996,6 +1014,7 @@ impl DirectTransaction {
             .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
         let previous = row_from_storage_identity(&self.catalog, &definition, &identity, &bytes)?;
         self.stage_indexes_for(table, &definition, &previous, &identity, false)?;
+        self.rows_changed = true;
         self.transaction
             .put(tree, &identity, &encode_row(&row)?)
             .map_err(map_seer_error)?;
@@ -1012,6 +1031,7 @@ impl DirectTransaction {
             .map_err(map_seer_error)?
             .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
         let row = row_from_storage_identity(&self.catalog, &definition, identity, &bytes)?;
+        self.rows_changed = true;
         self.transaction
             .delete(tree, identity)
             .map_err(map_seer_error)?;
@@ -1161,7 +1181,11 @@ impl DirectTransaction {
     /// Publish every staged change atomically after validating immediate
     /// foreign-key constraints against the transaction's own final state.
     pub(crate) fn commit(mut self) -> Result<CommitSeq> {
-        self.validate_referential_integrity()?;
+        // Authorization-only commits do not inspect relational rows or
+        // acquire FK dependencies on already-authorized concurrent work.
+        if self.rows_changed {
+            self.validate_referential_integrity()?;
+        }
         self.transaction
             .commit()
             .map_err(map_seer_error)
