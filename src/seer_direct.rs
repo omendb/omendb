@@ -582,19 +582,7 @@ impl DirectSeerStore {
         foreign_key: ForeignKeyDefinition,
         name: Option<String>,
     ) -> Result<CommitSeq> {
-        let candidate = {
-            let mut candidate = self.catalog.clone();
-            match &name {
-                Some(name) => {
-                    candidate.create_named_foreign_key(foreign_key.clone(), name.clone())?
-                }
-                None => candidate.create_foreign_key(foreign_key.clone())?,
-            }
-            candidate
-        };
-        self.begin_transaction()?
-            .validate_one_foreign_key(&foreign_key)?;
-        self.publish_catalog(candidate)
+        self.apply_schema_mutations(&[SchemaMutation::AddForeignKey { foreign_key, name }])
     }
 
     fn publish_catalog(&mut self, candidate: Catalog) -> Result<CommitSeq> {
@@ -818,39 +806,6 @@ impl DirectTransaction {
             transaction,
             heap_inserts: 0,
         })
-    }
-
-    /// Validate that current snapshot-plus-staged rows already satisfy one
-    /// newly created foreign-key definition. The reads register on this
-    /// scratch transaction, which is never committed; the publication
-    /// that follows runs in a separate transaction, so registration here
-    /// fences nothing.
-    pub(crate) fn validate_one_foreign_key(
-        &mut self,
-        foreign_key: &ForeignKeyDefinition,
-    ) -> Result<()> {
-        let parts = resolve_foreign_key_parts(&self.catalog, foreign_key)?;
-        let referenced_entries = self
-            .transaction
-            .scan(
-                self.index_tree(parts.referenced_index.id)?,
-                &[],
-                None,
-                usize::MAX,
-            )
-            .map_err(map_seer_error)?;
-        let child_entries = self
-            .transaction
-            .scan(self.table_tree(foreign_key.table)?, &[], None, usize::MAX)
-            .map_err(map_seer_error)?;
-        let referenced_values = decode_referenced_values(&referenced_entries);
-        validate_child_references(
-            &self.catalog,
-            foreign_key,
-            &parts,
-            &referenced_values,
-            &child_entries,
-        )
     }
 
     fn table_tree(&self, table: TableId) -> Result<TreeId> {
@@ -1554,8 +1509,8 @@ pub enum SchemaMutation {
         index: IndexDefinition,
         name: Option<String>,
     },
-    /// Register one named foreign key after validating existing rows
-    /// against it (same validation as the direct create path).
+    /// Validate existing references and publish one foreign key in the same
+    /// transaction, with read dependencies on the child and referenced index.
     AddForeignKey {
         foreign_key: ForeignKeyDefinition,
         name: Option<String>,

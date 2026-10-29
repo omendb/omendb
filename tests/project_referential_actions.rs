@@ -490,6 +490,87 @@ fn overlapping_parent_delete_and_child_insert_cannot_both_commit() {
 }
 
 #[test]
+fn foreign_key_activation_and_overlapping_writes_cannot_both_commit() {
+    let (_directory, mut database) = setup();
+    database.insert(PARENTS, row(PARENTS, 1, Some(0))).unwrap();
+    let mut seed = database.begin().unwrap();
+    // Enough references to overlap a real validation scan without test hooks
+    // or timing assumptions. Either publication order is valid, never both.
+    for id in 1..=500 {
+        seed.insert(&database, CHILDREN, row(CHILDREN, id, Some(1)))
+            .unwrap();
+    }
+    seed.commit().unwrap();
+    for named in [false, true] {
+        for delete_parent in [false, true] {
+            for _ in 0..8 {
+                let mut writer = database.begin().unwrap();
+                if delete_parent {
+                    writer
+                        .delete(&database, PARENTS, key_of(PARENTS, 1))
+                        .unwrap();
+                } else {
+                    writer
+                        .insert(&database, CHILDREN, row(CHILDREN, 1000, Some(2)))
+                        .unwrap();
+                }
+                let barrier = std::sync::Barrier::new(2);
+                let (activation, writing) = std::thread::scope(|scope| {
+                    let writer = scope.spawn(|| {
+                        barrier.wait();
+                        writer.commit()
+                    });
+                    barrier.wait();
+                    let definition = fk(1, CHILDREN, PARENTS, omendb::ReferentialAction::Restrict);
+                    let activation = if named {
+                        database.create_named_foreign_key(definition, "child_parent".into())
+                    } else {
+                        database.create_foreign_key(definition)
+                    };
+                    (activation, writer.join().unwrap())
+                });
+                assert!(
+                    activation.is_err() || writing.is_err(),
+                    "activation and invalidating write both committed (named={named}, delete_parent={delete_parent})"
+                );
+                if let Err(error) = &activation {
+                    assert!(
+                        matches!(
+                            error,
+                            omendb::DbError::ForeignKeyViolation { .. }
+                                | omendb::DbError::SerializationConflict { .. }
+                        ),
+                        "unexpected activation failure: {error:?}"
+                    );
+                }
+                if let Err(error) = &writing {
+                    assert!(
+                        matches!(error, omendb::DbError::SerializationConflict { .. }),
+                        "unexpected writer failure: {error:?}"
+                    );
+                }
+                // Restore valid, unconstrained state regardless of which
+                // operation won, before trying another interleaving.
+                if writing.is_ok() {
+                    if delete_parent {
+                        database.insert(PARENTS, row(PARENTS, 1, Some(0))).unwrap();
+                    } else {
+                        database.delete(CHILDREN, key_of(CHILDREN, 1000)).unwrap();
+                    }
+                }
+                if activation.is_ok() {
+                    database
+                        .apply_schema_mutations(&[omendb::SchemaMutation::DropForeignKey {
+                            constraint: ConstraintId(1),
+                        }])
+                        .unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn transaction_started_before_fk_activation_cannot_publish_dangling_reference() {
     let (_directory, mut database) = setup();
     seed(&mut database);

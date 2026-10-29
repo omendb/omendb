@@ -9,9 +9,9 @@ in `tests/project_pgwire_server.rs` and `tests/project_transaction_controls.rs`:
 cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls
 ```
 
-The [gap register](gap-register.md) qualifies this evidence. Name-keyed grants,
-typed FK schema publication, and other serving-path boundaries remain open;
-the intended [product architecture](architecture.md) is not a compatibility claim.
+The [gap register](gap-register.md) qualifies this evidence. Name-keyed grants
+and other serving-path boundaries remain open; the intended
+[product architecture](architecture.md) is not a compatibility claim.
 
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
 representative documented subset against PostgreSQL. It is ignored in ordinary
