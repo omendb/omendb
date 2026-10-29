@@ -773,6 +773,16 @@ impl RelationalDatabaseTransaction {
         self.snapshot
     }
 
+    /// Return the catalog retained with this transaction's row/index snapshot.
+    /// Later DDL does not change this view. SQL still refuses execution after a
+    /// catalog-generation change; current authorization is a separate view.
+    pub fn catalog(&self) -> Result<&Catalog> {
+        self.backend
+            .as_ref()
+            .map(DirectTransaction::catalog)
+            .ok_or(DbError::TransactionAborted)
+    }
+
     /// Return whether no writes have been staged.
     #[must_use]
     pub(crate) fn is_read_only(&self) -> bool {
@@ -824,9 +834,10 @@ impl RelationalDatabaseTransaction {
         primary: Key,
     ) -> Result<()> {
         self.operation(store, |transaction| {
-            store.catalog().table(table)?;
+            let catalog = transaction.catalog()?;
+            catalog.table(table)?;
             validate_legacy_key(table, primary)?;
-            if store.catalog().primary_key(table).is_some() {
+            if catalog.primary_key(table).is_some() {
                 return Err(DbError::InvalidState(
                     "legacy key delete requires a legacy primary-key table; use delete_row"
                         .to_owned(),
@@ -847,8 +858,9 @@ impl RelationalDatabaseTransaction {
         row: Row,
     ) -> Result<()> {
         self.operation(store, |transaction| {
-            let definition = store.catalog().table(table)?;
-            let identity = row_identity_bytes(store.catalog(), definition, &row)?;
+            let catalog = transaction.catalog()?;
+            let definition = catalog.table(table)?;
+            let identity = row_identity_bytes(catalog, definition, &row)?;
             transaction.backend_mut().delete(table, &identity)?;
             transaction.wrote = true;
             Ok(())
@@ -863,9 +875,10 @@ impl RelationalDatabaseTransaction {
         primary: Key,
     ) -> Result<Option<Row>> {
         self.operation(store, |transaction| {
-            store.catalog().table(table)?;
+            let catalog = transaction.catalog()?;
+            catalog.table(table)?;
             validate_legacy_key(table, primary)?;
-            if store.catalog().primary_key(table).is_some() {
+            if catalog.primary_key(table).is_some() {
                 return Err(DbError::InvalidState(
                     "legacy key lookup requires a legacy primary-key table; use get_by_identity"
                         .to_owned(),
@@ -884,8 +897,11 @@ impl RelationalDatabaseTransaction {
         identity: &RowIdentity,
     ) -> Result<Option<Row>> {
         self.operation(store, |transaction| {
-            let bytes =
-                crate::relational::row_identity_bytes_for_lookup(store.catalog(), table, identity)?;
+            let bytes = crate::relational::row_identity_bytes_for_lookup(
+                transaction.catalog()?,
+                table,
+                identity,
+            )?;
             transaction.backend_mut().get(table, &bytes)
         })
     }

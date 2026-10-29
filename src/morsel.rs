@@ -427,8 +427,9 @@ impl AnalyticalExecutor {
         query: &AnalyticalQuery,
         control: &OperationControl,
     ) -> Result<AnalyticalResult> {
-        let catalog = database.catalog();
-        let table_def = catalog.table(query.table)?;
+        // Retain this layout while scanning mutates the transaction's read
+        // dependencies. The database's live catalog may describe newer rows.
+        let table_def = transaction.catalog()?.table(query.table)?.clone();
 
         let mut scanner = MorselScanner::new(query.table, query.morsel_size);
         let mut morsels_processed = 0;
@@ -459,7 +460,7 @@ impl AnalyticalExecutor {
                 for row in &morsel.rows {
                     for (acc, spec) in accumulators.iter_mut().zip(&query.aggregates) {
                         let value = if let Some(col_id) = spec.column {
-                            Some(row.value(table_def, col_id)?)
+                            Some(row.value(&table_def, col_id)?)
                         } else {
                             None
                         };
@@ -492,7 +493,7 @@ impl AnalyticalExecutor {
             for row in &morsel.rows {
                 let mut group_key = Vec::with_capacity(query.group_by.len());
                 for col_id in &query.group_by {
-                    group_key.push(row.value(table_def, *col_id)?.clone());
+                    group_key.push(row.value(&table_def, *col_id)?.clone());
                 }
 
                 if !groups.contains_key(&group_key) {
@@ -514,7 +515,7 @@ impl AnalyticalExecutor {
                 let accs = groups.get_mut(&group_key).expect("group exists");
                 for (acc, spec) in accs.iter_mut().zip(&query.aggregates) {
                     let value = if let Some(col_id) = spec.column {
-                        Some(row.value(table_def, col_id)?)
+                        Some(row.value(&table_def, col_id)?)
                     } else {
                         None
                     };

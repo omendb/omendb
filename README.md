@@ -67,6 +67,12 @@ aborts the entire typed transaction, even if its error is caught. Later operatio
 and `commit()` return `DbError::TransactionAborted`; begin a new transaction to
 continue. Statement-level recovery and savepoints are not supported.
 
+Typed transactions retain their catalog alongside their row/index snapshot;
+`transaction.catalog()` exposes that layout even after later DDL. Old writers
+conflict with schema publication rather than omitting new constraints or indexes.
+SQL inside an existing transaction conservatively rejects catalog-generation
+changes; start a new transaction.
+
 ## Storage and tools
 
 OmenDB owns SQL, catalog and relational semantics plus the physical meaning of

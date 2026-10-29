@@ -825,6 +825,10 @@ impl DirectTransaction {
         })
     }
 
+    pub(crate) fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     fn table_tree(&self, table: TableId) -> Result<TreeId> {
         self.table_trees
             .get(&table)
