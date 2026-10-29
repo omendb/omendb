@@ -317,18 +317,7 @@ fn alter_table_mutation(
                     }])
                 }
                 sqlparser::ast::TableConstraint::ForeignKey(foreign_key) => {
-                    if foreign_key.index_name.is_some()
-                        || foreign_key.on_delete.is_some()
-                        || foreign_key.on_update.is_some()
-                        || foreign_key.match_kind.is_some()
-                        || foreign_key.characteristics.is_some()
-                        || foreign_key.columns.len() != foreign_key.referred_columns.len()
-                    {
-                        return Err(unsupported(
-                            "ALTER TABLE",
-                            "only immediate foreign keys with explicit columns are supported",
-                        ));
-                    }
+                    let on_delete = super::binding::foreign_key_delete_action(foreign_key)?;
                     let foreign_table_name =
                         simple_object_name(&foreign_key.foreign_table, "table")?;
                     let referenced_table = if table.name == foreign_table_name {
@@ -356,7 +345,7 @@ fn alter_table_mutation(
                                     column_id_by_name(referenced_table, &column.value, "referenced")
                                 })
                                 .collect::<Result<Vec<_>>>()?,
-                            on_delete: crate::ReferentialAction::default(),
+                            on_delete,
                             timing: crate::ConstraintTiming::default(),
                         },
                         name: foreign_key.name.as_ref().map(|name| name.value.clone()),
@@ -736,19 +725,7 @@ pub(super) fn execute_create_table(
                 });
             }
             TableConstraint::ForeignKey(foreign_key) => {
-                if foreign_key.index_name.is_some()
-                    || foreign_key.on_delete.is_some()
-                    || foreign_key.on_update.is_some()
-                    || foreign_key.match_kind.is_some()
-                    || foreign_key.characteristics.is_some()
-                    || foreign_key.columns.is_empty()
-                    || foreign_key.columns.len() != foreign_key.referred_columns.len()
-                {
-                    return Err(unsupported(
-                        "CREATE TABLE",
-                        "only immediate foreign keys with explicit columns are supported",
-                    ));
-                }
+                let on_delete = super::binding::foreign_key_delete_action(foreign_key)?;
                 let foreign_table_name = simple_object_name(&foreign_key.foreign_table, "table")?;
                 let referenced_table = if table.name == foreign_table_name {
                     &table
@@ -775,7 +752,7 @@ pub(super) fn execute_create_table(
                         columns,
                         referenced_table: referenced_table.id,
                         referenced_columns,
-                        on_delete: crate::ReferentialAction::default(),
+                        on_delete,
                         timing: crate::ConstraintTiming::default(),
                     },
                     name: foreign_key.name.as_ref().map(|name| name.value.clone()),

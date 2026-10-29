@@ -16,7 +16,6 @@ not treat current erroneous output as the contract.
 | Boundary | Known limitation | Source |
 | --- | --- | --- |
 | Wire statement lists | Multiple statements outside explicit blocks commit individually rather than sharing the simple message's implicit transaction boundary. Lexical splitting now respects quoted/commented semicolons. | `src/pgwire_server/handler.rs::do_query` |
-| Logical conversion | Dump/restore omits supported FK delete actions, converting Cascade to Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |
 | Constraint timing | Immediate and deferred typed FKs both validate at publication; advertised statement-time FK behavior is unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity` |
 
 ## Resource and execution limits

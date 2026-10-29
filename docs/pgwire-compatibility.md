@@ -42,6 +42,12 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | SHOW | The compatibility GUCs clients probe: `server_version`, `server_encoding`, `client_encoding`, `transaction_isolation` (reports `serializable` — read-write transactions certify first-committer-wins with SQLSTATE 40001 aborts), `standard_conforming_strings`, `max_connections`, `search_path`. Others are refused with the supported list. | `psql_session_matrix_matches_alpha_contract` |
 | Real client matrix | Interactive psql 17 runs the alpha contract: plain SQL in one session, capability detection, honest `feature not supported` failures for pg_catalog meta-commands (`\dt`, `\d`, `\l`) with the session staying usable, and explicit transaction blocks. | `tests/project_psql_session.rs` (self-skips without psql on PATH) |
 
+SQL foreign keys support explicit column pairs and `ON DELETE RESTRICT`,
+`CASCADE` and `SET NULL` in `CREATE TABLE` and `ALTER TABLE ADD CONSTRAINT`.
+Explicit `NO ACTION`, `SET DEFAULT`, `ON UPDATE`, `MATCH` and deferrability clauses
+are refused. Publication-time FK validation is not qualification of PostgreSQL's
+statement-time constraint semantics; see the [known gaps](gap-register.md).
+
 ## Wire protocol
 
 | Surface | Current behavior | Evidence |

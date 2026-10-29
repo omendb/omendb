@@ -18,7 +18,7 @@ mod rewrite;
 mod scope;
 mod writes;
 
-pub(crate) use ddl::sql_type;
+pub(crate) use ddl::{foreign_key_delete_action, sql_type};
 
 #[cfg(test)]
 mod tests;

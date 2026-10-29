@@ -742,7 +742,13 @@ async fn dump_restores_into_live_postgresql() -> Result<()> {
              group_id BIGINT,
              FOREIGN KEY (group_id) REFERENCES dump_groups (id)
          )",
-        "INSERT INTO dump_groups (id, name) VALUES (1, 'alpha'), (2, 'beta')",
+        "CREATE TABLE dump_cascades (id BIGINT PRIMARY KEY, group_id BIGINT,
+             FOREIGN KEY (group_id) REFERENCES dump_groups(id) ON DELETE CASCADE)",
+        "CREATE TABLE dump_nulls (id BIGINT PRIMARY KEY, group_id BIGINT,
+             FOREIGN KEY (group_id) REFERENCES dump_groups(id) ON DELETE SET NULL)",
+        "INSERT INTO dump_groups (id, name) VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
+        "INSERT INTO dump_cascades VALUES (11, 3)",
+        "INSERT INTO dump_nulls VALUES (12, 3)",
         "INSERT INTO dump_accounts (id, label, ratio, opened, price, token, payload, group_id) VALUES
              (1, 'first', 0.5, '2026-01-15', '19.99', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '\\xabcd', 1),
              (2, 'second', 'NaN', '2025-12-31', '-0.001', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', '\\x', 2),
@@ -759,7 +765,9 @@ async fn dump_restores_into_live_postgresql() -> Result<()> {
     let (postgres, postgres_connection) = connect(&postgres_url).await?;
     postgres
         .batch_execute(
-            "DROP TABLE IF EXISTS dump_accounts;
+            "DROP TABLE IF EXISTS dump_cascades;
+             DROP TABLE IF EXISTS dump_nulls;
+             DROP TABLE IF EXISTS dump_accounts;
              DROP TABLE IF EXISTS dump_groups;",
         )
         .await
@@ -813,10 +821,28 @@ async fn dump_restores_into_live_postgresql() -> Result<()> {
         .await;
     assert!(orphan.is_err(), "restored FK must reject orphans in PG");
 
-    // Unique constraint survives the round trip.
+    // Delete actions survive the export into an independent SQL engine.
+    postgres
+        .execute("DELETE FROM dump_groups WHERE id = 3", &[])
+        .await?;
+    assert!(
+        postgres
+            .query("SELECT id FROM dump_cascades", &[])
+            .await?
+            .is_empty()
+    );
+    let nulls = postgres
+        .query("SELECT id, group_id FROM dump_nulls", &[])
+        .await?;
+    assert_eq!(nulls.len(), 1);
+    assert_eq!(nulls[0].get::<_, i64>(0), 12);
+    assert_eq!(nulls[0].get::<_, Option<i64>>(1), None);
+
     postgres
         .batch_execute(
-            "DROP TABLE IF EXISTS dump_accounts;
+            "DROP TABLE IF EXISTS dump_cascades;
+             DROP TABLE IF EXISTS dump_nulls;
+             DROP TABLE IF EXISTS dump_accounts;
              DROP TABLE IF EXISTS dump_groups;",
         )
         .await

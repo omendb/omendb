@@ -59,9 +59,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         "restore" => {
-            // restore requires a fresh or existing-but-compatible target;
-            // open refuses nothing here, so an existing database grows.
-            let mut database = RelationalDatabase::open(config)?;
             let source = match file {
                 Some(file) => std::fs::read_to_string(file)?,
                 None => {
@@ -69,6 +66,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     std::io::stdin().read_to_string(&mut buffer)?;
                     buffer
                 }
+            };
+            // Create only a missing destination; never replace an existing
+            // history (including a malformed or unsupported one).
+            let mut database = if config.path.try_exists()? {
+                RelationalDatabase::open(config)?
+            } else {
+                RelationalDatabase::create(config)?
             };
             omendb::restore_sql(&mut database, &source)?;
             Ok(())

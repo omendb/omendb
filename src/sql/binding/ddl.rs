@@ -349,19 +349,7 @@ impl Binder<'_> {
                 }
             }
             TableConstraint::ForeignKey(foreign) => {
-                if foreign.index_name.is_some()
-                    || foreign.on_delete.is_some()
-                    || foreign.on_update.is_some()
-                    || foreign.match_kind.is_some()
-                    || foreign.characteristics.is_some()
-                    || foreign.columns.is_empty()
-                    || foreign.columns.len() != foreign.referred_columns.len()
-                {
-                    return Err(unsupported(
-                        "FOREIGN KEY",
-                        "only immediate explicit-column foreign keys are supported",
-                    ));
-                }
+                foreign_key_delete_action(foreign)?;
                 let name = crate::sql::simple_object_name(&foreign.foreign_table, "table")?;
                 let referenced = if name == table.name {
                     table
@@ -447,6 +435,37 @@ impl Binder<'_> {
                 "partial predicates require boolean columns or equality conjunctions",
             )),
         }
+    }
+}
+
+/// Shared by non-executing binding and schema publication, so a restored
+/// constraint cannot be accepted with different options at either boundary.
+pub(crate) fn foreign_key_delete_action(
+    foreign: &sqlparser::ast::ForeignKeyConstraint,
+) -> Result<crate::ReferentialAction> {
+    use crate::ReferentialAction;
+    use sqlparser::ast::ReferentialAction as SqlAction;
+
+    if foreign.index_name.is_some()
+        || foreign.on_update.is_some()
+        || foreign.match_kind.is_some()
+        || foreign.characteristics.is_some()
+        || foreign.columns.is_empty()
+        || foreign.columns.len() != foreign.referred_columns.len()
+    {
+        return Err(unsupported(
+            "FOREIGN KEY",
+            "only immediate explicit-column foreign keys without ON UPDATE or MATCH clauses are supported",
+        ));
+    }
+    match foreign.on_delete {
+        None | Some(SqlAction::Restrict) => Ok(ReferentialAction::Restrict),
+        Some(SqlAction::Cascade) => Ok(ReferentialAction::Cascade),
+        Some(SqlAction::SetNull) => Ok(ReferentialAction::SetNull),
+        Some(SqlAction::NoAction | SqlAction::SetDefault) => Err(unsupported(
+            "FOREIGN KEY",
+            "ON DELETE supports only RESTRICT, CASCADE and SET NULL",
+        )),
     }
 }
 

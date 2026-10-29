@@ -4,7 +4,10 @@
 
 use std::path::Path;
 
-use omendb::{DateValue, F64, RelationalBackendConfig, RelationalDatabase, UuidValue, Value};
+use omendb::{
+    ColumnId, ConstraintId, ConstraintTiming, DateValue, DbError, F64, ForeignKeyDefinition,
+    ReferentialAction, RelationalBackendConfig, RelationalDatabase, UuidValue, Value,
+};
 use tempfile::tempdir;
 
 fn config(path: &Path) -> RelationalBackendConfig {
@@ -55,6 +58,241 @@ fn seeded(path: &Path) -> RelationalDatabase {
         .execute_sql("CREATE INDEX accounts_opened_idx ON accounts (opened)")
         .expect("index");
     database
+}
+
+fn foreign_key_source(
+    path: &Path,
+    on_delete: ReferentialAction,
+    timing: ConstraintTiming,
+) -> RelationalDatabase {
+    let mut database = RelationalDatabase::create(config(path)).unwrap();
+    for sql in [
+        "CREATE TABLE parents (a BIGINT, b BIGINT, PRIMARY KEY (a, b))",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, x BIGINT, y BIGINT)",
+        "INSERT INTO parents VALUES (1, 2), (3, 4)",
+        "INSERT INTO children VALUES (10, 2, 1), (20, 4, 3), (30, NULL, 1)",
+    ] {
+        database.execute_sql(sql).unwrap();
+    }
+    let table_id = |name| {
+        database
+            .catalog()
+            .tables()
+            .find(|table| table.name == name)
+            .unwrap()
+            .id
+    };
+    let definition = ForeignKeyDefinition {
+        id: ConstraintId(99),
+        table: table_id("children"),
+        columns: vec![ColumnId(2), ColumnId(3)],
+        referenced_table: table_id("parents"),
+        // Declared pair order differs from the supporting primary-key index.
+        referenced_columns: vec![ColumnId(2), ColumnId(1)],
+        on_delete,
+        timing,
+    };
+    database
+        .create_named_foreign_key(definition, "pair \"action\"".to_owned())
+        .unwrap();
+    database
+}
+
+#[test]
+fn dump_restore_preserves_foreign_key_delete_actions_and_composite_pairs() {
+    for action in [
+        ReferentialAction::Restrict,
+        ReferentialAction::Cascade,
+        ReferentialAction::SetNull,
+    ] {
+        let directory = tempdir().unwrap();
+        let mut source = foreign_key_source(
+            &directory.path().join("source"),
+            action,
+            ConstraintTiming::Immediate,
+        );
+        let dump = omendb::dump_sql(&mut source).unwrap();
+        let path = directory.path().join("target");
+        let mut target = RelationalDatabase::create(config(&path)).unwrap();
+        omendb::restore_sql(&mut target, &dump).unwrap();
+        target.close().unwrap();
+        let mut target = RelationalDatabase::open(config(&path)).unwrap();
+        let fk = target.catalog().foreign_keys().next().unwrap();
+        assert_eq!(fk.on_delete, action);
+        assert_eq!(fk.timing, ConstraintTiming::Immediate);
+        assert_eq!(
+            target.catalog().foreign_key_name(fk.id),
+            Some("pair \"action\"")
+        );
+        assert_eq!(fk.referenced_columns, vec![ColumnId(2), ColumnId(1)]);
+        let deleted = target.execute_sql("DELETE FROM parents WHERE a = 1 AND b = 2");
+        if action == ReferentialAction::Restrict {
+            assert!(matches!(deleted, Err(DbError::ForeignKeyViolation { .. })));
+        } else {
+            deleted.unwrap();
+        }
+        let mut expected = vec![];
+        match action {
+            ReferentialAction::Restrict => {
+                expected.push(vec![Value::I64(10), Value::I64(2), Value::I64(1)])
+            }
+            ReferentialAction::SetNull => {
+                expected.push(vec![Value::I64(10), Value::Null, Value::Null])
+            }
+            ReferentialAction::Cascade => {}
+        }
+        expected.extend([
+            vec![Value::I64(20), Value::I64(4), Value::I64(3)],
+            vec![Value::I64(30), Value::Null, Value::I64(1)],
+        ]);
+        assert_eq!(
+            target
+                .execute_sql("SELECT id, x, y FROM children ORDER BY id")
+                .unwrap()
+                .rows,
+            expected
+        );
+        assert_eq!(
+            target
+                .execute_sql("SELECT COUNT(*) FROM parents")
+                .unwrap()
+                .rows,
+            vec![vec![Value::U64(if action == ReferentialAction::Restrict {
+                2
+            } else {
+                1
+            })]]
+        );
+    }
+}
+
+#[test]
+fn tool_round_trip_preserves_foreign_key_actions_into_a_fresh_directory() {
+    let directory = tempdir().unwrap();
+    let source_path = directory.path().join("source");
+    foreign_key_source(
+        &source_path,
+        ReferentialAction::Cascade,
+        ConstraintTiming::Immediate,
+    )
+    .close()
+    .unwrap();
+    let dump_path = directory.path().join("backup.sql");
+    let target_path = directory.path().join("fresh-target");
+    let dump = std::process::Command::new(env!("CARGO_BIN_EXE_omendb-tool"))
+        .arg("dump")
+        .arg("--path")
+        .arg(&source_path)
+        .arg("--output")
+        .arg(&dump_path)
+        .output()
+        .unwrap();
+    assert!(
+        dump.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dump.stderr)
+    );
+    let restore = std::process::Command::new(env!("CARGO_BIN_EXE_omendb-tool"))
+        .arg("restore")
+        .arg("--path")
+        .arg(&target_path)
+        .arg("--input")
+        .arg(&dump_path)
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let mut target = RelationalDatabase::open(config(&target_path)).unwrap();
+    assert_eq!(
+        target.catalog().foreign_keys().next().unwrap().on_delete,
+        ReferentialAction::Cascade
+    );
+    target
+        .execute_sql("DELETE FROM parents WHERE a = 1")
+        .unwrap();
+    assert_eq!(
+        target
+            .execute_sql("SELECT COUNT(*) FROM children")
+            .unwrap()
+            .rows,
+        vec![vec![Value::U64(2)]]
+    );
+    target.close().unwrap();
+    // An explicitly selected existing target grows; it is not replaced.
+    let append_path = directory.path().join("append.sql");
+    std::fs::write(&append_path, "INSERT INTO parents VALUES (5, 6);").unwrap();
+    let append = std::process::Command::new(env!("CARGO_BIN_EXE_omendb-tool"))
+        .arg("restore")
+        .arg("--path")
+        .arg(&target_path)
+        .arg("--input")
+        .arg(&append_path)
+        .output()
+        .unwrap();
+    assert!(
+        append.status.success(),
+        "{}",
+        String::from_utf8_lossy(&append.stderr)
+    );
+    let mut target = RelationalDatabase::open(config(&target_path)).unwrap();
+    assert_eq!(
+        target
+            .execute_sql("SELECT a, b FROM parents ORDER BY a")
+            .unwrap()
+            .rows,
+        vec![
+            vec![Value::I64(3), Value::I64(4)],
+            vec![Value::I64(5), Value::I64(6)]
+        ]
+    );
+    assert_eq!(
+        target.catalog().foreign_keys().next().unwrap().on_delete,
+        ReferentialAction::Cascade
+    );
+}
+
+#[test]
+fn dump_refuses_unrepresentable_foreign_key_timing_without_mutating_source() {
+    let directory = tempdir().unwrap();
+    let mut source = foreign_key_source(
+        &directory.path().join("source"),
+        ReferentialAction::Cascade,
+        ConstraintTiming::DeferredToPublication,
+    );
+    let before = source.catalog().clone();
+    let commit = source.commit_id();
+    assert!(matches!(
+        omendb::dump_sql(&mut source),
+        Err(DbError::SqlUnsupported { .. })
+    ));
+    assert_eq!(source.catalog(), &before);
+    assert_eq!(source.commit_id(), commit);
+    assert_eq!(
+        source
+            .execute_sql("SELECT COUNT(*) FROM children")
+            .unwrap()
+            .rows,
+        vec![vec![Value::U64(3)]]
+    );
+    source.close().unwrap();
+    let output_path = directory.path().join("existing-backup.sql");
+    std::fs::write(&output_path, "keep this backup").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omendb-tool"))
+        .arg("dump")
+        .arg("--path")
+        .arg(directory.path().join("source"))
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&output_path).unwrap(),
+        "keep this backup"
+    );
 }
 
 #[test]

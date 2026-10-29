@@ -741,6 +741,68 @@ fn supplied_hints_without_parameters_preserve_the_native_diagnostic() {
 }
 
 #[test]
+fn foreign_key_actions_share_binding_and_publication_validation() {
+    use crate::ReferentialAction::{Cascade, Restrict, SetNull};
+
+    for (clause, expected) in [
+        ("", Some(Restrict)),
+        ("ON DELETE RESTRICT", Some(Restrict)),
+        ("ON DELETE CASCADE", Some(Cascade)),
+        ("ON DELETE SET NULL", Some(SetNull)),
+        ("ON DELETE NO ACTION", None),
+        ("ON DELETE SET DEFAULT", None),
+        ("ON UPDATE CASCADE", None),
+        ("MATCH FULL", None),
+        ("DEFERRABLE INITIALLY DEFERRED", None),
+    ] {
+        let (_directory, mut database) = database();
+        for sql in [
+            format!(
+                "CREATE TABLE child (parent_id BIGINT, FOREIGN KEY(parent_id) REFERENCES a(id) {clause})"
+            ),
+            format!("ALTER TABLE b ADD FOREIGN KEY(aid) REFERENCES a(id) {clause}"),
+        ] {
+            let before = database.catalog().clone();
+            let commit = database.commit_id();
+            let bound = bind(&database, &sql, &[]);
+            assert_eq!(
+                database.catalog(),
+                &before,
+                "binding mutated catalog: {sql}"
+            );
+            assert_eq!(database.commit_id(), commit, "binding published: {sql}");
+            if expected.is_some() {
+                let bound = bound.unwrap();
+                assert_eq!(bound.effect, StatementEffect::Schema);
+                assert!(bound.access.requires_admin);
+                assert_eq!(bound.access.read.len(), 1);
+                database.execute_sql(&sql).unwrap();
+                assert!(
+                    database
+                        .catalog()
+                        .foreign_keys()
+                        .all(|fk| Some(fk.on_delete) == expected)
+                );
+            } else {
+                assert!(
+                    matches!(bound, Err(DbError::SqlUnsupported { .. })),
+                    "{sql}"
+                );
+                assert!(
+                    matches!(
+                        database.execute_sql(&sql),
+                        Err(DbError::SqlUnsupported { .. })
+                    ),
+                    "{sql}"
+                );
+                assert_eq!(database.catalog(), &before);
+                assert_eq!(database.commit_id(), commit);
+            }
+        }
+    }
+}
+
+#[test]
 fn ddl_resolves_references_without_scanning() {
     let (_directory, database) = database();
     let bound = bind(

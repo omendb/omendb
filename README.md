@@ -95,6 +95,10 @@ cargo run --bin omendb-tool -- dump --path ./omendb-data > backup.sql
 cargo run --bin omendb-tool -- restore --path ./fresh-db --input backup.sql
 ```
 
+Dumps preserve supported foreign-key delete actions and refuse constraint timing
+that SQL restore cannot represent. Restore creates a missing destination or adds
+to an existing one; use a fresh directory for a complete backup.
+
 See the [architecture](docs/architecture.md), [operational runbook](docs/runbook.md),
 and [kernel qualification procedures](crates/seerdb/docs/qualification.md) for
 design, recovery and available checks.

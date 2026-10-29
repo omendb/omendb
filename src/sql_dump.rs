@@ -36,6 +36,19 @@ pub fn dump_sql(database: &mut RelationalDatabase) -> Result<String> {
     let (dump, _) = database.transaction(|store, transaction| {
         let mut out = String::new();
         let catalog = store.catalog();
+        // Reject metadata the supported restore grammar cannot represent before
+        // scanning rows or returning a success-shaped, lossy export.
+        if let Some(foreign_key) = catalog.foreign_keys().find(|foreign_key| {
+            foreign_key.timing != crate::ConstraintTiming::Immediate
+        }) {
+            return Err(DbError::SqlUnsupported {
+                statement: "dump",
+                reason: format!(
+                    "foreign key {} has timing unsupported by SQL restore",
+                    foreign_key.id.0
+                ),
+            });
+        }
 
         // Section 1: tables with inline primary keys.
         let tables: Vec<crate::TableDefinition> = catalog.tables().cloned().collect();
@@ -131,9 +144,14 @@ pub fn dump_sql(database: &mut RelationalDatabase) -> Result<String> {
                 .map(|column| quote_identifier(&column_name(parent, *column)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let on_delete = match foreign_key.on_delete {
+                crate::ReferentialAction::Restrict => "RESTRICT",
+                crate::ReferentialAction::Cascade => "CASCADE",
+                crate::ReferentialAction::SetNull => "SET NULL",
+            };
             let _ = writeln!(
                 out,
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({child_columns}) REFERENCES {} ({parent_columns});",
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({child_columns}) REFERENCES {} ({parent_columns}) ON DELETE {on_delete};",
                 quote_identifier(&child.name),
                 quote_identifier(&name),
                 quote_identifier(&parent.name),

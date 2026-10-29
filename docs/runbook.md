@@ -76,9 +76,9 @@ publication atomically writes `ODC2`. Previous binaries refuse that new envelope
 For an affected history, keep the original directory and binary available. Export
 with the previous binary and restore with the new binary into a fresh directory,
 using the [logical backup procedure](#backups). Review the script against the
-[known conversion limitations](gap-register.md), including omitted FK delete
-actions, before restoring. Restore rejects conflicting logical duplicates rather
-than dropping them; resolve those conflicts explicitly and retry in another fresh
+[known conversion limitations](gap-register.md) before restoring. Exports from
+older binaries can omit FK delete actions; correct those definitions explicitly.
+Restore rejects conflicting logical duplicates rather than dropping them; resolve those conflicts explicitly and retry in another fresh
 directory. A failed restore may leave committed chunks and is not a usable migrated
 database. Validate the result and reprovision native authorization before serving
 it. There is no automatic in-place conversion.
@@ -188,13 +188,18 @@ omendb-tool restore --path ./restored-db --input backup.sql
 
 The dump renders one read-consistent snapshot as plain SQL: tables with
 inline primary keys, data as multi-row INSERTs in scan order, secondary
-indexes after data, foreign keys last as `ALTER TABLE ADD CONSTRAINT`.
+indexes after data, foreign keys last as `ALTER TABLE ADD CONSTRAINT` with their
+ordered column pairs and `ON DELETE RESTRICT`, `CASCADE` or `SET NULL` action.
+Dump refuses native deferred constraint timing because SQL restore cannot preserve
+that declaration; it does not return a lossy script or overwrite an output file.
 It restores into OmenDB and into PostgreSQL (within the documented
 divergences in `docs/gap-register.md`), so the same tool verifies a
 backup by differential restore. Native principals, credentials and grants are
 not included in logical dumps; explicitly reprovision authorization on a restored
-database before serving it. Restore is not resumable: it stops at
-the first error and earlier committed chunks remain — drop and re-run
+database before serving it. The CLI creates a missing destination; when given an
+existing database, it opens that history and applies the script without replacing
+it. Prefer a fresh destination for a complete backup. Restore is not resumable:
+it stops at the first error and earlier committed chunks remain — drop and re-run
 into a fresh directory after correcting the script. U64 columns dump as
 `NUMERIC(20,0)` (PostgreSQL has no unsigned 64-bit integer).
 
