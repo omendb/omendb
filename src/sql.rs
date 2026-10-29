@@ -166,14 +166,6 @@ pub(crate) fn execute_with_params(
     Ok(result)
 }
 
-pub(crate) fn execute_in_transaction(
-    database: &RelationalDatabase,
-    transaction: &mut RelationalDatabaseTransaction,
-    source: &str,
-) -> Result<SqlResult> {
-    execute_in_transaction_with_params(database, transaction, source, &[])
-}
-
 pub(crate) fn execute_in_transaction_with_params(
     database: &RelationalDatabase,
     transaction: &mut RelationalDatabaseTransaction,

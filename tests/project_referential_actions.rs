@@ -383,6 +383,27 @@ fn cascade_depth_bound_rejects_deeper_than_max_chains() {
             .len(),
         70
     );
+
+    // Both native delete entry points must retain the operation failure, not
+    // merely rely on a later FK check to catch the partly staged cascade.
+    for legacy_key in [true, false] {
+        let mut transaction = database.begin().expect("begin native delete");
+        let result = if legacy_key {
+            transaction.delete(&database, CHAIN, key_of(CHAIN, 1))
+        } else {
+            transaction.delete_row(&database, CHAIN, row(CHAIN, 1, None))
+        };
+        assert!(matches!(
+            result,
+            Err(omendb::DbError::CascadeDepthExceeded { constraint: 9, .. })
+        ));
+        assert!(matches!(
+            transaction.commit(),
+            Err(omendb::DbError::TransactionAborted)
+        ));
+        assert_eq!(database.commit_id(), before);
+        assert_eq!(database.scan(CHAIN, usize::MAX).unwrap().len(), 70);
+    }
 }
 
 #[test]

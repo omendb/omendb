@@ -140,6 +140,8 @@ pub enum DbError {
     ResourceLimitExceeded(String),
     #[error("invalid database state: {0}")]
     InvalidState(String),
+    #[error("transaction is aborted; begin a new transaction to continue")]
+    TransactionAborted,
     #[error("SQL parse error: {0}")]
     SqlParse(String),
     #[error("invalid SQL parameters: {0}")]
@@ -257,6 +259,7 @@ impl DbError {
                 TransactionErrorClass::SnapshotUnavailable
             }
             Self::InvalidState(_)
+            | Self::TransactionAborted
             | Self::NonMonotonicCommit { .. }
             | Self::ValueTooLarge(_)
             | Self::FragmentDebtExceeded { .. }
@@ -314,6 +317,10 @@ mod tests {
         assert_eq!(
             DbError::RecoveryRequired.transaction_class(),
             TransactionErrorClass::ReopenRequired
+        );
+        assert_eq!(
+            DbError::TransactionAborted.transaction_class(),
+            TransactionErrorClass::InvalidRequest
         );
         assert_eq!(
             DbError::UniqueViolation {

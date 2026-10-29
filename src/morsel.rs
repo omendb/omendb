@@ -67,6 +67,17 @@ impl MorselScanner {
         transaction: &mut RelationalDatabaseTransaction,
         control: &OperationControl,
     ) -> Result<Option<MorselBatch>> {
+        transaction.operation(database, |transaction| {
+            self.next_morsel_inner(database, transaction, control)
+        })
+    }
+
+    fn next_morsel_inner(
+        &mut self,
+        database: &RelationalDatabase,
+        transaction: &mut RelationalDatabaseTransaction,
+        control: &OperationControl,
+    ) -> Result<Option<MorselBatch>> {
         if self.exhausted {
             return Ok(None);
         }
@@ -400,6 +411,17 @@ pub struct AnalyticalExecutor;
 
 impl AnalyticalExecutor {
     pub fn execute(
+        database: &RelationalDatabase,
+        transaction: &mut RelationalDatabaseTransaction,
+        query: &AnalyticalQuery,
+        control: &OperationControl,
+    ) -> Result<AnalyticalResult> {
+        transaction.operation(database, |transaction| {
+            Self::execute_inner(database, transaction, query, control)
+        })
+    }
+
+    fn execute_inner(
         database: &RelationalDatabase,
         transaction: &mut RelationalDatabaseTransaction,
         query: &AnalyticalQuery,

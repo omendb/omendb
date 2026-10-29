@@ -54,6 +54,7 @@ pub(super) fn map_db_error(error: crate::DbError) -> PgWireError {
             "57014",
             "canceling statement due to user request".to_owned(),
         ),
+        crate::DbError::TransactionAborted => ("25P02", error.to_string()),
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
         crate::DbError::ForeignKeyViolation { .. }
         | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
@@ -124,13 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn sql_parameter_errors_use_protocol_violation_state() {
-        let error = map_db_error(DbError::SqlParameter(
-            "statement references parameters but none were supplied".to_owned(),
-        ));
-        match error {
-            PgWireError::UserError(info) => assert_eq!(info.code, "08P01"),
-            other => panic!("expected user error, got {other:?}"),
+    fn parameter_and_aborted_transaction_errors_preserve_protocol_states() {
+        for (error, code) in [
+            (
+                DbError::SqlParameter("missing parameter".to_owned()),
+                "08P01",
+            ),
+            (DbError::TransactionAborted, "25P02"),
+        ] {
+            match map_db_error(error) {
+                PgWireError::UserError(info) => assert_eq!(info.code, code),
+                other => panic!("expected user error, got {other:?}"),
+            }
         }
     }
 

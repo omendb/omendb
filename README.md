@@ -60,7 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `create` requires a directory that does not already exist. Each direct SQL
 write is one transaction; use `execute_sql_batch` or a typed transaction to
-commit several statements together.
+commit several statements together. A failed row, SQL, or analytical operation
+aborts the entire typed transaction, even if its error is caught. Later operations
+and `commit()` return `DbError::TransactionAborted`; begin a new transaction to
+continue. Statement-level recovery and savepoints are not supported.
 
 ## Storage and tools
 

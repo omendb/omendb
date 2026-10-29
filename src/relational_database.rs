@@ -540,9 +540,9 @@ impl RelationalDatabase {
         F: FnOnce(&Self, &mut RelationalDatabaseTransaction) -> Result<T>,
     {
         ensure_not_cancelled(cancellation)?;
-        let mut transaction =
+        let transaction =
             self.begin_with_control(&OperationControl::with_cancellation(cancellation.clone()))?;
-        self.run_transaction(&mut transaction, operation)
+        self.run_transaction(transaction, operation)
     }
 
     /// Run one bounded transaction under cooperative control.
@@ -554,8 +554,8 @@ impl RelationalDatabase {
     where
         F: FnOnce(&Self, &mut RelationalDatabaseTransaction) -> Result<T>,
     {
-        let mut transaction = self.begin_with_control(control)?;
-        self.run_transaction(&mut transaction, operation)
+        let transaction = self.begin_with_control(control)?;
+        self.run_transaction(transaction, operation)
     }
 
     /// Run one closure inside a fresh atomic transaction.
@@ -563,25 +563,24 @@ impl RelationalDatabase {
     where
         F: FnOnce(&Self, &mut RelationalDatabaseTransaction) -> Result<T>,
     {
-        let mut transaction = self.begin()?;
-        self.run_transaction(&mut transaction, operation)
+        let transaction = self.begin()?;
+        self.run_transaction(transaction, operation)
     }
 
     fn run_transaction<T, F>(
         &self,
-        transaction: &mut RelationalDatabaseTransaction,
+        mut transaction: RelationalDatabaseTransaction,
         operation: F,
     ) -> Result<(T, CommitId)>
     where
         F: FnOnce(&Self, &mut RelationalDatabaseTransaction) -> Result<T>,
     {
-        let value = operation(self, transaction)?;
+        let value = operation(self, &mut transaction)?;
         if transaction.is_read_only() {
             transaction.ensure_active()?;
             return Ok((value, transaction.snapshot()));
         }
-        let commit =
-            std::mem::replace(transaction, RelationalDatabaseTransaction::empty()).commit()?;
+        let commit = transaction.commit()?;
         Ok((value, commit))
     }
 
@@ -677,8 +676,14 @@ fn validate_legacy_key(table: TableId, key: Key) -> Result<()> {
 }
 
 /// An explicit multi-operation transaction owned by one database handle.
+///
+/// Any failed row, SQL, or analytical operation discards all staged changes and
+/// makes the transaction permanently aborted. The failing call returns its original error;
+/// later operations and commit return [`DbError::TransactionAborted`]. Drop the
+/// transaction to roll back, and begin a new one to continue.
 pub struct RelationalDatabaseTransaction {
     owner_id: u64,
+    snapshot: CommitId,
     wrote: bool,
     control: Option<OperationControl>,
     backend: Option<DirectTransaction>,
@@ -689,51 +694,46 @@ impl RelationalDatabaseTransaction {
         let backend = database.store.begin_transaction()?;
         Ok(Self {
             owner_id: database.handle_id,
+            snapshot: CommitId(backend.snapshot_csn().get()),
             wrote: false,
             control,
             backend: Some(backend),
         })
     }
 
-    fn empty() -> Self {
-        Self {
-            owner_id: 0,
-            wrote: false,
-            control: None,
-            backend: None,
+    // Guard the complete operation, including validation and SQL evaluation:
+    // storage may have staged only part of a row/index/cascade change on error.
+    pub(crate) fn operation<T>(
+        &mut self,
+        store: &RelationalDatabase,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let result = (|| {
+            self.ensure_active()?;
+            if self.owner_id != store.handle_id {
+                return Err(invalid_transaction_owner());
+            }
+            operation(self)
+        })();
+        if result.is_err() {
+            // Release staged mutations and snapshot/read dependencies now,
+            // even if the caller catches the error and retains this handle.
+            self.backend = None;
         }
+        result
     }
 
-    fn backend(&mut self, store: &RelationalDatabase) -> Result<&mut DirectTransaction> {
-        if self.owner_id != store.handle_id {
-            return Err(invalid_transaction_owner());
-        }
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
-        self.backend
-            .as_mut()
-            .ok_or_else(|| DbError::InvalidState("transaction is no longer active".to_owned()))
+    fn backend_mut(&mut self) -> &mut DirectTransaction {
+        self.backend.as_mut().expect("operation checked active")
     }
 
     fn ensure_active(&self) -> Result<()> {
-        if let Some(control) = &self.control {
-            control.check()?;
-        }
         if self.backend.is_none() {
-            return Err(DbError::InvalidState(
-                "transaction is no longer active".to_owned(),
-            ));
+            return Err(DbError::TransactionAborted);
         }
-        Ok(())
-    }
-
-    fn ensure_owner(&self, store: &RelationalDatabase) -> Result<()> {
-        if self.owner_id == store.handle_id {
-            Ok(())
-        } else {
-            Err(invalid_transaction_owner())
-        }
+        self.control
+            .as_ref()
+            .map_or(Ok(()), OperationControl::check)
     }
 
     fn stage_mutation(
@@ -752,11 +752,7 @@ impl RelationalDatabaseTransaction {
     /// Return the transaction's fixed read snapshot.
     #[must_use]
     pub fn snapshot(&self) -> CommitId {
-        self.backend
-            .as_ref()
-            .map_or(CommitId::default(), |backend| {
-                CommitId(backend.snapshot_csn().get())
-            })
+        self.snapshot
     }
 
     /// Return whether no writes have been staged.
@@ -767,9 +763,11 @@ impl RelationalDatabaseTransaction {
 
     /// Stage one row insert plus derived index entries.
     pub fn insert(&mut self, store: &RelationalDatabase, table: TableId, row: Row) -> Result<()> {
-        self.backend(store)?.insert(table, row)?;
-        self.wrote = true;
-        Ok(())
+        self.operation(store, |transaction| {
+            transaction.backend_mut().insert(table, row)?;
+            transaction.wrote = true;
+            Ok(())
+        })
     }
 
     /// Stage one heap-table (primary-key-less) insert: the engine
@@ -781,19 +779,22 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         mut row: Row,
     ) -> Result<Row> {
-        let backend = self.backend(store)?;
-        let primary = backend.next_heap_identity(table)?;
-        row.primary = primary;
-        backend.insert(table, row.clone())?;
-        self.wrote = true;
-        Ok(row)
+        self.operation(store, |transaction| {
+            let backend = transaction.backend_mut();
+            row.primary = backend.next_heap_identity(table)?;
+            backend.insert(table, row.clone())?;
+            transaction.wrote = true;
+            Ok(row)
+        })
     }
 
     /// Stage one row replacement plus derived index refreshes.
     pub fn update(&mut self, store: &RelationalDatabase, table: TableId, row: Row) -> Result<()> {
-        self.backend(store)?.update(table, row)?;
-        self.wrote = true;
-        Ok(())
+        self.operation(store, |transaction| {
+            transaction.backend_mut().update(table, row)?;
+            transaction.wrote = true;
+            Ok(())
+        })
     }
 
     /// Stage a legacy single-key delete. Use [`Self::delete_row`] for
@@ -804,18 +805,20 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         primary: Key,
     ) -> Result<()> {
-        let definition = store.catalog().table(table)?.clone();
-        validate_legacy_key(table, primary)?;
-        if store.catalog().primary_key(table).is_some() {
-            return Err(DbError::InvalidState(
-                "legacy key delete requires a legacy primary-key table; use delete_row".to_owned(),
-            ));
-        }
-        drop(definition);
-        let identity = encode_legacy_key(table, primary)?;
-        self.backend(store)?.delete(table, &identity)?;
-        self.wrote = true;
-        Ok(())
+        self.operation(store, |transaction| {
+            store.catalog().table(table)?;
+            validate_legacy_key(table, primary)?;
+            if store.catalog().primary_key(table).is_some() {
+                return Err(DbError::InvalidState(
+                    "legacy key delete requires a legacy primary-key table; use delete_row"
+                        .to_owned(),
+                ));
+            }
+            let identity = encode_legacy_key(table, primary)?;
+            transaction.backend_mut().delete(table, &identity)?;
+            transaction.wrote = true;
+            Ok(())
+        })
     }
 
     /// Stage one row delete resolved through the row's own identity.
@@ -825,11 +828,13 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         row: Row,
     ) -> Result<()> {
-        let definition = store.catalog().table(table)?.clone();
-        let identity = row_identity_bytes(store.catalog(), &definition, &row)?;
-        self.backend(store)?.delete(table, &identity)?;
-        self.wrote = true;
-        Ok(())
+        self.operation(store, |transaction| {
+            let definition = store.catalog().table(table)?;
+            let identity = row_identity_bytes(store.catalog(), definition, &row)?;
+            transaction.backend_mut().delete(table, &identity)?;
+            transaction.wrote = true;
+            Ok(())
+        })
     }
 
     /// Read one legacy single-key row including staged mutations.
@@ -839,22 +844,18 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         primary: Key,
     ) -> Result<Option<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        let definition = store.catalog().table(table)?.clone();
-        validate_legacy_key(table, primary)?;
-        if store.catalog().primary_key(table).is_some() {
-            return Err(DbError::InvalidState(
-                "legacy key lookup requires a legacy primary-key table; use get_by_identity"
-                    .to_owned(),
-            ));
-        }
-        drop(definition);
-        let identity = encode_legacy_key(table, primary)?;
-        self.backend
-            .as_mut()
-            .expect("checked active")
-            .get(table, &identity)
+        self.operation(store, |transaction| {
+            store.catalog().table(table)?;
+            validate_legacy_key(table, primary)?;
+            if store.catalog().primary_key(table).is_some() {
+                return Err(DbError::InvalidState(
+                    "legacy key lookup requires a legacy primary-key table; use get_by_identity"
+                        .to_owned(),
+                ));
+            }
+            let identity = encode_legacy_key(table, primary)?;
+            transaction.backend_mut().get(table, &identity)
+        })
     }
 
     /// Read one row by composite identity including staged mutations.
@@ -864,14 +865,11 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         identity: &RowIdentity,
     ) -> Result<Option<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        let bytes =
-            crate::relational::row_identity_bytes_for_lookup(store.catalog(), table, identity)?;
-        self.backend
-            .as_mut()
-            .expect("checked active")
-            .get(table, &bytes)
+        self.operation(store, |transaction| {
+            let bytes =
+                crate::relational::row_identity_bytes_for_lookup(store.catalog(), table, identity)?;
+            transaction.backend_mut().get(table, &bytes)
+        })
     }
 
     /// Read up to `limit` rows of one table including staged mutations.
@@ -884,11 +882,11 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         limit: usize,
     ) -> Result<Vec<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        let mut rows = self.backend.as_mut().expect("checked active").scan(table)?;
-        rows.truncate(limit);
-        Ok(rows)
+        self.operation(store, |transaction| {
+            let mut rows = transaction.backend_mut().scan(table)?;
+            rows.truncate(limit);
+            Ok(rows)
+        })
     }
 
     /// Exact-value lookup through one secondary index including staged state.
@@ -899,12 +897,9 @@ impl RelationalDatabaseTransaction {
         index: crate::IndexId,
         values: &[Value],
     ) -> Result<Vec<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        self.backend
-            .as_mut()
-            .expect("checked active")
-            .index_get(table, index, values)
+        self.operation(store, |transaction| {
+            transaction.backend_mut().index_get(table, index, values)
+        })
     }
 
     /// Read all rows of one index in index-key order including staged state.
@@ -914,12 +909,9 @@ impl RelationalDatabaseTransaction {
         table: TableId,
         index: crate::IndexId,
     ) -> Result<Vec<Row>> {
-        self.ensure_owner(store)?;
-        self.ensure_active()?;
-        self.backend
-            .as_mut()
-            .expect("checked active")
-            .index_scan(table, index)
+        self.operation(store, |transaction| {
+            transaction.backend_mut().index_scan(table, index)
+        })
     }
 
     #[cfg(feature = "pgwire")]
@@ -928,9 +920,7 @@ impl RelationalDatabaseTransaction {
     }
 
     pub(crate) fn check_operation_control(&self) -> Result<()> {
-        self.control
-            .as_ref()
-            .map_or(Ok(()), OperationControl::check)
+        self.ensure_active()
     }
 
     /// Execute one bounded embedded SQL statement inside this transaction.
@@ -939,7 +929,7 @@ impl RelationalDatabaseTransaction {
         store: &RelationalDatabase,
         sql: &str,
     ) -> Result<crate::SqlResult> {
-        crate::sql::execute_in_transaction(store, self, sql)
+        self.execute_sql_with_params(store, sql, &[])
     }
 
     /// Execute one bounded embedded SQL statement with positional parameters
@@ -950,7 +940,9 @@ impl RelationalDatabaseTransaction {
         sql: &str,
         params: &[Value],
     ) -> Result<crate::SqlResult> {
-        crate::sql::execute_in_transaction_with_params(store, self, sql, params)
+        self.operation(store, |transaction| {
+            crate::sql::execute_in_transaction_with_params(store, transaction, sql, params)
+        })
     }
 
     /// Validate referential integrity and publish every staged change.

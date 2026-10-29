@@ -403,6 +403,12 @@ fn morsel_scanner_enforces_memory_quota_and_cancellation() {
     constrained_query.max_memory_bytes = 500;
 
     let mut tx = database.begin().expect("begin tx");
+    tx.insert(
+        &database,
+        ACCOUNTS_TABLE,
+        account_row(501, 1, "pending", 10, "active"),
+    )
+    .expect("stage before query");
     let res = omendb::AnalyticalExecutor::execute(
         &database,
         &mut tx,
@@ -412,6 +418,14 @@ fn morsel_scanner_enforces_memory_quota_and_cancellation() {
     assert!(
         matches!(res, Err(DbError::ResourceLimitExceeded(_))),
         "Expected ResourceLimitExceeded under tight memory quota, got {res:?}"
+    );
+
+    assert!(matches!(tx.commit(), Err(DbError::TransactionAborted)));
+    assert_eq!(
+        database
+            .get(ACCOUNTS_TABLE, Key::new(ACCOUNTS_TABLE.0, 501))
+            .unwrap(),
+        None
     );
 
     // Test cooperative cancellation during morsel scan
