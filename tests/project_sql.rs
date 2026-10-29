@@ -1448,13 +1448,28 @@ fn embedded_sql_refuses_unsupported_and_atomicity_is_preserved() {
         vec![vec![Value::Bytes(vec![0, 255])]]
     );
 
-    assert!(matches!(
-        database.execute_sql("BEGIN"),
-        Err(DbError::SqlUnsupported {
-            statement: "transaction control",
-            ..
-        })
-    ));
+    for sql in [
+        "BEGIN",
+        "START TRANSACTION",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "ABORT",
+        "ROLLBACK TO SAVEPOINT missing",
+        "COMMIT AND CHAIN",
+        "BEGIN READ ONLY",
+    ] {
+        assert!(
+            matches!(
+                database.execute_sql(sql),
+                Err(DbError::SqlUnsupported {
+                    statement: "transaction control",
+                    ..
+                })
+            ),
+            "{sql}: native SQL must not change caller-owned transaction boundaries"
+        );
+    }
     // Table aliases are supported; a still-refused FROM shape is a
     // multi-table FROM clause.
     assert!(matches!(

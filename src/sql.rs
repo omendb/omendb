@@ -40,8 +40,17 @@ pub(crate) mod typed_input {
 #[path = "sql_write.rs"]
 mod write;
 
+mod control;
 #[path = "sql/explain.rs"]
 mod explain;
+
+#[cfg(feature = "pgwire")]
+pub(crate) use control::{TransactionControl, statement_sources};
+
+#[cfg(feature = "pgwire")]
+pub(crate) fn transaction_control(source: &str) -> Result<Option<TransactionControl>> {
+    control::bind(&parse_one(source)?)
+}
 
 #[path = "sql/window.rs"]
 pub(crate) mod window;
@@ -182,6 +191,12 @@ fn execute_in_transaction_statement(
     statement: &Statement,
     params: &[Value],
 ) -> Result<SqlResult> {
+    if control::bind(statement)?.is_some() {
+        return Err(unsupported(
+            "transaction control",
+            "use the typed transaction closure",
+        ));
+    }
     match statement {
         Statement::Explain {
             statement: explained,
@@ -232,12 +247,6 @@ fn execute_in_transaction_statement(
         Statement::Insert(insert) => write::execute_insert(database, transaction, insert, params),
         Statement::Update(update) => write::execute_update(database, transaction, update, params),
         Statement::Delete(delete) => write::execute_delete(database, transaction, delete, params),
-        Statement::StartTransaction { .. }
-        | Statement::Commit { .. }
-        | Statement::Rollback { .. } => Err(unsupported(
-            "transaction control",
-            "use the typed transaction closure",
-        )),
         Statement::CreateTable(_) => Err(unsupported(
             "CREATE TABLE",
             "schema changes must use the direct database method",
@@ -536,8 +545,34 @@ pub(super) fn table_from_join_name(table: &sqlparser::ast::TableWithJoins) -> Re
 
 fn parse_one(source: &str) -> Result<Statement> {
     let parse = || {
-        let statements = Parser::parse_sql(&GenericDialect {}, source)
+        use sqlparser::keywords::Keyword;
+        use sqlparser::tokenizer::{Token, Tokenizer};
+
+        let dialect = GenericDialect {};
+        let mut tokens = Tokenizer::new(&dialect, source)
+            .tokenize()
             .map_err(|error| DbError::SqlParse(error.to_string()))?;
+        // sqlparser has no PostgreSQL ABORT alias. Normalize only this token,
+        // then parse the entire rollback grammar, including any suffix.
+        if let Some(Token::Word(word)) = tokens
+            .iter_mut()
+            .find(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+            && word.keyword == Keyword::ABORT
+        {
+            word.keyword = Keyword::ROLLBACK;
+            word.value = "ROLLBACK".to_owned();
+        }
+        let mut parser = Parser::new(&dialect).with_tokens(tokens);
+        let statements = parser
+            .parse_statements()
+            .map_err(|error| DbError::SqlParse(error.to_string()))?;
+        // parse_statements also serves procedural blocks and may stop at END.
+        // Top-level SQL must consume every token before any boundary effect.
+        if parser.peek_token().token != Token::EOF {
+            return Err(DbError::SqlParse(
+                "unexpected trailing SQL tokens".to_owned(),
+            ));
+        }
         match statements.as_slice() {
             [statement] => Ok(statement.clone()),
             [] => Err(unsupported("empty SQL", "one statement is required")),

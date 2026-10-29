@@ -71,10 +71,9 @@ impl pgwire::api::stmt::QueryParser for PlaceholderParser {
 
 /// One connection's open transaction block.
 pub(super) struct TransactionBlock {
-    pub(super) transaction: RelationalDatabaseTransaction,
-    /// Set when a statement inside the block failed; the block then rejects
-    /// everything except ROLLBACK (and COMMIT, which rolls back).
-    pub(super) errored: bool,
+    /// None is a rollback-only block: its engine resources are released, but
+    /// its boundary remains until explicit cleanup or connection teardown.
+    pub(super) transaction: Option<RelationalDatabaseTransaction>,
     pub(super) last_used: Instant,
 }
 

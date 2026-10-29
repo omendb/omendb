@@ -3,16 +3,16 @@
 This is the current development evidence for OmenDB's deliberately bounded
 PostgreSQL wire surface. It is a compatibility record, not a claim that OmenDB
 implements PostgreSQL. The ordinary behavior and negative-path evidence lives
-in `tests/project_pgwire_server.rs`:
+in `tests/project_pgwire_server.rs` and `tests/project_transaction_controls.rs`:
 
 ```bash
-cargo test --features pgwire --test project_pgwire_server
+cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls
 ```
 
 Known negative-path defects in the [gap register](gap-register.md) qualify the
-ordinary evidence below: executable/unauthorized Describe, restricted transaction
-controls, unsafe control variants and committable result-admission errors remain open. The [known gaps](gap-register.md) distinguish these serving-path limitations
-from the intended [product architecture](architecture.md).
+ordinary evidence below: executable/unauthorized Describe and direct-API failed
+mutation integrity remain open. The [known gaps](gap-register.md) distinguish these
+serving-path limitations from the intended [product architecture](architecture.md).
 
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
 representative documented subset against PostgreSQL. It is ignored in ordinary
@@ -35,7 +35,7 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Result payload bound | `ServerConfig::max_result_bytes` and `--max-result-bytes` reject an estimated materialized result payload above the configured bound with `54000`. This limits response payload admission, not execution memory. | `persistent_server_rejects_result_over_byte_bound` |
 | Trust startup | Empty auth catalogs use trust only on loopback. | `wire_trust_mode_refuses_non_loopback_listener` |
 | SCRAM startup | Provisioned users authenticate with SCRAM-SHA-256; wrong and unknown credentials fail with `28P01`. Repeated failures receive bounded delay. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `wire_auth_failure_delays_repeat_attempts` |
-| Authorization | Execute distinguishes read, write, and schema-admin grants, including nested access. Describe bypass and restricted transaction-control classification remain open defects. | `wire_grant_enforcement_reader_writer_admin` |
+| Authorization | Execute distinguishes read, write, and schema-admin grants, including nested access. Session-local transaction controls require no schema-admin grant. Describe bypass remains an open defect. | `wire_grant_enforcement_reader_writer_admin` |
 | Diagnostics | `RunningServer::status()` reports connection admission and tracked query/describe worker outcomes. | `persistent_server_reopens_durable_database_after_shutdown`, `query_worker_tracker_records_terminal_operation_outcomes` (unit) |
 | Slow statement log | `ServerConfig::slow_statement_threshold` / `--slow-statement-ms N` log statements (execution plus commit publication) above the threshold to stderr as one structured line: duration, authenticated user, single-line statement. Default off. | `omendbd_logs_slow_statements_when_threshold_set` |
 | EXPLAIN | `EXPLAIN <SELECT/INSERT/UPDATE/DELETE>` reports the same access path the executor takes: primary-key lookup, index scan, NULL short-circuit, or seq scan. `EXPLAIN ANALYZE` is refused. Grant analysis recurses into the explained statement. | `explain_names_the_access_path_execution_takes`, `explain_reports_access_path_through_wire` |
@@ -48,10 +48,10 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 | Surface | Current behavior | Evidence |
 | --- | --- | --- |
 | Startup and authentication | PostgreSQL startup packets use trust or SCRAM according to the durable auth catalog. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `pgwire_sasl_initial_response_decode_probe` |
-| Simple queries | Semicolon-separated statements, transaction control, and ordinary SQL execute through the wire handler. | `wire_transaction_block_rollback_discards_writes`, `wire_transaction_block_commit_persists_and_crosses_connections` |
+| Simple queries | Statement splitting respects literals, identifiers and comments. Multiple statements outside explicit blocks still commit individually, not as one implicit transaction. | `plain_controls_and_lexical_boundaries_are_preserved`, `wire_transaction_block_rollback_discards_writes` |
 | Extended queries | Parse, parameter type resolution, bind, describe, and execute are exercised through `tokio-postgres`; repeated parameterized execution is covered. Parameter inference includes the supported `BETWEEN` form so bound values inherit the compared column's logical type. | `wire_hot_statement_repeats_across_params`, `sql_parameter_types_infer_between_bounds_from_column`, all `Client::query`/`Client::execute` tests |
 | Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; supported DML `RETURNING` uses static target-table metadata rather than depending on a probe row. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |
-| Transactions | Plain `BEGIN`/`START`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks; covered execution failures reject later statements with `25P02`. Variants are unsafe: `ROLLBACK TO SAVEPOINT` ends the entire block, and `BEGIN READ ONLY` still permits writes. Bind/auth/result-admission failure lifecycle and restricted-role cleanup are not fully qualified. | `wire_transaction_block_commit_persists_and_crosses_connections`, `wire_aborted_block_rejects_until_rollback`; variant defects in `handler.rs::transaction_command` |
+| Transactions | Plain `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks. Complete controls are parsed: characteristics (including read-only/isolation), savepoints and chaining are rejected rather than ignored. Block errors and idle expiry retain a rollback-only boundary (`25P02`); COMMIT then reports ROLLBACK. Consumed commit errors report idle, not a phantom aborted block. | `tests/project_transaction_controls.rs`, `wire_grant_enforcement_reader_writer_admin`, `idle_expiry_releases_transactions_without_restoring_autocommit` |
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
 

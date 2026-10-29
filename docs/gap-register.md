@@ -15,14 +15,13 @@ not treat current erroneous output as the contract.
 
 | Boundary | Known limitation | Source |
 | --- | --- | --- |
-| Authorization | Describe executes protected queries without grant enforcement. Name-keyed grants can transfer across rename/recreate; text-based access collection is incomplete. Transaction controls are misclassified as schema administration. | `src/pgwire_server/{auth,handler}.rs`, `src/sql.rs::statement_access` |
+| Authorization | Describe executes protected queries without grant enforcement. Name-keyed grants can transfer across rename/recreate; text-based access collection is incomplete. | `src/pgwire_server/{auth,handler}.rs`, `src/sql.rs::statement_access` |
 | Prepared statements | Parameter/result signatures can be inferred again from live catalog/probes; token-based invalidation misses direct-API DDL. | `src/pgwire_server/handler.rs::{resolved_parameter_types,describe_schema}` |
-| Failed operations | A failed unique insert can leave a base row committable without its index entry. Explicit-block result-admission errors can leave earlier writes committable. | `src/seer_direct.rs::DirectTransaction`, `src/relational_database.rs`, wire handler |
-| Transaction controls | First-keyword classification treats `ROLLBACK TO SAVEPOINT` as a full rollback; later writes can autocommit and escape the caller's final rollback. `BEGIN READ ONLY` ignores the requested mode and permits writes. Unsupported control variants do not reliably fail closed. | `src/pgwire_server/handler.rs::{transaction_command,run_statement_inner}` |
+| Failed operations | A failed direct-API unique insert can leave a base row committable without its index entry. The wire's rollback-only policy does not establish native statement atomicity. | `src/seer_direct.rs::DirectTransaction`, `src/relational_database.rs`, wire handler |
 | Schema publication | Typed FK creation validates and publishes in separate transactions. | `src/seer_direct.rs::create_foreign_key_with_name` |
 | Catalog snapshots | Storage captures a catalog while some binding/identity paths consult the live catalog, permitting mixed-generation behavior after concurrent DDL. | `src/sql_query.rs`, relational database and direct storage adapter |
 | Index equality | Typed negative and positive float zero can occupy separate unique-index entries despite scalar equality; indexed lookup can omit an equal row. Persisted indexes require explicit conversion/rebuild or refusal. | `src/relational.rs::Value::encode_for_key`, `src/sql_types.rs::F64` |
-| Wire statement lists | Raw semicolon splitting breaks quoted/commented semicolons and the simple message's implicit transaction boundary. | `src/pgwire_server/handler.rs::do_query` |
+| Wire statement lists | Multiple statements outside explicit blocks commit individually rather than sharing the simple message's implicit transaction boundary. Lexical splitting now respects quoted/commented semicolons. | `src/pgwire_server/handler.rs::do_query` |
 | Logical conversion | Dump/restore omits supported FK delete actions, converting Cascade to Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |
 | Constraint timing | Immediate and deferred typed FKs both validate at publication; advertised statement-time FK behavior is unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity` |
 

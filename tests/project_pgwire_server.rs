@@ -1203,76 +1203,102 @@ async fn wire_client(database: Arc<RwLock<RelationalDatabase>>) -> tokio_postgre
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wire_cancel_request_aborts_lock_wait_before_publication() {
-    let directory = tempdir().expect("tempdir");
-    let database = seed_database(directory.path());
-    let (addr, server) =
-        pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+    for explicit_block in [false, true] {
+        let directory = tempdir().expect("tempdir");
+        let database = seed_database(directory.path());
+        let (addr, server) =
+            pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().expect("addr"))
+                .await
+                .expect("spawn server");
+        let (client, connection) = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let cancel_token = client.cancel_token();
+        if explicit_block {
+            client
+                .batch_execute("BEGIN; INSERT INTO users VALUES (10, 'staged@example.com')")
+                .await
+                .unwrap();
+        }
+        let client = Arc::new(client);
+        let query_client = Arc::clone(&client);
+
+        let (release_lock, wait_for_release) = std::sync::mpsc::channel();
+        let (lock_acquired, wait_for_lock) = std::sync::mpsc::channel();
+        let database_for_lock = database.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let _database_guard = database_for_lock.write().expect("database lock");
+            lock_acquired
+                .send(())
+                .expect("signal publication lock is held");
+            wait_for_release.recv().expect("release publication lock");
+        });
+        // Wait until the publication lock is actually held: without this,
+        // the query can win the lock race on a slow runner and succeed,
+        // making the cancellation assertion a scheduling coin flip.
+        wait_for_lock
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("publication lock is held before the query starts");
+
+        let query = tokio::spawn(async move {
+            query_client
+                .batch_execute("INSERT INTO users (id, email) VALUES (2, 'cancelled@example.com')")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_token
+            .cancel_query(tokio_postgres::NoTls)
             .await
-            .expect("spawn server");
-    let (client, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
-        tokio_postgres::NoTls,
-    )
-    .await
-    .expect("connect");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let cancel_token = client.cancel_token();
+            .expect("send cancel request");
 
-    let (release_lock, wait_for_release) = std::sync::mpsc::channel();
-    let (lock_acquired, wait_for_lock) = std::sync::mpsc::channel();
-    let database_for_lock = database.clone();
-    let lock_thread = std::thread::spawn(move || {
-        let _database_guard = database_for_lock.write().expect("database lock");
-        lock_acquired
-            .send(())
-            .expect("signal publication lock is held");
-        wait_for_release.recv().expect("release publication lock");
-    });
-    // Wait until the publication lock is actually held: without this,
-    // the query can win the lock race on a slow runner and succeed,
-    // making the cancellation assertion a scheduling coin flip.
-    wait_for_lock
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("publication lock is held before the query starts");
-
-    let query = tokio::spawn(async move {
-        client
-            .execute(
-                "INSERT INTO users (id, email) VALUES (2, 'cancelled@example.com')",
-                &[],
-            )
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), query)
             .await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    cancel_token
-        .cancel_query(tokio_postgres::NoTls)
-        .await
-        .expect("send cancel request");
+            .expect("cancelled query completed")
+            .expect("query task completed")
+            .expect_err("cancelled query must fail");
+        assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED));
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(5), query)
+        release_lock.send(()).expect("release publication lock");
+        lock_thread.join().expect("lock thread");
+        if explicit_block {
+            let aborted = client
+                .batch_execute("INSERT INTO users VALUES (3, 'must not escape')")
+                .await
+                .expect_err("cancellation keeps rollback-only boundary");
+            assert_eq!(aborted.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+            client
+                .batch_execute("COMMIT")
+                .await
+                .expect("discard failed block");
+        }
+        let same_connection = client
+            .query_one("SELECT count(*) FROM users", &[])
+            .await
+            .expect("connection reusable after cancellation");
+        assert_eq!(same_connection.get::<_, i64>(0), 1);
+        let (check, connection) = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+            tokio_postgres::NoTls,
+        )
         .await
-        .expect("cancelled query completed")
-        .expect("query task completed")
-        .expect_err("cancelled query must fail");
-    assert_eq!(error.code(), Some(&SqlState::QUERY_CANCELED));
-
-    release_lock.send(()).expect("release publication lock");
-    lock_thread.join().expect("lock thread");
-    let (check, connection) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
-        tokio_postgres::NoTls,
-    )
-    .await
-    .expect("reconnect after cancellation");
-    tokio::spawn(async move { connection.await.expect("connection") });
-    let row = check
-        .query_one("SELECT count(*) FROM users", &[])
-        .await
-        .expect("read after cancellation");
-    assert_eq!(row.get::<_, i64>(0), 1);
-    server.abort();
+        .expect("reconnect after cancellation");
+        let check_connection = tokio::spawn(connection);
+        let row = check
+            .query_one("SELECT count(*) FROM users", &[])
+            .await
+            .expect("read after cancellation");
+        assert_eq!(row.get::<_, i64>(0), 1);
+        drop(check);
+        drop(client);
+        check_connection.await.unwrap().expect("clean disconnect");
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -3679,6 +3705,44 @@ async fn wire_grant_enforcement_reader_writer_admin() {
         .await;
     let error = denied.expect_err("read-only role must not insert");
     assert_eq!(error.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+
+    // Session-local controls require no schema-admin grant; authorization
+    // errors still poison a block, and its cleanup remains available.
+    for extended in [false, true] {
+        reader
+            .batch_execute("BEGIN")
+            .await
+            .expect("restricted begin");
+        reader
+            .query("SELECT body FROM notes", &[])
+            .await
+            .expect("granted read in block");
+        let denied = if extended {
+            reader
+                .execute("INSERT INTO notes VALUES (2, 'nope')", &[])
+                .await
+                .map(|_| ())
+        } else {
+            reader
+                .batch_execute("INSERT INTO notes VALUES (2, 'nope')")
+                .await
+        }
+        .expect_err("denied in block");
+        assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+        let aborted = reader
+            .batch_execute("SELECT body FROM notes")
+            .await
+            .expect_err("rollback-only");
+        assert_eq!(aborted.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+        reader
+            .batch_execute("COMMIT")
+            .await
+            .expect("commit rolls back failed block");
+        reader
+            .batch_execute("BEGIN; ROLLBACK")
+            .await
+            .expect("restricted cleanup");
+    }
 
     // Writer-admin: INSERT allowed, DDL allowed.
     let writer = connect("writer", "wpass").await.expect("writer connect");

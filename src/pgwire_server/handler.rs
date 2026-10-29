@@ -5,11 +5,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+#[path = "handler_tests.rs"]
+mod tests;
+
+use crate::sql::TransactionControl;
 use async_trait::async_trait;
+use futures::{Sink, SinkExt};
+use pgwire::api::ClientPortalStore;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{FieldInfo, Response, Tag};
+use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::response::TransactionStatus;
 
 use super::cancellation::{CancellationRegistry, QueryCancellationLease};
 use super::encoding::{
@@ -78,27 +88,6 @@ impl OmenDbHandler {
             .collect())
     }
 }
-/// Classify a wire statement as a transaction-control command.
-enum TransactionCommand {
-    Begin,
-    Commit,
-    Rollback,
-}
-
-fn transaction_command(statement: &str) -> Option<TransactionCommand> {
-    let head = statement
-        .split_whitespace()
-        .next()?
-        .trim_start_matches('(')
-        .to_ascii_uppercase();
-    match head.as_str() {
-        "BEGIN" | "START" => Some(TransactionCommand::Begin),
-        "COMMIT" | "END" => Some(TransactionCommand::Commit),
-        "ROLLBACK" | "ABORT" => Some(TransactionCommand::Rollback),
-        _ => None,
-    }
-}
-
 impl OmenDbHandler {
     pub(super) fn cleanup_connection(&self, client_addr: std::net::SocketAddr) {
         if let Ok(mut blocks) = self.transactions.lock() {
@@ -131,6 +120,33 @@ impl OmenDbHandler {
         }
     }
 
+    fn fail_block(&self, client_addr: std::net::SocketAddr) {
+        let transaction = {
+            let Ok(mut blocks) = self.transactions.lock() else {
+                return;
+            };
+            let Some(block) = blocks.get_mut(&client_addr) else {
+                return;
+            };
+            block.last_used = Instant::now();
+            block.transaction.take()
+        };
+        drop(transaction);
+    }
+
+    /// The engine map, not the previous protocol status, owns transaction state.
+    /// In particular, commit consumes a block even when its outcome is an error.
+    fn sync_transaction_status<C: ClientInfo>(&self, client: &mut C) -> PgWireResult<()> {
+        let blocks = self.lock_transactions()?;
+        let status = match blocks.get(&client.socket_addr()) {
+            Some(block) if block.transaction.is_none() => TransactionStatus::Error,
+            Some(_) => TransactionStatus::Transaction,
+            None => TransactionStatus::Idle,
+        };
+        client.set_transaction_status(status);
+        Ok(())
+    }
+
     fn lock_transactions(
         &self,
     ) -> PgWireResult<std::sync::MutexGuard<'_, HashMap<std::net::SocketAddr, TransactionBlock>>>
@@ -140,10 +156,17 @@ impl OmenDbHandler {
             .map_err(|_| pg_error("XX000", "transaction table poisoned".to_owned()))
     }
 
-    /// Abort transaction blocks orphaned by disconnected clients. Cheap
-    /// scan amortized over handled statements; stale blocks hold no locks.
-    fn reap_idle_blocks(&self, blocks: &mut HashMap<std::net::SocketAddr, TransactionBlock>) {
-        blocks.retain(|_, block| block.last_used.elapsed() < TX_IDLE_TIMEOUT);
+    /// Release idle engine transactions, never the session's rollback boundary.
+    /// Return owned resources so their destruction happens outside the map lock.
+    fn reap_idle_blocks(
+        &self,
+        blocks: &mut HashMap<std::net::SocketAddr, TransactionBlock>,
+    ) -> Vec<crate::RelationalDatabaseTransaction> {
+        blocks
+            .values_mut()
+            .filter(|block| block.last_used.elapsed() >= TX_IDLE_TIMEOUT)
+            .filter_map(|block| block.transaction.take())
+            .collect()
     }
 
     /// Route one wire statement: transaction control, in-block execution,
@@ -159,6 +182,9 @@ impl OmenDbHandler {
     ) -> PgWireResult<Response> {
         let started = self.slow_statement_threshold.map(|_| Instant::now());
         let response = self.run_statement_inner(client_addr, sql, params, format, control);
+        if response.is_err() {
+            self.fail_block(client_addr);
+        }
         if let (Some(started), Some(threshold)) = (started, self.slow_statement_threshold) {
             let elapsed = started.elapsed();
             if elapsed >= threshold {
@@ -208,18 +234,24 @@ impl OmenDbHandler {
         // connection must never block other connections from reaching
         // the database RwLock. In-block work takes its block out of the
         // map for the duration and reinserts it after.
-        {
+        let expired = {
             let mut blocks = self.lock_transactions()?;
-            self.reap_idle_blocks(&mut blocks);
+            self.reap_idle_blocks(&mut blocks)
+        };
+        drop(expired);
+        let transaction_control = crate::sql::transaction_control(sql).map_err(map_db_error)?;
+        // Bound controls touch only this session's transaction. In particular,
+        // cleanup must remain available without a schema-administration grant.
+        if transaction_control.is_none() {
+            self.enforce_grants(client_addr, sql, control)?;
         }
-        self.enforce_grants(client_addr, sql, control)?;
         control.check().map_err(map_db_error)?;
-        match transaction_command(sql) {
-            Some(TransactionCommand::Begin) => {
+        match transaction_control {
+            Some(TransactionControl::Begin) => {
                 let mut blocks = self.lock_transactions()?;
                 if let Some(block) = blocks.get_mut(&client_addr) {
                     block.last_used = Instant::now();
-                    if block.errored {
+                    if block.transaction.is_none() {
                         return Err(pg_error(
                             "25P02",
                             "current transaction is aborted, commands ignored until end of transaction block".to_owned(),
@@ -238,25 +270,23 @@ impl OmenDbHandler {
                 blocks.insert(
                     client_addr,
                     TransactionBlock {
-                        transaction,
-                        errored: false,
+                        transaction: Some(transaction),
                         last_used: Instant::now(),
                     },
                 );
                 Ok(Response::TransactionStart(Tag::new("BEGIN")))
             }
-            Some(TransactionCommand::Commit) => {
+            Some(TransactionControl::Commit) => {
                 let block = {
                     let mut blocks = self.lock_transactions()?;
                     blocks.remove(&client_addr)
                 };
-                let Some(mut block) = block else {
+                let Some(block) = block else {
                     return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
                 };
-                if block.errored {
-                    drop(block.transaction);
+                let Some(mut transaction) = block.transaction else {
                     return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
-                }
+                };
                 // Publication is the serialized-writer boundary; the map
                 // is free while this commit publishes.
                 //
@@ -269,11 +299,11 @@ impl OmenDbHandler {
                 // every wave to a singleton (measured members=1.00 across
                 // 3008 waves) and blocking all readers for the wave
                 // duration; the lane is the only serialization needed.
-                block.transaction.set_operation_control(control);
-                block.transaction.commit().map_err(map_db_error)?;
+                transaction.set_operation_control(control);
+                transaction.commit().map_err(map_db_error)?;
                 Ok(Response::TransactionEnd(Tag::new("COMMIT")))
             }
-            Some(TransactionCommand::Rollback) => {
+            Some(TransactionControl::Rollback) => {
                 let block = {
                     let mut blocks = self.lock_transactions()?;
                     blocks.remove(&client_addr)
@@ -297,32 +327,29 @@ impl OmenDbHandler {
                         .remove(&client_addr)
                         .expect("membership checked above")
                 };
-                if block.errored {
+                let Some(transaction) = block.transaction.as_mut() else {
                     self.lock_transactions()?.insert(client_addr, block);
                     return Err(pg_error(
                         "25P02",
                         "current transaction is aborted, commands ignored until end of transaction block".to_owned(),
                     ));
-                }
+                };
                 block.last_used = Instant::now();
-                block.transaction.set_operation_control(control);
+                transaction.set_operation_control(control);
                 // Buffered into the transaction; publication happens at
                 // COMMIT under the write lock, so execution only needs
                 // shared access.
-                let database = read_lock_with_control(&self.database, control)?;
-                let outcome = block
-                    .transaction
-                    .execute_sql_with_params(&database, sql, params);
-                drop(database);
-                let response = match outcome {
-                    Ok(result) => {
-                        encode_response_with_format(result, format, self.max_result_bytes)
-                    }
-                    Err(error) => {
-                        block.errored = true;
-                        Err(map_db_error(error))
-                    }
-                };
+                let response = (|| {
+                    let database = read_lock_with_control(&self.database, control)?;
+                    let result = transaction
+                        .execute_sql_with_params(&database, sql, params)
+                        .map_err(map_db_error)?;
+                    drop(database);
+                    encode_response_with_format(result, format, self.max_result_bytes)
+                })();
+                if response.is_err() {
+                    block.transaction = None;
+                }
                 self.lock_transactions()?.insert(client_addr, block);
                 response
             }
@@ -638,8 +665,72 @@ impl OmenDbHandler {
     }
 }
 
+impl pgwire::api::ErrorHandler for OmenDbHandler {
+    fn on_error<C>(&self, client: &C, _error: &mut PgWireError)
+    where
+        C: ClientInfo,
+    {
+        // Parse, Bind and Describe failures do not pass through execution.
+        self.fail_block(client.socket_addr());
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for OmenDbHandler {
+    async fn on_query<C>(
+        &self,
+        client: &mut C,
+        query: pgwire::messages::simplequery::Query,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::api::PgWireConnectionState;
+        use pgwire::api::query::{
+            send_execution_response, send_query_response, send_ready_for_query,
+        };
+        use pgwire::messages::response::EmptyQueryResponse;
+
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let result = async {
+            for response in self.do_query(client, &query.query).await? {
+                match response {
+                    Response::Query(rows) => send_query_response(client, rows, true).await?,
+                    Response::Execution(tag)
+                    | Response::TransactionStart(tag)
+                    | Response::TransactionEnd(tag) => {
+                        send_execution_response(client, tag).await?;
+                    }
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                                EmptyQueryResponse::new(),
+                            ))
+                            .await?
+                    }
+                    _ => return Err(pg_error("XX000", "unexpected SQL response kind".to_owned())),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.fail_block(client.socket_addr());
+        }
+        // Unlike pgwire's default responder, never infer final state from
+        // command tags or the status captured before this batch executed.
+        self.sync_transaction_status(client)?;
+        result?;
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        send_ready_for_query(client, client.transaction_status()).await
+    }
+
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
@@ -651,14 +742,7 @@ impl SimpleQueryHandler for OmenDbHandler {
         self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let mut responses = Vec::new();
-                // The embedded tier accepts one statement per call;
-                // simple-protocol strings may carry several, so split
-                // conservatively on semicolons.
-                for statement in query.split(';') {
-                    let statement = statement.trim();
-                    if statement.is_empty() {
-                        continue;
-                    }
+                for statement in crate::sql::statement_sources(&query).map_err(map_db_error)? {
                     let control = handler.operation_control(&cancellation);
                     responses.push(handler.run_statement(
                         client_addr,
@@ -669,7 +753,7 @@ impl SimpleQueryHandler for OmenDbHandler {
                     )?);
                 }
                 if responses.is_empty() {
-                    responses.push(Response::Execution(Tag::new("OK")));
+                    responses.push(Response::EmptyQuery);
                 }
                 Ok(responses)
             })
@@ -685,6 +769,41 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::new(PlaceholderParser)
+    }
+
+    async fn on_sync<C>(
+        &self,
+        client: &mut C,
+        _message: pgwire::messages::extendedquery::Sync,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        client.portal_store().rm_portal(pgwire::api::DEFAULT_NAME);
+        self.sync_transaction_status(client)?;
+        pgwire::api::query::send_ready_for_query(client, client.transaction_status()).await
+    }
+
+    async fn on_execute<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Execute,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_execute(client, message).await;
+        if result.is_err() {
+            self.fail_block(client.socket_addr());
+        }
+        self.sync_transaction_status(client)?;
+        result
     }
 
     async fn do_query<C>(

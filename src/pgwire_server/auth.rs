@@ -431,6 +431,10 @@ impl PgWireServerHandlers for HandlerFactory {
         self.handler.clone()
     }
 
+    fn error_handler(&self) -> Arc<impl pgwire::api::ErrorHandler> {
+        self.handler.clone()
+    }
+
     fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
         self.cancel_handler.clone()
     }
