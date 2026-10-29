@@ -142,8 +142,12 @@ pub enum DbError {
     InvalidState(String),
     #[error("transaction is aborted; begin a new transaction to continue")]
     TransactionAborted,
+    #[error("prepared statement invalidated by a catalog change; prepare it again")]
+    SqlPreparedStatementInvalidated,
     #[error("SQL parse error: {0}")]
     SqlParse(String),
+    #[error("could not determine data type of parameter ${index}")]
+    SqlIndeterminateParameter { index: usize },
     #[error("invalid SQL parameters: {0}")]
     SqlParameter(String),
     #[error("table {name} does not exist")]
@@ -260,6 +264,8 @@ impl DbError {
             }
             Self::InvalidState(_)
             | Self::TransactionAborted
+            | Self::SqlPreparedStatementInvalidated
+            | Self::SqlIndeterminateParameter { .. }
             | Self::NonMonotonicCommit { .. }
             | Self::ValueTooLarge(_)
             | Self::FragmentDebtExceeded { .. }

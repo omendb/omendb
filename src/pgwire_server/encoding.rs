@@ -284,45 +284,42 @@ fn numeric_groups_weighted(
     Ok((weight, groups))
 }
 
-pub(super) fn value_type(value: Option<&Value>) -> Type {
-    match value {
-        Some(Value::Bool(_)) => Type::BOOL,
-        Some(Value::U64(_) | Value::I64(_)) => Type::INT8,
-        Some(Value::Text(_)) => Type::TEXT,
-        Some(Value::Bytes(_)) => Type::BYTEA,
-        Some(Value::Float64(_)) => Type::FLOAT8,
-        Some(Value::Date(_)) => Type::DATE,
-        Some(Value::Timestamp(_)) => Type::TIMESTAMP,
-        Some(Value::Decimal(_)) => Type::NUMERIC,
-        Some(Value::Uuid(_)) => Type::UUID,
-        _ => Type::TEXT,
+pub(super) fn validate_format(
+    format: &pgwire::api::portal::Format,
+    count: usize,
+) -> PgWireResult<()> {
+    if let pgwire::api::portal::Format::Individual(codes) = format
+        && (codes.len() != count || codes.iter().any(|code| !matches!(code, 0 | 1)))
+    {
+        return Err(pg_error(
+            "08P01",
+            "invalid column format count or code".to_owned(),
+        ));
     }
+    Ok(())
 }
 
-pub(super) fn fields_from_result(
-    result: &crate::SqlResult,
+pub(super) fn fields_from_columns(
+    columns: &[crate::SqlColumn],
     format: &pgwire::api::portal::Format,
-) -> Arc<Vec<FieldInfo>> {
-    let sample = result.rows.first();
-    Arc::new(
-        result
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(position, column)| {
-                // Static projection types come first: they hold even when
-                // no row matches (a parameterized describe probe runs with
-                // benign values). Sample inference is the fallback for
-                // genuinely dynamic shapes (set-union arms, subqueries).
-                let ty = column
-                    .column_type
-                    .map(column_type_to_pg)
-                    .unwrap_or_else(|| value_type(sample.and_then(|row| row.get(position))));
-                let field_format = format.format_for(position);
-                FieldInfo::new(column.name.clone(), None, None, ty, field_format)
-            })
-            .collect::<Vec<_>>(),
-    )
+) -> PgWireResult<Vec<FieldInfo>> {
+    validate_format(format, columns.len())?;
+    columns
+        .iter()
+        .enumerate()
+        .map(|(position, column)| {
+            let column_type = column
+                .column_type
+                .ok_or_else(|| pg_error("XX000", "SQL binding omitted a result type".to_owned()))?;
+            Ok(FieldInfo::new(
+                column.name.clone(),
+                None,
+                None,
+                column_type_to_pg(column_type),
+                format.format_for(position),
+            ))
+        })
+        .collect()
 }
 
 fn estimated_value_bytes(value: &Value) -> usize {
@@ -374,10 +371,10 @@ pub(super) fn encode_response_with_format(
             Tag::new("OK").with_rows(result.affected_rows),
         ));
     }
-    let schema = fields_from_result(&result, format);
-    let rows = result.rows.clone();
-    let data_row_stream = stream::iter(rows).then(move |row| {
-        let schema = schema.clone();
+    let schema = Arc::new(fields_from_columns(&result.columns, format)?);
+    let row_schema = schema.clone();
+    let data_row_stream = stream::iter(result.rows).then(move |row| {
+        let schema = row_schema.clone();
         async move {
             let mut encoder = DataRowEncoder::new(schema);
             for value in &row {
@@ -386,10 +383,7 @@ pub(super) fn encode_response_with_format(
             Ok(encoder.take_row())
         }
     });
-    Ok(Response::Query(QueryResponse::new(
-        fields_from_result(&result, format),
-        data_row_stream,
-    )))
+    Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
 }
 
 pub(super) fn column_type_to_pg(column_type: crate::ColumnType) -> Type {
@@ -586,13 +580,23 @@ pub(super) fn decode_parameters(
     parameter_format: &pgwire::api::portal::Format,
     resolved: &[Type],
 ) -> PgWireResult<Vec<Value>> {
-    (0..parameters.len())
-        .map(|index| {
-            decode_parameter(
-                parameters.get(index).and_then(|raw| raw.as_deref()),
-                parameter_format.is_binary(index),
-                resolved.get(index).unwrap_or(&Type::TEXT),
-            )
+    if parameters.len() != resolved.len() {
+        return Err(pg_error(
+            "08P01",
+            format!(
+                "expected {} parameters, received {}",
+                resolved.len(),
+                parameters.len()
+            ),
+        ));
+    }
+    validate_format(parameter_format, parameters.len())?;
+    parameters
+        .iter()
+        .zip(resolved)
+        .enumerate()
+        .map(|(index, (raw, declared))| {
+            decode_parameter(raw.as_deref(), parameter_format.is_binary(index), declared)
         })
         .collect()
 }

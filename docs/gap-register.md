@@ -15,10 +15,9 @@ not treat current erroneous output as the contract.
 
 | Boundary | Known limitation | Source |
 | --- | --- | --- |
-| Authorization | Describe executes protected queries without grant enforcement. Name-keyed grants can transfer across rename/recreate; text-based access collection is incomplete. | `src/pgwire_server/{auth,handler}.rs`, `src/sql.rs::statement_access` |
-| Prepared statements | Parameter/result signatures can be inferred again from live catalog/probes; token-based invalidation misses direct-API DDL. | `src/pgwire_server/handler.rs::{resolved_parameter_types,describe_schema}` |
+| Authorization | Grants remain name-keyed and can transfer across rename/recreate. A missing grants catalog retains bootstrap access. | `src/pgwire_server/{auth,handler}.rs` |
 | Schema publication | Typed FK creation validates and publishes in separate transactions. | `src/seer_direct.rs::create_foreign_key_with_name` |
-| Catalog snapshots | Storage captures a catalog while some binding/identity paths consult the live catalog, permitting mixed-generation behavior after concurrent DDL. | `src/sql_query.rs`, relational database and direct storage adapter |
+| Catalog snapshots | Typed transaction and identity operations still consult live catalog metadata; their behavior across concurrent DDL remains unqualified. SQL binding rejects catalog-generation changes. | `src/relational_database.rs`, `src/seer_direct.rs` |
 | Index equality | Typed negative and positive float zero can occupy separate unique-index entries despite scalar equality; indexed lookup can omit an equal row. Persisted indexes require explicit conversion/rebuild or refusal. | `src/relational.rs::Value::encode_for_key`, `src/sql_types.rs::F64` |
 | Wire statement lists | Multiple statements outside explicit blocks commit individually rather than sharing the simple message's implicit transaction boundary. Lexical splitting now respects quoted/commented semicolons. | `src/pgwire_server/handler.rs::do_query` |
 | Logical conversion | Dump/restore omits supported FK delete actions, converting Cascade to Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |

@@ -946,7 +946,8 @@ fn scalar_function_catalog_matches_postgresql_semantics() {
         ]
     );
 
-    // EXTRACT: calendar fields and epoch as scale-6 decimal seconds.
+    // PostgreSQL EXTRACT has a numeric domain for every field, including
+    // integral calendar fields; epoch retains microsecond precision.
     let result = database
         .execute_sql(
             "SELECT extract(year from created), extract(month from created), extract(day from created), extract(hour from created), extract(epoch from created) FROM t WHERE id = 1",
@@ -955,10 +956,10 @@ fn scalar_function_catalog_matches_postgresql_semantics() {
     assert_eq!(
         result.rows[0],
         vec![
-            Value::I64(2026),
-            Value::I64(9),
-            Value::I64(5),
-            Value::I64(14),
+            Value::Decimal(omendb::DecimalValue::new(2026, 0).unwrap()),
+            Value::Decimal(omendb::DecimalValue::new(9, 0).unwrap()),
+            Value::Decimal(omendb::DecimalValue::new(5, 0).unwrap()),
+            Value::Decimal(omendb::DecimalValue::new(14, 0).unwrap()),
             Value::Decimal(omendb::DecimalValue::new(1_788_618_645_123_000, 6).expect("epoch")),
         ]
     );

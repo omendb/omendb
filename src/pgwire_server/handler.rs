@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 mod tests;
 
 use crate::sql::TransactionControl;
+use crate::sql::binding::{StatementAccess, StatementEffect};
+
+mod prepare;
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::ClientPortalStore;
@@ -24,13 +27,11 @@ use pgwire::messages::response::TransactionStatus;
 use super::cancellation::{CancellationRegistry, QueryCancellationLease};
 use super::encoding::{
     check_result_payload, column_type_to_pg, decode_parameters, encode_response_with_format,
-    value_type,
+    fields_from_columns,
 };
 use super::lifecycle::{QueryWorkers, read_lock_with_control, write_lock_with_control};
 use super::shared::TX_IDLE_TIMEOUT;
-use super::shared::{
-    IdentityMap, ParsedStatement, PlaceholderParser, ProbeCache, TransactionBlock,
-};
+use super::shared::{IdentityMap, ParsedStatement, TransactionBlock};
 use super::{CancellationToken, OperationControl, SharedDatabase, Value, map_db_error, pg_error};
 
 #[derive(Clone)]
@@ -42,13 +43,6 @@ pub(super) struct OmenDbHandler {
     /// handler after a successful exchange and read per statement for
     /// grant enforcement.
     pub(super) identities: Arc<IdentityMap>,
-    /// Describe-probe results keyed by (source text, declared parameter
-    /// types). Stores the schema-independent column list so each prepare
-    /// probes once instead of every describe; FieldInfo is rebuilt per
-    /// call with the portal's negotiated format. Cleared wholesale on
-    /// any DDL statement - DDL is rare and stale schemas are worse than
-    /// re-probing.
-    pub(super) schema_probes: Arc<Mutex<ProbeCache>>,
     pub(super) query_workers: Arc<QueryWorkers>,
     pub(super) statement_timeout: Option<Duration>,
     pub(super) max_result_bytes: Option<usize>,
@@ -57,37 +51,6 @@ pub(super) struct OmenDbHandler {
     pub(super) slow_statement_threshold: Option<Duration>,
 }
 
-impl OmenDbHandler {
-    /// Resolve the wire type reported for each parameter: client-declared
-    /// types win; otherwise statement-context inference from the SQL tier;
-    /// otherwise text as the least-lossy fallback.
-    fn resolved_parameter_types(
-        &self,
-        statement: &ParsedStatement,
-        control: &OperationControl,
-    ) -> PgWireResult<Vec<Type>> {
-        let count = statement.parameter_count;
-        let database = read_lock_with_control(&self.database, control)?;
-        let inferred = database
-            .sql_parameter_types(&statement.sql)
-            .map_err(map_db_error)?;
-        Ok((0..count)
-            .map(|index| {
-                statement
-                    .parameter_types
-                    .get(index)
-                    .cloned()
-                    .flatten()
-                    .or_else(|| {
-                        inferred
-                            .get(index)
-                            .and_then(|column_type| column_type.map(column_type_to_pg))
-                    })
-                    .unwrap_or(Type::TEXT)
-            })
-            .collect())
-    }
-}
 impl OmenDbHandler {
     pub(super) fn cleanup_connection(&self, client_addr: std::net::SocketAddr) {
         if let Ok(mut blocks) = self.transactions.lock() {
@@ -174,14 +137,37 @@ impl OmenDbHandler {
     /// statement executes exactly once.
     fn run_statement(
         &self,
-        client_addr: std::net::SocketAddr,
+        address: std::net::SocketAddr,
         sql: &str,
         params: &[Value],
         format: &pgwire::api::portal::Format,
         control: &OperationControl,
     ) -> PgWireResult<Response> {
+        let hints = crate::sql::parameter_hints(params)
+            .into_iter()
+            .map(|ty| ty.map(column_type_to_pg))
+            .collect::<Vec<_>>();
+        let result = self
+            .bind_statement(address, sql, &hints, control)
+            .and_then(|statement| {
+                self.run_bound_statement(address, &statement, params, format, control)
+            });
+        if result.is_err() {
+            self.fail_block(address);
+        }
+        result
+    }
+
+    fn run_bound_statement(
+        &self,
+        client_addr: std::net::SocketAddr,
+        statement: &ParsedStatement,
+        params: &[Value],
+        format: &pgwire::api::portal::Format,
+        control: &OperationControl,
+    ) -> PgWireResult<Response> {
         let started = self.slow_statement_threshold.map(|_| Instant::now());
-        let response = self.run_statement_inner(client_addr, sql, params, format, control);
+        let response = self.run_statement_inner(client_addr, statement, params, format, control);
         if response.is_err() {
             self.fail_block(client_addr);
         }
@@ -198,7 +184,7 @@ impl OmenDbHandler {
                     "omendbd: slow statement: {{\"duration_ms\":{:.3},\"user\":\"{}\",\"statement\":\"{}\"}}",
                     elapsed.as_secs_f64() * 1000.0,
                     identity,
-                    Self::statement_log_line(sql),
+                    Self::statement_log_line(&statement.sql),
                 );
             }
         }
@@ -218,34 +204,17 @@ impl OmenDbHandler {
     fn run_statement_inner(
         &self,
         client_addr: std::net::SocketAddr,
-        sql: &str,
+        statement: &ParsedStatement,
         params: &[Value],
         format: &pgwire::api::portal::Format,
         control: &OperationControl,
     ) -> PgWireResult<Response> {
         control.check().map_err(map_db_error)?;
-        if Self::is_schema_statement(sql)
-            && let Ok(mut cache) = self.schema_probes.lock()
-        {
-            cache.clear();
-        }
-        // The transaction map lock guards map membership only. Statement
-        // execution happens OUTSIDE the lock: a slow statement on one
-        // connection must never block other connections from reaching
-        // the database RwLock. In-block work takes its block out of the
-        // map for the duration and reinserts it after.
-        let expired = {
-            let mut blocks = self.lock_transactions()?;
-            self.reap_idle_blocks(&mut blocks)
+        let transaction_control = match statement.bound.effect {
+            StatementEffect::Control(control) => Some(control),
+            _ => None,
         };
-        drop(expired);
-        let transaction_control = crate::sql::transaction_control(sql).map_err(map_db_error)?;
-        // Bound controls touch only this session's transaction. In particular,
-        // cleanup must remain available without a schema-administration grant.
-        if transaction_control.is_none() {
-            self.enforce_grants(client_addr, sql, control)?;
-        }
-        control.check().map_err(map_db_error)?;
+        self.check_boundary(client_addr, transaction_control)?;
         match transaction_control {
             Some(TransactionControl::Begin) => {
                 let mut blocks = self.lock_transactions()?;
@@ -317,7 +286,7 @@ impl OmenDbHandler {
                 // Membership check under the lock; execution outside it.
                 let in_block = { self.lock_transactions()?.contains_key(&client_addr) };
                 if !in_block {
-                    return self.run_autocommit(sql, params, format, control);
+                    return self.run_autocommit(client_addr, statement, params, format, control);
                 }
 
                 // Take this connection's block out so other connections
@@ -341,8 +310,9 @@ impl OmenDbHandler {
                 // shared access.
                 let response = (|| {
                     let database = read_lock_with_control(&self.database, control)?;
+                    self.validate_access(client_addr, &database, statement, control)?;
                     let result = transaction
-                        .execute_sql_with_params(&database, sql, params)
+                        .execute_bound_sql(&database, &statement.bound, params)
                         .map_err(map_db_error)?;
                     drop(database);
                     encode_response_with_format(result, format, self.max_result_bytes)
@@ -356,28 +326,27 @@ impl OmenDbHandler {
         }
     }
 
-    /// Grant enforcement for authenticated roles. Inactive until any
-    /// row exists in pgwire_grants (bootstrap state grants full access
-    /// so provisioning works); then a role gets exactly its granted
-    /// access. The wildcard table "*" with can_write is schema
-    /// administration (DDL). Trust-mode connections carry no identity
-    /// and are loopback-only.
+    /// Enforce current committed wire grants. A missing pgwire_grants table
+    /// retains bootstrap access; once it exists, ungranted objects default to
+    /// deny. The wildcard "*" write grant authorizes schema administration.
+    /// Trust-mode connections carry no identity and are loopback-only.
     fn enforce_grants(
         &self,
         client_addr: std::net::SocketAddr,
-        sql: &str,
+        database: &crate::RelationalDatabase,
+        access: &StatementAccess,
         control: &OperationControl,
     ) -> PgWireResult<()> {
         let Some(role) = self
             .identities
             .lock()
-            .ok()
-            .and_then(|identities| identities.get(&client_addr).cloned())
+            .map_err(|_| pg_error("XX000", "identity registry poisoned".to_owned()))?
+            .get(&client_addr)
+            .cloned()
         else {
             return Ok(());
         };
 
-        let database = read_lock_with_control(&self.database, control)?;
         if !database
             .catalog()
             .tables()
@@ -387,7 +356,7 @@ impl OmenDbHandler {
         }
         let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
         let result = transaction.execute_sql_with_params(
-            &database,
+            database,
             "SELECT table_name, can_read, can_write FROM pgwire_grants WHERE role = $1",
             &[Value::Text(role.clone())],
         );
@@ -412,19 +381,27 @@ impl OmenDbHandler {
             table_grants.insert(table_name.clone(), (can_read, can_write));
         }
 
-        let (read_tables, write_tables, requires_admin) =
-            crate::sql::statement_access(sql).map_err(map_db_error)?;
+        let StatementAccess {
+            read: read_tables,
+            write: write_tables,
+            requires_admin,
+        } = access;
         // Admin grant must be consulted BEFORE refusing DDL.
         if admin {
             return Ok(());
         }
-        if requires_admin {
+        if *requires_admin {
             return Err(pg_error(
                 "42501",
                 format!("permission denied: role {role} lacks schema administration grant"),
             ));
         }
-        for table in &write_tables {
+        for table_id in write_tables {
+            let table = &database
+                .catalog()
+                .table(*table_id)
+                .map_err(map_db_error)?
+                .name;
             match table_grants.get(table) {
                 Some((_, true)) => {}
                 _ => {
@@ -437,10 +414,15 @@ impl OmenDbHandler {
                 }
             }
         }
-        for table in &read_tables {
-            if write_tables.contains(table) {
+        for table_id in read_tables {
+            if write_tables.contains(table_id) {
                 continue;
             }
+            let table = &database
+                .catalog()
+                .table(*table_id)
+                .map_err(map_db_error)?
+                .name;
             match table_grants.get(table) {
                 Some((true, _)) | Some((_, true)) => {}
                 _ => {
@@ -459,209 +441,51 @@ impl OmenDbHandler {
     /// Autocommit path: no transaction block exists for this connection.
     fn run_autocommit(
         &self,
-        sql: &str,
+        client_addr: std::net::SocketAddr,
+        statement: &ParsedStatement,
         params: &[Value],
         format: &pgwire::api::portal::Format,
         control: &OperationControl,
     ) -> PgWireResult<Response> {
-        if Self::is_schema_statement(sql) {
-            // Schema changes are owned by the direct database method rather
-            // than a relational transaction. Cancellation is therefore a
-            // preflight check for this non-interruptible publication.
-            control.check().map_err(map_db_error)?;
-            let mut database = write_lock_with_control(&self.database, control)?;
-            control.check().map_err(map_db_error)?;
-            return encode_response_with_format(
-                database
-                    .execute_sql_with_params(sql, params)
-                    .map_err(map_db_error)?,
-                format,
-                self.max_result_bytes,
-            );
-        }
         control.check().map_err(map_db_error)?;
-        if Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
-            // Reads scale: snapshot query under shared access via an
-            // autocommit transaction that aborts on completion.
-            let database = read_lock_with_control(&self.database, control)?;
-            let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
-            let result = transaction.execute_sql_with_params(&database, sql, params);
-            drop(transaction);
-            return encode_response_with_format(
-                result.map_err(map_db_error)?,
-                format,
-                self.max_result_bytes,
-            );
-        }
-        let mut database = write_lock_with_control(&self.database, control)?;
-        let (result, _) = database
-            .transaction_with_control(control, |database, transaction| {
-                let result = transaction.execute_sql_with_params(database, sql, params)?;
-                check_result_payload(&result, self.max_result_bytes)?;
-                Ok(result)
-            })
-            .map_err(map_db_error)?;
-        encode_response_with_format(result, format, self.max_result_bytes)
-    }
-
-    fn is_schema_statement(statement: &str) -> bool {
-        matches!(
-            statement
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_start_matches('(')
-                .to_ascii_uppercase()
-                .as_str(),
-            "CREATE" | "DROP" | "ALTER"
-        )
-    }
-
-    /// True when a statement produces rows and is safe to probe for its
-    /// result schema. DML and DDL describe as zero-column in PostgreSQL,
-    /// so they skip execution entirely here.
-    /// DML with a RETURNING clause produces rows but MUST take the
-    /// write path - the read-lock probe would discard its writes.
-    fn has_returning_clause(statement: &str) -> bool {
-        statement
-            .split_whitespace()
-            .enumerate()
-            .any(|(index, token)| index > 0 && token.eq_ignore_ascii_case("RETURNING"))
-    }
-
-    fn is_row_returning(statement: &str) -> bool {
-        matches!(
-            statement
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_start_matches('(')
-                .to_ascii_uppercase()
-                .as_str(),
-            "SELECT" | "WITH" | "TABLE" | "VALUES" | "SHOW" | "EXPLAIN"
-        )
-    }
-
-    /// Compute a statement's result schema without durable effect: the typed
-    /// transaction aborts on drop, so describe is side-effect free. Probes
-    /// bind benign values for placeholders using the client's declared
-    /// parameter types.
-    fn describe_schema(
-        &self,
-        sql: &str,
-        resolved: &[Type],
-        format: &pgwire::api::portal::Format,
-        control: &OperationControl,
-    ) -> PgWireResult<Arc<Vec<FieldInfo>>> {
-        control.check().map_err(map_db_error)?;
-        if !Self::is_row_returning(sql) && !Self::has_returning_clause(sql) {
-            return Ok(Arc::new(Vec::new()));
-        }
-        let returning_columns = {
-            let database = read_lock_with_control(&self.database, control)?;
-            crate::sql::describe_returning_columns(&database, sql).map_err(map_db_error)?
-        };
-        if let Some(columns) = returning_columns {
-            return Ok(Arc::new(
-                columns
-                    .into_iter()
-                    .enumerate()
-                    .map(|(position, (name, column_type))| {
-                        FieldInfo::new(
-                            name,
-                            None,
-                            None,
-                            column_type_to_pg(column_type),
-                            format.format_for(position),
-                        )
+        match statement.bound.effect {
+            StatementEffect::Schema => {
+                let mut database = write_lock_with_control(&self.database, control)?;
+                self.validate_access(client_addr, &database, statement, control)?;
+                encode_response_with_format(
+                    crate::sql::execute_bound(&mut database, &statement.bound, params)
+                        .map_err(map_db_error)?,
+                    format,
+                    self.max_result_bytes,
+                )
+            }
+            StatementEffect::Read => {
+                let database = read_lock_with_control(&self.database, control)?;
+                self.validate_access(client_addr, &database, statement, control)?;
+                let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
+                let result = transaction.execute_bound_sql(&database, &statement.bound, params);
+                drop(transaction);
+                encode_response_with_format(
+                    result.map_err(map_db_error)?,
+                    format,
+                    self.max_result_bytes,
+                )
+            }
+            StatementEffect::Write => {
+                let mut database = write_lock_with_control(&self.database, control)?;
+                self.validate_access(client_addr, &database, statement, control)?;
+                let (result, _) = database
+                    .transaction_with_control(control, |database, transaction| {
+                        let result =
+                            transaction.execute_bound_sql(database, &statement.bound, params)?;
+                        check_result_payload(&result, self.max_result_bytes)?;
+                        Ok(result)
                     })
-                    .collect(),
-            ));
+                    .map_err(map_db_error)?;
+                encode_response_with_format(result, format, self.max_result_bytes)
+            }
+            StatementEffect::Control(_) => unreachable!("controls are routed by the session"),
         }
-        let probe_params: Vec<Value> = resolved
-            .iter()
-            .map(|declared| match declared {
-                &Type::BOOL => Value::Bool(false),
-                &Type::INT2 | &Type::INT4 | &Type::INT8 => Value::I64(0),
-                &Type::BYTEA => Value::Bytes(Vec::new()),
-                &Type::FLOAT4 | &Type::FLOAT8 => Value::Float64(crate::sql_types::F64::new(0.0)),
-                &Type::DATE => Value::Date(crate::sql_types::DateValue(0)),
-                &Type::TIMESTAMP => Value::Timestamp(crate::sql_types::TimestampValue(0)),
-                &Type::NUMERIC => {
-                    Value::Decimal(crate::sql_types::DecimalValue::new(0, 0).expect("zero"))
-                }
-                &Type::UUID => Value::Uuid(crate::sql_types::UuidValue([0; 16])),
-                _ => Value::Text(String::new()),
-            })
-            .collect();
-        let type_signature = resolved
-            .iter()
-            .map(|ty| ty.name().to_owned())
-            .collect::<Vec<_>>()
-            .join(",");
-        if let Ok(cache) = self.schema_probes.lock()
-            && let Some(columns) = cache.get(&(sql.to_owned(), type_signature.clone()))
-        {
-            return Ok(Arc::new(
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(position, (name, ty))| {
-                        FieldInfo::new(
-                            name.clone(),
-                            None,
-                            None,
-                            ty.clone(),
-                            format.format_for(position),
-                        )
-                    })
-                    .collect(),
-            ));
-        }
-        let database = read_lock_with_control(&self.database, control)?;
-        let mut transaction = database.begin_with_control(control).map_err(map_db_error)?;
-        let result = transaction.execute_sql_with_params(&database, sql, &probe_params);
-        drop(transaction);
-        let result = result.map_err(map_db_error)?;
-        control.check().map_err(map_db_error)?;
-        let sample = result.rows.first();
-        let columns: Arc<Vec<(String, Type)>> = Arc::new(
-            result
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(position, column)| {
-                    let ty = column
-                        .column_type
-                        .map(column_type_to_pg)
-                        .unwrap_or_else(|| value_type(sample.and_then(|row| row.get(position))));
-                    (column.name.clone(), ty)
-                })
-                .collect(),
-        );
-        if let Ok(mut cache) = self.schema_probes.lock()
-            && cache.len() >= 1024
-        {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.schema_probes.lock() {
-            cache.insert((sql.to_owned(), type_signature), columns.clone());
-        }
-        Ok(Arc::new(
-            columns
-                .iter()
-                .enumerate()
-                .map(|(position, (name, ty))| {
-                    FieldInfo::new(
-                        name.clone(),
-                        None,
-                        None,
-                        ty.clone(),
-                        format.format_for(position),
-                    )
-                })
-                .collect(),
-        ))
     }
 }
 
@@ -765,10 +589,87 @@ impl SimpleQueryHandler for OmenDbHandler {
 #[async_trait]
 impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
     type Statement = ParsedStatement;
-    type QueryParser = PlaceholderParser;
+    type QueryParser = Self;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(PlaceholderParser)
+        Arc::new(self.clone())
+    }
+
+    async fn on_parse<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Parse,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if message
+            .type_oids
+            .iter()
+            .any(|oid| *oid != 0 && Type::from_oid(*oid).is_none())
+        {
+            return Err(pg_error(
+                "0A000",
+                "unsupported parameter type OID".to_owned(),
+            ));
+        }
+        let statement =
+            pgwire::api::stmt::StoredStatement::parse(client, &message, self.query_parser())
+                .await?;
+        client.portal_store().put_statement(Arc::new(statement));
+        client
+            .send(PgWireBackendMessage::ParseComplete(
+                pgwire::messages::extendedquery::ParseComplete::new(),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Bind,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        let statement = client
+            .portal_store()
+            .get_statement(name)
+            .ok_or_else(|| PgWireError::StatementNotFound(name.to_owned()))?;
+        let parameters = statement.statement.parameter_types.len();
+        let columns = statement.statement.bound.columns.len();
+        let valid_codes = |codes: &[i16], count| {
+            (codes.len() <= 1 || codes.len() == count)
+                && codes.iter().all(|code| matches!(code, 0 | 1))
+        };
+        if message.parameters.len() != parameters
+            || !valid_codes(&message.parameter_format_codes, parameters)
+            || !valid_codes(&message.result_column_format_codes, columns)
+        {
+            return Err(pg_error(
+                "08P01",
+                "Bind parameter or format count does not match the prepared signature".to_owned(),
+            ));
+        }
+        let portal = pgwire::api::portal::Portal::try_new(&message, statement)?;
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .send(PgWireBackendMessage::BindComplete(
+                pgwire::messages::extendedquery::BindComplete::new(),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn on_sync<C>(
@@ -798,7 +699,52 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let result = self._on_execute(client, message).await;
+        let result = async {
+            let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+            let portal = client
+                .portal_store()
+                .get_portal(name)
+                .ok_or_else(|| PgWireError::PortalNotFound(name.to_owned()))?;
+            let transaction_control = match portal.statement.statement.bound.effect {
+                StatementEffect::Control(control) => Some(control),
+                _ => None,
+            };
+            self.check_boundary(client.socket_addr(), transaction_control)?;
+            if message.max_rows < 0 {
+                return Err(pg_error(
+                    "08P01",
+                    "Execute row count cannot be negative".to_owned(),
+                ));
+            }
+            if message.max_rows > 0 {
+                return Err(pg_error(
+                    "0A000",
+                    "incremental portal fetching is not supported".to_owned(),
+                ));
+            }
+            // pgwire skips do_query for completed/suspended portals. The
+            // retained binding must still be checked on every Execute.
+            let initial = matches!(
+                &*portal.state.lock().await,
+                pgwire::api::portal::PortalExecutionState::Initial
+            );
+            if !initial {
+                let (cancellation, _lease) = self.begin_query(client);
+                let handler = self.clone();
+                let address = client.socket_addr();
+                self.query_workers
+                    .spawn_operation(cancellation.clone(), move || {
+                        let control = handler.operation_control(&cancellation);
+                        handler.validate_statement(address, &portal.statement.statement, &control)
+                    })
+                    .await
+                    .map_err(|error| {
+                        pg_error("XX000", format!("query worker failed: {error}"))
+                    })??;
+            }
+            self._on_execute(client, message).await
+        }
+        .await;
         if result.is_err() {
             self.fail_block(client.socket_addr());
         }
@@ -829,9 +775,17 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
         self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let control = handler.operation_control(&cancellation);
-                let resolved = handler.resolved_parameter_types(&statement, &control)?;
-                let params = decode_parameters(&parameters, &parameter_format, &resolved)?;
-                handler.run_statement(client_addr, &statement.sql, &params, &format, &control)
+                control.check().map_err(map_db_error)?;
+                handler.check_boundary(
+                    client_addr,
+                    match statement.bound.effect {
+                        StatementEffect::Control(control) => Some(control),
+                        _ => None,
+                    },
+                )?;
+                let params =
+                    decode_parameters(&parameters, &parameter_format, &statement.parameter_types)?;
+                handler.run_bound_statement(client_addr, &statement, &params, &format, &control)
             })
             .await
             .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
@@ -839,59 +793,55 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         statement: &pgwire::api::stmt::StoredStatement<Self::Statement>,
     ) -> PgWireResult<pgwire::api::results::DescribeStatementResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let (cancellation, _lease) = self.begin_query(_client);
+        let (cancellation, _lease) = self.begin_query(client);
         let handler = self.clone();
         let statement = statement.statement.clone();
-        let (parameter_types, fields) = self
-            .query_workers
+        let address = client.socket_addr();
+        self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let control = handler.operation_control(&cancellation);
-                let parameter_types = handler.resolved_parameter_types(&statement, &control)?;
-                let fields = handler.describe_schema(
-                    &statement.sql,
-                    &parameter_types,
-                    &pgwire::api::portal::Format::UnifiedBinary,
-                    &control,
+                handler.validate_statement(address, &statement, &control)?;
+                let fields = fields_from_columns(
+                    &statement.bound.columns,
+                    &pgwire::api::portal::Format::UnifiedText,
                 )?;
-                Ok::<_, PgWireError>((parameter_types, fields))
+                Ok(pgwire::api::results::DescribeStatementResponse::new(
+                    statement.parameter_types.clone(),
+                    fields,
+                ))
             })
             .await
-            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??;
-        let fields = Arc::try_unwrap(fields).unwrap_or_default();
-        Ok(pgwire::api::results::DescribeStatementResponse::new(
-            parameter_types,
-            fields,
-        ))
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
     }
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &pgwire::api::portal::Portal<Self::Statement>,
     ) -> PgWireResult<pgwire::api::results::DescribePortalResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let (cancellation, _lease) = self.begin_query(_client);
+        let (cancellation, _lease) = self.begin_query(client);
         let handler = self.clone();
         let statement = portal.statement.statement.clone();
         let format = portal.result_column_format.clone();
-        let fields = self
-            .query_workers
+        let address = client.socket_addr();
+        self.query_workers
             .spawn_operation(cancellation.clone(), move || {
                 let control = handler.operation_control(&cancellation);
-                let resolved = handler.resolved_parameter_types(&statement, &control)?;
-                handler.describe_schema(&statement.sql, &resolved, &format, &control)
+                handler.validate_statement(address, &statement, &control)?;
+                Ok(pgwire::api::results::DescribePortalResponse::new(
+                    fields_from_columns(&statement.bound.columns, &format)?,
+                ))
             })
             .await
-            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))??;
-        let fields = Arc::try_unwrap(fields).unwrap_or_default();
-        Ok(pgwire::api::results::DescribePortalResponse::new(fields))
+            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
     }
 }

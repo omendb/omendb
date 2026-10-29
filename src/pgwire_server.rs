@@ -55,6 +55,7 @@ pub(super) fn map_db_error(error: crate::DbError) -> PgWireError {
             "canceling statement due to user request".to_owned(),
         ),
         crate::DbError::TransactionAborted => ("25P02", error.to_string()),
+        crate::DbError::SqlPreparedStatementInvalidated => ("0A000", error.to_string()),
         crate::DbError::UniqueViolation { .. } => ("23505", error.to_string()),
         crate::DbError::ForeignKeyViolation { .. }
         | crate::DbError::CascadeDepthExceeded { .. } => ("23503", error.to_string()),
@@ -68,6 +69,7 @@ pub(super) fn map_db_error(error: crate::DbError) -> PgWireError {
         ),
         crate::DbError::SqlParse(_) => ("42601", error.to_string()),
         crate::DbError::SqlParameter(_) => ("08P01", error.to_string()),
+        crate::DbError::SqlIndeterminateParameter { .. } => ("42P18", error.to_string()),
         crate::DbError::SqlUndefinedTable { .. } => ("42P01", error.to_string()),
         crate::DbError::SqlUndefinedColumn { .. } => ("42703", error.to_string()),
         crate::DbError::SqlDatatypeMismatch { .. } => ("42804", error.to_string()),
@@ -132,6 +134,8 @@ mod tests {
                 "08P01",
             ),
             (DbError::TransactionAborted, "25P02"),
+            (DbError::SqlPreparedStatementInvalidated, "0A000"),
+            (DbError::SqlIndeterminateParameter { index: 1 }, "42P18"),
         ] {
             match map_db_error(error) {
                 PgWireError::UserError(info) => assert_eq!(info.code, code),

@@ -3758,6 +3758,27 @@ async fn wire_grant_enforcement_reader_writer_admin() {
         .await
         .expect("writer admin DDL");
 
+    // Describe must authorize before exposing protected metadata, and its
+    // failure must retain the enclosing rollback-only boundary.
+    reader
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin before describe");
+    let denied = reader
+        .prepare("SELECT email FROM users")
+        .await
+        .expect_err("protected Describe");
+    assert_eq!(denied.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    let aborted = reader
+        .batch_execute("SELECT body FROM notes")
+        .await
+        .expect_err("Describe failure aborts block");
+    assert_eq!(aborted.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+    reader
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("cleanup after Describe");
+
     // Ungranted table defaults to deny even for reads.
     let ungranted = reader.query("SELECT * FROM users", &[]).await;
     assert!(ungranted.is_err(), "ungranted tables default to deny");
@@ -3771,6 +3792,177 @@ async fn wire_grant_enforcement_reader_writer_admin() {
         nested_ungranted.code(),
         Some(&SqlState::INSUFFICIENT_PRIVILEGE)
     );
+
+    // A prepared binding and an older transaction snapshot do not retain a
+    // revoked grant. Authorization uses current committed grants at execution.
+    let prepared = reader.prepare("SELECT body FROM notes").await.unwrap();
+    reader.batch_execute("BEGIN").await.unwrap();
+    omendb::pgwire_server::provision_wire_grant(
+        &mut database.write().unwrap(),
+        "reader",
+        "notes",
+        false,
+        false,
+    )
+    .unwrap();
+    let revoked = reader
+        .query(&prepared, &[])
+        .await
+        .expect_err("revoked prepared access");
+    assert_eq!(revoked.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+    let aborted = reader
+        .batch_execute("SELECT body FROM notes")
+        .await
+        .expect_err("revocation aborts block");
+    assert_eq!(aborted.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+    reader.batch_execute("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test]
+async fn describe_binds_without_evaluating_rows_or_benign_parameter_values() {
+    let directory = tempdir().unwrap();
+    let database = seed_database(directory.path());
+    let (addr, _server) = pgwire_server::spawn(database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(connection);
+    let statement = client
+        .prepare("SELECT 1 / (id - 1) AS quotient FROM users")
+        .await
+        .expect("Describe must not evaluate stored rows");
+    assert_eq!(
+        statement.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8
+    );
+    let error = client
+        .query(&statement, &[])
+        .await
+        .expect_err("execution still evaluates division");
+    assert_eq!(error.code(), Some(&SqlState::DIVISION_BY_ZERO));
+
+    let statement = client
+        .prepare("SELECT COALESCE($1, id) AS chosen FROM users")
+        .await
+        .expect("infer across COALESCE arms");
+    assert_eq!(statement.params(), &[tokio_postgres::types::Type::INT8]);
+    assert_eq!(
+        statement.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8
+    );
+    let row = client.query_one(&statement, &[&7_i64]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 7);
+    let row = client.query_one(&statement, &[&None::<i64>]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+
+    // A dynamic datetime field changes the value, never the prepared domain.
+    let statement = client
+        .prepare("SELECT date_part($1, CAST('2026-09-05 14:30:45' AS TIMESTAMP)) AS part")
+        .await
+        .expect("field inference must not evaluate a made-up field");
+    assert_eq!(statement.params(), &[tokio_postgres::types::Type::TEXT]);
+    assert_eq!(
+        statement.columns()[0].type_(),
+        &tokio_postgres::types::Type::FLOAT8
+    );
+    for (field, expected) in [("year", 2026.0), ("epoch", 1_788_618_645.0)] {
+        let row = client.query_one(&statement, &[&field]).await.unwrap();
+        assert_eq!(row.get::<_, f64>(0), expected);
+    }
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn wire_portal_execute_checks_failed_blocks_and_refuses_incremental_fetch() {
+    let directory = tempdir().unwrap();
+    let database = seed_database(directory.path());
+    let (addr, _server) = pgwire_server::spawn(database, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (mut client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(connection);
+    let transaction = client.transaction().await.unwrap();
+    let portal = transaction.bind("SELECT id FROM users", &[]).await.unwrap();
+    assert_eq!(transaction.query_portal(&portal, 0).await.unwrap().len(), 1);
+    let error = transaction
+        .batch_execute("SELECT missing FROM users")
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::UNDEFINED_COLUMN));
+    let error = transaction
+        .query_portal(&portal, 0)
+        .await
+        .expect_err("finished portal cannot bypass a failed block");
+    assert_eq!(error.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
+    transaction.rollback().await.unwrap();
+
+    for (max_rows, state) in [
+        (1, SqlState::FEATURE_NOT_SUPPORTED),
+        (-1, SqlState::PROTOCOL_VIOLATION),
+    ] {
+        let transaction = client.transaction().await.unwrap();
+        let portal = transaction.bind("SELECT id FROM users", &[]).await.unwrap();
+        let error = transaction
+            .query_portal(&portal, max_rows)
+            .await
+            .expect_err("unsupported or invalid Execute row limit");
+        assert_eq!(error.code(), Some(&state));
+        transaction.rollback().await.unwrap();
+    }
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn prepared_signature_cannot_drift_after_direct_api_ddl() {
+    let directory = tempdir().unwrap();
+    let database = seed_database(directory.path());
+    let (addr, _server) = pgwire_server::spawn(database.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (client, connection) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={} user=omendb", addr.port()),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(connection);
+    let statement = client.prepare("SELECT * FROM users").await.unwrap();
+    assert_eq!(statement.columns().len(), 2);
+    database
+        .write()
+        .unwrap()
+        .add_nullable_column(
+            TableId(7),
+            ColumnDefinition {
+                id: ColumnId(3),
+                name: "extra".to_owned(),
+                data_type: ColumnType::Text,
+                nullable: true,
+            },
+        )
+        .unwrap();
+    let error = client
+        .query(&statement, &[])
+        .await
+        .expect_err("catalog changes require reprepare, never a changed wire signature");
+    assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED));
+    let fresh = client.prepare("SELECT * FROM users").await.unwrap();
+    assert_eq!(fresh.columns().len(), 3);
+    assert_eq!(client.query_one(&fresh, &[]).await.unwrap().len(), 3);
+    drop(client);
+    connection.await.unwrap().unwrap();
 }
 
 #[tokio::test]

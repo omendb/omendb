@@ -112,7 +112,6 @@ pub(super) fn build_factory(
             database: Arc::clone(database),
             transactions: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::clone(&cancellations),
-            schema_probes: Arc::new(Mutex::new(HashMap::new())),
             identities: Arc::clone(&identities),
             query_workers,
             statement_timeout,

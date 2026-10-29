@@ -201,54 +201,6 @@ fn returning_plan(
     Ok((columns, positions))
 }
 
-#[cfg(feature = "pgwire")]
-/// Return target-table names and logical types for supported DML RETURNING.
-/// The executor already restricts RETURNING to column names or `*`, making
-/// this metadata independent of row values and safe to use during Describe.
-pub(super) fn describe_returning_columns(
-    database: &RelationalDatabase,
-    statement: &sqlparser::ast::Statement,
-) -> Result<Option<Vec<(String, crate::ColumnType)>>> {
-    let (table, returning) = match statement {
-        sqlparser::ast::Statement::Insert(insert) => {
-            let table_name = match &insert.table {
-                TableObject::TableName(name) => simple_object_name(name, "table")?,
-                _ => {
-                    return Err(unsupported("INSERT", "the target must be a plain table"));
-                }
-            };
-            let table = find_table(database.catalog(), table_name)?;
-            (table, insert.returning.as_ref())
-        }
-        sqlparser::ast::Statement::Update(update) => {
-            let table = super::table_from_join(database.catalog(), &update.table)?;
-            (table, update.returning.as_ref())
-        }
-        sqlparser::ast::Statement::Delete(delete) => {
-            let tables = match &delete.from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-            };
-            if tables.len() != 1 {
-                return Ok(None);
-            }
-            let table = super::table_from_join(database.catalog(), &tables[0])?;
-            (table, delete.returning.as_ref())
-        }
-        _ => return Ok(None),
-    };
-    let Some(items) = returning else {
-        return Ok(None);
-    };
-    let (columns, positions) = returning_plan(table, items)?;
-    Ok(Some(
-        columns
-            .into_iter()
-            .zip(positions)
-            .map(|(column, position)| (column.name, table.columns[position].data_type))
-            .collect(),
-    ))
-}
-
 pub(super) fn execute_update(
     database: &RelationalDatabase,
     transaction: &mut RelationalDatabaseTransaction,
@@ -284,7 +236,12 @@ pub(super) fn execute_update(
                 sqlparser::ast::UpdateTableFromKind::AfterSet(tables)
                 | sqlparser::ast::UpdateTableFromKind::BeforeSet(tables) => tables,
             };
-            Some(cross_table_scope(database.catalog(), tables, table)?)
+            Some(cross_table_scope(
+                database.catalog(),
+                tables,
+                table,
+                &super::query::relation_name(&update.table.relation)?,
+            )?)
         }
         None => None,
     };
@@ -554,6 +511,7 @@ fn cross_table_scope<'a>(
     catalog: &'a crate::Catalog,
     tables: &'a [sqlparser::ast::TableWithJoins],
     target: &TableDefinition,
+    target_name: &str,
 ) -> Result<(&'a TableDefinition, Vec<SqlColumn>)> {
     if tables.len() != 1 {
         return Err(unsupported(
@@ -565,11 +523,12 @@ fn cross_table_scope<'a>(
     let mut combined_columns: Vec<SqlColumn> = target
         .columns
         .iter()
-        .map(|column| SqlColumn::typed(column.name.clone(), column.data_type))
+        .map(|column| SqlColumn::typed(format!("{target_name}.{}", column.name), column.data_type))
         .collect();
+    let source_name = super::query::relation_name(&tables[0].relation)?;
     for column in &from_table.columns {
         combined_columns.push(SqlColumn::typed(
-            format!("{}.{}", from_table.name, column.name),
+            format!("{source_name}.{}", column.name),
             column.data_type,
         ));
     }
@@ -601,8 +560,14 @@ pub(super) fn execute_delete(
         .transpose()?;
     // DELETE ... USING source: the WHERE may reference one source table;
     // a target row deletes if any combined predicate match exists.
+    let target_name = super::query::relation_name(&tables[0].relation)?;
     let using_scope = match &delete.using {
-        Some(tables) => Some(cross_table_scope(database.catalog(), tables, table)?),
+        Some(tables) => Some(cross_table_scope(
+            database.catalog(),
+            tables,
+            table,
+            &target_name,
+        )?),
         None => None,
     };
     if using_scope.is_some() && delete.selection.is_none() {

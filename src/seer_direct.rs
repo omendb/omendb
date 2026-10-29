@@ -31,6 +31,7 @@ pub(crate) struct DirectSeerStore {
     database: TransactionDatabase,
     catalog_tree: TreeId,
     catalog: Catalog,
+    catalog_version: CommitSeq,
     table_trees: BTreeMap<TableId, TreeId>,
     index_trees: BTreeMap<IndexId, TreeId>,
 }
@@ -47,12 +48,13 @@ impl DirectSeerStore {
         transaction
             .put(catalog_tree, DIRECT_CATALOG_MARKER, &state)
             .map_err(map_seer_error)?;
-        transaction.commit().map_err(map_seer_error)?;
+        let catalog_version = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         Ok(Self {
             database,
             catalog_tree,
             catalog,
+            catalog_version,
             table_trees: BTreeMap::new(),
             index_trees: BTreeMap::new(),
         })
@@ -96,10 +98,14 @@ impl DirectSeerStore {
         )?;
         transaction.abort().map_err(map_seer_error)?;
         drop(transaction);
+        // Prepared bindings never survive this handle. Subsequent schema
+        // publications use their CSN, including identical drop/recreate cycles.
+        let catalog_version = database.commit_sequence().map_err(map_seer_error)?;
         Ok(Self {
             database,
             catalog_tree,
             catalog,
+            catalog_version,
             table_trees,
             index_trees,
         })
@@ -112,6 +118,10 @@ impl DirectSeerStore {
 
     pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub(crate) fn catalog_version(&self) -> CommitSeq {
+        self.catalog_version
     }
 
     pub(crate) fn table_tree(&self, table: TableId) -> Result<TreeId> {
@@ -147,6 +157,7 @@ impl DirectSeerStore {
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
+        self.catalog_version = commit;
         self.table_trees = table_trees;
         Ok(commit)
     }
@@ -194,6 +205,7 @@ impl DirectSeerStore {
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
+        self.catalog_version = commit;
         self.table_trees = table_trees;
         self.index_trees = index_trees;
         Ok(commit)
@@ -271,6 +283,7 @@ impl DirectSeerStore {
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
+        self.catalog_version = commit;
         self.index_trees = index_trees;
         Ok(commit)
     }
@@ -493,6 +506,7 @@ impl DirectSeerStore {
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
+        self.catalog_version = commit;
         self.table_trees = table_trees;
         self.index_trees = index_trees;
         Ok(commit)
@@ -592,6 +606,7 @@ impl DirectSeerStore {
         let commit = transaction.commit().map_err(map_seer_error)?.csn;
         drop(transaction);
         self.catalog = candidate;
+        self.catalog_version = commit;
         Ok(commit)
     }
 

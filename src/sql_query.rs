@@ -40,31 +40,24 @@ pub(super) fn execute_query(
             return Err(unsupported("SELECT", "literal SELECT has no WHERE clause"));
         }
         let (offset, limit) = query_window(query, params)?;
-        if offset != 0 || limit == 0 {
-            let columns = select
-                .projection
-                .iter()
-                .map(|item| {
-                    let (expression, alias) = projection_expression(item)?;
-                    Ok(SqlColumn {
-                        name: alias.unwrap_or_else(|| expression.to_string()),
-                        column_type: None,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(SqlResult::rows(columns, Vec::new()));
-        }
         let mut columns = Vec::with_capacity(select.projection.len());
-        let mut row = Vec::with_capacity(select.projection.len());
+        let mut terms = Vec::with_capacity(select.projection.len());
         for item in &select.projection {
             let (expression, alias) = projection_expression(item)?;
-            let value = literal_value(expression, params)?;
+            let term = plan_computed(expression, &[], params)?;
             columns.push(SqlColumn {
                 name: alias.unwrap_or_else(|| expression.to_string()),
-                column_type: value_static_type(&value),
+                column_type: term.static_type(&[])?,
             });
-            row.push(value);
+            terms.push(term);
         }
+        if offset != 0 || limit == 0 {
+            return Ok(SqlResult::rows(columns, Vec::new()));
+        }
+        let row = terms
+            .iter()
+            .map(|term| term.evaluate(&[]))
+            .collect::<Result<Vec<_>>>()?;
         return Ok(SqlResult::rows(columns, vec![row]));
     }
     if select.from.len() != 1 {
@@ -264,8 +257,9 @@ fn execute_set_operation(
 
     let keep_duplicates = matches!(quantifier, sqlparser::ast::SetQuantifier::All);
 
-    let left_result = execute_query(database, transaction, &strip_side_clauses(left), params)?;
-    let right_result = execute_query(database, transaction, &strip_side_clauses(right), params)?;
+    let mut left_result = execute_query(database, transaction, &strip_side_clauses(left), params)?;
+    let mut right_result =
+        execute_query(database, transaction, &strip_side_clauses(right), params)?;
 
     if left_result.columns.len() != right_result.columns.len() {
         return Err(DbError::InvalidState(format!(
@@ -274,6 +268,38 @@ fn execute_set_operation(
             right_result.columns.len()
         )));
     }
+
+    // Coerce both domains before equality and ordering, not only on output.
+    let columns = left_result
+        .columns
+        .iter()
+        .zip(&right_result.columns)
+        .map(|(left, right)| {
+            Ok(SqlColumn {
+                name: left.name.clone(),
+                column_type: Some(
+                    super::binding::common_type(left.column_type, right.column_type)?
+                        .unwrap_or(crate::ColumnType::Text),
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    super::normalize_rows(&mut left_result.rows, &columns)?;
+    super::normalize_rows(&mut right_result.rows, &columns)?;
+    for row in left_result.rows.iter_mut().chain(&mut right_result.rows) {
+        for (value, column) in row.iter_mut().zip(&columns) {
+            if column.column_type == Some(crate::ColumnType::I64)
+                && let Value::U64(integer) = value
+            {
+                *value = Value::I64(i64::try_from(*integer).map_err(|_| {
+                    DbError::SqlNumericValueOutOfRange(
+                        "set operand exceeds its signed integer domain".to_owned(),
+                    )
+                })?);
+            }
+        }
+    }
+    left_result.columns = columns;
 
     let rows = match op {
         sqlparser::ast::SetOperator::Union => {
@@ -361,7 +387,12 @@ fn execute_set_operation(
     Ok(SqlResult::rows(left_result.columns, rows))
 }
 
-type ScalarSubqueries = std::collections::HashMap<String, Value>;
+struct ScalarValue {
+    value: Value,
+    column_type: Option<crate::ColumnType>,
+}
+
+type ScalarSubqueries = std::collections::HashMap<String, ScalarValue>;
 
 fn collect_scalar_subqueries<'a>(expression: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expression {
@@ -402,7 +433,13 @@ fn resolve_scalar_subqueries(
                 "scalar subqueries must return exactly one row",
             ));
         }
-        resolved.insert(key, result.rows[0][0].clone());
+        resolved.insert(
+            key,
+            ScalarValue {
+                value: result.rows[0][0].clone(),
+                column_type: result.columns[0].column_type,
+            },
+        );
     }
     Ok(resolved)
 }
@@ -924,6 +961,10 @@ fn non_negative_integer(expression: &Expr, params: &[Value], clause: &str) -> Re
 /// column or constant: binary arithmetic over nested operands.
 #[derive(Clone)]
 enum ComputedTerm {
+    Cast {
+        term: Box<ComputedTerm>,
+        column_type: crate::ColumnType,
+    },
     Column(usize),
     Literal(Value),
     Binary {
@@ -940,9 +981,13 @@ enum ComputedTerm {
         operand: Option<Box<ComputedTerm>>,
         conditions: Vec<(ComputedCondition, ComputedTerm)>,
         else_result: Option<Box<ComputedTerm>>,
+        output_type: crate::ColumnType,
     },
     /// COALESCE: first non-NULL argument in source order.
-    Coalesce(Vec<ComputedTerm>),
+    Coalesce {
+        arguments: Vec<ComputedTerm>,
+        output_type: crate::ColumnType,
+    },
     /// A catalog scalar function over computed arguments.
     Scalar {
         name: String,
@@ -965,6 +1010,9 @@ enum ComputedCondition {
 impl ComputedTerm {
     fn evaluate(&self, values: &[Value]) -> Result<Value> {
         match self {
+            Self::Cast { term, column_type } => {
+                super::coerce_result_value(term.evaluate(values)?, *column_type, "cast")
+            }
             Self::Column(position) => values.get(*position).cloned().ok_or_else(|| {
                 DbError::InvalidState("row is missing a projected value".to_owned())
             }),
@@ -978,6 +1026,7 @@ impl ComputedTerm {
                 operand,
                 conditions,
                 else_result,
+                output_type,
             } => {
                 let operand_value = match operand {
                     Some(operand) => Some(operand.evaluate(values)?),
@@ -1000,19 +1049,28 @@ impl ComputedTerm {
                         }
                     };
                     if matched {
-                        return result.evaluate(values);
+                        return super::coerce_result_value(
+                            result.evaluate(values)?,
+                            *output_type,
+                            "CASE",
+                        );
                     }
                 }
                 match else_result {
-                    Some(result) => result.evaluate(values),
+                    Some(result) => {
+                        super::coerce_result_value(result.evaluate(values)?, *output_type, "CASE")
+                    }
                     None => Ok(Value::Null),
                 }
             }
-            Self::Coalesce(arguments) => {
+            Self::Coalesce {
+                arguments,
+                output_type,
+            } => {
                 for argument in arguments {
                     let value = argument.evaluate(values)?;
                     if !matches!(value, Value::Null) {
-                        return Ok(value);
+                        return super::coerce_result_value(value, *output_type, "COALESCE");
                     }
                 }
                 Ok(Value::Null)
@@ -1036,58 +1094,50 @@ impl ComputedTerm {
         }
     }
 
-    /// The statically knowable result type, mirroring the `arithmetic`
-    /// promotion rules: a float operand makes float8, a decimal operand
-    /// (without float) makes decimal, and integers stay in the i64/u64
-    /// integer domain. Column positions resolve through the projection's
-    /// table.
-    fn static_type(&self, table: &TableDefinition) -> crate::ColumnType {
-        match self {
-            Self::Column(position) => table
-                .columns
-                .get(*position)
-                .map(|column| column.data_type)
-                .unwrap_or(crate::ColumnType::I64),
-            Self::Literal(value) => value_static_type(value).unwrap_or(crate::ColumnType::I64),
-            Self::Binary { left, right, .. } => {
-                use crate::ColumnType as CT;
-                let lhs = left.static_type(table);
-                let rhs = right.static_type(table);
-                if lhs == CT::Float64 || rhs == CT::Float64 {
-                    CT::Float64
-                } else if lhs == CT::Decimal || rhs == CT::Decimal {
-                    CT::Decimal
-                } else {
-                    CT::I64
-                }
+    // Compiled expression domains are needed for coercions before an outer
+    // operator runs, not for advertising result metadata. Reuse the binder's
+    // domain rules; parameter casts retain their types even for NULL values.
+    fn static_type(
+        &self,
+        columns: &[crate::ColumnDefinition],
+    ) -> Result<Option<crate::ColumnType>> {
+        use crate::ColumnType as CT;
+        Ok(match self {
+            Self::Cast { column_type, .. } => Some(*column_type),
+            Self::Column(position) => Some(
+                columns
+                    .get(*position)
+                    .ok_or_else(|| {
+                        DbError::InvalidState("compiled column is outside its input".to_owned())
+                    })?
+                    .data_type,
+            ),
+            Self::Literal(value) => value_static_type(value),
+            Self::Binary { left, right, .. } => super::binding::common_type(
+                left.static_type(columns)?,
+                right.static_type(columns)?,
+            )?,
+            Self::Case { output_type, .. } | Self::Coalesce { output_type, .. } => {
+                Some(*output_type)
             }
-            // CASE/COALESCE arms may differ in type; PostgreSQL resolves
-            // the union at runtime. The first arm's static type is the
-            // best honest guess without a full type resolver.
-            Self::Case { conditions, .. } => conditions
-                .first()
-                .map(|(_, result)| result.static_type(table))
-                .unwrap_or(crate::ColumnType::I64),
-            Self::Coalesce(arguments) => arguments
-                .first()
-                .map(|argument| argument.static_type(table))
-                .unwrap_or(crate::ColumnType::I64),
-            // Scalar text functions produce TEXT; length produces INT8;
-            // abs/round/floor/ceil preserve the argument's numeric type.
             Self::Scalar { name, arguments } => match name.as_str() {
-                "upper" | "lower" | "btrim" | "ltrim" | "rtrim" => crate::ColumnType::Text,
-                "length" | "char_length" | "character_length" => crate::ColumnType::I64,
+                "upper" | "lower" | "btrim" | "ltrim" | "rtrim" => Some(CT::Text),
+                "length" | "char_length" | "character_length" => Some(CT::I64),
+                "date_part" => Some(CT::Float64),
+                name if name.starts_with("__extract_") => Some(CT::Decimal),
+                "date_trunc" => Some(CT::Timestamp),
                 _ => arguments
                     .first()
-                    .map(|argument| argument.static_type(table))
-                    .unwrap_or(crate::ColumnType::I64),
+                    .map(|term| term.static_type(columns))
+                    .transpose()?
+                    .flatten(),
             },
-        }
+        })
     }
 }
 
 /// Map a literal value to its static result type where one exists.
-/// NULL and parameters have no static type; they stay sample-inferred.
+/// NULL carries no preferred domain; parameter types are retained in bound casts.
 pub(super) fn value_static_type(value: &Value) -> Option<crate::ColumnType> {
     match value {
         Value::Bool(_) => Some(crate::ColumnType::Bool),
@@ -1280,21 +1330,31 @@ fn decimal_divide(
 
 fn plan_computed(
     expression: &Expr,
-    table: &TableDefinition,
+    columns: &[crate::ColumnDefinition],
     params: &[Value],
-) -> Option<ComputedTerm> {
+) -> Result<ComputedTerm> {
     match expression {
-        Expr::Identifier(identifier) => table
-            .columns
+        Expr::Cast {
+            expr, data_type, ..
+        } => Ok(ComputedTerm::Cast {
+            term: Box::new(plan_computed(expr, columns, params)?),
+            column_type: super::binding::sql_type(data_type)?,
+        }),
+        Expr::Identifier(identifier) => columns
             .iter()
             .position(|column| column.name == identifier.value)
-            .map(ComputedTerm::Column),
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => table
-            .columns
+            .map(ComputedTerm::Column)
+            .ok_or_else(|| DbError::SqlUndefinedColumn {
+                name: expression.to_string(),
+            }),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => columns
             .iter()
             .position(|column| column.name == parts[parts.len() - 1].value)
-            .map(ComputedTerm::Column),
-        Expr::Nested(inner) => plan_computed(inner, table, params),
+            .map(ComputedTerm::Column)
+            .ok_or_else(|| DbError::SqlUndefinedColumn {
+                name: expression.to_string(),
+            }),
+        Expr::Nested(inner) => plan_computed(inner, columns, params),
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -1305,9 +1365,9 @@ fn plan_computed(
                     | BinaryOperator::Modulo
             ) =>
         {
-            let left = plan_computed(left, table, params)?;
-            let right = plan_computed(right, table, params)?;
-            Some(ComputedTerm::Binary {
+            let left = plan_computed(left, columns, params)?;
+            let right = plan_computed(right, columns, params)?;
+            Ok(ComputedTerm::Binary {
                 op: op.clone(),
                 left: Box::new(left),
                 right: Box::new(right),
@@ -1320,7 +1380,7 @@ fn plan_computed(
             ..
         } => {
             let planned_operand = match operand {
-                Some(operand) => Some(Box::new(plan_computed(operand, table, params)?)),
+                Some(operand) => Some(Box::new(plan_computed(operand, columns, params)?)),
                 None => None,
             };
             let mut planned_conditions = Vec::with_capacity(conditions.len());
@@ -1328,7 +1388,7 @@ fn plan_computed(
                 let condition = match (&planned_operand, &when.condition) {
                     // Simple CASE: compare the operand with the WHEN value.
                     (Some(_), expression) => {
-                        let left = plan_computed(expression, table, params)?;
+                        let left = plan_computed(expression, columns, params)?;
                         ComputedCondition::Compare {
                             left: Box::new(left),
                             op: BinaryOperator::Eq,
@@ -1348,8 +1408,8 @@ fn plan_computed(
                                 | BinaryOperator::LtEq
                         ) =>
                     {
-                        let left = plan_computed(left, table, params)?;
-                        let right = plan_computed(right, table, params)?;
+                        let left = plan_computed(left, columns, params)?;
+                        let right = plan_computed(right, columns, params)?;
                         ComputedCondition::Compare {
                             left: Box::new(left),
                             op: op.clone(),
@@ -1357,7 +1417,7 @@ fn plan_computed(
                         }
                     }
                     (None, Expr::IsNull(inner)) => {
-                        let left = plan_computed(inner, table, params)?;
+                        let left = plan_computed(inner, columns, params)?;
                         ComputedCondition::Compare {
                             left: Box::new(left),
                             op: BinaryOperator::Eq,
@@ -1365,23 +1425,37 @@ fn plan_computed(
                         }
                     }
                     (None, Expr::IsNotNull(inner)) => {
-                        let left = plan_computed(inner, table, params)?;
+                        let left = plan_computed(inner, columns, params)?;
                         ComputedCondition::Compare {
                             left: Box::new(left),
                             op: BinaryOperator::NotEq,
                             right: Box::new(ComputedTerm::Literal(Value::Null)),
                         }
                     }
-                    (None, _) => return None,
+                    (None, _) => {
+                        return Err(unsupported(
+                            "expression",
+                            "unsupported bound computed expression",
+                        ));
+                    }
                 };
-                let result = plan_computed(&when.result, table, params)?;
+                let result = plan_computed(&when.result, columns, params)?;
                 planned_conditions.push((condition, result));
             }
             let planned_else = match else_result {
-                Some(result) => Some(Box::new(plan_computed(result, table, params)?)),
+                Some(result) => Some(Box::new(plan_computed(result, columns, params)?)),
                 None => None,
             };
-            Some(ComputedTerm::Case {
+            let output_type = planned_conditions
+                .iter()
+                .map(|(_, term)| term)
+                .chain(planned_else.iter().map(Box::as_ref))
+                .try_fold(None, |kind, term| {
+                    super::binding::common_type(kind, term.static_type(columns)?)
+                })?
+                .unwrap_or(crate::ColumnType::Text);
+            Ok(ComputedTerm::Case {
+                output_type,
                 operand: planned_operand,
                 conditions: planned_conditions,
                 else_result: planned_else,
@@ -1392,33 +1466,39 @@ fn plan_computed(
             syntax: _,
             expr,
         } => {
-            let argument = plan_computed(expr, table, params)?;
-            Some(ComputedTerm::Scalar {
+            let argument = plan_computed(expr, columns, params)?;
+            Ok(ComputedTerm::Scalar {
                 name: format!("__extract_{}", field),
                 arguments: vec![argument],
             })
         }
         Expr::Floor { expr, .. } => {
-            let argument = plan_computed(expr, table, params)?;
-            Some(ComputedTerm::Scalar {
+            let argument = plan_computed(expr, columns, params)?;
+            Ok(ComputedTerm::Scalar {
                 name: "floor".to_owned(),
                 arguments: vec![argument],
             })
         }
         Expr::Ceil { expr, .. } => {
-            let argument = plan_computed(expr, table, params)?;
-            Some(ComputedTerm::Scalar {
+            let argument = plan_computed(expr, columns, params)?;
+            Ok(ComputedTerm::Scalar {
                 name: "ceil".to_owned(),
                 arguments: vec![argument],
             })
         }
         Expr::Function(func) if scalar_function_arity(&func.name.to_string()).is_some() => {
             let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
-                return None;
+                return Err(unsupported(
+                    "expression",
+                    "unsupported bound computed expression",
+                ));
             };
             let arity = scalar_function_arity(&func.name.to_string()).expect("guarded");
             if list.args.len() != arity {
-                return None;
+                return Err(unsupported(
+                    "expression",
+                    "unsupported bound computed expression",
+                ));
             }
             let mut arguments = Vec::with_capacity(arity);
             for argument in &list.args {
@@ -1426,18 +1506,24 @@ fn plan_computed(
                     expression,
                 )) = argument
                 else {
-                    return None;
+                    return Err(unsupported(
+                        "expression",
+                        "unsupported bound computed expression",
+                    ));
                 };
-                arguments.push(plan_computed(expression, table, params)?);
+                arguments.push(plan_computed(expression, columns, params)?);
             }
-            Some(ComputedTerm::Scalar {
+            Ok(ComputedTerm::Scalar {
                 name: func.name.to_string().to_ascii_lowercase(),
                 arguments,
             })
         }
         Expr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
             let sqlparser::ast::FunctionArguments::List(list) = &func.args else {
-                return None;
+                return Err(unsupported(
+                    "expression",
+                    "unsupported bound computed expression",
+                ));
             };
             let mut arguments = Vec::with_capacity(list.args.len());
             for argument in &list.args {
@@ -1445,16 +1531,25 @@ fn plan_computed(
                     expression,
                 )) = argument
                 else {
-                    return None;
+                    return Err(unsupported(
+                        "expression",
+                        "unsupported bound computed expression",
+                    ));
                 };
-                arguments.push(plan_computed(expression, table, params)?);
+                arguments.push(plan_computed(expression, columns, params)?);
             }
-            Some(ComputedTerm::Coalesce(arguments))
+            let output_type = arguments
+                .iter()
+                .try_fold(None, |kind, term| {
+                    super::binding::common_type(kind, term.static_type(columns)?)
+                })?
+                .unwrap_or(crate::ColumnType::Text);
+            Ok(ComputedTerm::Coalesce {
+                arguments,
+                output_type,
+            })
         }
-        Expr::Value(_) | Expr::UnaryOp { .. } => literal_value(expression, params)
-            .ok()
-            .map(ComputedTerm::Literal),
-        _ => None,
+        _ => literal_value(expression, params).map(ComputedTerm::Literal),
     }
 }
 
@@ -1665,10 +1760,10 @@ fn projection_plan(
                     })?;
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
-                        column_type: value_static_type(value),
+                        column_type: value.column_type,
                     });
                     positions.push(None);
-                    literals.push(Some(value.clone()));
+                    literals.push(Some(value.value.clone()));
                     computed.push(None);
                     window_columns.push(None);
                 } else if let Expr::Function(func) = expression
@@ -1694,24 +1789,15 @@ fn projection_plan(
                     literals.push(None);
                     computed.push(None);
                     window_columns.push(Some(next_window - 1));
-                } else if let Some(term) = plan_computed(expression, table, params) {
+                } else {
+                    let term = plan_computed(expression, &table.columns, params)?;
                     columns.push(SqlColumn {
                         name: alias.unwrap_or_else(|| expression.to_string()),
-                        column_type: Some(term.static_type(table)),
+                        column_type: term.static_type(&table.columns)?,
                     });
                     positions.push(None);
                     literals.push(None);
                     computed.push(Some(term));
-                    window_columns.push(None);
-                } else {
-                    let literal = literal_value(expression, params)?;
-                    columns.push(SqlColumn {
-                        name: alias.unwrap_or_else(|| expression.to_string()),
-                        column_type: value_static_type(&literal),
-                    });
-                    positions.push(None);
-                    literals.push(Some(literal));
-                    computed.push(None);
                     window_columns.push(None);
                 }
             }
@@ -1797,40 +1883,31 @@ fn plain_table<'a>(
     }
 }
 
-/// Inner equi-join over snapshots: nested loop with the ON equality
-/// resolved to column positions at planning time. v1 shape per
-/// `design/OLTP_COMPETITIVE_GAPS.md` slice 3: wildcard projection,
-/// optional conjunctive WHERE over the combined schema, no aliases,
-/// no ORDER BY.
-#[allow(clippy::too_many_arguments)]
+/// Fold joins left-to-right, retaining qualified source columns separately
+/// from the coalesced, unqualified USING/NATURAL outputs.
 fn execute_join_query(
     database: &RelationalDatabase,
     transaction: &mut RelationalDatabaseTransaction,
     query: &Query,
-    select: &sqlparser::ast::Select,
+    select: &Select,
     params: &[Value],
 ) -> Result<SqlResult> {
-    // Fold joins left-to-right: the accumulated combined rows join each
-    // next relation as a pairwise nested loop, so ON operands must land
-    // one side in the accumulated scope and one in the new table.
-    let mut scope: Vec<(String, &TableDefinition)> = vec![(
-        relation_name(&select.from[0].relation)?,
-        plain_table(database, &select.from[0].relation)?,
-    )];
+    let first = plain_table(database, &select.from[0].relation)?;
+    let first_name = relation_name(&select.from[0].relation)?;
     let mut combined_rows: Vec<Vec<Value>> = transaction
-        .scan(database, scope[0].1.id, usize::MAX)?
+        .scan(database, first.id, usize::MAX)?
         .into_iter()
         .map(|row| row.values)
         .collect();
-    let mut combined_columns: Vec<SqlColumn> = scope[0]
-        .1
+    let mut combined_columns: Vec<SqlColumn> = first
         .columns
         .iter()
         .map(|column| SqlColumn {
-            name: format!("{}.{}", scope[0].0, column.name),
+            name: format!("{first_name}.{}", column.name),
             column_type: Some(column.data_type),
         })
         .collect();
+    let mut visible: Vec<usize> = (0..combined_columns.len()).collect();
 
     for join in &select.from[0].joins {
         let right_name = relation_name(&join.relation)?;
@@ -1847,222 +1924,203 @@ fn execute_join_query(
             join.join_operator,
             sqlparser::ast::JoinOperator::FullOuter(_)
         );
-        let none_constraint = sqlparser::ast::JoinConstraint::None;
         let constraint = match &join.join_operator {
-            sqlparser::ast::JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None) => {
-                &none_constraint
-            }
-            sqlparser::ast::JoinOperator::Join(constraint)
-            | sqlparser::ast::JoinOperator::Inner(constraint)
-            | sqlparser::ast::JoinOperator::Left(constraint)
-            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
-            | sqlparser::ast::JoinOperator::Right(constraint)
-            | sqlparser::ast::JoinOperator::RightOuter(constraint)
-            | sqlparser::ast::JoinOperator::FullOuter(constraint) => constraint,
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "only INNER, LEFT/RIGHT/FULL OUTER JOIN are supported",
-                ));
-            }
+            sqlparser::ast::JoinOperator::Join(c)
+            | sqlparser::ast::JoinOperator::Inner(c)
+            | sqlparser::ast::JoinOperator::Left(c)
+            | sqlparser::ast::JoinOperator::LeftOuter(c)
+            | sqlparser::ast::JoinOperator::Right(c)
+            | sqlparser::ast::JoinOperator::RightOuter(c)
+            | sqlparser::ast::JoinOperator::FullOuter(c)
+            | sqlparser::ast::JoinOperator::CrossJoin(c) => c,
+            _ => return Err(unsupported("JOIN", "unsupported join operator")),
         };
-        // USING/NATURAL are equi-join sugar: terms pair each shared
-        // column, and the incoming duplicates are dropped from the
-        // emitted schema so the using columns appear once.
-        let mut merged_incoming: Vec<usize> = Vec::new();
-        let on_terms: Vec<(usize, usize, BinaryOperator)> = match constraint {
+        let mut merged_incoming = Vec::new();
+        let on_terms = match constraint {
             sqlparser::ast::JoinConstraint::On(expression) => {
-                on_positions_in_scope(expression, &scope, right)?
+                on_positions_in_scope(expression, &combined_columns, &right_name, right)?
             }
             sqlparser::ast::JoinConstraint::Using(names) => {
                 let mut terms = Vec::new();
                 for name in names {
-                    let column_name = name.to_string();
-                    let scope_position = unique_bare_position(&combined_columns, &column_name)?;
-                    let Some(right_position) =
-                        right.columns.iter().position(|c| c.name == column_name)
-                    else {
-                        return Err(DbError::SqlUndefinedColumn { name: column_name });
-                    };
-                    merged_incoming.push(right_position);
-                    terms.push((scope_position, right_position, BinaryOperator::Eq));
-                }
-                if names.is_empty() {
-                    return Err(unsupported("JOIN", "USING requires at least one column"));
+                    let name = super::simple_object_name(name, "USING column")?;
+                    let left = unique_bare_position(&combined_columns, name)?;
+                    let incoming = right
+                        .columns
+                        .iter()
+                        .position(|column| column.name == name)
+                        .ok_or_else(|| DbError::SqlUndefinedColumn {
+                            name: name.to_owned(),
+                        })?;
+                    merged_incoming.push(incoming);
+                    terms.push((left, incoming, BinaryOperator::Eq));
                 }
                 terms
             }
             sqlparser::ast::JoinConstraint::Natural => {
                 let mut terms = Vec::new();
-                for (index, column) in right.columns.iter().enumerate() {
-                    let matches = combined_columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.name.ends_with(&format!(".{}", column.name)))
-                        .map(|(p, _)| p)
-                        .collect::<Vec<_>>();
-                    if matches.len() == 1 {
-                        merged_incoming.push(index);
-                        terms.push((matches[0], index, BinaryOperator::Eq));
+                for (incoming, column) in right.columns.iter().enumerate() {
+                    if visible.iter().any(|index| {
+                        combined_columns[*index].name.split('.').next_back()
+                            == Some(column.name.as_str())
+                    }) {
+                        let left = unique_bare_position(&combined_columns, &column.name)?;
+                        merged_incoming.push(incoming);
+                        terms.push((left, incoming, BinaryOperator::Eq));
                     }
-                }
-                if terms.is_empty() {
-                    return Err(unsupported("JOIN", "NATURAL JOIN found no shared columns"));
                 }
                 terms
             }
-            // CROSS JOIN: no ON terms, so every pair matches.
             sqlparser::ast::JoinConstraint::None => Vec::new(),
         };
 
         let incoming_offset = combined_columns.len();
-        for column in &right.columns {
-            combined_columns.push(SqlColumn {
-                name: format!("{right_name}.{}", column.name),
-                column_type: Some(column.data_type),
-            });
+        combined_columns.extend(right.columns.iter().map(|column| SqlColumn {
+            name: format!("{right_name}.{}", column.name),
+            column_type: Some(column.data_type),
+        }));
+        let mut merges = Vec::new();
+        for (left, incoming, _) in &on_terms {
+            if !merged_incoming.contains(incoming) {
+                continue;
+            }
+            let name = &right.columns[*incoming].name;
+            let ty = super::binding::common_type(
+                combined_columns[*left].column_type,
+                combined_columns[incoming_offset + incoming].column_type,
+            )?;
+            let target = if combined_columns[*left].name == *name {
+                combined_columns[*left].column_type = ty;
+                *left
+            } else {
+                let target = combined_columns.len();
+                combined_columns.push(SqlColumn {
+                    name: name.clone(),
+                    column_type: ty,
+                });
+                for position in &mut visible {
+                    if *position == *left {
+                        *position = target;
+                    }
+                }
+                target
+            };
+            merges.push((target, *left, incoming_offset + incoming));
         }
-        scope.push((right_name, right));
-
-        let right_rows = transaction.scan(database, right.id, usize::MAX)?;
-        let null_tail = vec![Value::Null; right.columns.len()];
-        let scope_width = combined_columns.len() - right.columns.len();
-        let null_head = vec![Value::Null; scope_width];
+        visible.extend(
+            (0..right.columns.len())
+                .filter(|index| !merged_incoming.contains(index))
+                .map(|index| incoming_offset + index),
+        );
         let width = combined_columns.len();
+        let right_rows = transaction.scan(database, right.id, usize::MAX)?;
         let mut next_rows = Vec::new();
         let mut right_matched = vec![false; right_rows.len()];
-        for left_row in &combined_rows {
+        let mut push_row = |mut row: Vec<Value>| -> Result<()> {
+            row.resize(width, Value::Null);
+            for (target, left, right) in &merges {
+                let value = if matches!(row[*left], Value::Null) {
+                    &row[*right]
+                } else {
+                    &row[*left]
+                };
+                row[*target] = super::coerce_result_value(
+                    value.clone(),
+                    combined_columns[*target]
+                        .column_type
+                        .expect("bound USING domain"),
+                    "USING",
+                )?;
+            }
+            next_rows.push(row);
+            Ok(())
+        };
+        for left in &combined_rows {
             transaction.check_operation_control()?;
             let mut matched = false;
-            for (right_index, right_row) in right_rows.iter().enumerate() {
+            for (right_index, incoming) in right_rows.iter().enumerate() {
                 transaction.check_operation_control()?;
                 if !on_terms
                     .iter()
-                    .all(|(scope_position, right_position, on_op)| {
-                        join_pair_matches(
-                            &left_row[*scope_position],
-                            &right_row.values[*right_position],
-                            on_op,
-                        )
-                    })
+                    .all(|(a, b, op)| join_pair_matches(&left[*a], &incoming.values[*b], op))
                 {
                     continue;
                 }
                 matched = true;
                 right_matched[right_index] = true;
-                let mut combined = Vec::with_capacity(width);
-                combined.extend_from_slice(left_row);
-                combined.extend_from_slice(&right_row.values);
-                if let Some(selection) = &select.selection
-                    && !join_predicate(selection, &combined, &combined_columns, params)?
-                {
-                    continue;
-                }
-                next_rows.push(combined);
+                let mut row = left.clone();
+                row.extend_from_slice(&incoming.values);
+                push_row(row)?;
             }
-            // LEFT OUTER: an accumulated row with no ON match survives
-            // once with NULLs for the incoming columns. WHERE still
-            // applies - a null-extended row failing the predicate drops.
             if (left_outer || full_outer) && !matched {
-                let mut combined = Vec::with_capacity(width);
-                combined.extend_from_slice(left_row);
-                combined.extend_from_slice(&null_tail);
-                if let Some(selection) = &select.selection
-                    && !join_predicate(selection, &combined, &combined_columns, params)?
-                {
-                    continue;
-                }
-                next_rows.push(combined);
+                let mut row = left.clone();
+                row.resize(incoming_offset + right.columns.len(), Value::Null);
+                push_row(row)?;
             }
         }
-        // RIGHT/FULL OUTER: incoming rows no accumulated row matched
-        // emit once with NULLs for the accumulated columns.
         if right_outer || full_outer {
-            for (right_index, right_row) in right_rows.iter().enumerate() {
+            for (right_index, incoming) in right_rows.iter().enumerate() {
                 transaction.check_operation_control()?;
-                if right_matched[right_index] {
-                    continue;
+                if !right_matched[right_index] {
+                    let mut row = vec![Value::Null; incoming_offset];
+                    row.extend_from_slice(&incoming.values);
+                    push_row(row)?;
                 }
-                let mut combined = Vec::with_capacity(width);
-                combined.extend_from_slice(&null_head);
-                combined.extend_from_slice(&right_row.values);
-                if let Some(selection) = &select.selection
-                    && !join_predicate(selection, &combined, &combined_columns, params)?
-                {
-                    continue;
-                }
-                next_rows.push(combined);
-            }
-        }
-        if !merged_incoming.is_empty() {
-            // Drop the incoming duplicates (descending so positions stay
-            // valid) from every emitted row and from the output schema.
-            let mut dropped = merged_incoming.clone();
-            dropped.sort_unstable();
-            for row in &mut next_rows {
-                for position in dropped.iter().rev() {
-                    row.remove(*position + incoming_offset);
-                }
-            }
-            for position in dropped.iter().rev() {
-                combined_columns.remove(incoming_offset + position);
             }
         }
         combined_rows = next_rows;
     }
-
+    // WHERE belongs after the entire FROM/outer-join phase, not after each
+    // intermediate pair (which can lack later relations or null extensions).
+    if let Some(selection) = &select.selection {
+        let mut filtered = Vec::new();
+        for row in combined_rows {
+            transaction.check_operation_control()?;
+            if join_predicate(selection, &row, &combined_columns, params)? {
+                filtered.push(row);
+            }
+        }
+        combined_rows = filtered;
+    }
     let aggregate_items: Vec<&SelectItem> = select
         .projection
         .iter()
-        .filter(|item| matches!(projection_expression(item), Ok((Expr::Function(_), _))))
+        .filter(|item| {
+            projection_expression(item).is_ok_and(|(expr, _)| is_aggregate_expression(expr))
+        })
         .collect();
-    let grouped = matches!(
-        &select.group_by,
-        GroupByExpr::Expressions(expressions, _) if !expressions.is_empty()
-    ) || (!aggregate_items.is_empty()
-        && aggregate_items.len() == select.projection.len());
-    if grouped {
-        return joined_grouped_aggregates(
+    let mut result = if is_aggregate_query(select) {
+        joined_grouped_aggregates(
             select,
             &aggregate_items,
             combined_rows,
             &combined_columns,
             query.order_by.as_ref(),
             params,
-        );
-    }
-    if let Some(order_by) = &query.order_by {
-        sort_joined_rows(&mut combined_rows, order_by, &combined_columns, params)?;
-    }
-    if !aggregate_items.is_empty() {
-        return Err(unsupported(
-            "JOIN",
-            "mixing aggregates and plain columns requires GROUP BY",
-        ));
-    }
-    let projection = join_projection_plan(select, &combined_columns, params)?;
-    let projected = combined_rows
-        .into_iter()
-        .map(|row| project_values(&projection, &row, &[]))
-        .collect::<Result<Vec<_>>>()?;
-    let projected = if select.distinct.is_some() {
-        apply_distinct(projected)
+        )?
     } else {
-        projected
+        if let Some(order) = &query.order_by {
+            sort_joined_rows(&mut combined_rows, order, &combined_columns, params)?;
+        }
+        let projection = join_projection_plan(select, &combined_columns, &visible, params)?;
+        let rows = combined_rows
+            .into_iter()
+            .map(|row| project_values(&projection, &row, &[]))
+            .collect::<Result<Vec<_>>>()?;
+        SqlResult::rows(
+            projection.columns,
+            if select.distinct.is_some() {
+                apply_distinct(rows)
+            } else {
+                rows
+            },
+        )
     };
     let (offset, limit) = query_window(query, params)?;
-    let projected = projected
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    Ok(SqlResult::rows(projection.columns, projected))
+    result.rows = result.rows.into_iter().skip(offset).take(limit).collect();
+    Ok(result)
 }
 
-/// GROUP BY over joins: hash-group combined rows by the group-by column
-/// positions, then emit each group's columns plus its aggregates in
-/// first-seen order. Group-by items must be plain columns; aggregates
-/// reuse the no-GROUP-BY plan machinery per group.
 fn joined_grouped_aggregates(
     select: &Select,
     aggregate_items: &[&SelectItem],
@@ -2072,178 +2130,87 @@ fn joined_grouped_aggregates(
     params: &[Value],
 ) -> Result<SqlResult> {
     let GroupByExpr::Expressions(expressions, _) = &select.group_by else {
-        unreachable!("caller checked");
+        unreachable!("binding requires column GROUP BY");
     };
-    let mut group_positions = Vec::new();
-    for expr in expressions {
-        let (table_hint, name) = match expr {
-            Expr::Identifier(identifier) => (None, identifier.value.clone()),
-            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-                Some(parts[parts.len() - 2].value.clone()),
-                parts[parts.len() - 1].value.clone(),
-            ),
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "GROUP BY items must be columns over joins",
-                ));
-            }
-        };
-        let position = match table_hint {
-            Some(hint) => combined_columns
+    let group_positions = expressions
+        .iter()
+        .map(|expr| combined_column_position(expr, combined_columns))
+        .collect::<Result<Vec<_>>>()?;
+    let aggregate = JoinedAggregation::plan(aggregate_items, combined_columns)?;
+    let mut storage_columns: Vec<SqlColumn> = group_positions
+        .iter()
+        .map(|position| combined_columns[*position].clone())
+        .collect();
+    storage_columns.extend(aggregate.columns.iter().cloned());
+    let mut projection_positions = Vec::new();
+    let mut columns = Vec::new();
+    let mut aggregate_index = 0;
+    for item in &select.projection {
+        let (expr, alias) = projection_expression(item)?;
+        let position = if is_aggregate_expression(expr) {
+            let position = group_positions.len() + aggregate_index;
+            aggregate_index += 1;
+            position
+        } else {
+            let source = combined_column_position(expr, combined_columns)?;
+            group_positions
                 .iter()
-                .position(|column| column.name == format!("{hint}.{name}"))
-                .ok_or_else(|| DbError::SqlUndefinedColumn {
-                    name: format!("{hint}.{name}"),
-                })?,
-            None => {
-                let matches: Vec<usize> = combined_columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, column)| {
-                        column.name == name || column.name.ends_with(&format!(".{name}"))
-                    })
-                    .map(|(position, _)| position)
-                    .collect();
-                match matches.len() {
-                    1 => matches[0],
-                    0 => {
-                        return Err(DbError::SqlUndefinedColumn { name });
-                    }
-                    _ => {
-                        return Err(unsupported(
-                            "JOIN",
-                            "ambiguous unqualified GROUP BY column; qualify it",
-                        ));
-                    }
-                }
-            }
+                .position(|position| *position == source)
+                .ok_or_else(|| {
+                    DbError::InvalidState("column must appear in GROUP BY or an aggregate".into())
+                })?
         };
-        group_positions.push(position);
+        let source = &storage_columns[position];
+        columns.push(SqlColumn {
+            name: alias.unwrap_or_else(|| {
+                source
+                    .name
+                    .split('.')
+                    .next_back()
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+            column_type: source.column_type,
+        });
+        projection_positions.push(position);
     }
-
+    let mut order_columns = columns.clone();
+    let mut order_positions = projection_positions.clone();
+    if order_by.is_some() {
+        for (position, column) in storage_columns[..group_positions.len()].iter().enumerate() {
+            let name = column.name.split('.').next_back().unwrap_or_default();
+            if !order_columns.iter().any(|column| column.name == name) {
+                order_columns.push(SqlColumn {
+                    name: name.to_owned(),
+                    column_type: column.column_type,
+                });
+                order_positions.push(position);
+            }
+        }
+    }
     let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
     for row in rows {
-        let key: Vec<Value> = group_positions.iter().map(|p| row[*p].clone()).collect();
-        match groups.iter_mut().find(|(existing, _)| *existing == key) {
-            Some((_, members)) => members.push(row),
-            None => groups.push((key, vec![row])),
+        let key: Vec<Value> = group_positions
+            .iter()
+            .map(|position| row[*position].clone())
+            .collect();
+        if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
+            members.push(row);
+        } else {
+            groups.push((key, vec![row]));
         }
     }
-
-    let mut columns = Vec::new();
+    if group_positions.is_empty() && groups.is_empty() {
+        groups.push((Vec::new(), Vec::new()));
+    }
     let mut output_rows = Vec::new();
-    for item in select.projection.iter() {
-        if matches!(projection_expression(item), Ok((Expr::Function(_), _))) {
-            continue;
-        }
-        let (expr, alias) = projection_expression(item)?;
-        let position = match expr {
-            Expr::Identifier(identifier) => combined_columns
-                .iter()
-                .position(|column| {
-                    column.name == identifier.value
-                        || column.name.ends_with(&format!(".{}", identifier.value))
-                })
-                .ok_or_else(|| {
-                    DbError::InvalidState(format!(
-                        "unknown column {} must appear in GROUP BY or an aggregate",
-                        identifier.value
-                    ))
-                })?,
-            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => combined_columns
-                .iter()
-                .position(|column| {
-                    column.name
-                        == format!(
-                            "{}.{}",
-                            parts[parts.len() - 2].value,
-                            parts[parts.len() - 1].value
-                        )
-                })
-                .ok_or_else(|| DbError::SqlUndefinedColumn {
-                    name: format!(
-                        "{}.{}",
-                        parts[parts.len() - 2].value,
-                        parts[parts.len() - 1].value
-                    ),
-                })?,
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "grouped projections must be columns or aggregates",
-                ));
-            }
-        };
-        if !group_positions.contains(&position) {
-            return Err(DbError::InvalidState(
-                "column must appear in the GROUP BY clause or be used in an aggregate function"
-                    .to_owned(),
-            ));
-        }
-        let group_type = combined_columns[position].column_type;
-        columns.push(SqlColumn {
-            name: alias
-                .unwrap_or_else(|| {
-                    combined_columns[position]
-                        .name
-                        .split('.')
-                        .next_back()
-                        .unwrap_or("")
-                        .to_owned()
-                })
-                .replace('.', ""),
-            column_type: group_type,
-        });
-    }
-
-    // Column list: group-by columns first (in projection order is not
-    // guaranteed; we use group_positions order), then aggregates. Built
-    // before the group loop so HAVING can evaluate against it.
-    let mut final_columns: Vec<SqlColumn> = group_positions
-        .iter()
-        .map(|p| SqlColumn {
-            column_type: combined_columns[*p].column_type,
-            name: combined_columns[*p]
-                .name
-                .split('.')
-                .next_back()
-                .unwrap_or_default()
-                .to_owned(),
-        })
-        .collect();
-    for item in aggregate_items {
-        let (_, alias) = projection_expression(item)?;
-        let name = match alias {
-            Some(alias) => alias,
-            None => {
-                let Ok((Expr::Function(func), _)) = projection_expression(item) else {
-                    unreachable!()
-                };
-                func.name.to_string().to_lowercase()
-            }
-        };
-        final_columns.push(SqlColumn {
-            name,
-            column_type: None,
-        });
-    }
-    let _ = columns;
-
-    for (key, members) in &groups {
-        let mut output = key.clone();
-        let aggregate_refs: Vec<&SelectItem> = aggregate_items.to_vec();
-        let aggregated = joined_aggregates_into(&aggregate_refs, members, combined_columns)?;
-        output.extend(aggregated);
-        // HAVING evaluates against this group's output row: group-key
-        // columns by name, aggregates matched to their projected output
-        // position (so HAVING may reference aggregates not selected
-        // verbatim only when they appear in the projection).
+    for (mut output, members) in groups {
+        output.extend(aggregate.values(&members)?);
         if let Some(having) = &select.having
             && !having_predicate(
                 having,
                 &output,
-                &final_columns,
+                &storage_columns,
                 group_positions.len(),
                 aggregate_items,
                 params,
@@ -2251,45 +2218,25 @@ fn joined_grouped_aggregates(
         {
             continue;
         }
-        output_rows.push(output);
-    }
-
-    if let Some(order_by) = order_by {
-        let OrderByKind::Expressions(expressions) = &order_by.kind else {
-            return Err(unsupported("JOIN", "unsupported ORDER BY shape over joins"));
-        };
-        let mut terms = Vec::new();
-        for kind in expressions {
-            let Expr::Identifier(identifier) = &kind.expr else {
-                return Err(unsupported(
-                    "JOIN",
-                    "ORDER BY must reference an output column name",
-                ));
-            };
-            let name = &identifier.value;
-            let position = final_columns
+        output_rows.push(
+            order_positions
                 .iter()
-                .position(|column| &column.name == name)
-                .ok_or_else(|| DbError::SqlUndefinedColumn { name: name.clone() })?;
-            terms.push((position, kind.options.asc.unwrap_or(true)));
-        }
-        output_rows.sort_by(|left, right| {
-            for (position, asc) in &terms {
-                let ordering = joined_value_ordering(&left[*position], &right[*position]);
-                let ordering = if *asc { ordering } else { ordering.reverse() };
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-            }
-            Ordering::Equal
-        });
+                .map(|position| output[*position].clone())
+                .collect(),
+        );
     }
-    Ok(SqlResult::rows(final_columns, output_rows))
+    if let Some(order) = order_by {
+        sort_joined_rows(&mut output_rows, order, &order_columns, params)?;
+        for row in &mut output_rows {
+            row.truncate(columns.len());
+        }
+    }
+    Ok(SqlResult::rows(columns, output_rows))
 }
 
-/// HAVING over a grouped join: identifiers resolve against the output
-/// schema, and function operands must match a projected aggregate (by
-/// canonical SQL text) whose computed value sits at
+/// HAVING sees group keys and aggregate aliases before external projection.
+/// Function operands must match a projected aggregate (by canonical SQL
+/// text) whose computed value sits at
 /// group_columns + its index among aggregate items.
 fn having_predicate(
     expression: &Expr,
@@ -2370,16 +2317,6 @@ fn having_predicate(
     }
 }
 
-/// Aggregate values for one group, in `items` order.
-fn joined_aggregates_into(
-    items: &[&SelectItem],
-    rows: &[Vec<Value>],
-    combined_columns: &[SqlColumn],
-) -> Result<Vec<Value>> {
-    let result = joined_aggregates(items, rows, combined_columns)?;
-    Ok(result.rows.into_iter().next().unwrap_or_default())
-}
-
 #[derive(Clone, Copy)]
 enum JoinedAggregate {
     CountStar,
@@ -2389,199 +2326,183 @@ enum JoinedAggregate {
     Max,
 }
 
-/// No-GROUP-BY aggregates over the full joined row set. The morsel
-/// analytical engine is single-table; this covers the common
-/// `SELECT count(*) FROM a JOIN b ...` shape directly.
-fn joined_aggregates(
-    items: &[&SelectItem],
-    rows: &[Vec<Value>],
-    combined_columns: &[SqlColumn],
-) -> Result<SqlResult> {
-    fn resolve_operand(expr: &Expr, combined_columns: &[SqlColumn]) -> Result<Option<usize>> {
-        match expr {
-            Expr::Identifier(identifier) => combined_columns
-                .iter()
-                .position(|column| {
-                    column.name == identifier.value
-                        || column.name.ends_with(&format!(".{}", identifier.value))
-                })
-                .map(Some)
-                .ok_or_else(|| DbError::SqlUndefinedColumn {
-                    name: identifier.value.clone(),
-                }),
-            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-                let qualified = format!(
-                    "{}.{}",
-                    parts[parts.len() - 2].value,
-                    parts[parts.len() - 1].value
-                );
-                combined_columns
-                    .iter()
-                    .position(|column| column.name == qualified)
-                    .map(Some)
-                    .ok_or(DbError::SqlUndefinedColumn { name: qualified })
+struct JoinedAggregation {
+    columns: Vec<SqlColumn>,
+    plans: Vec<(JoinedAggregate, Option<usize>)>,
+}
+
+impl JoinedAggregation {
+    fn plan(items: &[&SelectItem], combined_columns: &[SqlColumn]) -> Result<Self> {
+        let mut columns = Vec::new();
+        let mut plans = Vec::new();
+        for item in items {
+            let (expr, alias) = projection_expression(item)?;
+            let Expr::Function(func) = expr else {
+                unreachable!("filtered to functions");
+            };
+            let func_name = func.name.to_string().to_uppercase();
+            let sqlparser::ast::FunctionArguments::List(argument_list) = &func.args else {
+                return Err(unsupported("JOIN", "unsupported aggregate argument shape"));
+            };
+            if argument_list.args.len() != 1 {
+                return Err(unsupported("JOIN", "aggregates take exactly one argument"));
             }
-            _ => Err(unsupported(
-                "JOIN",
-                "aggregate arguments must be columns or *",
-            )),
+            let arg = match &argument_list.args[0] {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
+                    None
+                }
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expr,
+                )) => Some(Some(combined_column_position(expr, combined_columns)?)),
+                _ => {
+                    return Err(unsupported(
+                        "JOIN",
+                        "aggregate arguments must be columns or *",
+                    ));
+                }
+            };
+            let kind = match (func_name.as_str(), arg.is_none()) {
+                ("COUNT", true) => JoinedAggregate::CountStar,
+                ("COUNT", false) => JoinedAggregate::CountColumn,
+                ("SUM", false) => JoinedAggregate::Sum,
+                ("MIN", false) => JoinedAggregate::Min,
+                ("MAX", false) => JoinedAggregate::Max,
+                _ => {
+                    return Err(unsupported(
+                        "JOIN",
+                        "only COUNT/SUM/MIN/MAX are supported over joins",
+                    ));
+                }
+            };
+            let aggregate_type = match kind {
+                JoinedAggregate::CountStar | JoinedAggregate::CountColumn => {
+                    Some(crate::ColumnType::I64)
+                }
+                _ => arg
+                    .flatten()
+                    .and_then(|position| combined_columns[position].column_type),
+            };
+            columns.push(SqlColumn {
+                name: alias.unwrap_or_else(|| func_name.to_lowercase()),
+                column_type: aggregate_type,
+            });
+            plans.push((kind, arg.flatten()));
         }
+
+        Ok(Self { columns, plans })
     }
 
-    let mut columns = Vec::new();
-    let mut plans = Vec::new();
-    for item in items {
-        let (expr, alias) = projection_expression(item)?;
-        let Expr::Function(func) = expr else {
-            unreachable!("filtered to functions");
-        };
-        let func_name = func.name.to_string().to_uppercase();
-        let sqlparser::ast::FunctionArguments::List(argument_list) = &func.args else {
-            return Err(unsupported("JOIN", "unsupported aggregate argument shape"));
-        };
-        if argument_list.args.len() != 1 {
-            return Err(unsupported("JOIN", "aggregates take exactly one argument"));
-        }
-        let arg = match &argument_list.args[0] {
-            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => None,
-            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
-                Some(resolve_operand(expr, combined_columns)?)
-            }
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "aggregate arguments must be columns or *",
-                ));
-            }
-        };
-        let kind = match (func_name.as_str(), arg.is_none()) {
-            ("COUNT", true) => JoinedAggregate::CountStar,
-            ("COUNT", false) => JoinedAggregate::CountColumn,
-            ("SUM", false) => JoinedAggregate::Sum,
-            ("MIN", false) => JoinedAggregate::Min,
-            ("MAX", false) => JoinedAggregate::Max,
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "only COUNT/SUM/MIN/MAX are supported over joins",
-                ));
-            }
-        };
-        let aggregate_type = match kind {
-            JoinedAggregate::CountStar | JoinedAggregate::CountColumn => {
-                Some(crate::ColumnType::I64)
-            }
-            _ => None,
-        };
-        columns.push(SqlColumn {
-            name: alias.unwrap_or_else(|| func_name.to_lowercase()),
-            column_type: aggregate_type,
-        });
-        plans.push((kind, arg.flatten()));
-    }
-
-    let count_star = plans
-        .iter()
-        .any(|(kind, _)| matches!(kind, JoinedAggregate::CountStar));
-    let mut result = vec![Value::U64(rows.len() as u64); plans.len()];
-    for (index, (kind, position)) in plans.iter().enumerate() {
-        result[index] = match kind {
-            JoinedAggregate::CountStar => Value::U64(rows.len() as u64),
-            JoinedAggregate::CountColumn => Value::U64(
-                rows.iter()
-                    .filter(|row| !matches!(&row[position.expect("resolved")], Value::Null))
-                    .count() as u64,
-            ),
-            JoinedAggregate::Sum | JoinedAggregate::Min | JoinedAggregate::Max => {
-                let mut accumulator: Option<Value> = None;
-                for row in rows {
-                    let value = &row[position.expect("resolved")];
-                    if matches!(value, Value::Null) {
-                        continue;
-                    }
-                    accumulator = Some(match (kind, accumulator.take()) {
-                        (JoinedAggregate::Min, Some(current)) => {
-                            if joined_value_ordering(value, &current) == Ordering::Less {
-                                value.clone()
-                            } else {
-                                current
-                            }
+    fn values(&self, rows: &[Vec<Value>]) -> Result<Vec<Value>> {
+        let plans = &self.plans;
+        let mut result = vec![Value::U64(rows.len() as u64); plans.len()];
+        for (index, (kind, position)) in plans.iter().enumerate() {
+            result[index] = match kind {
+                JoinedAggregate::CountStar => Value::U64(rows.len() as u64),
+                JoinedAggregate::CountColumn => Value::U64(
+                    rows.iter()
+                        .filter(|row| !matches!(&row[position.expect("resolved")], Value::Null))
+                        .count() as u64,
+                ),
+                JoinedAggregate::Sum | JoinedAggregate::Min | JoinedAggregate::Max => {
+                    let mut accumulator: Option<Value> = None;
+                    for row in rows {
+                        let value = &row[position.expect("resolved")];
+                        if matches!(value, Value::Null) {
+                            continue;
                         }
-                        (JoinedAggregate::Max, Some(current)) => {
-                            if joined_value_ordering(value, &current) == Ordering::Greater {
-                                value.clone()
-                            } else {
-                                current
+                        accumulator = Some(match (kind, accumulator.take()) {
+                            (JoinedAggregate::Min, Some(current)) => {
+                                if joined_value_ordering(value, &current) == Ordering::Less {
+                                    value.clone()
+                                } else {
+                                    current
+                                }
                             }
-                        }
-                        (JoinedAggregate::Sum, Some(Value::U64(current))) => match value {
-                            Value::U64(addend) => Value::U64(current + addend),
-                            Value::I64(addend) => Value::I64(current as i64 + addend),
-                            other => {
-                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
+                            (JoinedAggregate::Max, Some(current)) => {
+                                if joined_value_ordering(value, &current) == Ordering::Greater {
+                                    value.clone()
+                                } else {
+                                    current
+                                }
                             }
-                        },
-                        (JoinedAggregate::Sum, Some(Value::I64(current))) => match value {
-                            Value::I64(addend) => Value::I64(current + addend),
-                            Value::U64(addend) => Value::I64(current + *addend as i64),
-                            other => {
-                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
-                            }
-                        },
-                        // Float and decimal sums accumulate in their own
-                        // domain: floats add in f64, decimals align scales
-                        // exactly (the same rule as the morsel executor).
-                        (JoinedAggregate::Sum, Some(Value::Float64(current))) => match value {
-                            Value::Float64(addend) => {
-                                Value::Float64(crate::sql_types::F64::new(current.0 + addend.0))
-                            }
-                            other => {
-                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
-                            }
-                        },
-                        (JoinedAggregate::Sum, Some(Value::Decimal(current))) => match value {
-                            Value::Decimal(addend) => {
-                                let target = current.scale.max(addend.scale);
-                                let left = current.rescale(target).map_err(|_| {
-                                    DbError::SqlNumericValueOutOfRange(
-                                        "decimal sum overflow".to_owned(),
-                                    )
-                                })?;
-                                let right = addend.rescale(target).map_err(|_| {
-                                    DbError::SqlNumericValueOutOfRange(
-                                        "decimal sum overflow".to_owned(),
-                                    )
-                                })?;
-                                let mantissa =
-                                    left.mantissa.checked_add(right.mantissa).ok_or_else(|| {
+                            (JoinedAggregate::Sum, Some(Value::U64(current))) => match value {
+                                Value::U64(addend) => Value::U64(current + addend),
+                                Value::I64(addend) => Value::I64(current as i64 + addend),
+                                other => {
+                                    return Err(DbError::InvalidState(format!(
+                                        "cannot sum {other:?}"
+                                    )));
+                                }
+                            },
+                            (JoinedAggregate::Sum, Some(Value::I64(current))) => match value {
+                                Value::I64(addend) => Value::I64(current + addend),
+                                Value::U64(addend) => Value::I64(current + *addend as i64),
+                                other => {
+                                    return Err(DbError::InvalidState(format!(
+                                        "cannot sum {other:?}"
+                                    )));
+                                }
+                            },
+                            // Float and decimal sums accumulate in their own
+                            // domain: floats add in f64, decimals align scales
+                            // exactly (the same rule as the morsel executor).
+                            (JoinedAggregate::Sum, Some(Value::Float64(current))) => match value {
+                                Value::Float64(addend) => {
+                                    Value::Float64(crate::sql_types::F64::new(current.0 + addend.0))
+                                }
+                                other => {
+                                    return Err(DbError::InvalidState(format!(
+                                        "cannot sum {other:?}"
+                                    )));
+                                }
+                            },
+                            (JoinedAggregate::Sum, Some(Value::Decimal(current))) => match value {
+                                Value::Decimal(addend) => {
+                                    let target = current.scale.max(addend.scale);
+                                    let left = current.rescale(target).map_err(|_| {
                                         DbError::SqlNumericValueOutOfRange(
                                             "decimal sum overflow".to_owned(),
                                         )
                                     })?;
-                                Value::Decimal(
-                                    crate::sql_types::DecimalValue::new(mantissa, target).map_err(
-                                        |_| {
+                                    let right = addend.rescale(target).map_err(|_| {
+                                        DbError::SqlNumericValueOutOfRange(
+                                            "decimal sum overflow".to_owned(),
+                                        )
+                                    })?;
+                                    let mantissa = left
+                                        .mantissa
+                                        .checked_add(right.mantissa)
+                                        .ok_or_else(|| {
                                             DbError::SqlNumericValueOutOfRange(
                                                 "decimal sum overflow".to_owned(),
                                             )
-                                        },
-                                    )?,
-                                )
-                            }
-                            other => {
-                                return Err(DbError::InvalidState(format!("cannot sum {other:?}")));
-                            }
-                        },
-                        (_, None) => value.clone(),
-                        _ => unreachable!("min/max handled above"),
-                    });
+                                        })?;
+                                    Value::Decimal(
+                                        crate::sql_types::DecimalValue::new(mantissa, target)
+                                            .map_err(|_| {
+                                                DbError::SqlNumericValueOutOfRange(
+                                                    "decimal sum overflow".to_owned(),
+                                                )
+                                            })?,
+                                    )
+                                }
+                                other => {
+                                    return Err(DbError::InvalidState(format!(
+                                        "cannot sum {other:?}"
+                                    )));
+                                }
+                            },
+                            (_, None) => value.clone(),
+                            _ => unreachable!("min/max handled above"),
+                        });
+                    }
+                    accumulator.unwrap_or(Value::Null)
                 }
-                accumulator.unwrap_or(Value::Null)
-            }
-        };
+            };
+        }
+
+        Ok(result)
     }
-    let _ = count_star;
-    Ok(SqlResult::rows(columns, vec![result]))
 }
 
 /// Projection over the combined join schema: wildcard spans both tables
@@ -2591,6 +2512,7 @@ fn joined_aggregates(
 fn join_projection_plan(
     select: &Select,
     combined_columns: &[SqlColumn],
+    visible: &[usize],
     params: &[Value],
 ) -> Result<ProjectionPlan> {
     if select.distinct.is_some()
@@ -2610,48 +2532,8 @@ fn join_projection_plan(
             "only a plain projection is supported over joins",
         ));
     }
-    let resolve = |expression: &Expr| -> Result<Option<usize>> {
-        let (table_hint, name) = match expression {
-            Expr::Identifier(identifier) => (None, identifier.value.clone()),
-            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-                Some(parts[parts.len() - 2].value.clone()),
-                parts[parts.len() - 1].value.clone(),
-            ),
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "projections must be columns, literals, or parameters",
-                ));
-            }
-        };
-        match table_hint {
-            Some(hint) => combined_columns
-                .iter()
-                .position(|column| column.name == format!("{hint}.{name}"))
-                .map(Some)
-                .ok_or_else(|| DbError::SqlUndefinedColumn {
-                    name: format!("{hint}.{name}"),
-                }),
-            None => {
-                let matches: Vec<usize> = combined_columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, column)| {
-                        column.name == name || column.name.ends_with(&format!(".{name}"))
-                    })
-                    .map(|(position, _)| position)
-                    .collect();
-                match matches.len() {
-                    1 => Ok(Some(matches[0])),
-                    0 => Err(DbError::SqlUndefinedColumn { name }),
-                    _ => Err(unsupported(
-                        "JOIN",
-                        "ambiguous unqualified column; qualify it with the table name",
-                    )),
-                }
-            }
-        }
-    };
+    let resolve =
+        |expression: &Expr| combined_column_position(expression, combined_columns).map(Some);
     let mut columns = Vec::new();
     let mut positions = Vec::new();
     let mut computed: Vec<Option<ComputedTerm>> = Vec::new();
@@ -2659,7 +2541,8 @@ fn join_projection_plan(
     for item in &select.projection {
         match item {
             SelectItem::Wildcard(options) if options.to_string().is_empty() => {
-                for (position, column) in combined_columns.iter().enumerate() {
+                for &position in visible {
+                    let column = &combined_columns[position];
                     columns.push(SqlColumn {
                         name: column.name.clone(),
                         column_type: column.column_type,
@@ -2705,11 +2588,10 @@ fn join_projection_plan(
                     SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                     _ => "literal".to_owned(),
                 };
-                let literal = literal_value(expression, params)?;
-                columns.push(SqlColumn {
-                    name,
-                    column_type: value_static_type(&literal),
-                });
+                let term = plan_computed(expression, &[], params)?;
+                let column_type = term.static_type(&[])?;
+                let literal = term.evaluate(&[])?;
+                columns.push(SqlColumn { name, column_type });
                 positions.push(None);
                 literals.push(Some(literal));
                 computed.push(None);
@@ -2749,57 +2631,37 @@ fn sort_joined_rows(
     };
     let mut terms = Vec::new();
     for kind in expressions {
-        // Bare names match uniquely across the combined schema; qualified
-        // names (users.email) must name an existing relation prefix.
-        let (table_hint, name) = match &kind.expr {
-            Expr::Identifier(identifier) => (None, identifier.value.clone()),
-            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-                Some(parts[parts.len() - 2].value.clone()),
-                parts[parts.len() - 1].value.clone(),
-            ),
-            _ => {
-                return Err(unsupported(
-                    "JOIN",
-                    "ORDER BY must reference a column by name",
-                ));
-            }
-        };
-        let position = match table_hint {
-            Some(hint) => combined_columns
-                .iter()
-                .position(|column| column.name == format!("{hint}.{name}"))
-                .ok_or_else(|| DbError::SqlUndefinedColumn {
-                    name: format!("{hint}.{name}"),
-                })?,
-            None => {
-                let matches: Vec<usize> = combined_columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, column)| {
-                        column.name == name || column.name.ends_with(&format!(".{name}"))
-                    })
-                    .map(|(position, _)| position)
-                    .collect();
-                match matches.len() {
-                    1 => matches[0],
-                    0 => {
-                        return Err(DbError::SqlUndefinedColumn { name });
-                    }
-                    _ => {
-                        return Err(unsupported(
-                            "JOIN",
-                            "ambiguous unqualified ORDER BY column; qualify it with the table name",
-                        ));
-                    }
-                }
-            }
-        };
-        terms.push((position, kind.options.asc.unwrap_or(true)));
+        let position = combined_column_position(&kind.expr, combined_columns)?;
+        let ascending = kind.options.asc.unwrap_or(true);
+        terms.push((
+            position,
+            ascending,
+            kind.options.nulls_first.unwrap_or(!ascending),
+        ));
     }
     rows.sort_by(|left, right| {
-        for (position, asc) in &terms {
-            let ordering = joined_value_ordering(&left[*position], &right[*position]);
-            let ordering = if *asc { ordering } else { ordering.reverse() };
+        for (position, asc, nulls_first) in &terms {
+            let ordering = match (&left[*position], &right[*position]) {
+                (Value::Null, Value::Null) => Ordering::Equal,
+                (Value::Null, _) => {
+                    if *nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (_, Value::Null) => {
+                    if *nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (left, right) => {
+                    let ordering = joined_value_ordering(left, right);
+                    if *asc { ordering } else { ordering.reverse() }
+                }
+            };
             if ordering != Ordering::Equal {
                 return ordering;
             }
@@ -2828,7 +2690,7 @@ fn joined_value_ordering(left: &Value, right: &Value) -> Ordering {
     }
 }
 
-fn relation_name(relation: &sqlparser::ast::TableFactor) -> Result<String> {
+pub(super) fn relation_name(relation: &sqlparser::ast::TableFactor) -> Result<String> {
     match relation {
         sqlparser::ast::TableFactor::Table { name, alias, .. } => Ok(match alias {
             Some(alias) => alias.name.value.clone(),
@@ -2844,198 +2706,147 @@ enum JoinSide {
     Incoming,
 }
 
-/// Resolve one ON operand to a global combined-column position. The
-/// operand must land either in the accumulated scope (qualified by any
-/// earlier relation's name, or uniquely by bare name) or in the incoming
-/// table.
-fn resolve_on_operand(
-    expression: &Expr,
-    scope: &[(String, &TableDefinition)],
-    incoming: &TableDefinition,
-) -> Result<(JoinSide, usize)> {
-    let (table_hint, column_name) = match expression {
-        Expr::Identifier(identifier) => (None, identifier.value.clone()),
-        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-            Some(parts[parts.len() - 2].value.clone()),
-            parts[parts.len() - 1].value.clone(),
-        ),
-        _ => return Err(unsupported("JOIN", "ON must compare two columns")),
-    };
-    let locate = |table: &TableDefinition| {
-        table
-            .columns
-            .iter()
-            .position(|column| column.name == column_name)
-    };
-    match table_hint.as_deref() {
-        Some(hint) => {
-            if let Some((_, table)) = scope.iter().find(|(name, _)| name == hint) {
-                locate(table)
-                    .ok_or_else(|| unsupported("JOIN", "ON column not found in referenced table"))
-                    .map(|position| (JoinSide::Accumulated, position))
-            } else {
-                locate(incoming)
-                    .map(|position| (JoinSide::Incoming, position))
-                    .ok_or_else(|| unsupported("JOIN", "ON references a table outside the join"))
-            }
-        }
-        None => {
-            if let Some(position) = locate(incoming) {
-                return Ok((JoinSide::Incoming, position));
-            }
-            let matches: Vec<usize> = scope
+fn combined_column_position(expression: &Expr, columns: &[SqlColumn]) -> Result<usize> {
+    match expression {
+        Expr::Identifier(name) => unique_bare_position(columns, &name.value),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let name = format!("{}.{}", parts[0].value, parts[1].value);
+            columns
                 .iter()
-                .filter_map(|(_, table)| locate(table))
-                .collect();
-            match matches.len() {
-                1 => Ok((JoinSide::Accumulated, matches[0])),
-                0 => Err(unsupported(
-                    "JOIN",
-                    "ON column does not resolve to any joined table",
-                )),
-                _ => Err(unsupported(
-                    "JOIN",
-                    "ambiguous unqualified ON column; qualify it with the table name",
-                )),
-            }
+                .position(|column| column.name == name)
+                .ok_or(DbError::SqlUndefinedColumn { name })
         }
+        _ => Err(unsupported("JOIN", "expected a column or table.column")),
     }
 }
 
-/// Resolve `a.x = b.y` (either orientation) to positions: one operand in
-/// the accumulated scope, one in the incoming table. `offset` is the
-/// incoming table's first column index in the final combined schema.
+fn resolve_on_operand(
+    expression: &Expr,
+    scope: &[SqlColumn],
+    incoming_name: &str,
+    incoming: &TableDefinition,
+) -> Result<(JoinSide, usize)> {
+    let accumulated = match combined_column_position(expression, scope) {
+        Ok(position) => Some(position),
+        Err(DbError::SqlUndefinedColumn { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    let incoming_position = match expression {
+        Expr::Identifier(name) => incoming
+            .columns
+            .iter()
+            .position(|column| column.name == name.value),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 && parts[0].value == incoming_name => {
+            incoming
+                .columns
+                .iter()
+                .position(|column| column.name == parts[1].value)
+        }
+        _ => None,
+    };
+    match (accumulated, incoming_position) {
+        (Some(position), None) => Ok((JoinSide::Accumulated, position)),
+        (None, Some(position)) => Ok((JoinSide::Incoming, position)),
+        (None, None) => Err(DbError::SqlUndefinedColumn {
+            name: expression.to_string(),
+        }),
+        (Some(_), Some(_)) => Err(unsupported(
+            "JOIN",
+            "ambiguous unqualified ON column; qualify it",
+        )),
+    }
+}
+
 type OnTerms = Vec<(usize, usize, BinaryOperator)>;
 
 fn on_positions_in_scope(
     expression: &Expr,
-    scope: &[(String, &TableDefinition)],
+    scope: &[SqlColumn],
+    incoming_name: &str,
     incoming: &TableDefinition,
 ) -> Result<OnTerms> {
     let mut terms = Vec::new();
-    collect_on_comparisons(expression, scope, incoming, &mut terms)?;
+    collect_on_comparisons(expression, scope, incoming_name, incoming, &mut terms)?;
     Ok(terms)
 }
 
-/// Flatten an AND-tree of column comparisons into per-pair terms.
 fn collect_on_comparisons(
     expression: &Expr,
-    scope: &[(String, &TableDefinition)],
+    scope: &[SqlColumn],
+    incoming_name: &str,
     incoming: &TableDefinition,
-    terms: &mut Vec<(usize, usize, BinaryOperator)>,
+    terms: &mut OnTerms,
 ) -> Result<()> {
+    if let Expr::Nested(expr) = expression {
+        return collect_on_comparisons(expr, scope, incoming_name, incoming, terms);
+    }
     if let Expr::BinaryOp {
         left,
         op: BinaryOperator::And,
         right,
     } = expression
     {
-        collect_on_comparisons(left, scope, incoming, terms)?;
-        collect_on_comparisons(right, scope, incoming, terms)?;
+        collect_on_comparisons(left, scope, incoming_name, incoming, terms)?;
+        collect_on_comparisons(right, scope, incoming_name, incoming, terms)?;
         return Ok(());
     }
-    let Expr::BinaryOp {
-        left: lhs,
-        op,
-        right: rhs,
-    } = expression
-    else {
+    let Expr::BinaryOp { left, op, right } = expression else {
         return Err(unsupported("JOIN", "ON must be column comparisons"));
     };
-    if !matches!(
-        op,
-        BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-    ) {
-        return Err(unsupported("JOIN", "unsupported ON operator"));
-    }
-    let (first_side, first_position) = resolve_on_operand(lhs, scope, incoming)?;
-    let (second_side, second_position) = resolve_on_operand(rhs, scope, incoming)?;
-    match (first_side, second_side) {
+    let reversed = match op {
+        BinaryOperator::Eq | BinaryOperator::NotEq => op.clone(),
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        _ => return Err(unsupported("JOIN", "unsupported ON operator")),
+    };
+    let (a, a_position) = resolve_on_operand(left, scope, incoming_name, incoming)?;
+    let (b, b_position) = resolve_on_operand(right, scope, incoming_name, incoming)?;
+    match (a, b) {
         (JoinSide::Accumulated, JoinSide::Incoming) => {
-            terms.push((first_position, second_position, op.clone()));
+            terms.push((a_position, b_position, op.clone()))
         }
         (JoinSide::Incoming, JoinSide::Accumulated) => {
-            terms.push((second_position, first_position, op.clone()));
+            terms.push((b_position, a_position, reversed))
         }
         _ => {
             return Err(unsupported(
                 "JOIN",
-                "ON must compare one column from the joined tables so far and one from the new table",
+                "ON must compare the accumulated and incoming relations",
             ));
         }
     }
     Ok(())
 }
 
-/// Unique unqualified column lookup over the combined join schema.
-fn unique_bare_position(combined_columns: &[SqlColumn], name: &str) -> Result<usize> {
-    let matches: Vec<usize> = combined_columns
+/// Bare USING/NATURAL outputs have their own coalesced slot. Qualified
+/// source slots stay available but do not make that bare lookup ambiguous.
+fn unique_bare_position(columns: &[SqlColumn], name: &str) -> Result<usize> {
+    let exact = columns.iter().position(|column| column.name == name);
+    if let Some(position) = exact {
+        return Ok(position);
+    }
+    let mut matches = columns
         .iter()
         .enumerate()
-        .filter(|(_, column)| column.name == name || column.name.ends_with(&format!(".{name}")))
-        .map(|(position, _)| position)
-        .collect();
-    match matches.len() {
-        1 => Ok(matches[0]),
-        0 => Err(DbError::SqlUndefinedColumn {
+        .filter(|(_, column)| column.name.ends_with(&format!(".{name}")));
+    let Some((position, _)) = matches.next() else {
+        return Err(DbError::SqlUndefinedColumn {
             name: name.to_owned(),
-        }),
-        _ => Err(unsupported(
+        });
+    };
+    if matches.next().is_some() {
+        return Err(unsupported(
             "JOIN",
-            "ambiguous USING column; qualify it or rename one side",
-        )),
+            "ambiguous unqualified column; qualify it",
+        ));
     }
+    Ok(position)
 }
 
-fn ordering_matches(ordering: Ordering, op: &BinaryOperator) -> bool {
-    match op {
-        BinaryOperator::Eq => ordering == Ordering::Equal,
-        BinaryOperator::NotEq => ordering != Ordering::Equal,
-        BinaryOperator::Lt => ordering == Ordering::Less,
-        BinaryOperator::LtEq => ordering != Ordering::Greater,
-        BinaryOperator::Gt => ordering == Ordering::Greater,
-        BinaryOperator::GtEq => ordering != Ordering::Less,
-        _ => false,
-    }
-}
-
-fn column_reference_name(expression: &Expr) -> Option<String> {
-    match expression {
-        Expr::Identifier(identifier) => Some(identifier.value.clone()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|part| part.value.clone()),
-        _ => None,
-    }
-}
-
-/// Cross-type equivalence for join keys, following coerce_value's
-/// non-negative integer rule.
-/// Per-pair ON evaluation with the non-negative integer coercion rule.
-/// Incomparable types (e.g. Text vs U64) match only for Eq/NotEq via
-/// direct equality, mirroring compare_joined's fallback.
 fn join_pair_matches(left: &Value, right: &Value, op: &BinaryOperator) -> bool {
-    match (left, right) {
-        (Value::U64(_), Value::U64(_))
-        | (Value::I64(_), Value::I64(_))
-        | (Value::Text(_), Value::Text(_)) => {
-            ordering_matches(joined_value_ordering(left, right), op)
-        }
-        (Value::U64(a), Value::I64(b)) | (Value::I64(b), Value::U64(a)) if *b >= 0 => {
-            ordering_matches((*a as i64).cmp(b), op)
-        }
-        (l, r) => {
-            let equal = l == r;
-            match op {
-                BinaryOperator::Eq => equal,
-                BinaryOperator::NotEq => !equal,
-                _ => false,
-            }
-        }
-    }
+    compare_values(left, right, op) == Truth::True
 }
 
 /// Conjunctive WHERE over the combined joined schema: comparisons between
@@ -3112,15 +2923,7 @@ pub(super) fn join_predicate(
 }
 
 fn combined_value(expression: &Expr, combined: &[Value], columns: &[SqlColumn]) -> Result<Value> {
-    let name = column_reference_name(expression)
-        .ok_or_else(|| unsupported("JOIN", "WHERE operands must be columns or literals"))?;
-    let position = columns
-        .iter()
-        .position(|column| column.name == name || column.name.ends_with(&format!(".{name}")))
-        .ok_or_else(|| DbError::SqlUndefinedColumn {
-            name: name.to_owned(),
-        })?;
-    Ok(combined[position].clone())
+    Ok(combined[combined_column_position(expression, columns)?].clone())
 }
 
 fn compare_joined(left: Value, right: Value, op: &BinaryOperator) -> bool {
@@ -3491,22 +3294,16 @@ fn is_aggregate_query(select: &Select) -> bool {
         GroupByExpr::All(_) => return true,
         _ => {}
     }
-    fn is_row_function(expression: &Expr) -> bool {
-        // Row functions evaluate per row (COALESCE, the scalar catalog);
-        // window calls get their own phase; everything else that parses
-        // as a function is an aggregate.
-        matches!(expression, Expr::Function(func)
-            if !func.name.to_string().eq_ignore_ascii_case("coalesce")
-                && scalar_function_arity(&func.name.to_string()).is_none()
-                && func.over.is_none())
-    }
-    select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(expression)
-        | SelectItem::ExprWithAlias {
-            expr: expression, ..
-        } => is_row_function(expression),
-        _ => false,
+    select.projection.iter().any(|item| {
+        projection_expression(item).is_ok_and(|(expression, _)| is_aggregate_expression(expression))
     })
+}
+
+fn is_aggregate_expression(expression: &Expr) -> bool {
+    matches!(expression, Expr::Function(function)
+        if function.over.is_none() && matches!(
+            function.name.to_string().to_ascii_lowercase().as_str(),
+            "count" | "sum" | "avg" | "min" | "max"))
 }
 
 fn execute_aggregate_query(
@@ -3616,9 +3413,9 @@ fn execute_aggregate_query(
             });
             analytical_query = analytical_query.with_aggregate(kind, col_id, final_alias);
         } else {
-            let value = literal_value(expr, params)?;
-            let column_type = value_static_type(&value);
-            constant_values[item_index] = Some(value);
+            let term = plan_computed(expr, &[], params)?;
+            let column_type = term.static_type(&[])?;
+            constant_values[item_index] = Some(term.evaluate(&[])?);
             result_columns.push(SqlColumn {
                 name: alias.unwrap_or_else(|| expr.to_string()),
                 column_type,

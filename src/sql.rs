@@ -8,9 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
-    BinaryOperator, Expr, Query, Statement, Value as AstValue, visit_expressions,
-};
+use sqlparser::ast::{Expr, Statement, Value as AstValue, visit_expressions};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -40,17 +38,13 @@ pub(crate) mod typed_input {
 #[path = "sql_write.rs"]
 mod write;
 
+pub(crate) mod binding;
 mod control;
 #[path = "sql/explain.rs"]
 mod explain;
 
 #[cfg(feature = "pgwire")]
 pub(crate) use control::{TransactionControl, statement_sources};
-
-#[cfg(feature = "pgwire")]
-pub(crate) fn transaction_control(source: &str) -> Result<Option<TransactionControl>> {
-    control::bind(&parse_one(source)?)
-}
 
 #[path = "sql/window.rs"]
 pub(crate) mod window;
@@ -62,11 +56,8 @@ mod result {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct SqlColumn {
         pub name: String,
-        /// The column's static result type when the projection determines
-        /// it (catalog column, typed literal, or computed term). `None`
-        /// means the type is only observable from result values (set-union
-        /// arms, expression fallbacks); wire servers then infer from a
-        /// sample row.
+        /// The bound SQL result type. Public execution always supplies it;
+        /// internal operators may leave it unset while constructing a result.
         pub column_type: Option<crate::ColumnType>,
     }
 
@@ -120,9 +111,35 @@ pub(crate) fn execute_with_params(
     source: &str,
     params: &[Value],
 ) -> Result<SqlResult> {
-    let statement = parse_one(source)?;
-    validate_parameters(&statement, params)?;
-    if let Statement::CreateTable(create) = &statement {
+    let bound = binding::bind(database, source, &parameter_hints(params))?;
+    execute_bound(database, &bound, params)
+}
+
+pub(crate) fn validate_bound(
+    database: &RelationalDatabase,
+    bound: &binding::BoundStatement,
+) -> Result<()> {
+    if !matches!(bound.effect, binding::StatementEffect::Control(_))
+        && bound.catalog_stamp != Some(database.catalog_stamp())
+    {
+        return Err(DbError::SqlPreparedStatementInvalidated);
+    }
+    Ok(())
+}
+
+pub(crate) fn parameter_hints(params: &[Value]) -> Vec<Option<ColumnType>> {
+    params.iter().map(query::value_static_type).collect()
+}
+
+pub(crate) fn execute_bound(
+    database: &mut RelationalDatabase,
+    bound: &binding::BoundStatement,
+    params: &[Value],
+) -> Result<SqlResult> {
+    validate_bound(database, bound)?;
+    let statement = &bound.statement;
+    validate_parameters(statement, params)?;
+    if let Statement::CreateTable(create) = statement {
         let commit = schema::execute_create_table(database, create)?;
         return Ok(SqlResult {
             columns: Vec::new(),
@@ -131,7 +148,7 @@ pub(crate) fn execute_with_params(
             commit: Some(commit),
         });
     }
-    if let Statement::AlterTable(alter) = &statement {
+    if let Statement::AlterTable(alter) = statement {
         let commit = schema::execute_alter_table(database, alter)?;
         return Ok(SqlResult {
             columns: Vec::new(),
@@ -140,7 +157,7 @@ pub(crate) fn execute_with_params(
             commit: Some(commit),
         });
     }
-    if let Statement::CreateIndex(create) = &statement {
+    if let Statement::CreateIndex(create) = statement {
         let commit = schema::execute_create_index(database, create)?;
         return Ok(SqlResult {
             columns: Vec::new(),
@@ -149,8 +166,8 @@ pub(crate) fn execute_with_params(
             commit: Some(commit),
         });
     }
-    if let Statement::Drop { .. } = &statement {
-        let commit = schema::execute_drop(database, &statement)?;
+    if let Statement::Drop { .. } = statement {
+        let commit = schema::execute_drop(database, statement)?;
         return Ok(SqlResult {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -159,9 +176,8 @@ pub(crate) fn execute_with_params(
         });
     }
 
-    let (mut result, commit) = database.transaction(|store, transaction| {
-        execute_in_transaction_statement(store, transaction, &statement, params)
-    })?;
+    let (mut result, commit) = database
+        .transaction(|store, transaction| transaction.execute_bound_sql(store, bound, params))?;
     result.commit = Some(commit);
     Ok(result)
 }
@@ -172,9 +188,70 @@ pub(crate) fn execute_in_transaction_with_params(
     source: &str,
     params: &[Value],
 ) -> Result<SqlResult> {
-    let statement = parse_one(source)?;
-    validate_parameters(&statement, params)?;
-    execute_in_transaction_statement(database, transaction, &statement, params)
+    transaction.ensure_sql_catalog(database)?;
+    let bound = binding::bind(database, source, &parameter_hints(params))?;
+    execute_bound_in_transaction(database, transaction, &bound, params)
+}
+
+pub(crate) fn execute_bound_in_transaction(
+    database: &RelationalDatabase,
+    transaction: &mut RelationalDatabaseTransaction,
+    bound: &binding::BoundStatement,
+    params: &[Value],
+) -> Result<SqlResult> {
+    transaction.ensure_sql_catalog(database)?;
+    validate_bound(database, bound)?;
+    validate_parameters(&bound.statement, params)?;
+    let mut result =
+        execute_in_transaction_statement(database, transaction, &bound.statement, params)?;
+    normalize_rows(&mut result.rows, &bound.columns)?;
+    result.columns = bound.columns.clone();
+    Ok(result)
+}
+
+fn coerce_result_value(value: Value, column_type: ColumnType, name: &str) -> Result<Value> {
+    let actual = query::value_static_type(&value);
+    if actual == Some(column_type)
+        || matches!(
+            (actual, column_type),
+            (
+                Some(ColumnType::I64 | ColumnType::U64),
+                ColumnType::I64 | ColumnType::U64
+            )
+        )
+    {
+        return Ok(value);
+    }
+    values::coerce_value(
+        value,
+        &crate::ColumnDefinition {
+            id: crate::ColumnId(0),
+            name: name.to_owned(),
+            data_type: column_type,
+            nullable: true,
+        },
+    )
+}
+
+fn normalize_rows(rows: &mut [Vec<Value>], columns: &[SqlColumn]) -> Result<()> {
+    for row in rows {
+        if row.len() != columns.len() {
+            return Err(DbError::InvalidState(
+                "SQL executor violated the bound result width".to_owned(),
+            ));
+        }
+        for (value, column) in row.iter_mut().zip(columns) {
+            let column_type = column.column_type.ok_or_else(|| {
+                DbError::InvalidState("SQL binding omitted a result type".to_owned())
+            })?;
+            *value = coerce_result_value(
+                std::mem::replace(value, Value::Null),
+                column_type,
+                &column.name,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn execute_in_transaction_statement(
@@ -262,257 +339,16 @@ fn execute_in_transaction_statement(
     }
 }
 
-#[cfg(feature = "pgwire")]
-/// Describe the statically known columns of a supported DML RETURNING clause.
-/// SELECT result typing still uses the execution probe; INSERT/UPDATE/DELETE
-/// RETURNING is restricted to target-table columns, so its wire schema does
-/// not depend on whether benign describe-time parameters happen to match a row.
-pub(crate) fn describe_returning_columns(
-    database: &RelationalDatabase,
-    source: &str,
-) -> Result<Option<Vec<(String, ColumnType)>>> {
-    let statement = parse_one(source)?;
-    write::describe_returning_columns(database, &statement)
-}
-
-/// Infer the expected engine type of each positional parameter in a
-/// statement so wire servers can report concrete parameter types to clients
-/// that refuse unspecified types. Positions the statement context does not
-/// determine map to `None`. Single-table scope only; joins and aliases are
-/// outside the tier anyway.
+/// Infer parameter domains using the same binding used by execution.
 pub(crate) fn describe_parameters(
     database: &RelationalDatabase,
     source: &str,
 ) -> Result<Vec<Option<ColumnType>>> {
-    let statement = parse_one(source)?;
-    parameter_indexes(&statement)?;
-    let mut inferred = ParameterInference::default();
-    match &statement {
-        Statement::Insert(insert) => {
-            let table_name = match &insert.table {
-                sqlparser::ast::TableObject::TableName(name) => simple_object_name(name, "table")?,
-                _ => return Ok(Vec::new()),
-            };
-            let table = find_table(database.catalog(), table_name)?;
-            let positions = write::insert_positions(table, &insert.columns)
-                .unwrap_or_else(|_| (0..table.columns.len()).collect());
-            if let Some(source_query) = insert.source.as_deref()
-                && let sqlparser::ast::SetExpr::Values(values) = source_query.body.as_ref()
-            {
-                for row in &values.rows {
-                    for (expression, position) in row.iter().zip(&positions) {
-                        inferred.observe_expression(expression, column_type_at(table, *position));
-                    }
-                }
-            }
-        }
-        Statement::Update(update) => {
-            let table = super_table_from_join(database.catalog(), &update.table);
-            if let Some(table) = table {
-                for assignment in &update.assignments {
-                    if let Expr::Value(value) = &assignment.value
-                        && let AstValue::Placeholder(_) = value.value
-                    {
-                        let name = match &assignment.target {
-                            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                                simple_object_name(name, "column").ok().map(str::to_owned)
-                            }
-                            sqlparser::ast::AssignmentTarget::Tuple(_) => None,
-                        };
-                        if let Some(column_type) = column_type_by_name(table, name.as_deref()) {
-                            inferred.observe_placeholder(&assignment.value, column_type);
-                        }
-                    }
-                }
-                if let Some(selection) = &update.selection {
-                    inferred.walk_predicate(selection, Some(table));
-                }
-            }
-        }
-        Statement::Delete(delete) => {
-            let (sqlparser::ast::FromTable::WithFromKeyword(tables)
-            | sqlparser::ast::FromTable::WithoutKeyword(tables)) = &delete.from;
-            if tables.len() == 1 {
-                let table = super_table_from_join(database.catalog(), &tables[0]);
-                if let (Some(table), Some(selection)) = (table, &delete.selection) {
-                    inferred.walk_predicate(selection, Some(table));
-                }
-            }
-        }
-        Statement::Query(query) => {
-            inferred.walk_query(database, query);
-        }
-        _ => {}
-    }
-    Ok(inferred.finish())
+    Ok(binding::bind(database, source, &[])?.parameter_types)
 }
 
-fn super_table_from_join<'a>(
-    catalog: &'a Catalog,
-    table: &'a sqlparser::ast::TableWithJoins,
-) -> Option<&'a TableDefinition> {
-    crate::sql::table_from_join(catalog, table).ok()
-}
-
-fn column_type_at(table: &TableDefinition, position: usize) -> Option<ColumnType> {
-    table.columns.get(position).map(|column| column.data_type)
-}
-
-fn column_type_by_name(table: &TableDefinition, name: Option<&str>) -> Option<ColumnType> {
-    let name = name?;
-    table
-        .columns
-        .iter()
-        .find(|column| column.name == name)
-        .map(|column| column.data_type)
-}
-
-#[derive(Default)]
-struct ParameterInference {
-    types: std::collections::BTreeMap<usize, ColumnType>,
-}
-
-impl ParameterInference {
-    fn observe_placeholder(&mut self, expression: &Expr, column_type: ColumnType) {
-        if let Expr::Value(value) = expression
-            && let AstValue::Placeholder(name) = &value.value
-            && let Ok(index) = values::parameter_index(name)
-        {
-            self.types.insert(index, column_type);
-        }
-    }
-
-    fn observe_expression(&mut self, expression: &Expr, column_type: Option<ColumnType>) {
-        if let Some(column_type) = column_type {
-            self.observe_placeholder(expression, column_type);
-        }
-    }
-
-    /// Infer comparison operands (`column OP $n`, `$n LIKE ...`) against a
-    /// known single-table scope.
-    fn walk_predicate(&mut self, expression: &Expr, table: Option<&TableDefinition>) {
-        let _ = visit_expressions(expression, |visited| {
-            match visited {
-                Expr::BinaryOp { left, op, right } => {
-                    if matches!(
-                        op,
-                        BinaryOperator::Eq
-                            | BinaryOperator::NotEq
-                            | BinaryOperator::Lt
-                            | BinaryOperator::LtEq
-                            | BinaryOperator::Gt
-                            | BinaryOperator::GtEq
-                            | BinaryOperator::And
-                            | BinaryOperator::Or
-                    ) {
-                        if let Some(resolved) = identifier_type(left.as_ref(), table) {
-                            self.observe_placeholder(right, resolved);
-                        }
-                        if let Some(resolved) = identifier_type(right.as_ref(), table) {
-                            self.observe_placeholder(left, resolved);
-                        }
-                    }
-                }
-                Expr::Between {
-                    expr, low, high, ..
-                } => {
-                    if let Some(resolved) = identifier_type(expr, table) {
-                        self.observe_placeholder(low, resolved);
-                        self.observe_placeholder(high, resolved);
-                    }
-                }
-                Expr::Like { expr, pattern, .. } => {
-                    if let Some(resolved) = identifier_type(expr, table) {
-                        self.observe_placeholder(pattern, resolved);
-                    }
-                }
-                _ => {}
-            }
-            ControlFlow::<DbError>::Continue(())
-        });
-    }
-
-    fn walk_query(&mut self, database: &RelationalDatabase, query: &Query) {
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            return;
-        };
-        // Join queries infer over a synthetic scope whose columns are the
-        // concatenation of both sides, so unqualified predicate columns
-        // resolve to real types instead of falling back to TEXT.
-        let joined_scope;
-        let table = match select.from.first() {
-            Some(from) if !from.joins.is_empty() && from.joins.len() == 1 => {
-                let resolve = |factor: &sqlparser::ast::TableFactor| -> Option<&TableDefinition> {
-                    match factor {
-                        sqlparser::ast::TableFactor::Table { name, .. } => {
-                            find_table(database.catalog(), simple_object_name(name, "table").ok()?)
-                                .ok()
-                        }
-                        _ => None,
-                    }
-                };
-                let (Some(left), Some(right)) =
-                    (resolve(&from.relation), resolve(&from.joins[0].relation))
-                else {
-                    return;
-                };
-                joined_scope = TableDefinition {
-                    id: left.id,
-                    name: String::new(),
-                    columns: left
-                        .columns
-                        .iter()
-                        .chain(right.columns.iter())
-                        .cloned()
-                        .collect(),
-                };
-                Some(&joined_scope)
-            }
-            other => other.and_then(|from| super_table_from_join(database.catalog(), from)),
-        };
-        if let Some(selection) = &select.selection {
-            self.walk_predicate(selection, table);
-        }
-        // LIMIT/OFFSET parameters are non-negative integers.
-        if let Some(sqlparser::ast::LimitClause::LimitOffset {
-            limit,
-            offset,
-            limit_by,
-        }) = &query.limit_clause
-            && limit_by.is_empty()
-        {
-            let offset_exprs = offset.iter().map(|offset| &offset.value);
-            for window in limit.iter().chain(offset_exprs) {
-                self.observe_expression(window, Some(ColumnType::U64));
-            }
-        }
-    }
-
-    fn finish(self) -> Vec<Option<ColumnType>> {
-        let count = self.types.keys().next_back().map_or(0, |index| index + 1);
-        let mut result = vec![None; count];
-        for (index, column_type) in self.types {
-            result[index] = Some(column_type);
-        }
-        result
-    }
-}
-
-fn identifier_type(expression: &Expr, table: Option<&TableDefinition>) -> Option<ColumnType> {
-    let name = match expression {
-        Expr::Identifier(identifier) => identifier.value.as_str(),
-        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
-        _ => return None,
-    };
-    column_type_by_name(table?, Some(name))
-}
-
-/// Successful parses are cached by exact source text so repeated
-/// executions (wire prepared statements, describe probes) skip the
-/// parser. Bounded: a full cache clears wholesale, which keeps hot
-/// statement sets resident without LRU bookkeeping. Parse failures are
-/// not cached - clients retry malformed SQL far less often than valid
-/// hot statements.
+// Cache only syntax, by exact source. Every binding still resolves against the
+// current catalog; typed/coerced ASTs are private to their retained binding.
 const PARSE_CACHE_LIMIT: usize = 1024;
 
 fn parse_cache() -> &'static std::sync::Mutex<HashMap<String, Statement>> {
@@ -521,18 +357,8 @@ fn parse_cache() -> &'static std::sync::Mutex<HashMap<String, Statement>> {
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Wire-tier helpers: only the feature-gated pgwire server consults these.
-#[cfg(feature = "pgwire")]
 pub(super) fn parse_statement(sql: &str) -> Result<Statement> {
     parse_one(sql)
-}
-
-#[cfg(feature = "pgwire")]
-pub(super) fn table_from_join_name(table: &sqlparser::ast::TableWithJoins) -> Result<String> {
-    let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
-        return Err(unsupported("FROM", "only plain tables are supported"));
-    };
-    Ok(simple_object_name(name, "table")?.to_owned())
 }
 
 fn parse_one(source: &str) -> Result<Statement> {
@@ -610,7 +436,6 @@ fn parameter_indexes(statement: &Statement) -> Result<BTreeSet<usize>> {
     Ok(indexes)
 }
 
-#[cfg(feature = "pgwire")]
 pub(crate) fn parameter_count(source: &str) -> Result<usize> {
     let indexes = parameter_indexes(&parse_one(source)?)?;
     Ok(indexes.last().map_or(0, |index| index + 1))
@@ -731,241 +556,6 @@ pub(super) fn simple_object_name<'a>(
         .as_ident()
         .map(|identifier| identifier.value.as_str())
         .ok_or_else(|| unsupported(kind, "computed names are not supported"))
-}
-
-/// Tables a statement reads and writes, plus whether it is schema
-/// administration. Used by the wire tier's grant enforcement; embedded
-/// callers are trusted and never consult this.
-#[cfg(feature = "pgwire")]
-pub(super) fn statement_access(
-    sql: &str,
-) -> Result<(
-    std::collections::BTreeSet<String>,
-    std::collections::BTreeSet<String>,
-    bool,
-)> {
-    use sqlparser::ast::{
-        Expr as SqlExpr, SetExpr as SqlSetExpr, Statement as SqlStatement,
-        TableObject as SqlTableObject,
-    };
-
-    fn collect_expr_tables(expr: &SqlExpr, read: &mut std::collections::BTreeSet<String>) {
-        match expr {
-            SqlExpr::Nested(inner) => collect_expr_tables(inner, read),
-            SqlExpr::BinaryOp { left, right, .. } => {
-                collect_expr_tables(left, read);
-                collect_expr_tables(right, read);
-            }
-            SqlExpr::UnaryOp { expr: inner, .. } => collect_expr_tables(inner, read),
-            SqlExpr::InList { expr, list, .. } => {
-                collect_expr_tables(expr, read);
-                for item in list {
-                    collect_expr_tables(item, read);
-                }
-            }
-            SqlExpr::InSubquery { subquery, .. } | SqlExpr::Subquery(subquery) => {
-                collect_query_tables(subquery, read);
-            }
-            SqlExpr::Exists { subquery, .. } => collect_query_tables(subquery, read),
-            SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => collect_expr_tables(inner, read),
-            SqlExpr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                if let Some(operand) = operand {
-                    collect_expr_tables(operand, read);
-                }
-                for when in conditions {
-                    collect_expr_tables(&when.condition, read);
-                    collect_expr_tables(&when.result, read);
-                }
-                if let Some(else_result) = else_result {
-                    collect_expr_tables(else_result, read);
-                }
-            }
-            SqlExpr::Function(func)
-                if func.name.to_string().eq_ignore_ascii_case("coalesce")
-                    || func.over.is_some() =>
-            {
-                // COALESCE and window calls (OVER ...) can carry column
-                // references in their arguments; grant analysis must see
-                // them so a role cannot read a column through lag(amount)
-                // that a plain projection would refuse.
-                if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
-                    for argument in &list.args {
-                        if let sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(expression),
-                        ) = argument
-                        {
-                            collect_expr_tables(expression, read);
-                        }
-                    }
-                }
-                if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &func.over {
-                    for expression in &spec.partition_by {
-                        collect_expr_tables(expression, read);
-                    }
-                    for term in &spec.order_by {
-                        collect_expr_tables(&term.expr, read);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_query_tables(
-        query: &sqlparser::ast::Query,
-        read: &mut std::collections::BTreeSet<String>,
-    ) {
-        collect_setexpr_tables(&query.body, read);
-        if let Some(selection) = query_body_selection(&query.body)
-            && let Some(where_clause) = &selection.selection
-        {
-            collect_expr_tables(where_clause, read);
-        }
-        // Table factors in the top-level FROM are handled above. Walk every
-        // expression as well so scalar, EXISTS, and IN subqueries in
-        // projections and join predicates cannot bypass table grants.
-        let _ = visit_expressions(query, |expression| {
-            match expression {
-                SqlExpr::InSubquery { subquery, .. }
-                | SqlExpr::Subquery(subquery)
-                | SqlExpr::Exists { subquery, .. } => collect_query_tables(subquery, read),
-                _ => {}
-            }
-            ControlFlow::<()>::Continue(())
-        });
-    }
-
-    fn query_body_selection(body: &SqlSetExpr) -> Option<&sqlparser::ast::Select> {
-        match body {
-            SqlSetExpr::Select(select) => Some(select.as_ref()),
-            _ => None,
-        }
-    }
-
-    fn collect_setexpr_tables(body: &SqlSetExpr, read: &mut std::collections::BTreeSet<String>) {
-        match body {
-            SqlSetExpr::Select(select) => {
-                let select = select.as_ref();
-                for from_item in &select.from {
-                    collect_table_with_joins(from_item, read);
-                }
-                if let Some(selection_where) = &select.selection {
-                    collect_expr_tables(selection_where, read);
-                }
-            }
-            SqlSetExpr::SetOperation { left, right, .. } => {
-                collect_setexpr_tables(left.as_ref(), read);
-                collect_setexpr_tables(right.as_ref(), read);
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_factor_tables(
-        factor: &sqlparser::ast::TableFactor,
-        read: &mut std::collections::BTreeSet<String>,
-    ) {
-        match factor {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                if let Ok(table) = simple_object_name(name, "table") {
-                    read.insert(table.to_owned());
-                }
-            }
-            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-                collect_query_tables(subquery, read);
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_table_with_joins(
-        table: &sqlparser::ast::TableWithJoins,
-        read: &mut std::collections::BTreeSet<String>,
-    ) {
-        collect_factor_tables(&table.relation, read);
-        for join in &table.joins {
-            collect_factor_tables(&join.relation, read);
-        }
-    }
-
-    fn object_to_write(target: &SqlTableObject, write: &mut std::collections::BTreeSet<String>) {
-        if let SqlTableObject::TableName(name) = target
-            && let Ok(table) = simple_object_name(name, "table")
-        {
-            write.insert(table.to_owned());
-        }
-    }
-
-    let statement = parse_statement(sql)?;
-    let mut read = std::collections::BTreeSet::new();
-    let mut write = std::collections::BTreeSet::new();
-    let admin = match &statement {
-        SqlStatement::Query(query) => {
-            collect_query_tables(query, &mut read);
-            false
-        }
-        SqlStatement::Insert(insert) => {
-            object_to_write(&insert.table, &mut write);
-            if let Some(source) = &insert.source {
-                collect_query_tables(source, &mut read);
-            }
-            false
-        }
-        SqlStatement::Update(update) => {
-            if let Ok(table) = table_from_join_name(&update.table) {
-                write.insert(table);
-            }
-            if let Some(kind) = &update.from {
-                let tables = match kind {
-                    sqlparser::ast::UpdateTableFromKind::BeforeSet(tables)
-                    | sqlparser::ast::UpdateTableFromKind::AfterSet(tables) => tables,
-                };
-                for item in tables {
-                    collect_table_with_joins(item, &mut read);
-                }
-            }
-            if let Some(selection) = &update.selection {
-                collect_expr_tables(selection, &mut read);
-            }
-            false
-        }
-        SqlStatement::Delete(delete) => {
-            let tables = match &delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(tables)
-                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-            };
-            for item in tables {
-                collect_factor_tables(&item.relation, &mut write);
-            }
-            if let Some(using) = &delete.using {
-                for item in using {
-                    collect_table_with_joins(item, &mut read);
-                }
-            }
-            if let Some(selection) = &delete.selection {
-                collect_expr_tables(selection, &mut read);
-            }
-            false
-        }
-        // EXPLAIN reads what its statement reads (and writes what it
-        // writes, since the plan names the target): grant analysis
-        // recurses so a role cannot probe table structure it cannot
-        // read through the plan.
-        SqlStatement::Explain { statement, .. } => {
-            let inner = statement.to_string();
-            let (inner_read, inner_write, inner_admin) = statement_access(&inner)?;
-            read.extend(inner_read);
-            write.extend(inner_write);
-            inner_admin
-        }
-        _ => true,
-    };
-    Ok((read, write, admin))
 }
 
 fn statement_kind(statement: &Statement) -> &'static str {

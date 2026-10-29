@@ -325,6 +325,10 @@ impl RelationalDatabase {
         self.store.catalog()
     }
 
+    pub(crate) fn catalog_stamp(&self) -> (u64, u64) {
+        (self.handle_id, self.store.catalog_version().get())
+    }
+
     /// Return the backend-neutral capability report.
     pub fn capabilities(&self) -> RelationalCapabilityReport {
         RelationalCapabilityReport::for_direct_backend()
@@ -684,6 +688,7 @@ fn validate_legacy_key(table: TableId, key: Key) -> Result<()> {
 pub struct RelationalDatabaseTransaction {
     owner_id: u64,
     snapshot: CommitId,
+    catalog_version: u64,
     wrote: bool,
     control: Option<OperationControl>,
     backend: Option<DirectTransaction>,
@@ -695,6 +700,7 @@ impl RelationalDatabaseTransaction {
         Ok(Self {
             owner_id: database.handle_id,
             snapshot: CommitId(backend.snapshot_csn().get()),
+            catalog_version: database.store.catalog_version().get(),
             wrote: false,
             control,
             backend: Some(backend),
@@ -721,6 +727,16 @@ impl RelationalDatabaseTransaction {
             self.backend = None;
         }
         result
+    }
+
+    pub(crate) fn ensure_sql_catalog(&self, store: &RelationalDatabase) -> Result<()> {
+        if self.catalog_version != store.store.catalog_version().get() {
+            return Err(DbError::SerializationConflict {
+                snapshot: self.snapshot.0,
+                current: store.commit_id().0,
+            });
+        }
+        Ok(())
     }
 
     fn backend_mut(&mut self) -> &mut DirectTransaction {
@@ -942,6 +958,17 @@ impl RelationalDatabaseTransaction {
     ) -> Result<crate::SqlResult> {
         self.operation(store, |transaction| {
             crate::sql::execute_in_transaction_with_params(store, transaction, sql, params)
+        })
+    }
+
+    pub(crate) fn execute_bound_sql(
+        &mut self,
+        store: &RelationalDatabase,
+        bound: &crate::sql::binding::BoundStatement,
+        params: &[Value],
+    ) -> Result<crate::SqlResult> {
+        self.operation(store, |transaction| {
+            crate::sql::execute_bound_in_transaction(store, transaction, bound, params)
         })
     }
 

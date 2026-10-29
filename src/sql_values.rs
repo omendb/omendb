@@ -7,6 +7,13 @@ use super::unsupported;
 pub(super) fn literal_value(expression: &Expr, params: &[Value]) -> Result<Value> {
     match expression {
         Expr::Nested(expression) => literal_value(expression, params),
+        Expr::Cast {
+            expr, data_type, ..
+        } => super::coerce_result_value(
+            literal_value(expr, params)?,
+            super::binding::sql_type(data_type)?,
+            "cast",
+        ),
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
@@ -209,6 +216,14 @@ fn evaluate_scalar_function(func: &sqlparser::ast::Function, params: &[Value]) -
 /// semantics over DATE and TIMESTAMP. `extract(field from x)` routes
 /// here from its dedicated expression arm with the same field logic.
 pub(super) fn extract_datetime_part(field: &str, value: &Value) -> Result<Value> {
+    super::coerce_result_value(
+        datetime_part_value(field, value)?,
+        ColumnType::Decimal,
+        "EXTRACT",
+    )
+}
+
+fn datetime_part_value(field: &str, value: &Value) -> Result<Value> {
     if field.eq_ignore_ascii_case("epoch") {
         // PostgreSQL's epoch is numeric seconds with the fractional
         // part; dates are whole-day (integer) seconds.
@@ -284,6 +299,9 @@ fn apply_date_function(name: &'static str, arguments: &[Value]) -> Result<Value>
             &format!("{name} takes a field and a value"),
         ));
     };
+    if matches!(field, Value::Null) || matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
     let Value::Text(field) = field else {
         return Err(unsupported(
             name,
@@ -291,7 +309,11 @@ fn apply_date_function(name: &'static str, arguments: &[Value]) -> Result<Value>
         ));
     };
     if name == "date_part" {
-        return extract_datetime_part(field, value);
+        return super::coerce_result_value(
+            datetime_part_value(field, value)?,
+            ColumnType::Float64,
+            "date_part",
+        );
     }
     // date_trunc: floor the value to the field's boundary.
     match value {
@@ -337,11 +359,12 @@ fn apply_date_function(name: &'static str, arguments: &[Value]) -> Result<Value>
                     ));
                 }
             };
-            Ok(Value::Date(crate::sql_types::DateValue(
-                i32::try_from(days).map_err(|_| {
-                    DbError::SqlNumericValueOutOfRange("date out of range".to_owned())
-                })?,
-            )))
+            let micros = days.checked_mul(86_400_000_000).ok_or_else(|| {
+                DbError::SqlNumericValueOutOfRange("timestamp out of range".to_owned())
+            })?;
+            Ok(Value::Timestamp(
+                crate::sql_types::TimestampValue::from_micros(micros)?,
+            ))
         }
         Value::Null => Ok(Value::Null),
         other => Err(unsupported(
