@@ -15,7 +15,6 @@ not treat current erroneous output as the contract.
 
 | Boundary | Known limitation | Source |
 | --- | --- | --- |
-| Index equality | Typed negative and positive float zero can occupy separate unique-index entries despite scalar equality; indexed lookup can omit an equal row. Persisted indexes require explicit conversion/rebuild or refusal. | `src/relational.rs::Value::encode_for_key`, `src/sql_types.rs::F64` |
 | Wire statement lists | Multiple statements outside explicit blocks commit individually rather than sharing the simple message's implicit transaction boundary. Lexical splitting now respects quoted/commented semicolons. | `src/pgwire_server/handler.rs::do_query` |
 | Logical conversion | Dump/restore omits supported FK delete actions, converting Cascade to Restrict. | `src/sql_dump.rs`, `src/sql_schema.rs` |
 | Constraint timing | Immediate and deferred typed FKs both validate at publication; advertised statement-time FK behavior is unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity` |

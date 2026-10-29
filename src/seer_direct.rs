@@ -18,8 +18,13 @@ use crate::relational::{
 use crate::{DbError, IndexId, Key, Result};
 
 mod authorization;
+#[cfg(test)]
+mod format_tests;
 
-const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC1";
+// ODC2 declares canonical float equality keys; the catalog slot stays fixed
+// so schema publication still fences transactions opened against either format.
+const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC2";
+const LEGACY_CATALOG_MAGIC: &[u8; 4] = b"ODC1";
 const DIRECT_CATALOG_MARKER: &[u8] = b"\x00omendb/direct/catalog/v1";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_OBJECTS: usize = 1_000_000;
@@ -1424,7 +1429,9 @@ fn decode_catalog_state(
     BTreeMap<TableId, TreeId>,
     BTreeMap<IndexId, TreeId>,
 )> {
-    if bytes.len() > MAX_CATALOG_BYTES || bytes.get(..4) != Some(DIRECT_CATALOG_MAGIC) {
+    let legacy = bytes.get(..4) == Some(LEGACY_CATALOG_MAGIC);
+    if bytes.len() > MAX_CATALOG_BYTES || (!legacy && bytes.get(..4) != Some(DIRECT_CATALOG_MAGIC))
+    {
         return Err(DbError::Corruption {
             artifact: "direct SeerDB catalog",
             reason: "invalid catalog state header".to_owned(),
@@ -1474,7 +1481,54 @@ fn decode_catalog_state(
             reason: "catalog state has trailing bytes".to_owned(),
         });
     }
+    if legacy && catalog_has_float_equality_keys(&catalog)? {
+        return Err(DbError::InvalidState(
+            "legacy float equality-key encoding (ODC1) requires explicit conversion: \
+             export with the previous binary and restore into a fresh database; \
+             resolve conflicting logical duplicates without discarding rows and \
+             reprovision native authorization"
+                .to_owned(),
+        ));
+    }
     Ok((catalog, table_trees, index_trees))
+}
+
+/// ODC1 is readable only where the new codec leaves every possible key unchanged.
+/// Checking the schema, rather than current rows, also protects future writes.
+fn catalog_has_float_equality_keys(catalog: &Catalog) -> Result<bool> {
+    use crate::{ColumnType, IndexKeyPart};
+
+    for table in catalog.tables() {
+        for column in catalog.primary_key(table.id).unwrap_or_default() {
+            if table.column(*column)?.data_type == ColumnType::Float64 {
+                return Ok(true);
+            }
+        }
+    }
+    for index in catalog.indexes() {
+        let table = catalog.table(index.table)?;
+        for part in &index.parts {
+            let mut types = BTreeSet::new();
+            let mut visit = |column| {
+                types.insert(table.column(column)?.data_type);
+                Ok(())
+            };
+            match part {
+                IndexKeyPart::Column(column) => visit(*column)?,
+                IndexKeyPart::Expression(expression) => {
+                    expression.referenced_columns(&mut visit)?;
+                }
+            }
+            // Homogeneous integer arithmetic stays exact; mixed signedness
+            // promotes to Float64. Separate composite parts never promote.
+            if types.contains(&ColumnType::Float64)
+                || (types.contains(&ColumnType::I64) && types.contains(&ColumnType::U64))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Byte prefix shared by every index entry carrying one encoded value key.

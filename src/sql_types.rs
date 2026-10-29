@@ -40,9 +40,9 @@ impl F64 {
         Self(value)
     }
 
-    /// Canonical hash input: zero signs and NaN payloads normalized so
-    /// equal values hash equal.
-    fn hash_bits(&self) -> u64 {
+    /// Shared hash and equality-key input: normalize zero signs and NaN
+    /// payloads without changing the stored row value.
+    pub(crate) fn canonical_bits(&self) -> u64 {
         if self.0 == 0.0 {
             0.0f64.to_bits()
         } else if self.0.is_nan() {
@@ -91,7 +91,7 @@ impl Ord for F64 {
 
 impl std::hash::Hash for F64 {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.hash_bits().hash(state);
+        self.canonical_bits().hash(state);
     }
 }
 

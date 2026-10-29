@@ -58,6 +58,31 @@ shutdown drains it before closing the database. Schema publication remains a
 non-interruptible operation and checks cancellation and the statement deadline
 before it starts.
 
+## Equality-key format upgrades
+
+New histories use the `ODC2` relational envelope. Float equality keys normalize
+signed zero and all NaN payloads; stored row values retain their original IEEE-754
+bits. Primary keys, secondary indexes and foreign-key probes share this encoding.
+
+An `ODC1` history is refused if its schema can produce float equality keys:
+float primary-key columns, float index-key columns, or index expressions with
+float operands or mixed signed/unsigned integer arithmetic. Refusal applies even
+to empty affected tables and does not rewrite the catalog. Unindexed float row
+columns, integer keys and homogeneous integer expressions remain readable. Float
+partial-index predicates alone do not change key encoding. An unaffected history
+keeps its envelope during ordinary row and authorization writes; its next schema
+publication atomically writes `ODC2`. Previous binaries refuse that new envelope.
+
+For an affected history, keep the original directory and binary available. Export
+with the previous binary and restore with the new binary into a fresh directory,
+using the [logical backup procedure](#backups). Review the script against the
+[known conversion limitations](gap-register.md), including omitted FK delete
+actions, before restoring. Restore rejects conflicting logical duplicates rather
+than dropping them; resolve those conflicts explicitly and retry in another fresh
+directory. A failed restore may leave committed chunks and is not a usable migrated
+database. Validate the result and reprovision native authorization before serving
+it. There is no automatic in-place conversion.
+
 ## Principals and grants
 
 The native catalog owns principals, opaque credentials, table grants and an
@@ -99,7 +124,8 @@ reauthorize its commit. A later authorization error aborts the block's staged
 changes; rollback and failed-block cleanup remain available.
 
 Histories created before native authorization remain readable through the
-trusted native API, but serving refuses missing authorization state. The old
+trusted native API, subject to the equality-key format checks above, but serving
+refuses missing authorization state. The old
 `pgwire_auth` and `pgwire_grants` tables are not imported: their name-based grants
 cannot identify the intended object incarnations safely. Inspect the intended
 policy, explicitly remove those legacy tables through `apply_schema_mutations`,

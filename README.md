@@ -73,6 +73,10 @@ conflict with schema publication rather than omitting new constraints or indexes
 SQL inside an existing transaction conservatively rejects catalog-generation
 changes; start a new transaction.
 
+Float equality keys normalize signed zeros and all NaN payloads while stored rows
+retain their original bits. Affected legacy histories require explicit conversion;
+see the [format upgrade procedure](docs/runbook.md#equality-key-format-upgrades).
+
 ## Storage and tools
 
 OmenDB owns SQL, catalog and relational semantics plus the physical meaning of

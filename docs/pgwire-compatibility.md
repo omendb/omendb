@@ -63,7 +63,7 @@ and type OIDs for a representative typed workload in every CI run.
 
 | Type | Storage | Wire encoding | Semantics | Evidence |
 | --- | --- | --- | --- | --- |
-| `FLOAT8` / `DOUBLE PRECISION` | IEEE-754 bits | PostgreSQL float8 binary; NaN/Infinity text forms | SQL float total order: NaN sorts greatest and equals itself, `-0 == 0` | `typed_scalar_subset_matches_live_postgres`, `project_typed_values.rs` |
+| `FLOAT8` / `DOUBLE PRECISION` | IEEE-754 bits | PostgreSQL float8 binary; NaN/Infinity text forms | SQL float total order: all NaNs compare equal and sort greatest, `-0 == 0`; equality keys canonicalize these classes, row bits are retained | `typed_scalar_subset_matches_live_postgres`, `project_typed_values.rs` |
 | `DATE` | days since Unix epoch | i32 days since 2000-01-01 | Proleptic Gregorian, no timezone | `typed_scalar_subset_matches_live_postgres`, date parse/format unit tests |
 | `TIMESTAMP` (without time zone) | microseconds since Unix epoch | i64 microseconds since 2000-01-01 | Microsecond precision, no timezone | `typed_scalar_subset_matches_live_postgres` |
 | `NUMERIC` / `DECIMAL` | i128 mantissa + scale | PostgreSQL base-10000 groups, decimal-point-aligned weight, u16 dscale | Exact decimal arithmetic (PG divide rule: result scale = dscale + divisor digits + 4); stored rows keep dscale (`1.50` round-trips), equality keys normalize trailing zeros (`1.50 == 1.5`) | `typed_scalar_subset_matches_live_postgres`, `tests/project_typed_values.rs` |

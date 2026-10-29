@@ -1075,17 +1075,23 @@ pub enum Value {
 
 impl Value {
     /// Canonical encoding for equality keys (row identities, index
-    /// entries), where byte equality must mean value equality: decimals
-    /// normalize so 1.50 and 1.5 collide, as they do in SQL.
+    /// entries). Equal decimals, float signed zeros and NaN payloads
+    /// collide, while row encoding retains their original representations.
     pub(crate) fn encode_for_key(&self, bytes: &mut Vec<u8>) -> Result<()> {
-        if let Self::Decimal(value) = self {
-            let crate::sql_types::DecimalValue { mantissa, scale } = value.normalized();
-            bytes.push(9);
-            bytes.extend_from_slice(&mantissa.to_le_bytes());
-            bytes.extend_from_slice(&scale.to_le_bytes());
-            return Ok(());
+        match self {
+            Self::Decimal(value) => {
+                let crate::sql_types::DecimalValue { mantissa, scale } = value.normalized();
+                bytes.push(9);
+                bytes.extend_from_slice(&mantissa.to_le_bytes());
+                bytes.extend_from_slice(&scale.to_le_bytes());
+            }
+            Self::Float64(value) => {
+                bytes.push(6);
+                bytes.extend_from_slice(&value.canonical_bits().to_le_bytes());
+            }
+            _ => return self.encode(bytes),
         }
-        self.encode(bytes)
+        Ok(())
     }
 
     /// Numeric view for index-expression arithmetic promotion.
@@ -1845,6 +1851,7 @@ fn decode_value(cursor: &mut CatalogCursor) -> Result<Value> {
         2 => Value::Bool(cursor.byte()? != 0),
         3 => Value::I64(cursor.u64()? as i64),
         4 => Value::U64(cursor.u64()?),
+        6 => Value::Float64(crate::sql_types::F64(f64::from_bits(cursor.u64()?))),
         5 => {
             // Value::encode writes put_bytes: a u32 length prefix then the
             // bytes; bytes_value reads exactly that shape.
