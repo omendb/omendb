@@ -226,3 +226,67 @@ fn zero_limit_reports_no_read_for_aggregate_and_ordinary_selects() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn cross_table_dml_reports_its_scan_without_executing() {
+    for (predicate, source_present, matches) in [
+        ("positions.id = 1", true, true),
+        ("positions.bucket = 1", true, true),
+        ("positions.bucket = NULL", true, false),
+        ("positions.id = drivers.driver_id", true, true),
+        ("positions.id = 1", false, false),
+    ] {
+        for update in [true, false] {
+            let (_directory, mut db) = database(false);
+            db.execute_sql("CREATE TABLE drivers (driver_id BIGINT PRIMARY KEY)")
+                .unwrap();
+            if source_present {
+                db.execute_sql("INSERT INTO drivers VALUES (1)").unwrap();
+            }
+            let sql = if update {
+                format!("UPDATE positions SET bucket = 9 FROM drivers WHERE {predicate}")
+            } else {
+                format!("DELETE FROM positions USING drivers WHERE {predicate}")
+            };
+            let original = vec![
+                vec![Value::I64(1), Value::I64(1)],
+                vec![Value::I64(2), Value::I64(2)],
+            ];
+            assert_eq!(
+                db.execute_sql(&format!("EXPLAIN {sql}")).unwrap().rows,
+                vec![vec![Value::Text("Seq Scan on positions".into())]],
+                "{sql}"
+            );
+            assert_eq!(
+                db.execute_sql("SELECT id, bucket FROM positions ORDER BY id")
+                    .unwrap()
+                    .rows,
+                original,
+                "EXPLAIN executed {sql}"
+            );
+            assert_eq!(
+                db.execute_sql(&sql).unwrap().affected_rows,
+                usize::from(matches),
+                "{sql}"
+            );
+            let expected = if !matches {
+                original
+            } else if update {
+                vec![
+                    vec![Value::I64(1), Value::I64(9)],
+                    vec![Value::I64(2), Value::I64(2)],
+                ]
+            } else {
+                vec![vec![Value::I64(2), Value::I64(2)]]
+            };
+            assert_eq!(
+                db.execute_sql("SELECT id, bucket FROM positions ORDER BY id")
+                    .unwrap()
+                    .rows,
+                expected,
+                "{sql}"
+            );
+            db.close().unwrap();
+        }
+    }
+}

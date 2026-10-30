@@ -241,6 +241,42 @@ async fn explain_reports_access_path_through_wire() {
             .is_empty()
     );
 
+    // Cross-table DML scans its target even when the target predicate alone
+    // would permit a lookup or NULL shortcut. EXPLAIN must not perform writes.
+    client
+        .batch_execute("CREATE TABLE drivers (driver_id BIGINT PRIMARY KEY)")
+        .await
+        .expect("create source table");
+    client
+        .batch_execute("INSERT INTO drivers VALUES (1)")
+        .await
+        .expect("seed source");
+    for sql in [
+        "UPDATE accounts SET balance = 1 FROM drivers WHERE accounts.id = 1",
+        "DELETE FROM accounts USING drivers WHERE accounts.state = 'closed'",
+        "UPDATE accounts SET balance = 1 FROM drivers WHERE accounts.state = NULL",
+        "DELETE FROM accounts USING drivers WHERE accounts.id = drivers.driver_id",
+    ] {
+        let row = client
+            .query_one(&format!("EXPLAIN {sql}"), &[])
+            .await
+            .expect("explain cross-table DML");
+        assert_eq!(row.get::<_, String>(0), "Seq Scan on accounts", "{sql}");
+    }
+    let rows = client
+        .query("SELECT id, balance FROM accounts ORDER BY id", &[])
+        .await
+        .expect("read unchanged accounts");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].get::<_, i64>(0), rows[0].get::<_, i64>(1)),
+        (1, 100)
+    );
+    assert_eq!(
+        (rows[1].get::<_, i64>(0), rows[1].get::<_, i64>(1)),
+        (2, 40)
+    );
+
     // EXPLAIN runs inside transaction blocks like any statement.
     client.batch_execute("BEGIN").await.expect("begin");
     let row = client

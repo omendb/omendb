@@ -96,6 +96,15 @@ pub(crate) fn explain_statement(
         }
         Statement::Update(update) => {
             let table = table_from_join(database.catalog(), &update.table)?;
+            if update.from.is_some() {
+                // FROM-mode selection scans the target before matching source rows.
+                return Ok(plan_result(
+                    AccessPath::SeqScan {
+                        table: table.name.clone(),
+                    }
+                    .plan_line(),
+                ));
+            }
             explain_table_predicate(database, table, update.selection.as_ref(), params)
         }
         Statement::Delete(delete) => {
@@ -107,6 +116,15 @@ pub(crate) fn explain_statement(
                 return Err(unsupported("DELETE", "only one table is supported"));
             }
             let table = table_from_join(database.catalog(), &tables[0])?;
+            if delete.using.is_some() {
+                // USING-mode selection likewise bypasses predicate_candidate_rows.
+                return Ok(plan_result(
+                    AccessPath::SeqScan {
+                        table: table.name.clone(),
+                    }
+                    .plan_line(),
+                ));
+            }
             explain_table_predicate(database, table, delete.selection.as_ref(), params)
         }
         Statement::Insert(insert) => {
