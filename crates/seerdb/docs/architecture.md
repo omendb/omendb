@@ -1,6 +1,6 @@
 # SeerDB architecture
 
-**Target boundaries, 2026-10-28—not a qualification claim.**
+**Target boundaries, 2026-10-30—not a qualification claim.**
 The [crate README](../README.md) describes the current generation-based ordered-KV
 API. [Qualification](qualification.md) documents the available development
 harnesses and their limits. The experimental replacement is not yet a qualified
@@ -51,10 +51,12 @@ all retained readers, outcomes and recovery inputs.
 
 ## Physical access and resources
 
-The initial reference uses local RAM/NVMe, buffered ordered access, compact current
-records and seekable retained history. Row identity, commit scheduling and physical
-layout alternatives remain conditional on whole-engine evidence. No runtime plugin
-ABI, mandatory second engine or network coordinator is required.
+The initial executable reference uses local RAM/NVMe, buffered ordered access,
+compact current records and seekable retained history. Local/block and authoritative
+object-backed storage are first-class targets of the same kernel. Row identity,
+commit scheduling and physical layout alternatives remain conditional on whole-engine
+evidence. No runtime plugin ABI or mandatory second engine is required; local/block
+needs no network coordinator.
 
 Storage cursors preserve logical continuation and snapshot identity while bounding
 traversal, decoding, I/O and memory. Guards do not span executor suspension or slow
@@ -69,6 +71,37 @@ worker's reservations.
 
 Immutable analytical/vector extents may use different physical layouts where useful.
 Separately ingested products keep independent authorities; shared algorithms do not
-make their writes part of an OmenDB transaction. Object storage is initially a
-secondary immutable tier; remote-primary and replicated deployments need separate
-qualified protocols.
+make their writes part of an OmenDB transaction.
+
+## Storage authority and deployment profiles
+
+Separate the **decision journal** (ordering, durable outcomes and replay),
+**materialization repository** (immutable images/history/extents and closed checkpoint
+roots), and **disposable caches**. These are responsibilities inside one runtime,
+not independently committing databases. `durable-fs` remains a filesystem helper,
+not an object-store append/fsync abstraction.
+
+Target profiles include local/block without mandatory network, object-backed
+materialization with a local or replicated low-latency journal, and sealed/batched
+object-only journaling as an explicit latency/cost candidate. A journal containing
+the only acknowledged suffix is authoritative, even if older images are in a
+bucket. Profile guarantees state process/device/host/AZ/region failure assumptions;
+object durability is not automatic database HA. Object-only storage does not
+inherently prohibit concurrent or serializable transactions.
+
+ACK requires the complete readable committed prefix, not necessarily final page
+materialization. Deferring uploads requires complete journal/dependency recovery
+closure, including supported retained cuts and outcomes; the current undo sync
+cannot simply be removed. A bounded complete read overlay or invisible installation
+may change physical scheduling, never permit missing index/catalog effects.
+
+Remote profiles need immutable incarnation-qualified identities, integrity checks,
+version-bound range reads, closed publication and fencing of journal/root ownership.
+In-flight ambiguous requests and old destructive I/O remain owned through safe
+resolution. GC joins retention registration, publication and physical-reader
+quiescence; TTL alone is not proof, and retired identities cannot be reused while
+old deletes could affect them. Packing, request/transfer cost, cold-cache recovery
+and upload debt belong in resource accounting and qualification.
+
+These are target contracts. The preview and experimental replacement do not yet
+implement qualified object-backed profiles.

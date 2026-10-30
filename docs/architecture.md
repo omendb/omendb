@@ -1,6 +1,6 @@
 # OmenDB architecture
 
-**Product direction, 2026-10-28—not an implementation or performance claim.**
+**Product direction, 2026-10-30—not an implementation or performance claim.**
 The [README](../README.md), [known limitations](gap-register.md),
 [wire compatibility matrix](pgwire-compatibility.md) and [operator runbook](runbook.md)
 describe the development preview. This page explains the intended product and
@@ -9,20 +9,24 @@ engine boundaries, not an implementation schedule.
 ## Product
 
 OmenDB is a native, server-first, general-purpose relational database in Rust.
-It aims to compete with PostgreSQL and MySQL in relational functionality,
-correctness, operability and performance, and eventually support horizontal
-scale, high availability and online movement. Embedded Rust clients share the
-engine but are not its primary performance target.
+The goal is an OLTP-led engine with strong mixed-query behavior and clear
+operational UX: concurrent transactions, useful scans/reports and predictable
+maintenance, resource limits and recovery. PostgreSQL and MySQL are correctness,
+functionality and performance references, not architectures to clone. Eventual
+horizontal scale, high availability and online movement remain goals. Embedded
+Rust clients share the engine but are not its primary performance target.
 
 OmenDB owns its SQL, type and catalog semantics. PostgreSQL wire/dialect support
 is an interoperability surface, compatible only where explicitly tested; it does
 not require PostgreSQL's physical formats, process model, catalog IDs or extension
 ABI. A native engine does not require a proprietary wire protocol.
 
-The first qualification profile is local durable indexed OLTP with concurrent
-reads, writes, selective scans/joins/aggregates and history/checkpoint/GC work.
-Larger-than-RAM data, skew, long snapshots and maintenance interference belong in
-that profile. No competitive performance or resource budget has been qualified.
+Local/block and authoritative object-backed storage are first-class design targets.
+The first executable qualification profile may use local durable indexed OLTP with
+concurrent reads, writes, selective scans/joins/aggregates and history/checkpoint/GC
+work. Larger-than-RAM data, skew, long snapshots and maintenance interference belong
+in that profile. Storage placement does not select a niche or change SQL semantics.
+No competitive performance or resource budget has been qualified.
 
 ## Engine boundaries
 
@@ -55,13 +59,15 @@ SQL / Rust API / optional PostgreSQL-wire clients
                rows, indexes, constraints
                          |
              SeerDB transaction runtime
-          MVCC / conflicts / WAL / retention
-                         |
-               ordered access / buffers
-                         |
-          local NVMe / checkpoint / history / GC
-                         |
-           optional immutable object-storage tier
+          MVCC / conflicts / outcomes / retention
+                   /                 \
+        durable decision journal   ordered access / buffers
+                   |                         |
+        local / replicated /       materialization repository
+          sealed object log        checkpoint / history / GC
+                                             |
+                                  local/block or object storage
+                                  + disposable RAM/disk caches
 ```
 
 Canonical rows, required indexes and catalog share one durable outcome within a
@@ -89,11 +95,22 @@ worker stopped, and cooperative checks are not a security or hard RSS boundary.
 SERIALIZABLE is the reference correctness mode; the default SQL isolation remains
 an open product choice, including READ COMMITTED and retry ergonomics.
 
-Local RAM/NVMe is the initial authoritative serving tier. S3-compatible storage is
-initially optional for immutable checkpoints, backup, archived log and cold data.
-Remote-primary storage, replication and sharding require their own durability,
-latency, ownership and recovery protocols, without imposing network authority on
-the local fast path.
+Separate the **durable decision journal**, **materialization/checkpoint repository**
+and **disposable caches** within one transaction authority. Target profiles are
+local/block with no mandatory network, object-backed materialization with a local
+or replicated low-latency journal, and potentially sealed/batched object-only
+journaling with its explicit latency/cost trade-off. A local disk holding the only
+acknowledged journal suffix is not a cache. Host-independent recovery needs all
+required journal/history inputs to survive that failure, not just older data in a
+bucket.
+
+Object stores are not filesystems: immutable identity, validated range reads,
+publication, writer fencing, ambiguous I/O and safe reclamation need their own
+protocols. Page uploads can leave ACK only when the durable journal/dependencies
+close recovery and complete effects are readable. Object durability alone supplies
+neither HA nor distributed SQL ownership/global snapshots. Support and qualify
+specific provider/API profiles without weakening local durability or pretending
+all backends have identical latency, cost or failure guarantees.
 
 Storage layout, row identity, compression and execution mechanisms remain measured
 choices—not claims that a B-tree, LSM or particular runtime wins universally.
