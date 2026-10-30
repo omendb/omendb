@@ -1,4 +1,4 @@
-//! EXPLAIN must name an executable strategy, not a partially bound candidate.
+//! EXPLAIN must name the statement's actual row-access strategy.
 use omendb::{RelationalBackendConfig, RelationalDatabase, Value};
 
 fn database(expression_index: bool) -> (tempfile::TempDir, RelationalDatabase) {
@@ -133,5 +133,96 @@ fn fully_modeled_equalities_keep_their_lookup_and_empty_plans() {
             .rows
             .is_empty()
     );
+    db.close().unwrap();
+}
+
+#[test]
+fn aggregates_and_grouping_report_their_scan_not_predicate_lookups() {
+    let (_directory, mut db) = database(false);
+    for (sql, rows) in [
+        (
+            "SELECT COUNT(*) FROM positions WHERE id = 1",
+            vec![vec![Value::U64(1)]],
+        ),
+        (
+            "SELECT SUM(x) FROM positions WHERE bucket = 1",
+            vec![vec![Value::I64(3)]],
+        ),
+        // Global aggregation still returns a row when its input is empty.
+        (
+            "SELECT COUNT(*) FROM positions WHERE bucket = NULL",
+            vec![vec![Value::U64(0)]],
+        ),
+        (
+            "SELECT bucket FROM positions WHERE bucket = 1 GROUP BY bucket",
+            vec![vec![Value::I64(1)]],
+        ),
+        (
+            "SELECT bucket FROM positions WHERE bucket = NULL GROUP BY bucket",
+            vec![],
+        ),
+    ] {
+        assert_eq!(
+            db.execute_sql(&format!("EXPLAIN {sql}")).unwrap().rows,
+            vec![vec![Value::Text("Seq Scan on positions".into())]],
+            "{sql}"
+        );
+        assert_eq!(db.execute_sql(sql).unwrap().rows, rows, "{sql}");
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn window_aggregate_keeps_the_ordinary_select_index_path() {
+    let (_directory, mut db) = database(false);
+    let sql = "SELECT COUNT(*) OVER () FROM positions WHERE bucket = 1";
+    assert_eq!(
+        db.execute_sql(&format!("EXPLAIN {sql}")).unwrap().rows,
+        vec![vec![Value::Text(
+            "Index Scan using bucket_key on positions (bucket)".into()
+        )]]
+    );
+    assert_eq!(db.execute_sql(sql).unwrap().rows, vec![vec![Value::U64(1)]]);
+    db.close().unwrap();
+}
+
+#[test]
+fn zero_limit_reports_no_read_for_aggregate_and_ordinary_selects() {
+    let (_directory, mut db) = database(false);
+    let zero = [Value::I64(0)];
+    for (projection, nonempty_plan, value) in [
+        ("COUNT(*)", "Seq Scan on positions", Value::U64(1)),
+        ("id", "Primary Key Lookup on positions", Value::I64(1)),
+    ] {
+        for (limit, params, empty) in [
+            ("0", &[][..], true),
+            ("$1", &zero[..], true),
+            ("1", &[][..], false),
+        ] {
+            let sql = format!("SELECT {projection} FROM positions WHERE id = 1 LIMIT {limit}");
+            let expected = if empty {
+                "Result (empty) on positions (LIMIT 0)"
+            } else {
+                nonempty_plan
+            };
+            assert_eq!(
+                db.execute_sql_with_params(&format!("EXPLAIN {sql}"), params)
+                    .unwrap()
+                    .rows,
+                vec![vec![Value::Text(expected.into())]],
+                "{sql}"
+            );
+            let rows = if empty {
+                vec![]
+            } else {
+                vec![vec![value.clone()]]
+            };
+            assert_eq!(
+                db.execute_sql_with_params(&sql, params).unwrap().rows,
+                rows,
+                "{sql}"
+            );
+        }
+    }
     db.close().unwrap();
 }

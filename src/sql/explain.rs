@@ -1,12 +1,10 @@
 //! `EXPLAIN <statement>`: report the row-access strategy the executor
 //! will actually use, without running the statement.
 //!
-//! OmenDB has no cost-based planner; the executor's decision is a
-//! deterministic function of the catalog (primary key, secondary
-//! indexes) and the predicate shape. This module resolves the same
-//! [`PredicatePlan`] the executor does, so `EXPLAIN` output never
-//! disagrees with execution: whatever access path it names is the one
-//! taken.
+//! OmenDB has no cost-based planner. EXPLAIN shares the executor's
+//! query classification, window limits, and predicate access resolution.
+//! Aggregation scans its input even when an ordinary SELECT could use
+//! a [`PredicatePlan`] lookup for the same predicate.
 
 use sqlparser::ast::Statement;
 
@@ -32,6 +30,8 @@ pub(crate) enum AccessPath {
     NullShortCircuit { table: String },
     /// Every table row is read and filtered.
     SeqScan { table: String },
+    /// LIMIT 0 returns no rows without reading the input.
+    LimitZero { table: String },
 }
 
 impl AccessPath {
@@ -52,6 +52,9 @@ impl AccessPath {
                 format!("Result (empty) on {table} (NULL equality)")
             }
             AccessPath::SeqScan { table } => format!("Seq Scan on {table}"),
+            AccessPath::LimitZero { table } => {
+                format!("Result (empty) on {table} (LIMIT 0)")
+            }
         }
     }
 }
@@ -74,8 +77,22 @@ pub(crate) fn explain_statement(
 ) -> Result<SqlExplainResult> {
     match statement {
         Statement::Query(query) => {
-            let (table, selection) = query::query_table_and_selection(database.catalog(), query)?;
-            explain_table_predicate(database, &table, selection.as_ref(), params)
+            let (table, select) = query::query_table_and_select(database.catalog(), query)?;
+            let (_, limit) = query::query_window(query, params)?;
+            let path = if limit == 0 {
+                AccessPath::LimitZero {
+                    table: table.name.clone(),
+                }
+            } else if query::is_aggregate_query(select) {
+                // execute_aggregate_query scans directly; predicate lookup
+                // candidates are not executable strategies for this caller.
+                AccessPath::SeqScan {
+                    table: table.name.clone(),
+                }
+            } else {
+                return explain_table_predicate(database, table, select.selection.as_ref(), params);
+            };
+            Ok(plan_result(path.plan_line()))
         }
         Statement::Update(update) => {
             let table = table_from_join(database.catalog(), &update.table)?;

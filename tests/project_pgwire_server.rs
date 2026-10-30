@@ -192,6 +192,55 @@ async fn explain_reports_access_path_through_wire() {
         .expect("explain scan");
     assert_eq!(row.get::<_, String>(0), "Seq Scan on accounts");
 
+    // Aggregate inputs scan even with fully bound predicates. A window
+    // aggregate, in contrast, stays on the ordinary SELECT access path.
+    for (sql, plan, count) in [
+        (
+            "SELECT COUNT(*) FROM accounts WHERE id = 1",
+            "Seq Scan on accounts",
+            1_i64,
+        ),
+        (
+            "SELECT COUNT(*) FROM accounts WHERE state = 'open'",
+            "Seq Scan on accounts",
+            1,
+        ),
+        (
+            "SELECT COUNT(*) FROM accounts WHERE state = NULL",
+            "Seq Scan on accounts",
+            0,
+        ),
+        (
+            "SELECT COUNT(*) OVER () FROM accounts WHERE state = 'open'",
+            "Index Scan using accounts_state_idx on accounts (state)",
+            1,
+        ),
+    ] {
+        let row = client
+            .query_one(&format!("EXPLAIN {sql}"), &[])
+            .await
+            .expect("explain aggregate access");
+        assert_eq!(row.get::<_, String>(0), plan, "{sql}");
+        let row = client.query_one(sql, &[]).await.expect("execute aggregate");
+        assert_eq!(row.get::<_, i64>(0), count, "{sql}");
+    }
+    let sql = "SELECT COUNT(*) FROM accounts WHERE id = 1 LIMIT $1";
+    let row = client
+        .query_one(&format!("EXPLAIN {sql}"), &[&0_i64])
+        .await
+        .expect("explain zero limit");
+    assert_eq!(
+        row.get::<_, String>(0),
+        "Result (empty) on accounts (LIMIT 0)"
+    );
+    assert!(
+        client
+            .query(sql, &[&0_i64])
+            .await
+            .expect("execute zero limit")
+            .is_empty()
+    );
+
     // EXPLAIN runs inside transaction blocks like any statement.
     client.batch_execute("BEGIN").await.expect("begin");
     let row = client

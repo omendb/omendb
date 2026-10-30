@@ -462,13 +462,12 @@ pub(super) enum PredicatePlan {
     NullShortCircuit,
 }
 
-/// Resolve the single-table SELECT's target and WHERE for EXPLAIN.
-/// Mirrors execute_query's table resolution without executing: rejects
-/// the same shapes the executor rejects.
-pub(crate) fn query_table_and_selection(
-    catalog: &crate::Catalog,
-    query: &Query,
-) -> Result<(crate::TableDefinition, Option<sqlparser::ast::Expr>)> {
+/// Resolve the single-table SELECT and its target without executing, so
+/// EXPLAIN can use the executor's query classification and predicate plan.
+pub(super) fn query_table_and_select<'a>(
+    catalog: &'a Catalog,
+    query: &'a Query,
+) -> Result<(&'a TableDefinition, &'a Select)> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err(unsupported(
             "SELECT",
@@ -483,7 +482,7 @@ pub(crate) fn query_table_and_selection(
         return Err(unsupported("SELECT", "JOIN is not explainable yet"));
     }
     let table = table_from_join(catalog, &select.from[0])?;
-    Ok((table.clone(), select.selection.clone()))
+    Ok((table, select))
 }
 
 /// The INSERT's target table name for EXPLAIN.
@@ -715,7 +714,7 @@ fn validate_query_shape(query: &Query) -> Result<()> {
     Ok(())
 }
 
-fn query_window(query: &Query, params: &[Value]) -> Result<(usize, usize)> {
+pub(super) fn query_window(query: &Query, params: &[Value]) -> Result<(usize, usize)> {
     let Some(limit_clause) = &query.limit_clause else {
         return Ok((0, usize::MAX));
     };
@@ -2823,7 +2822,7 @@ impl Truth {
     }
 }
 
-fn is_aggregate_query(select: &Select) -> bool {
+pub(super) fn is_aggregate_query(select: &Select) -> bool {
     match &select.group_by {
         GroupByExpr::Expressions(expressions, modifiers)
             if !expressions.is_empty() || !modifiers.is_empty() =>
