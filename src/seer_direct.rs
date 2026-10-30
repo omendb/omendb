@@ -181,6 +181,21 @@ impl DirectSeerStore {
         primary_key: Option<Vec<ColumnId>>,
         schema: RelationalSchemaDefinition,
     ) -> Result<CommitSeq> {
+        // Empty-tree creation and FK activation are safe only for objects
+        // owned by this new, empty table. Existing tables use validated builds.
+        if schema
+            .indexes
+            .iter()
+            .any(|index| index.definition.table != table.id)
+            || schema
+                .foreign_keys
+                .iter()
+                .any(|key| key.definition.table != table.id)
+        {
+            return Err(DbError::InvalidState(
+                "new-table schema objects must belong to the new table".to_owned(),
+            ));
+        }
         let mut candidate = self.catalog.clone();
         candidate.create_table_with_primary_key(table.clone(), primary_key)?;
         for named in &schema.indexes {
@@ -204,9 +219,11 @@ impl DirectSeerStore {
         let mut table_trees = self.table_trees.clone();
         table_trees.insert(table.id, tree);
         let mut index_trees = self.index_trees.clone();
-        for named in &schema.indexes {
+        // Anonymous identical definitions are idempotent in the catalog;
+        // allocate once per resulting object, not once per input definition.
+        for index in candidate.indexes_for(table.id) {
             let index_tree = transaction.create_tree().map_err(map_seer_error)?;
-            index_trees.insert(named.definition.id, index_tree);
+            index_trees.insert(index.id, index_tree);
         }
         let state = encode_catalog_state(&candidate, &table_trees, &index_trees)?;
         transaction
@@ -222,9 +239,7 @@ impl DirectSeerStore {
     }
 
     /// Create one secondary index and build its entries atomically with the
-    /// catalog mapping. The first direct path uses a deterministic encoded
-    /// entry key and scans it for exact-value lookup; ordered index cursors
-    /// are a later optimization once the physical key codec is benchmarked.
+    /// catalog mapping.
     pub(crate) fn create_index(&mut self, index: IndexDefinition) -> Result<CommitSeq> {
         self.create_index_with_name(index, None)
     }
@@ -247,55 +262,7 @@ impl DirectSeerStore {
         if self.catalog.index(index.id) == Some(&index) {
             return self.database.commit_sequence().map_err(map_seer_error);
         }
-        let mut candidate = self.catalog.clone();
-        match &name {
-            Some(name) => candidate.create_named_index(index.clone(), name.clone())?,
-            None => candidate.create_index(index.clone())?,
-        }
-        let table_tree = self.table_tree(index.table)?;
-        let table = candidate.table(index.table)?.clone();
-        let mut transaction = self.database.begin().map_err(map_seer_error)?;
-        let index_tree = transaction.create_tree().map_err(map_seer_error)?;
-        let mut seen_unique = BTreeSet::new();
-        // Register the whole table range as a read dependency so a
-        // concurrent row write that lands between this scan and the
-        // publication fails THIS commit instead of silently missing
-        // from the new index (same rule as foreign-key validation).
-        let mut cursor = transaction
-            .cursor(table_tree, &[], None)
-            .map_err(map_seer_error)?;
-        let mut entries = Vec::new();
-        while let Some((identity, bytes)) = cursor.next().transpose().map_err(map_seer_error)? {
-            entries.push((identity, bytes));
-        }
-        drop(cursor);
-        for (identity, bytes) in entries {
-            let row = row_from_storage_identity(&candidate, &table, &identity, &bytes)?;
-            if let Some(values) = row_index_key(&table, &index, &row)? {
-                if index.unique && !seen_unique.insert(values.clone()) {
-                    return Err(DbError::UniqueViolation {
-                        index: index.id.0,
-                        key: values,
-                    });
-                }
-                let key = encode_index_entry(&values, &identity)?;
-                transaction
-                    .put(index_tree, &key, &identity)
-                    .map_err(map_seer_error)?;
-            }
-        }
-        let mut index_trees = self.index_trees.clone();
-        index_trees.insert(index.id, index_tree);
-        let state = encode_catalog_state(&candidate, &self.table_trees, &index_trees)?;
-        transaction
-            .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
-            .map_err(map_seer_error)?;
-        let commit = transaction.commit().map_err(map_seer_error)?.csn;
-        drop(transaction);
-        self.catalog = candidate;
-        self.catalog_version = commit;
-        self.index_trees = index_trees;
-        Ok(commit)
+        self.apply_schema_mutations(&[SchemaMutation::AddIndex { index, name }])
     }
 
     /// Append one nullable column atomically. Existing rows expose a
@@ -305,12 +272,7 @@ impl DirectSeerStore {
         table: TableId,
         column: crate::ColumnDefinition,
     ) -> Result<CommitSeq> {
-        let candidate = {
-            let mut candidate = self.catalog.clone();
-            candidate.add_nullable_column(table, column)?;
-            candidate
-        };
-        self.publish_catalog(candidate)
+        self.apply_schema_mutations(&[SchemaMutation::AddNullableColumn { table, column }])
     }
 
     /// Apply a batch of schema mutations as one atomic publication.
@@ -335,44 +297,10 @@ impl DirectSeerStore {
     ) -> Result<CommitSeq> {
         // Build the candidate catalog first: validation failures must be
         // certain no-ops before any physical work begins.
-        let mut candidate = self.catalog.clone();
-        for mutation in mutations {
-            match mutation {
-                SchemaMutation::AddNullableColumn { table, column } => {
-                    candidate.add_nullable_column(*table, column.clone())?
-                }
-                SchemaMutation::AddIndex { index, name } => match name {
-                    Some(name) => candidate.create_named_index(index.clone(), name.clone())?,
-                    None => candidate.create_index(index.clone())?,
-                },
-                SchemaMutation::AddForeignKey { foreign_key, name } => match name {
-                    Some(name) => {
-                        candidate.create_named_foreign_key(foreign_key.clone(), name.clone())?
-                    }
-                    None => candidate.create_foreign_key(foreign_key.clone())?,
-                },
-                SchemaMutation::RenameColumn {
-                    table,
-                    column,
-                    new_name,
-                } => candidate.rename_column(*table, *column, new_name)?,
-                SchemaMutation::AlterColumnType {
-                    table,
-                    column,
-                    data_type,
-                    nullable,
-                } => candidate.alter_column_type(*table, *column, *data_type, *nullable)?,
-                SchemaMutation::DropColumn { table, column } => {
-                    candidate.drop_column(*table, *column)?
-                }
-                SchemaMutation::RenameTable { table, new_name } => {
-                    candidate.rename_table(*table, new_name)?
-                }
-                SchemaMutation::DropTable { table } => candidate.drop_table(*table)?,
-                SchemaMutation::DropIndex { index } => candidate.drop_index(*index)?,
-                SchemaMutation::DropForeignKey { constraint } => {
-                    candidate.drop_foreign_key(*constraint)?
-                }
+        {
+            let mut preflight = self.catalog.clone();
+            for mutation in mutations {
+                mutation.apply_to_catalog(&mut preflight)?;
             }
         }
         let mut transaction = self.database.begin().map_err(map_seer_error)?;
@@ -382,14 +310,37 @@ impl DirectSeerStore {
         // slipping past the publication.
         let mut table_trees = self.table_trees.clone();
         let mut index_trees = self.index_trees.clone();
-        let mut dropped_trees: BTreeSet<TreeId> = BTreeSet::new();
+        let mut candidate = self.catalog.clone();
         for mutation in mutations {
+            // Physical work must see this step's schema, not the final
+            // layout of the batch. Keep only the metadata this step removes.
+            let previous_definition = match mutation {
+                SchemaMutation::AlterColumnType { table, .. }
+                | SchemaMutation::DropColumn { table, .. } => {
+                    Some(candidate.table(*table)?.clone())
+                }
+                _ => None,
+            };
+            let dropped_indexes = match mutation {
+                SchemaMutation::DropTable { table } => candidate
+                    .indexes_for(*table)
+                    .map(|index| index.id)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            mutation.apply_to_catalog(&mut candidate)?;
             match mutation {
                 SchemaMutation::AddNullableColumn { .. }
                 | SchemaMutation::RenameColumn { .. }
                 | SchemaMutation::RenameTable { .. }
                 | SchemaMutation::DropForeignKey { .. } => {}
                 SchemaMutation::AddIndex { index, .. } => {
+                    // The catalog accepted an identical anonymous definition
+                    // as a no-op. Do not replace its tree and orphan the old
+                    // one; a preceding DropIndex removes the mapping instead.
+                    if index_trees.contains_key(&index.id) {
+                        continue;
+                    }
                     let index_tree = transaction.create_tree().map_err(map_seer_error)?;
                     let table = candidate
                         .table(index.table)
@@ -473,8 +424,10 @@ impl DirectSeerStore {
                 | SchemaMutation::DropColumn { table, column } => {
                     Self::rewrite_rows_for_column_change(
                         &mut transaction,
-                        &self.catalog,
                         &candidate,
+                        previous_definition
+                            .as_ref()
+                            .expect("column rewrite captured its previous layout"),
                         &table_trees,
                         *table,
                         *column,
@@ -483,26 +436,18 @@ impl DirectSeerStore {
                 SchemaMutation::DropTable { table } => {
                     if let Some(tree) = table_trees.remove(table) {
                         transaction.drop_tree(tree).map_err(map_seer_error)?;
-                        dropped_trees.insert(tree);
                     }
-                    // The candidate catalog already removed the table's
-                    // secondary indexes; drop their physical trees too.
-                    for index in self
-                        .catalog
-                        .indexes_for(*table)
-                        .map(|index| index.id)
-                        .collect::<Vec<_>>()
-                    {
+                    // Include indexes created earlier in this batch, not
+                    // just those present before the schema transaction.
+                    for index in dropped_indexes {
                         if let Some(tree) = index_trees.remove(&index) {
                             transaction.drop_tree(tree).map_err(map_seer_error)?;
-                            dropped_trees.insert(tree);
                         }
                     }
                 }
                 SchemaMutation::DropIndex { index } => {
                     if let Some(tree) = index_trees.remove(index) {
                         transaction.drop_tree(tree).map_err(map_seer_error)?;
-                        dropped_trees.insert(tree);
                     }
                 }
             }
@@ -538,8 +483,8 @@ impl DirectSeerStore {
     /// same identity key.
     fn rewrite_rows_for_column_change(
         transaction: &mut Transaction,
-        old_catalog: &Catalog,
         candidate: &Catalog,
+        old_definition: &TableDefinition,
         table_trees: &BTreeMap<TableId, TreeId>,
         table: TableId,
         changed_column: ColumnId,
@@ -549,8 +494,7 @@ impl DirectSeerStore {
         })?;
         // Decode against the old declaration, re-encode against the new
         // one: a row written before the change must satisfy the change.
-        let old_definition = old_catalog.table(table)?.clone();
-        let new_definition = candidate.table(table)?.clone();
+        let new_definition = candidate.table(table)?;
         let old_position = old_definition
             .columns
             .iter()
@@ -558,6 +502,10 @@ impl DirectSeerStore {
             .ok_or_else(|| {
                 DbError::InvalidState(format!("column {} does not exist", changed_column.0))
             })?;
+        let new_column = new_definition
+            .columns
+            .iter()
+            .find(|column| column.id == changed_column);
         // Register the whole table range as a read dependency so a
         // concurrent insert cannot slip between the scan and the commit.
         let mut cursor = transaction
@@ -569,11 +517,20 @@ impl DirectSeerStore {
         }
         drop(cursor);
         for (identity, bytes) in entries {
-            let row = row_from_storage_identity(old_catalog, &old_definition, &identity, &bytes)?;
-            let rewritten =
-                rewrite_row_for_column(&old_definition, &new_definition, row, old_position)?;
+            // Supported column changes cannot change primary-key metadata;
+            // only the positional row layout needs its previous declaration.
+            let mut row = row_from_storage_identity(candidate, old_definition, &identity, &bytes)?;
+            if let Some(target) = new_column {
+                let value = &mut row.values[old_position];
+                let previous = std::mem::replace(value, Value::Null);
+                *value = crate::sql::typed_input::coerce_value(previous, target)?;
+            } else {
+                // Decoding materializes all old fields, including NULL tails.
+                row.values.remove(old_position);
+            }
+            row.validate(new_definition)?;
             transaction
-                .put(tree, &identity, &encode_row(&rewritten)?)
+                .put(tree, &identity, &encode_row(&row)?)
                 .map_err(map_seer_error)?;
         }
         Ok(())
@@ -602,19 +559,6 @@ impl DirectSeerStore {
         name: Option<String>,
     ) -> Result<CommitSeq> {
         self.apply_schema_mutations(&[SchemaMutation::AddForeignKey { foreign_key, name }])
-    }
-
-    fn publish_catalog(&mut self, candidate: Catalog) -> Result<CommitSeq> {
-        let mut transaction = self.database.begin().map_err(map_seer_error)?;
-        let state = encode_catalog_state(&candidate, &self.table_trees, &self.index_trees)?;
-        transaction
-            .put(self.catalog_tree, DIRECT_CATALOG_MARKER, &state)
-            .map_err(map_seer_error)?;
-        let commit = transaction.commit().map_err(map_seer_error)?.csn;
-        drop(transaction);
-        self.catalog = candidate;
-        self.catalog_version = commit;
-        Ok(commit)
     }
 
     /// Insert one row and all derived index entries atomically.
@@ -1647,52 +1591,37 @@ pub enum SchemaMutation {
     },
 }
 
-/// Rewrite one decoded row for a column change: coerce the changed
-/// column's value into its new declaration, or remove the dropped
-/// column's value. Values are positional, so every column after the
-/// changed position shifts once on a drop.
-fn rewrite_row_for_column(
-    old_definition: &TableDefinition,
-    new_definition: &TableDefinition,
-    row: Row,
-    old_position: usize,
-) -> Result<Row> {
-    if new_definition.columns.len() == old_definition.columns.len() {
-        // ALTER TYPE: coerce the changed value through the same input
-        // grammar SQL literals and wire parameters use.
-        let mut values = row.values;
-        let target = new_definition
-            .columns
-            .get(old_position)
-            .ok_or_else(|| {
-                DbError::InvalidState("altered column is missing from the new table".to_owned())
-            })?
-            .clone();
-        let value = values
-            .get_mut(old_position)
-            .ok_or_else(|| DbError::InvalidState("row is missing the altered column".to_owned()))?;
-        let previous = std::mem::replace(value, Value::Null);
-        *value = crate::sql::typed_input::coerce_value(previous, &target)?;
-        Ok(Row {
-            primary: row.primary,
-            values,
-        })
-    } else {
-        // DROP COLUMN: remove the positional value.
-        let mut values = row.values;
-        if old_position >= values.len() {
-            // The row predates a later ADD COLUMN; the dropped column was
-            // logically NULL and there is nothing to remove.
-            return Ok(Row {
-                primary: row.primary,
-                values,
-            });
+impl SchemaMutation {
+    fn apply_to_catalog(&self, catalog: &mut Catalog) -> Result<()> {
+        match self {
+            Self::AddNullableColumn { table, column } => {
+                catalog.add_nullable_column(*table, column.clone())
+            }
+            Self::AddIndex { index, name } => match name {
+                Some(name) => catalog.create_named_index(index.clone(), name.clone()),
+                None => catalog.create_index(index.clone()),
+            },
+            Self::AddForeignKey { foreign_key, name } => match name {
+                Some(name) => catalog.create_named_foreign_key(foreign_key.clone(), name.clone()),
+                None => catalog.create_foreign_key(foreign_key.clone()),
+            },
+            Self::RenameColumn {
+                table,
+                column,
+                new_name,
+            } => catalog.rename_column(*table, *column, new_name),
+            Self::AlterColumnType {
+                table,
+                column,
+                data_type,
+                nullable,
+            } => catalog.alter_column_type(*table, *column, *data_type, *nullable),
+            Self::DropColumn { table, column } => catalog.drop_column(*table, *column),
+            Self::RenameTable { table, new_name } => catalog.rename_table(*table, new_name),
+            Self::DropTable { table } => catalog.drop_table(*table),
+            Self::DropIndex { index } => catalog.drop_index(*index),
+            Self::DropForeignKey { constraint } => catalog.drop_foreign_key(*constraint),
         }
-        values.remove(old_position);
-        Ok(Row {
-            primary: row.primary,
-            values,
-        })
     }
 }
 

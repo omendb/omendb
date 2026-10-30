@@ -36,7 +36,7 @@ admission authority and must not be treated as a hard resource bound.
   expression indexes currently cover arithmetic.
 - Transactional DDL is unsupported. Send DDL alone in simple Query messages,
   outside explicit blocks; mixed or compound DDL messages are refused.
-  Dropping a self-referencing table is also refused.
+  Multi-table drops do not reorder dependencies; drop referencing tables first.
 - SQL isolation alternatives are not selectable. Legacy serializability tests do
   not qualify the replacement's read/range/catalog certification.
 - TLS is not terminated by OmenDB. Use loopback/private deployment or a TLS proxy;

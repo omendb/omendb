@@ -398,7 +398,10 @@ pub struct NamedForeignKeyDefinition {
     pub name: Option<String>,
 }
 
-/// Additional schema objects to publish with one new table.
+/// Additional schema objects owned by one new table. Each definition's
+/// `table` must identify that new table; foreign keys may reference other
+/// tables. Index builds and FK activation on existing tables use separate
+/// validated schema mutations.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RelationalSchemaDefinition {
     pub indexes: Vec<NamedIndexDefinition>,
@@ -926,9 +929,20 @@ impl Catalog {
     /// Remove one table, its primary-key order, its secondary indexes,
     /// and the foreign keys it owns from the catalog. The owning store
     /// drops the physical trees in the same publication. Foreign keys
-    /// from OTHER tables that reference this one refuse the drop (the
-    /// caller checks first) because they strand child rows.
+    /// from other tables that reference this one refuse the drop because
+    /// they would strand child rows. Self-references disappear with their
+    /// owning table.
     pub fn drop_table(&mut self, table: TableId) -> Result<()> {
+        self.table(table)?;
+        if let Some(foreign_key) = self
+            .foreign_keys()
+            .find(|foreign_key| foreign_key.referenced_table == table && foreign_key.table != table)
+        {
+            return Err(DbError::InvalidState(format!(
+                "table {} is referenced by foreign key {}",
+                table.0, foreign_key.id.0
+            )));
+        }
         self.tables
             .remove(&table)
             .ok_or_else(|| DbError::InvalidState(format!("table {} does not exist", table.0)))?;

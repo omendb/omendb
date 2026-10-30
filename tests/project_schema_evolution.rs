@@ -8,7 +8,12 @@
 #[allow(dead_code)]
 mod support;
 
-use omendb::{DbError, F64, RelationalDatabase, Value};
+use omendb::{
+    ColumnDefinition, ColumnId, ColumnType, ConstraintId, ConstraintTiming, DbError, F64,
+    ForeignKeyDefinition, IndexDefinition, IndexId, IndexKeyPart, NamedForeignKeyDefinition,
+    NamedIndexDefinition, ReferentialAction, RelationalDatabase, RelationalSchemaDefinition,
+    SchemaMutation, TableDefinition, TableId, Value,
+};
 use support::config;
 use tempfile::tempdir;
 
@@ -34,6 +39,492 @@ fn setup(directory: &std::path::Path) -> RelationalDatabase {
             .expect("seed row");
     }
     database
+}
+
+fn text_columns_database(directory: &std::path::Path) -> RelationalDatabase {
+    let mut database = RelationalDatabase::create(config(&directory.join("text-db"))).unwrap();
+    database
+        .execute_sql(
+            "CREATE TABLE changes (id BIGINT PRIMARY KEY, first TEXT, kept TEXT, amount TEXT)",
+        )
+        .unwrap();
+    database
+        .execute_sql("INSERT INTO changes VALUES (1, '101', 'keep', '0007'), (2, NULL, NULL, NULL)")
+        .unwrap();
+    database
+}
+
+#[test]
+fn combined_column_changes_preserve_values_and_nullable_tails_after_reopen() {
+    for (alter, projection, expected_first) in [
+        (
+            "DROP COLUMN first, ADD COLUMN extra TEXT",
+            "id, kept, amount, extra",
+            vec![
+                Value::I64(1),
+                Value::Text("keep".into()),
+                Value::Text("0007".into()),
+                Value::Null,
+            ],
+        ),
+        (
+            "DROP COLUMN first, DROP COLUMN amount",
+            "id, kept",
+            vec![Value::I64(1), Value::Text("keep".into())],
+        ),
+    ] {
+        let directory = tempdir().unwrap();
+        let mut database = text_columns_database(directory.path());
+        database
+            .execute_sql(&format!("ALTER TABLE changes {alter}"))
+            .unwrap();
+        let query = format!("SELECT {projection} FROM changes ORDER BY id");
+        let mut null_row = vec![Value::Null; expected_first.len()];
+        null_row[0] = Value::I64(2);
+        let expected = vec![expected_first, null_row];
+        assert_eq!(
+            database.execute_sql(&query).unwrap().rows,
+            expected,
+            "{alter}"
+        );
+        database.close().unwrap();
+        let mut reopened =
+            RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+        assert_eq!(
+            reopened.execute_sql(&query).unwrap().rows,
+            expected,
+            "{alter}: reopen"
+        );
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn type_changes_mixed_with_column_adds_or_drops_preserve_values() {
+    for (alter, projection, expected_first) in [
+        (
+            "ALTER COLUMN amount TYPE DOUBLE PRECISION, DROP COLUMN discarded",
+            "id, amount",
+            vec![Value::I64(1), Value::Float64(F64::new(7.0))],
+        ),
+        (
+            "ADD COLUMN extra TEXT, ALTER COLUMN amount TYPE DOUBLE PRECISION",
+            "id, discarded, amount, extra",
+            vec![
+                Value::I64(1),
+                Value::Text("gone".into()),
+                Value::Float64(F64::new(7.0)),
+                Value::Null,
+            ],
+        ),
+    ] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("numbers-db");
+        let mut database = RelationalDatabase::create(config(&path)).unwrap();
+        database
+            .execute_sql(
+                "CREATE TABLE numbers (id BIGINT PRIMARY KEY, discarded TEXT, amount BIGINT)",
+            )
+            .unwrap();
+        database
+            .execute_sql("INSERT INTO numbers VALUES (1, 'gone', 7), (2, NULL, NULL)")
+            .unwrap();
+        database
+            .execute_sql(&format!("ALTER TABLE numbers {alter}"))
+            .unwrap();
+        let query = format!("SELECT {projection} FROM numbers ORDER BY id");
+        let mut null_row = vec![Value::Null; expected_first.len()];
+        null_row[0] = Value::I64(2);
+        let expected = vec![expected_first, null_row];
+        assert_eq!(
+            database.execute_sql(&query).unwrap().rows,
+            expected,
+            "{alter}"
+        );
+        database.close().unwrap();
+        let mut reopened = RelationalDatabase::open(config(&path)).unwrap();
+        assert_eq!(
+            reopened.execute_sql(&query).unwrap().rows,
+            expected,
+            "{alter}: reopen"
+        );
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn native_column_changes_validate_each_intermediate_declaration() {
+    let directory = tempdir().unwrap();
+    let mut database = text_columns_database(directory.path());
+    let table = database
+        .catalog()
+        .tables()
+        .find(|table| table.name == "changes")
+        .unwrap();
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == "amount")
+        .unwrap()
+        .id;
+    let table = table.id;
+    let catalog = database.catalog().clone();
+    let commit = database.commit_id();
+    // The final TEXT declaration cannot erase an invalid intermediate DATE.
+    let result = database.apply_schema_mutations(&[
+        SchemaMutation::AlterColumnType {
+            table,
+            column,
+            data_type: ColumnType::Date,
+            nullable: true,
+        },
+        SchemaMutation::AlterColumnType {
+            table,
+            column,
+            data_type: ColumnType::Text,
+            nullable: true,
+        },
+    ]);
+    assert!(result.is_err());
+    assert_eq!(database.catalog(), &catalog);
+    assert_eq!(database.commit_id(), commit);
+    let expected = vec![vec![Value::Text("0007".into())], vec![Value::Null]];
+    assert_eq!(
+        database
+            .execute_sql("SELECT amount FROM changes ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+    database.close().unwrap();
+    let mut reopened = RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+    assert_eq!(
+        reopened
+            .execute_sql("SELECT amount FROM changes ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+    reopened.close().unwrap();
+}
+
+fn kept_index(database: &RelationalDatabase) -> IndexDefinition {
+    let table = database
+        .catalog()
+        .tables()
+        .find(|table| table.name == "changes")
+        .unwrap();
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == "kept")
+        .unwrap()
+        .id;
+    IndexDefinition {
+        id: IndexId(100),
+        table: table.id,
+        parts: vec![IndexKeyPart::Column(column)],
+        unique: false,
+        predicate: None,
+    }
+}
+
+#[test]
+fn index_builds_use_the_row_layout_at_their_mutation_step() {
+    for build_first in [true, false] {
+        let directory = tempdir().unwrap();
+        let mut database = text_columns_database(directory.path());
+        let index = kept_index(&database);
+        let table = index.table;
+        let column = database
+            .catalog()
+            .table(table)
+            .unwrap()
+            .columns
+            .iter()
+            .find(|column| column.name == "first")
+            .unwrap()
+            .id;
+        let mut mutations = vec![
+            SchemaMutation::AddIndex {
+                index,
+                name: Some("changes_kept".into()),
+            },
+            SchemaMutation::DropColumn { table, column },
+        ];
+        if !build_first {
+            mutations.reverse();
+        }
+        database.apply_schema_mutations(&mutations).unwrap();
+        let expected = vec![
+            Value::I64(1),
+            Value::Text("keep".into()),
+            Value::Text("0007".into()),
+        ];
+        let rows = database
+            .index_get(table, IndexId(100), &[Value::Text("keep".into())])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, expected);
+        database.close().unwrap();
+        let reopened = RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+        let rows = reopened
+            .index_get(table, IndexId(100), &[Value::Text("keep".into())])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values, expected);
+        reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn anonymous_index_registration_is_idempotent_without_losing_recreation() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("text-db");
+    let mut database = text_columns_database(directory.path());
+    let index = kept_index(&database);
+    let add = SchemaMutation::AddIndex {
+        index: index.clone(),
+        name: None,
+    };
+    database
+        .apply_schema_mutations(&[add.clone(), add.clone()])
+        .unwrap();
+    database.close().unwrap();
+    let mut reopened = RelationalDatabase::open(config(&path)).unwrap();
+    // An existing registration is a no-op; a genuine drop must still
+    // allow a replacement to be built in this same publication.
+    reopened
+        .apply_schema_mutations(&[
+            add.clone(),
+            SchemaMutation::DropIndex { index: index.id },
+            add,
+        ])
+        .unwrap();
+    reopened.close().unwrap();
+    let reopened = RelationalDatabase::open(config(&path)).unwrap();
+    let rows = reopened
+        .index_get(index.table, index.id, &[Value::Text("keep".into())])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values,
+        vec![
+            Value::I64(1),
+            Value::Text("101".into()),
+            Value::Text("keep".into()),
+            Value::Text("0007".into())
+        ]
+    );
+    reopened.close().unwrap();
+}
+
+fn new_table_definition() -> TableDefinition {
+    TableDefinition {
+        id: TableId(200),
+        name: "new_table".into(),
+        columns: vec![ColumnDefinition {
+            id: ColumnId(1),
+            name: "id".into(),
+            data_type: ColumnType::I64,
+            nullable: false,
+        }],
+    }
+}
+
+#[test]
+fn new_table_index_definitions_allocate_one_tree_per_catalog_object() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("new-table-db");
+    let mut database = RelationalDatabase::create(config(&path)).unwrap();
+    let table = new_table_definition();
+    let index = NamedIndexDefinition {
+        definition: IndexDefinition {
+            id: IndexId(100),
+            table: table.id,
+            parts: vec![IndexKeyPart::Column(ColumnId(1))],
+            unique: false,
+            predicate: None,
+        },
+        name: None,
+    };
+    database
+        .create_table_with_schema(
+            table,
+            RelationalSchemaDefinition {
+                indexes: vec![index.clone(), index],
+                foreign_keys: vec![],
+            },
+        )
+        .unwrap();
+    database.close().unwrap();
+    let reopened = RelationalDatabase::open(config(&path)).unwrap();
+    assert_eq!(reopened.catalog().indexes().count(), 1);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn new_table_schema_refuses_indexes_owned_by_existing_tables() {
+    assert_new_table_schema_owner(false);
+}
+
+#[test]
+fn new_table_schema_refuses_foreign_keys_owned_by_existing_tables() {
+    assert_new_table_schema_owner(true);
+}
+
+fn assert_new_table_schema_owner(attach_foreign_key: bool) {
+    let directory = tempdir().unwrap();
+    let mut database = text_columns_database(directory.path());
+    database
+        .execute_sql("CREATE TABLE codes (code TEXT PRIMARY KEY)")
+        .unwrap();
+    let index = kept_index(&database);
+    let schema = if attach_foreign_key {
+        let parent = database
+            .catalog()
+            .tables()
+            .find(|table| table.name == "codes")
+            .unwrap();
+        let child = database.catalog().table(index.table).unwrap();
+        let column = child
+            .columns
+            .iter()
+            .find(|column| column.name == "amount")
+            .unwrap()
+            .id;
+        // Existing references have no parent: new-table creation must
+        // not bypass activation's existing-row validation.
+        RelationalSchemaDefinition {
+            indexes: vec![],
+            foreign_keys: vec![NamedForeignKeyDefinition {
+                definition: ForeignKeyDefinition {
+                    id: ConstraintId(100),
+                    table: child.id,
+                    columns: vec![column],
+                    referenced_table: parent.id,
+                    referenced_columns: vec![parent.columns[0].id],
+                    on_delete: ReferentialAction::Restrict,
+                    timing: ConstraintTiming::Immediate,
+                },
+                name: None,
+            }],
+        }
+    } else {
+        // A populated table's index cannot be published as empty on
+        // the assumption that its owner is the newly created table.
+        RelationalSchemaDefinition {
+            indexes: vec![NamedIndexDefinition {
+                definition: index,
+                name: None,
+            }],
+            foreign_keys: vec![],
+        }
+    };
+    let catalog = database.catalog().clone();
+    let commit = database.commit_id();
+    assert!(
+        database
+            .create_table_with_schema(new_table_definition(), schema)
+            .is_err()
+    );
+    assert_eq!(database.catalog(), &catalog);
+    assert_eq!(database.commit_id(), commit);
+    database.close().unwrap();
+    let reopened = RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+    assert_eq!(reopened.catalog(), &catalog);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn dropping_a_table_removes_indexes_added_earlier_in_the_same_batch() {
+    let directory = tempdir().unwrap();
+    let mut database = text_columns_database(directory.path());
+    let index = kept_index(&database);
+    let table = index.table;
+    database
+        .apply_schema_mutations(&[
+            SchemaMutation::AddIndex {
+                index,
+                name: Some("changes_kept".into()),
+            },
+            SchemaMutation::DropTable { table },
+        ])
+        .unwrap();
+    assert_eq!(database.catalog().tables().count(), 0);
+    assert_eq!(database.catalog().indexes().count(), 0);
+    database.close().unwrap();
+    let reopened = RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+    assert_eq!(reopened.catalog().tables().count(), 0);
+    assert_eq!(reopened.catalog().indexes().count(), 0);
+    reopened.close().unwrap();
+}
+
+#[test]
+fn late_conversion_failure_discards_earlier_schema_rewrites() {
+    let directory = tempdir().unwrap();
+    let mut database = text_columns_database(directory.path());
+    let catalog = database.catalog().clone();
+    let commit = database.commit_id();
+    assert!(
+        database
+            .execute_sql(
+                "ALTER TABLE changes ALTER COLUMN amount TYPE NUMERIC, ALTER COLUMN kept TYPE DATE"
+            )
+            .is_err()
+    );
+    assert_eq!(database.catalog(), &catalog);
+    assert_eq!(database.commit_id(), commit);
+    let expected = vec![
+        vec![Value::Text("keep".into()), Value::Text("0007".into())],
+        vec![Value::Null, Value::Null],
+    ];
+    assert_eq!(
+        database
+            .execute_sql("SELECT kept, amount FROM changes ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+    database.close().unwrap();
+    let mut reopened = RelationalDatabase::open(config(&directory.path().join("text-db"))).unwrap();
+    assert_eq!(reopened.catalog(), &catalog);
+    assert_eq!(
+        reopened
+            .execute_sql("SELECT kept, amount FROM changes ORDER BY id")
+            .unwrap()
+            .rows,
+        expected
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn self_referencing_table_drops_remove_owned_foreign_keys_atomically() {
+    for native in [false, true] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("self-drop-db");
+        let mut database = RelationalDatabase::create(config(&path)).unwrap();
+        database.execute_sql("CREATE TABLE nodes (id BIGINT PRIMARY KEY, parent BIGINT, FOREIGN KEY (parent) REFERENCES nodes(id))").unwrap();
+        database
+            .execute_sql("INSERT INTO nodes VALUES (1, 1)")
+            .unwrap();
+        if native {
+            let table = database.catalog().tables().next().unwrap().id;
+            database
+                .apply_schema_mutations(&[SchemaMutation::DropTable { table }])
+                .unwrap();
+        } else {
+            database.execute_sql("DROP TABLE nodes").unwrap();
+        }
+        assert_eq!(database.catalog().tables().count(), 0);
+        assert_eq!(database.catalog().foreign_keys().count(), 0);
+        database.close().unwrap();
+        let reopened = RelationalDatabase::open(config(&path)).unwrap();
+        assert_eq!(reopened.catalog().tables().count(), 0);
+        assert_eq!(reopened.catalog().foreign_keys().count(), 0);
+        reopened.close().unwrap();
+    }
 }
 
 #[test]
@@ -258,6 +749,21 @@ fn drop_table_refuses_referenced_foreign_keys() {
         database.execute_sql("DROP TABLE groups"),
         Err(DbError::InvalidState(reason)) if reason.contains("foreign key")
     ));
+    // The native path must enforce the same dependency before publication.
+    let table = database
+        .catalog()
+        .tables()
+        .find(|table| table.name == "groups")
+        .unwrap()
+        .id;
+    let catalog = database.catalog().clone();
+    let commit = database.commit_id();
+    assert!(matches!(
+        database.apply_schema_mutations(&[SchemaMutation::DropTable { table }]),
+        Err(DbError::InvalidState(_))
+    ));
+    assert_eq!(database.catalog(), &catalog);
+    assert_eq!(database.commit_id(), commit);
     // Dropping the referencing table first frees the referenced one.
     database
         .execute_sql("DROP TABLE members")

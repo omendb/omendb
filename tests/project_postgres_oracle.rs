@@ -981,6 +981,121 @@ async fn immediate_foreign_keys_match_live_postgresql() -> Result<()> {
     Ok(())
 }
 
+/// Multi-operation DDL must publish matching layouts and preserve values.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn schema_mutation_batches_match_live_postgresql() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL)?;
+    let directory = tempdir()?;
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse()?,
+    ))
+    .await?;
+    let (omen, omen_connection) = connect(&format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    ))
+    .await?;
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+
+    for (columns, values, alteration) in [
+        (
+            "id BIGINT PRIMARY KEY, first TEXT, kept TEXT, amount TEXT",
+            "(1, '101', 'keep', '0007'), (2, NULL, NULL, NULL)",
+            "DROP COLUMN first, ADD COLUMN extra TEXT",
+        ),
+        (
+            "id BIGINT PRIMARY KEY, first TEXT, kept TEXT, amount TEXT",
+            "(1, '101', 'keep', '0007'), (2, NULL, NULL, NULL)",
+            "DROP COLUMN first, DROP COLUMN amount",
+        ),
+        (
+            "id BIGINT PRIMARY KEY, discarded TEXT, amount BIGINT",
+            "(1, 'gone', 7), (2, NULL, NULL)",
+            "ALTER COLUMN amount TYPE DOUBLE PRECISION, DROP COLUMN discarded",
+        ),
+        (
+            "id BIGINT PRIMARY KEY, discarded TEXT, amount BIGINT",
+            "(1, 'gone', 7), (2, NULL, NULL)",
+            "ADD COLUMN extra TEXT, ALTER COLUMN amount TYPE DOUBLE PRECISION",
+        ),
+    ] {
+        for client in [&omen, &postgres] {
+            // Each DDL statement is a standalone Query message.
+            for sql in [
+                "DROP TABLE IF EXISTS oracle_schema_batch".to_owned(),
+                format!("CREATE TABLE oracle_schema_batch ({columns})"),
+                format!("INSERT INTO oracle_schema_batch VALUES {values}"),
+                format!("ALTER TABLE oracle_schema_batch {alteration}"),
+            ] {
+                client.batch_execute(&sql).await.with_context(|| sql)?;
+            }
+        }
+        compare_query(
+            &omen,
+            &postgres,
+            "SELECT * FROM oracle_schema_batch ORDER BY id",
+            &[],
+        )
+        .await?;
+        for client in [&omen, &postgres] {
+            client
+                .batch_execute("DROP TABLE oracle_schema_batch")
+                .await?;
+        }
+    }
+
+    for client in [&omen, &postgres] {
+        client.batch_execute("CREATE TABLE oracle_schema_batch (id BIGINT PRIMARY KEY, kept TEXT, amount BIGINT)").await?;
+        client
+            .batch_execute("INSERT INTO oracle_schema_batch VALUES (1, 'keep', 7)")
+            .await?;
+        let before = snapshot(client, "SELECT * FROM oracle_schema_batch", &[]).await?;
+        // A later rejected conversion cannot publish the earlier type change.
+        let error = client.batch_execute("ALTER TABLE oracle_schema_batch ALTER COLUMN amount TYPE DOUBLE PRECISION, ALTER COLUMN kept TYPE DATE").await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::DATATYPE_MISMATCH)
+        );
+        assert_eq!(
+            snapshot(client, "SELECT * FROM oracle_schema_batch", &[]).await?,
+            before
+        );
+        client
+            .batch_execute("DROP TABLE oracle_schema_batch")
+            .await?;
+
+        client
+            .batch_execute("DROP TABLE IF EXISTS oracle_schema_nodes")
+            .await?;
+        client.batch_execute("CREATE TABLE oracle_schema_nodes (id BIGINT PRIMARY KEY, parent BIGINT, FOREIGN KEY (parent) REFERENCES oracle_schema_nodes(id))").await?;
+        client
+            .batch_execute("INSERT INTO oracle_schema_nodes VALUES (1, 1)")
+            .await?;
+        client
+            .batch_execute("DROP TABLE oracle_schema_nodes")
+            .await?;
+        client
+            .batch_execute("CREATE TABLE oracle_schema_nodes (id BIGINT PRIMARY KEY)")
+            .await?;
+        client
+            .batch_execute("INSERT INTO oracle_schema_nodes VALUES (1)")
+            .await?;
+    }
+    compare_query(&omen, &postgres, "SELECT id FROM oracle_schema_nodes", &[]).await?;
+    for client in [&omen, &postgres] {
+        client
+            .batch_execute("DROP TABLE oracle_schema_nodes")
+            .await?;
+    }
+    drop((omen, postgres));
+    server.shutdown().await?;
+    omen_connection.await??;
+    postgres_connection.await??;
+    Ok(())
+}
+
 /// Dump/restore differential: an OmenDB dump must restore into real
 /// PostgreSQL and reproduce the same logical content. This is the
 /// data-in/data-out trust gate — if a dump cannot move data into

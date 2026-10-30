@@ -109,8 +109,9 @@ The wire suite exercises the supported bounded SQL overlap, including:
   operations; and schema-qualified public names;
 - `INSERT`, `INSERT ... SELECT`, `UPDATE`, `DELETE`, `RETURNING`, `UPDATE ...
   FROM`, and `DELETE ... USING`; and
-- schema publication and schema-qualified public names exercised against the
-  seeded durable catalog.
+- schema publication, including multi-operation column rewrites and dropping
+  self-referencing tables, and schema-qualified public names exercised against
+  the seeded durable catalog.
 
 The embedded SQL suite owns the differential SQLite oracle for the bounded
 engine-level overlap. The live PostgreSQL oracle independently exercises a

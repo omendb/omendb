@@ -441,20 +441,6 @@ pub(super) fn execute_drop(
                         "table {name} does not exist"
                     )));
                 };
-                // Refuse while foreign keys depend on this table: dropping
-                // it would strand child rows with no referenced index.
-                // CASCADE is the explicit path, and it is not supported
-                // yet.
-                if let Some(foreign_key) = database
-                    .catalog()
-                    .foreign_keys()
-                    .find(|foreign_key| foreign_key.referenced_table == table)
-                {
-                    return Err(DbError::InvalidState(format!(
-                        "table {name} is referenced by foreign key {}",
-                        foreign_key.id.0
-                    )));
-                }
                 mutations.push(SchemaMutation::DropTable { table });
             }
             ObjectType::Index => {
