@@ -13,10 +13,10 @@ use crate::sql::TransactionControl;
 use crate::sql::binding::{StatementAccess, StatementEffect};
 
 mod prepare;
+mod simple;
 use async_trait::async_trait;
 use futures::{Sink, SinkExt};
 use pgwire::api::ClientPortalStore;
-use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{FieldInfo, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, Type};
@@ -31,7 +31,9 @@ use super::encoding::{
 };
 use super::lifecycle::{QueryWorkers, read_lock_with_control, write_lock_with_control};
 use super::shared::TX_IDLE_TIMEOUT;
-use super::shared::{IdentityMap, ParsedStatement, SessionAuthority, TransactionBlock};
+use super::shared::{
+    IdentityMap, ParsedStatement, SessionAuthority, TransactionBlock, TransactionKind,
+};
 use super::{CancellationToken, OperationControl, SharedDatabase, Value, map_db_error, pg_error};
 
 #[derive(Clone)]
@@ -126,35 +128,12 @@ impl OmenDbHandler {
     ) -> Vec<crate::RelationalDatabaseTransaction> {
         blocks
             .values_mut()
-            .filter(|block| block.last_used.elapsed() >= TX_IDLE_TIMEOUT)
+            .filter(|block| {
+                block.kind == TransactionKind::Explicit
+                    && block.last_used.elapsed() >= TX_IDLE_TIMEOUT
+            })
             .filter_map(|block| block.transaction.take())
             .collect()
-    }
-
-    /// Route one wire statement: transaction control, in-block execution,
-    /// or autocommit. `format` is the negotiated result-column format; the
-    /// statement executes exactly once.
-    fn run_statement(
-        &self,
-        address: std::net::SocketAddr,
-        sql: &str,
-        params: &[Value],
-        format: &pgwire::api::portal::Format,
-        control: &OperationControl,
-    ) -> PgWireResult<Response> {
-        let hints = crate::sql::parameter_hints(params)
-            .into_iter()
-            .map(|ty| ty.map(column_type_to_pg))
-            .collect::<Vec<_>>();
-        let result = self
-            .bind_statement(address, sql, &hints, control)
-            .and_then(|statement| {
-                self.run_bound_statement(address, &statement, params, format, control)
-            });
-        if result.is_err() {
-            self.fail_block(address);
-        }
-        result
     }
 
     fn run_bound_statement(
@@ -164,9 +143,17 @@ impl OmenDbHandler {
         params: &[Value],
         format: &pgwire::api::portal::Format,
         control: &OperationControl,
+        end_implicit: bool,
     ) -> PgWireResult<Response> {
         let started = self.slow_statement_threshold.map(|_| Instant::now());
-        let response = self.run_statement_inner(client_addr, statement, params, format, control);
+        let response = self
+            .run_statement_inner(client_addr, statement, params, format, control)
+            .and_then(|response| {
+                if end_implicit {
+                    self.commit_implicit(client_addr, control)?;
+                }
+                Ok(response)
+            });
         if response.is_err() {
             self.fail_block(client_addr);
         }
@@ -229,6 +216,8 @@ impl OmenDbHandler {
                             "current transaction is aborted, commands ignored until end of transaction block".to_owned(),
                         ));
                     }
+                    // BEGIN adopts any work already staged by this message.
+                    block.kind = TransactionKind::Explicit;
                     return Ok(Response::TransactionStart(Tag::new("BEGIN")));
                 }
                 drop(blocks);
@@ -242,6 +231,7 @@ impl OmenDbHandler {
                 blocks.insert(
                     client_addr,
                     TransactionBlock {
+                        kind: TransactionKind::Explicit,
                         transaction: Some(transaction),
                         last_used: Instant::now(),
                     },
@@ -308,9 +298,8 @@ impl OmenDbHandler {
                 };
                 block.last_used = Instant::now();
                 transaction.set_operation_control(control);
-                // Buffered into the transaction; publication happens at
-                // COMMIT under the write lock, so execution only needs
-                // shared access.
+                // Publication belongs to the engine's commit lane; staging
+                // needs only shared database access.
                 let response = (|| {
                     let database = read_lock_with_control(&self.database, control)?;
                     let _authorization =
@@ -433,93 +422,6 @@ impl pgwire::api::ErrorHandler for OmenDbHandler {
     {
         // Parse, Bind and Describe failures do not pass through execution.
         self.fail_block(client.socket_addr());
-    }
-}
-
-#[async_trait]
-impl SimpleQueryHandler for OmenDbHandler {
-    async fn on_query<C>(
-        &self,
-        client: &mut C,
-        query: pgwire::messages::simplequery::Query,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::PortalStore: PortalStore,
-        C::Error: std::fmt::Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        use pgwire::api::PgWireConnectionState;
-        use pgwire::api::query::{
-            send_execution_response, send_query_response, send_ready_for_query,
-        };
-        use pgwire::messages::response::EmptyQueryResponse;
-
-        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
-            return Err(PgWireError::NotReadyForQuery);
-        }
-        client.set_state(PgWireConnectionState::QueryInProgress);
-        let result = async {
-            for response in self.do_query(client, &query.query).await? {
-                match response {
-                    Response::Query(rows) => send_query_response(client, rows, true).await?,
-                    Response::Execution(tag)
-                    | Response::TransactionStart(tag)
-                    | Response::TransactionEnd(tag) => {
-                        send_execution_response(client, tag).await?;
-                    }
-                    Response::EmptyQuery => {
-                        client
-                            .feed(PgWireBackendMessage::EmptyQueryResponse(
-                                EmptyQueryResponse::new(),
-                            ))
-                            .await?
-                    }
-                    _ => return Err(pg_error("XX000", "unexpected SQL response kind".to_owned())),
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
-            self.fail_block(client.socket_addr());
-        }
-        // Unlike pgwire's default responder, never infer final state from
-        // command tags or the status captured before this batch executed.
-        self.sync_transaction_status(client)?;
-        result?;
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-        send_ready_for_query(client, client.transaction_status()).await
-    }
-
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        let client_addr = _client.socket_addr();
-        let (cancellation, _lease) = self.begin_query(_client);
-        let handler = self.clone();
-        let query = query.to_owned();
-        self.query_workers
-            .spawn_operation(cancellation.clone(), move || {
-                let mut responses = Vec::new();
-                for statement in crate::sql::statement_sources(&query).map_err(map_db_error)? {
-                    let control = handler.operation_control(&cancellation);
-                    responses.push(handler.run_statement(
-                        client_addr,
-                        statement,
-                        &[],
-                        &pgwire::api::portal::Format::UnifiedText,
-                        &control,
-                    )?);
-                }
-                if responses.is_empty() {
-                    responses.push(Response::EmptyQuery);
-                }
-                Ok(responses)
-            })
-            .await
-            .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?
     }
 }
 
@@ -722,7 +624,14 @@ impl pgwire::api::query::ExtendedQueryHandler for OmenDbHandler {
                 )?;
                 let params =
                     decode_parameters(&parameters, &parameter_format, &statement.parameter_types)?;
-                handler.run_bound_statement(client_addr, &statement, &params, &format, &control)
+                handler.run_bound_statement(
+                    client_addr,
+                    &statement,
+                    &params,
+                    &format,
+                    &control,
+                    false,
+                )
             })
             .await
             .map_err(|error| pg_error("XX000", format!("query worker failed: {error}")))?

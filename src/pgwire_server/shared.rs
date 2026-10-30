@@ -19,10 +19,18 @@ pub(super) struct ParsedStatement {
     pub(super) parameter_types: Vec<Type>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TransactionKind {
+    Implicit,
+    Explicit,
+}
+
 /// One connection's open transaction block.
 pub(super) struct TransactionBlock {
+    pub(super) kind: TransactionKind,
     /// None is a rollback-only block: its engine resources are released, but
-    /// its boundary remains until explicit cleanup or connection teardown.
+    /// an explicit boundary remains until COMMIT/ROLLBACK or teardown;
+    /// an implicit boundary is removed when the Query message fails.
     pub(super) transaction: Option<RelationalDatabaseTransaction>,
     pub(super) last_used: Instant,
 }

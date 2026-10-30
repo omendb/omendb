@@ -246,14 +246,15 @@ impl QueryWorkers {
         }
     }
 
-    pub(crate) fn spawn_operation<F, T>(
+    pub(crate) fn spawn_operation<F, T, E>(
         self: &Arc<Self>,
         cancellation: CancellationToken,
         work: F,
-    ) -> tokio::task::JoinHandle<PgWireResult<T>>
+    ) -> tokio::task::JoinHandle<Result<T, E>>
     where
-        F: FnOnce() -> PgWireResult<T> + Send + 'static,
+        F: FnOnce() -> Result<T, E> + Send + 'static,
         T: Send + 'static,
+        E: Send + 'static,
     {
         self.active.fetch_add(1, Ordering::AcqRel);
         let tracker = Arc::clone(self);

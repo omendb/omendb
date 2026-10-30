@@ -1,6 +1,9 @@
 //! Transaction-control boundaries through real simple and extended wire clients.
 #![cfg(feature = "pgwire")]
 
+#[path = "common/simple_query_boundaries.rs"]
+mod simple_query_boundaries;
+
 use omendb::pgwire_server::{RunningServer, ServerConfig};
 use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -383,24 +386,171 @@ async fn plain_controls_and_lexical_boundaries_are_preserved() {
 }
 
 #[tokio::test]
-async fn parse_failure_in_batch_keeps_prior_writes_rollback_only() {
+async fn simple_message_failure_rolls_back_implicit_writes_and_retains_completed_responses() {
+    let fixture = Fixture::new().await;
+    let mut wire = Wire::connect(&fixture.server).await;
+    let outcome = wire
+        .query(
+            "INSERT INTO items VALUES (1); SELECT missing FROM items; INSERT INTO items VALUES (2)",
+            false,
+        )
+        .await;
+    assert_eq!(outcome.errors, ["42703"]);
+    assert_eq!(outcome.status, b'I');
+    assert_eq!(fixture.count().await, 0, "implicit prefix escaped rollback");
+    assert_eq!(
+        outcome.tags.len(),
+        1,
+        "the successful prefix still completes on the wire"
+    );
+    assert_eq!(
+        wire.query("INSERT INTO items VALUES (3)", false)
+            .await
+            .status,
+        b'I'
+    );
+    assert_eq!(fixture.count().await, 1);
+    drop(wire);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn begin_adopts_earlier_implicit_writes_in_the_same_message() {
+    let fixture = Fixture::new().await;
+    let mut wire = Wire::connect(&fixture.server).await;
+    let outcome = wire
+        .query(
+            "INSERT INTO items VALUES (1); BEGIN; INSERT INTO items VALUES (2)",
+            false,
+        )
+        .await;
+    assert!(outcome.errors.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.status, b'T');
+    assert_eq!(
+        fixture.count().await,
+        0,
+        "BEGIN must adopt the earlier implicit work"
+    );
+    assert_eq!(wire.query("ROLLBACK", false).await.tags, ["ROLLBACK"]);
+    assert_eq!(fixture.count().await, 0);
+    drop(wire);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn whole_message_syntax_validation_precedes_explicit_commits() {
+    let fixture = Fixture::new().await;
+    let mut wire = Wire::connect(&fixture.server).await;
+    let outcome = wire
+        .query(
+            "BEGIN; INSERT INTO items VALUES (1); COMMIT; SELCT 1",
+            false,
+        )
+        .await;
+    assert_eq!(outcome.errors, ["42601"]);
+    assert_eq!(outcome.status, b'I');
+    assert_eq!(
+        fixture.count().await,
+        0,
+        "syntax failure must prevent the entire message"
+    );
+    assert!(outcome.tags.is_empty());
+    drop(wire);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn schema_batches_refuse_before_any_catalog_publication() {
+    let fixture = Fixture::new().await;
+    let result = fixture
+        .client
+        .batch_execute(
+            "CREATE TABLE first_schema (id BIGINT); CREATE TABLE second_schema (id BIGINT)",
+        )
+        .await;
+    assert_eq!(
+        result.unwrap_err().code(),
+        Some(&SqlState::FEATURE_NOT_SUPPORTED)
+    );
+    let error = fixture
+        .client
+        .query("SELECT id FROM first_schema", &[])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(&SqlState::UNDEFINED_TABLE));
+    assert_eq!(fixture.count().await, 0);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn simple_message_controls_partition_only_their_owned_segments() {
     let fixture = Fixture::new().await;
     fixture
         .client
-        .batch_execute("BEGIN; INSERT INTO items VALUES (1); ROLLBACK nonsense")
+        .batch_execute("CREATE TABLE oracle_boundary_items (id BIGINT PRIMARY KEY)")
         .await
-        .expect_err("malformed rollback");
-    let error = fixture
-        .client
-        .batch_execute("INSERT INTO items VALUES (2)")
-        .await
-        .expect_err("failed block");
-    assert_eq!(error.code(), Some(&SqlState::IN_FAILED_SQL_TRANSACTION));
-    let result = fixture.client.simple_query("COMMIT").await.unwrap();
-    assert!(matches!(
-        result.as_slice(),
-        [SimpleQueryMessage::CommandComplete(0)]
-    ));
+        .unwrap();
+    let mut wire = Wire::connect(&fixture.server).await;
+    for case in simple_query_boundaries::CASES {
+        if !case.before.is_empty() {
+            assert!(
+                wire.query(case.before, false).await.errors.is_empty(),
+                "{}",
+                case.name
+            );
+        }
+        let outcome = wire.query(case.query, false).await;
+        assert_eq!(outcome.status, case.status, "{}", case.name);
+        assert_eq!(
+            outcome.errors,
+            case.error.into_iter().collect::<Vec<_>>(),
+            "{}",
+            case.name
+        );
+        assert_eq!(outcome.tags.len(), case.completions, "{}", case.name);
+        assert_eq!(
+            outcome
+                .tags
+                .iter()
+                .map(String::as_str)
+                .filter(|tag| matches!(*tag, "BEGIN" | "COMMIT" | "ROLLBACK"))
+                .collect::<Vec<_>>(),
+            case.controls,
+            "{}",
+            case.name
+        );
+        let ids: Vec<i64> = fixture
+            .client
+            .query("SELECT id FROM oracle_boundary_items ORDER BY id", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(ids, case.committed_ids, "{}", case.name);
+        assert_eq!(wire.query("ROLLBACK", false).await.status, b'I');
+        fixture
+            .client
+            .batch_execute("DELETE FROM oracle_boundary_items")
+            .await
+            .unwrap();
+    }
+    drop(wire);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn implicit_result_admission_failure_rolls_back_the_message_prefix() {
+    let fixture = Fixture::with_result_limit(Some(32)).await;
+    let mut wire = Wire::connect(&fixture.server).await;
+    let outcome = wire.query(
+        "INSERT INTO items VALUES (1); SELECT 'this payload deliberately exceeds the thirty-two byte response admission bound'",
+        false,
+    ).await;
+    assert_eq!(outcome.errors, ["54000"]);
+    assert_eq!(outcome.status, b'I');
+    assert_eq!(outcome.tags.len(), 1);
     assert_eq!(fixture.count().await, 0);
+    drop(wire);
     fixture.close().await;
 }

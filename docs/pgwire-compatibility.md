@@ -53,12 +53,26 @@ statement-time constraint semantics; see the [known gaps](gap-register.md).
 | Surface | Current behavior | Evidence |
 | --- | --- | --- |
 | Startup and authentication | PostgreSQL startup packets use explicit bootstrap or SCRAM according to the native authorization catalog. | `wire_scram_auth_accepts_provisioned_user_and_rejects_bad_password`, `pgwire_sasl_initial_response_decode_probe` |
-| Simple queries | Statement splitting respects literals, identifiers and comments. Multiple statements outside explicit blocks still commit individually, not as one implicit transaction. | `plain_controls_and_lexical_boundaries_are_preserved`, `wire_transaction_block_rollback_discards_writes` |
+| Simple queries | Multi-statement messages share an implicit transaction unless explicit controls establish boundaries. The entire message is syntax-checked before execution; binding and authorization remain per statement. Literals, identifiers and comments preserve quoted semicolons. | `simple_message_controls_partition_only_their_owned_segments`, `whole_message_syntax_validation_precedes_explicit_commits`, `simple_query_boundaries_match_live_postgresql` |
+| Schema statements | DDL requires a standalone statement outside SQL transaction blocks. DDL inside implicit or explicit blocks is refused, not independently committed. | `schema_batches_refuse_before_any_catalog_publication` |
 | Extended queries | Parse binds supported SQL without execution. Describe and execution share fixed parameter/result signatures. Catalog changes, including direct-API DDL, require reprepare (`0A000`). Incremental Execute row limits are refused (`0A000`). | `describe_binds_without_evaluating_rows_or_benign_parameter_values`, `prepared_signature_cannot_drift_after_direct_api_ddl`, `wire_portal_execute_checks_failed_blocks_and_refuses_incremental_fetch`, `wire_hot_statement_repeats_across_params` |
 | Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; all supported result signatures come from binding, not observed rows. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |
-| Transactions | Plain `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks. Complete controls are parsed: characteristics (including read-only/isolation), savepoints and chaining are rejected rather than ignored. Block errors and idle expiry retain a rollback-only boundary (`25P02`); COMMIT then reports ROLLBACK. Consumed commit errors report idle, not a phantom aborted block. | `tests/project_transaction_controls.rs`, `wire_grant_enforcement_reader_writer_admin`, `idle_expiry_releases_transactions_without_restoring_autocommit` |
+| Transactions | Plain `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks. Complete controls are parsed: characteristics (including read-only/isolation), savepoints and chaining are rejected rather than ignored. Explicit-block errors and idle expiry retain a rollback-only boundary (`25P02`); COMMIT then reports ROLLBACK. Consumed commit errors report idle, not a phantom aborted block. | `tests/project_transaction_controls.rs`, `wire_grant_enforcement_reader_writer_admin`, `idle_expiry_releases_transactions_without_restoring_autocommit` |
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
+
+A simple Query error stops the remaining statements. An implicit block rolls back
+and leaves the connection idle; a failed explicit block requires `COMMIT` or
+`ROLLBACK` cleanup. `BEGIN` adopts earlier implicit work in the same message.
+`COMMIT` and `ROLLBACK` end the current block; later statements start a new
+implicit segment. A completed explicit commit survives a later binding or
+execution error, but a syntax error anywhere prevents the entire message from
+executing. Successful prefix responses are still returned before an error and
+must not be mistaken for commit acknowledgements.
+
+Send each DDL statement as a separate Query message, without `BEGIN`. For schema
+setup, do not combine DDL with other statements in `batch_execute`; transactional
+DDL is not supported. Data-only batches can use the implicit message boundary.
 
 ## Scalar value types
 

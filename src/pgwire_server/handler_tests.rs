@@ -22,15 +22,7 @@ fn missing_or_poisoned_identity_never_confers_bootstrap_authority() {
     .unwrap();
     let handler = &factory.handler;
     let control = OperationControl::default();
-    let run = |sql| {
-        handler.run_statement(
-            address,
-            sql,
-            &[],
-            &pgwire::api::portal::Format::UnifiedText,
-            &control,
-        )
-    };
+    let run = |sql| handler.run_simple_statement(address, sql, &control, false);
     run("BEGIN").unwrap();
     let PgWireError::UserError(error) = run("SELECT 1").unwrap_err() else {
         panic!("expected authorization error");
@@ -85,15 +77,7 @@ fn idle_expiry_releases_transactions_without_restoring_autocommit() {
         .unwrap()
         .insert(address, SessionAuthority::Bootstrap);
     let control = OperationControl::with_cancellation(CancellationToken::new());
-    let run = |sql| {
-        handler.run_statement(
-            address,
-            sql,
-            &[],
-            &pgwire::api::portal::Format::UnifiedText,
-            &control,
-        )
-    };
+    let run = |sql| handler.run_simple_statement(address, sql, &control, false);
     let mut client = DefaultClient::<ParsedStatement>::new(address, false);
     for failed in [false, true] {
         run("BEGIN").unwrap();

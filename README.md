@@ -37,6 +37,8 @@ multiple client sessions, cancellation, and configurable connection, statement,
 and result limits. PostgreSQL wire support does not imply full PostgreSQL SQL
 or client compatibility. Check the [compatibility matrix](docs/pgwire-compatibility.md)
 and [SQL gap register](docs/gap-register.md) before integrating a client.
+Data-only multi-statement Query messages are atomic unless explicit transaction
+controls divide them. Send DDL as standalone statements outside transaction blocks.
 
 ## Use from Rust
 

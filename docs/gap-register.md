@@ -15,7 +15,6 @@ not treat current erroneous output as the contract.
 
 | Boundary | Known limitation | Source |
 | --- | --- | --- |
-| Wire statement lists | Multiple statements outside explicit blocks commit individually rather than sharing the simple message's implicit transaction boundary. Lexical splitting now respects quoted/commented semicolons. | `src/pgwire_server/handler.rs::do_query` |
 | Constraint timing | Immediate and deferred typed FKs both validate at publication; advertised statement-time FK behavior is unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity` |
 
 ## Resource and execution limits
@@ -45,6 +44,8 @@ admission authority and must not be treated as a hard resource bound.
 - GROUPING SETS, explicit/named window frames, `nth_value`, explicit `lag`/`lead`
   offsets and general index expressions are outside the supported subset;
   expression indexes currently cover arithmetic.
+- Transactional DDL is unsupported. Send DDL alone in simple Query messages,
+  outside explicit blocks; mixed or compound DDL messages are refused.
 - SQL isolation alternatives are not selectable. Legacy serializability tests do
   not qualify the replacement's read/range/catalog certification.
 - TLS is not terminated by OmenDB. Use loopback/private deployment or a TLS proxy;

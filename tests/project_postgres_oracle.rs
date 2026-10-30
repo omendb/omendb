@@ -7,7 +7,12 @@
 
 #![cfg(feature = "pgwire")]
 
+#[path = "common/simple_query_boundaries.rs"]
+mod simple_query_boundaries;
+
 use std::env;
+
+use futures::{TryStreamExt, pin_mut};
 
 use anyhow::{Context, Result, bail};
 use omendb::pgwire_server;
@@ -67,29 +72,32 @@ async fn connect(
 }
 
 async fn seed(client: &Client) -> Result<()> {
-    client
-        .batch_execute(
-            "CREATE TABLE oracle_groups (
-                 id BIGINT PRIMARY KEY,
-                 label TEXT NOT NULL
-             );
-             CREATE TABLE oracle_accounts (
-                 id BIGINT PRIMARY KEY,
-                 group_id BIGINT NOT NULL,
-                 balance BIGINT NOT NULL,
-                 state TEXT
-             );
-             INSERT INTO oracle_groups (id, label)
-             VALUES (10, 'retail'), (20, 'business');
-             INSERT INTO oracle_accounts (id, group_id, balance, state)
-             VALUES
-                 (1, 10, 100, 'open'),
-                 (2, 10, 40, 'open'),
-                 (3, 20, 10, 'closed'),
-                 (4, 20, 0, NULL);",
-        )
-        .await
-        .context("seed oracle schema")?;
+    // DDL is supported only in standalone messages, not SQL transaction blocks.
+    for statement in [
+        "CREATE TABLE oracle_groups (
+             id BIGINT PRIMARY KEY,
+             label TEXT NOT NULL
+         )",
+        "CREATE TABLE oracle_accounts (
+             id BIGINT PRIMARY KEY,
+             group_id BIGINT NOT NULL,
+             balance BIGINT NOT NULL,
+             state TEXT
+         )",
+        "INSERT INTO oracle_groups (id, label)
+         VALUES (10, 'retail'), (20, 'business');
+         INSERT INTO oracle_accounts (id, group_id, balance, state)
+         VALUES
+             (1, 10, 100, 'open'),
+             (2, 10, 40, 'open'),
+             (3, 20, 10, 'closed'),
+             (4, 20, 0, NULL)",
+    ] {
+        client
+            .batch_execute(statement)
+            .await
+            .context("seed oracle schema")?;
+    }
     Ok(())
 }
 
@@ -709,6 +717,102 @@ fn civil_from_days(days: i32) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Compare both transaction-visible effects and the completed response prefix.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn simple_query_boundaries_match_live_postgresql() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL)?;
+    let directory = tempdir()?;
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse()?,
+    ))
+    .await?;
+    let omen_url = format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    );
+    let (omen, omen_connection) = connect(&omen_url).await?;
+    let (omen_observer, omen_observer_connection) = connect(&omen_url).await?;
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+    let (postgres_observer, postgres_observer_connection) = connect(&postgres_url).await?;
+    postgres
+        .batch_execute("DROP TABLE IF EXISTS oracle_boundary_items")
+        .await?;
+    for client in [&omen, &postgres] {
+        client
+            .batch_execute("CREATE TABLE oracle_boundary_items (id BIGINT PRIMARY KEY)")
+            .await?;
+    }
+    for case in simple_query_boundaries::CASES {
+        for (engine, client, observer) in [
+            ("OmenDB", &omen, &omen_observer),
+            ("PostgreSQL", &postgres, &postgres_observer),
+        ] {
+            if !case.before.is_empty() {
+                client.batch_execute(case.before).await?;
+            }
+            let stream = client.simple_query_raw(case.query).await?;
+            pin_mut!(stream);
+            let mut completed = Vec::new();
+            let error = loop {
+                match stream.try_next().await {
+                    Ok(Some(tokio_postgres::SimpleQueryMessage::CommandComplete(rows))) => {
+                        completed.push(rows)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break None,
+                    Err(error) => break Some(error.code().context("SQLSTATE")?.code().to_owned()),
+                }
+            };
+            assert_eq!(error.as_deref(), case.error, "{engine}: {}", case.name);
+            assert_eq!(completed.len(), case.completions, "{engine}: {}", case.name);
+            // Every data command in this matrix inserts exactly one row;
+            // transaction controls complete with zero affected rows.
+            assert_eq!(
+                completed.iter().filter(|rows| **rows == 0).count(),
+                case.controls.len(),
+                "{engine}: {}",
+                case.name
+            );
+            let ids: Vec<i64> = observer
+                .query("SELECT id FROM oracle_boundary_items ORDER BY id", &[])
+                .await?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(ids, case.committed_ids, "{engine}: {}", case.name);
+            let probe = client.batch_execute("SELECT 1").await;
+            if case.status == b'E' {
+                assert_eq!(
+                    probe.unwrap_err().code(),
+                    Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION),
+                    "{engine}: {}",
+                    case.name
+                );
+            } else {
+                probe?;
+            }
+            client.batch_execute("ROLLBACK").await?;
+            observer
+                .batch_execute("DELETE FROM oracle_boundary_items")
+                .await?;
+        }
+    }
+    for client in [&omen, &postgres] {
+        client
+            .batch_execute("DROP TABLE oracle_boundary_items")
+            .await?;
+    }
+    drop((omen, omen_observer, postgres, postgres_observer));
+    server.shutdown().await?;
+    omen_connection.await??;
+    omen_observer_connection.await??;
+    postgres_connection.await??;
+    postgres_observer_connection.await??;
+    Ok(())
 }
 
 /// Dump/restore differential: an OmenDB dump must restore into real
