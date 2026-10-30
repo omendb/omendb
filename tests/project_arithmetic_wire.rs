@@ -1,6 +1,8 @@
 //! Scalar arithmetic errors must abort the statement and all earlier staged work.
 #![cfg(feature = "pgwire")]
 
+#[path = "common/expression_arithmetic_wire.rs"]
+mod expression_arithmetic_wire;
 #[path = "common/numeric_text.rs"]
 mod numeric_text;
 #[path = "common/scalar_arithmetic_wire.rs"]
@@ -28,6 +30,7 @@ async fn scalar_arithmetic_keeps_types_values_and_rollback_boundaries() -> Resul
     .await?;
     let connection = tokio::spawn(connection);
     scalar_arithmetic_wire::exercise(&client, false).await?;
+    expression_arithmetic_wire::exercise(&client).await?;
     drop(client);
     connection.await??;
     server.shutdown().await?;
@@ -54,6 +57,25 @@ async fn scalar_arithmetic_keeps_types_values_and_rollback_boundaries() -> Resul
             .rows,
         vec![vec![Value::I64(1)]]
     );
+    assert!(
+        reopened
+            .execute_sql("SELECT id FROM oracle_expression_saved")?
+            .rows
+            .is_empty()
+    );
+    let expression_index = reopened
+        .catalog()
+        .indexes()
+        .find(|index| reopened.catalog().index_name(index.id) == Some("oracle_expression_float"))
+        .unwrap()
+        .clone();
+    let rows = reopened.index_get(
+        expression_index.table,
+        expression_index.id,
+        &[Value::Float64(omendb::F64(5.0))],
+    )?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::I64(1));
     reopened.close()?;
     Ok(())
 }

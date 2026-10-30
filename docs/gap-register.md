@@ -39,10 +39,10 @@ admission authority and must not be treated as a hard resource bound.
   lack qualified schema-evolution support.
 - GROUPING SETS, explicit/named window frames, `nth_value`, explicit `lag`/`lead`
   offsets and general index expressions are outside the supported subset;
-  expression indexes currently cover arithmetic. Their evaluator still uses
-  separate numeric/error rules, including Float64 promotion for mixed signed
-  and unsigned integers; the scalar query/UPDATE arithmetic checks do not
-  qualify expression-index correctness.
+  expression indexes cover column-only arithmetic with the same bounded numeric
+  rules as scalar SQL. SQL expression-equality predicates currently fall back to
+  a full scan even when EXPLAIN names an expression index; native index lookups
+  use the maintained expression keys.
 - Transactional DDL is unsupported. Send DDL alone in simple Query messages,
   outside explicit blocks; mixed or compound DDL messages are refused.
   Multi-table drops do not reorder dependencies; drop referencing tables first.

@@ -45,11 +45,12 @@ fn column(id: u16) -> IndexExpression {
 fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
     use IndexKeyPart::{Column, Expression};
     let cases = [
-        ("unindexed floats", None, vec![], false),
+        ("unindexed floats", None, vec![], false, false),
         (
             "integer primary key",
             Some(vec![ColumnId(1), ColumnId(2)]),
             vec![],
+            false,
             false,
         ),
         (
@@ -57,13 +58,21 @@ fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
             Some(vec![ColumnId(1), ColumnId(3)]),
             vec![],
             true,
+            false,
         ),
-        ("integer index", None, vec![Column(ColumnId(1))], false),
-        ("float index", None, vec![Column(ColumnId(3))], true),
+        (
+            "integer index",
+            None,
+            vec![Column(ColumnId(1))],
+            false,
+            false,
+        ),
+        ("float index", None, vec![Column(ColumnId(3))], true, false),
         (
             "separate signed parts",
             None,
             vec![Column(ColumnId(1)), Column(ColumnId(2))],
+            false,
             false,
         ),
         (
@@ -71,11 +80,13 @@ fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
             None,
             vec![Expression(add(column(1), column(4)))],
             false,
+            false,
         ),
         (
             "signed arithmetic",
             None,
             vec![Expression(add(column(2), column(5)))],
+            false,
             false,
         ),
         (
@@ -86,11 +97,13 @@ fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
                 Expression(add(column(2), column(5))),
             ],
             false,
+            false,
         ),
         (
             "mixed arithmetic",
             None,
             vec![Expression(add(column(1), column(2)))],
+            true,
             true,
         ),
         (
@@ -98,21 +111,31 @@ fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
             None,
             vec![Expression(add(add(column(1), column(4)), column(2)))],
             true,
+            true,
         ),
         (
             "float expression leaf",
             None,
             vec![Expression(column(3))],
             true,
+            false,
+        ),
+        (
+            "homogeneous float arithmetic",
+            None,
+            vec![Expression(add(column(3), column(6)))],
+            true,
+            false,
         ),
         (
             "nested float expression",
             None,
             vec![Expression(add(column(1), add(column(2), column(3))))],
             true,
+            true,
         ),
     ];
-    for (name, primary, parts, affected) in cases {
+    for (name, primary, parts, float_keys, mixed_arithmetic) in cases {
         for unique in [false, true] {
             let mut catalog = Catalog::default();
             catalog
@@ -135,25 +158,99 @@ fn legacy_catalog_acceptance_depends_on_each_key_parts_possible_types() {
             let current =
                 encode_catalog_state(&catalog, &BTreeMap::new(), &BTreeMap::new()).unwrap();
             assert_eq!(decode_catalog_state(&current).unwrap().0, catalog, "{name}");
-            let mut legacy = current;
-            legacy[..4].copy_from_slice(LEGACY_CATALOG_MAGIC);
-            let decoded = decode_catalog_state(&legacy);
-            if affected {
-                assert!(
-                    matches!(decoded, Err(DbError::InvalidState(_))),
-                    "{name}: {decoded:?}"
-                );
-                // Malformed legacy state must still fail strict decoding, not
-                // masquerade as an otherwise valid unsupported encoding.
-                legacy.push(0);
-                assert!(matches!(
-                    decode_catalog_state(&legacy),
-                    Err(DbError::Corruption { .. })
-                ));
-            } else {
-                assert_eq!(decoded.unwrap().0, catalog, "{name}");
+            for (magic, affected) in [
+                (LEGACY_CATALOG_MAGIC, float_keys || mixed_arithmetic),
+                (LEGACY_ARITHMETIC_CATALOG_MAGIC, mixed_arithmetic),
+            ] {
+                let mut legacy = current.clone();
+                legacy[..4].copy_from_slice(magic);
+                let decoded = decode_catalog_state(&legacy);
+                if affected {
+                    assert!(
+                        matches!(decoded, Err(DbError::InvalidState(_))),
+                        "{name}: {decoded:?}"
+                    );
+                    // Invalid bytes still fail strict decoding before the
+                    // schema-dependent conversion check.
+                    legacy.push(0);
+                    assert!(matches!(
+                        decode_catalog_state(&legacy),
+                        Err(DbError::Corruption { .. })
+                    ));
+                } else {
+                    assert_eq!(decoded.unwrap().0, catalog, "{name}");
+                }
             }
         }
+    }
+}
+
+#[test]
+fn odc2_open_refuses_mixed_expression_keys_even_when_empty_without_rewriting() {
+    for populated in [false, true] {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("db");
+        let mut store = DirectSeerStore::create(&path, Options::for_test()).unwrap();
+        store.create_table(table(), None).unwrap();
+        store
+            .create_index(IndexDefinition {
+                id: IndexId(1),
+                table: TableId(1),
+                parts: vec![IndexKeyPart::Expression(add(column(1), column(2)))],
+                predicate: None,
+                unique: true,
+            })
+            .unwrap();
+        if populated {
+            store
+                .insert(
+                    TableId(1),
+                    Row {
+                        primary: Key::new(1, 1),
+                        values: vec![
+                            Value::U64(1),
+                            Value::I64(-1),
+                            Value::Float64(F64(2.0)),
+                            Value::U64(2),
+                            Value::I64(-2),
+                            Value::Float64(F64(3.0)),
+                        ],
+                    },
+                )
+                .unwrap();
+        }
+        let catalog_tree = store.catalog_tree;
+        store.close().unwrap();
+        drop(store);
+        let database = TransactionDatabase::open(&path, Options::for_test()).unwrap();
+        let mut tx = database.begin().unwrap();
+        let mut legacy = tx
+            .get(catalog_tree, DIRECT_CATALOG_MARKER)
+            .unwrap()
+            .unwrap();
+        legacy[..4].copy_from_slice(LEGACY_ARITHMETIC_CATALOG_MAGIC);
+        tx.put(catalog_tree, DIRECT_CATALOG_MARKER, &legacy)
+            .unwrap();
+        tx.commit().unwrap();
+        drop(tx);
+        let head = database.commit_sequence().unwrap();
+        database.close().unwrap();
+        drop(database);
+
+        assert!(matches!(DirectSeerStore::open(&path, Options::for_test()),
+            Err(DbError::InvalidState(reason)) if reason.contains("mixed-type expression-index arithmetic")));
+        let database = TransactionDatabase::open(&path, Options::for_test()).unwrap();
+        assert_eq!(database.commit_sequence().unwrap(), head);
+        let mut tx = database.begin().unwrap();
+        assert_eq!(
+            tx.get(catalog_tree, DIRECT_CATALOG_MARKER)
+                .unwrap()
+                .unwrap(),
+            legacy
+        );
+        tx.abort().unwrap();
+        drop(tx);
+        database.close().unwrap();
     }
 }
 
@@ -230,7 +327,7 @@ fn legacy_open_refuses_float_keys_without_rewriting_and_upgrades_safe_schema_ato
                 );
                 tx.abort().unwrap();
                 drop(tx);
-                // The first float key is built with ODC2 in the same decision.
+                // The first float key and new envelope publish in the same decision.
                 store
                     .create_index(IndexDefinition {
                         id: IndexId(1),

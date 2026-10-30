@@ -60,27 +60,37 @@ before it starts.
 
 ## Equality-key format upgrades
 
-New histories use the `ODC2` relational envelope. Float equality keys normalize
-signed zero and all NaN payloads; stored row values retain their original IEEE-754
-bits. Primary keys, secondary indexes and foreign-key probes share this encoding.
+New histories use the `ODC3` relational envelope, which declares shared bounded
+arithmetic for scalar SQL and expression-index keys. Mixed signed/unsigned
+integer expressions now retain exact, bounded signed results; mixed float
+expressions preserve operand order. Float equality keys still normalize signed
+zero and all NaN payloads; stored row values retain their original IEEE-754 bits.
+Primary keys, secondary indexes and foreign-key probes share this encoding.
 
 An `ODC1` history is refused if its schema can produce float equality keys:
 float primary-key columns, float index-key columns, or index expressions with
 float operands or mixed signed/unsigned integer arithmetic. Refusal applies even
 to empty affected tables and does not rewrite the catalog. Unindexed float row
 columns, integer keys and homogeneous integer expressions remain readable. Float
-partial-index predicates alone do not change key encoding. An unaffected history
+partial-index predicates alone do not change key encoding.
+
+Both `ODC1` and `ODC2` histories are also refused when an arithmetic index
+expression references columns of different types, including nested expressions.
+Their persisted keys may differ under the repaired arithmetic. This conservative
+schema check applies even to empty tables. Homogeneous expressions and separate
+composite key parts do not trigger this additional refusal. An unaffected history
 keeps its envelope during ordinary row and authorization writes; its next schema
-publication atomically writes `ODC2`. Previous binaries refuse that new envelope.
+publication atomically writes `ODC3`. Previous binaries refuse that new envelope.
 
 For an affected history, keep the original directory and binary available. Export
 with the previous binary and restore with the new binary into a fresh directory,
 using the [logical backup procedure](#backups). Review the script against the
 [known conversion limitations](gap-register.md) before restoring. Exports from
 older binaries can omit FK delete actions; correct those definitions explicitly.
-Restore rejects conflicting logical duplicates rather than dropping them; resolve those conflicts explicitly and retry in another fresh
-directory. A failed restore may leave committed chunks and is not a usable migrated
-database. Validate the result and reprovision native authorization before serving
+Restore rejects conflicting logical duplicates and out-of-range expression
+results rather than dropping rows; resolve those values explicitly and retry in
+another fresh directory. A failed restore may leave committed chunks and is not
+a usable migrated database. Validate the result and reprovision native authorization before serving
 it. There is no automatic in-place conversion.
 
 ## Principals and grants

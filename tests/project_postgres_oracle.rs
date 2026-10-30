@@ -11,6 +11,8 @@
 mod aggregate_sum;
 #[path = "common/aggregate_sum_wire.rs"]
 mod aggregate_sum_wire;
+#[path = "common/expression_arithmetic_wire.rs"]
+mod expression_arithmetic_wire;
 #[path = "common/numeric_text.rs"]
 mod numeric_text;
 #[path = "common/scalar_arithmetic_wire.rs"]
@@ -1093,7 +1095,14 @@ async fn scalar_arithmetic_matches_live_postgresql_reference() -> Result<()> {
     let (postgres, postgres_connection) = connect(&postgres_url).await?;
     scalar_arithmetic_wire::exercise(&omen, false).await?;
     scalar_arithmetic_wire::exercise(&postgres, true).await?;
-    for table in ["oracle_scalar_saved", "oracle_scalar_numbers"] {
+    expression_arithmetic_wire::exercise(&omen).await?;
+    expression_arithmetic_wire::exercise(&postgres).await?;
+    for table in [
+        "oracle_scalar_saved",
+        "oracle_scalar_numbers",
+        "oracle_expression_saved",
+        "oracle_expression_numbers",
+    ] {
         postgres
             .batch_execute(&format!("DROP TABLE {table}"))
             .await?;

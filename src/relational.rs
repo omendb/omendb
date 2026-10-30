@@ -139,8 +139,8 @@ impl IndexKeyPart {
 
 /// An index-key expression over stable column IDs: the typed subset the
 /// write path can evaluate for every mutated row without re-parsing
-/// SQL. Arithmetic and CASE mirror the SQL tier's `ComputedTerm`
-/// semantics; NULL propagates and skips the row (NULL keys never match).
+/// SQL. Arithmetic shares the scalar evaluator's bounded semantics;
+/// NULL propagates and skips the row (NULL keys never match).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexExpression {
     /// One column's value.
@@ -201,15 +201,26 @@ impl IndexExpression {
     /// checked semantics.
     pub fn evaluate(&self, table: &TableDefinition, row: &Row) -> Result<Option<Value>> {
         match self {
-            Self::Column(column) => Ok(Some(row.value(table, *column)?.clone())),
+            Self::Column(column) => Ok(match row.value(table, *column)? {
+                Value::Null => None,
+                value => Some(value.clone()),
+            }),
             Self::Arithmetic { left, op, right } => {
-                let Some(left) = left.evaluate(table, row)? else {
+                // Evaluate both children like scalar SQL before propagating
+                // NULL: a NULL left child must not hide an error on the right.
+                let left = left.evaluate(table, row)?;
+                let right = right.evaluate(table, row)?;
+                let (Some(left), Some(right)) = (left, right) else {
                     return Ok(None);
                 };
-                let Some(right) = right.evaluate(table, row)? else {
-                    return Ok(None);
+                use crate::arithmetic::Operator;
+                let op = match op {
+                    ArithmeticOperator::Add => Operator::Add,
+                    ArithmeticOperator::Subtract => Operator::Subtract,
+                    ArithmeticOperator::Multiply => Operator::Multiply,
+                    ArithmeticOperator::Divide => Operator::Divide,
                 };
-                apply_arithmetic(*op, &left, &right).map(Some)
+                crate::arithmetic::evaluate(op, &left, &right).map(Some)
             }
         }
     }
@@ -224,111 +235,6 @@ impl IndexExpression {
                 right.referenced_columns(sink)
             }
         }
-    }
-}
-
-/// Checked binary arithmetic over the numeric Value shapes the SQL tier
-/// supports; NULL operands were filtered by the caller. Same-shape
-/// integers stay exact (i64+i64, u64+u64); a float operand promotes the
-/// result to float64, matching the SQL tier's arithmetic promotion.
-fn apply_arithmetic(op: ArithmeticOperator, left: &Value, right: &Value) -> Result<Value> {
-    use crate::sql_types::F64;
-    match (left, right) {
-        (Value::Float64(a), Value::Float64(b)) => {
-            let (a, b) = (a.0, b.0);
-            let result = match op {
-                ArithmeticOperator::Add => a + b,
-                ArithmeticOperator::Subtract => a - b,
-                ArithmeticOperator::Multiply => a * b,
-                ArithmeticOperator::Divide => {
-                    if b == 0.0 {
-                        return Err(DbError::InvalidState(
-                            "division by zero in index expression".to_owned(),
-                        ));
-                    }
-                    a / b
-                }
-            };
-            Ok(Value::Float64(F64(result)))
-        }
-        (Value::Float64(a), other) | (other, Value::Float64(a)) => {
-            let b = other.as_f64_for_arithmetic().ok_or_else(|| {
-                DbError::InvalidState("index expression operands must be numeric".to_owned())
-            })?;
-            let a = a.0;
-            let result = match op {
-                ArithmeticOperator::Add => a + b,
-                ArithmeticOperator::Subtract => a - b,
-                ArithmeticOperator::Multiply => a * b,
-                ArithmeticOperator::Divide => {
-                    if b == 0.0 {
-                        return Err(DbError::InvalidState(
-                            "division by zero in index expression".to_owned(),
-                        ));
-                    }
-                    a / b
-                }
-            };
-            Ok(Value::Float64(F64(result)))
-        }
-        (Value::I64(a), Value::I64(b)) => {
-            let checked = match op {
-                ArithmeticOperator::Add => a.checked_add(*b),
-                ArithmeticOperator::Subtract => a.checked_sub(*b),
-                ArithmeticOperator::Multiply => a.checked_mul(*b),
-                ArithmeticOperator::Divide => {
-                    if *b == 0 {
-                        return Err(DbError::InvalidState(
-                            "division by zero in index expression".to_owned(),
-                        ));
-                    }
-                    a.checked_div(*b)
-                }
-            };
-            checked
-                .map(Value::I64)
-                .ok_or_else(|| DbError::InvalidState("index expression overflow".to_owned()))
-        }
-        (Value::U64(a), Value::U64(b)) => {
-            let checked = match op {
-                ArithmeticOperator::Add => a.checked_add(*b),
-                ArithmeticOperator::Subtract => a.checked_sub(*b),
-                ArithmeticOperator::Multiply => a.checked_mul(*b),
-                ArithmeticOperator::Divide => {
-                    if *b == 0 {
-                        return Err(DbError::InvalidState(
-                            "division by zero in index expression".to_owned(),
-                        ));
-                    }
-                    a.checked_div(*b)
-                }
-            };
-            checked
-                .map(Value::U64)
-                .ok_or_else(|| DbError::InvalidState("index expression overflow".to_owned()))
-        }
-        // Mixed i64/u64 promotes to float64: either order can exceed the
-        // other shape, so no exact integer result exists.
-        (Value::I64(a), Value::U64(b)) | (Value::U64(b), Value::I64(a)) => {
-            let (a, b) = (*a as f64, *b as f64);
-            let result = match op {
-                ArithmeticOperator::Add => a + b,
-                ArithmeticOperator::Subtract => a - b,
-                ArithmeticOperator::Multiply => a * b,
-                ArithmeticOperator::Divide => {
-                    if b == 0.0 {
-                        return Err(DbError::InvalidState(
-                            "division by zero in index expression".to_owned(),
-                        ));
-                    }
-                    a / b
-                }
-            };
-            Ok(Value::Float64(F64(result)))
-        }
-        _ => Err(DbError::InvalidState(
-            "index expression operands must be numeric".to_owned(),
-        )),
     }
 }
 
@@ -1107,16 +1013,6 @@ impl Value {
         Ok(())
     }
 
-    /// Numeric view for index-expression arithmetic promotion.
-    pub(crate) fn as_f64_for_arithmetic(&self) -> Option<f64> {
-        match self {
-            Self::I64(v) => Some(*v as f64),
-            Self::U64(v) => Some(*v as f64),
-            Self::Float64(v) => Some(v.0),
-            _ => None,
-        }
-    }
-
     pub(crate) fn matches(&self, data_type: ColumnType) -> bool {
         matches!(
             (self, data_type),
@@ -1607,9 +1503,8 @@ pub(crate) fn index_values_key(
                     )));
                 }
             }
-            // Expression parts accept the static result type they were
-            // validated against at DDL time; the key bytes are the same
-            // encoding the write path produced.
+            // Expression lookups take already-computed keys in the exact
+            // result Value shape, encoded identically to the write path.
             IndexKeyPart::Expression(_) => {}
         }
         value.encode_for_key(&mut bytes)?;

@@ -22,9 +22,10 @@ mod authorization;
 #[cfg(test)]
 mod format_tests;
 
-// ODC2 declares canonical float equality keys; the catalog slot stays fixed
-// so schema publication still fences transactions opened against either format.
-const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC2";
+// ODC3 also declares shared bounded expression arithmetic. Keep the catalog
+// slot fixed so schema publication fences transactions opened on older formats.
+const DIRECT_CATALOG_MAGIC: &[u8; 4] = b"ODC3";
+const LEGACY_ARITHMETIC_CATALOG_MAGIC: &[u8; 4] = b"ODC2";
 const LEGACY_CATALOG_MAGIC: &[u8; 4] = b"ODC1";
 const DIRECT_CATALOG_MARKER: &[u8] = b"\x00omendb/direct/catalog/v1";
 const MAX_CATALOG_BYTES: usize = 16 * 1024 * 1024;
@@ -1391,7 +1392,9 @@ fn decode_catalog_state(
     BTreeMap<IndexId, TreeId>,
 )> {
     let legacy = bytes.get(..4) == Some(LEGACY_CATALOG_MAGIC);
-    if bytes.len() > MAX_CATALOG_BYTES || (!legacy && bytes.get(..4) != Some(DIRECT_CATALOG_MAGIC))
+    let legacy_arithmetic = legacy || bytes.get(..4) == Some(LEGACY_ARITHMETIC_CATALOG_MAGIC);
+    if bytes.len() > MAX_CATALOG_BYTES
+        || (!legacy_arithmetic && bytes.get(..4) != Some(DIRECT_CATALOG_MAGIC))
     {
         return Err(DbError::Corruption {
             artifact: "direct SeerDB catalog",
@@ -1451,7 +1454,41 @@ fn decode_catalog_state(
                 .to_owned(),
         ));
     }
+    if legacy_arithmetic && catalog_has_mixed_arithmetic_keys(&catalog)? {
+        return Err(DbError::InvalidState(
+            "legacy mixed-type expression-index arithmetic (ODC1/ODC2) requires explicit conversion: \
+             export with the previous binary and restore into a fresh database; \
+             resolve out-of-range values and conflicting logical duplicates explicitly and \
+             reprovision native authorization"
+                .to_owned(),
+        ));
+    }
     Ok((catalog, table_trees, index_trees))
+}
+
+/// Homogeneous arithmetic retains every previously valid key. Mixed-type
+/// expressions may change operand order, result type or precision, including
+/// inside nested expressions. Refuse the schema even if its tables are empty.
+fn catalog_has_mixed_arithmetic_keys(catalog: &Catalog) -> Result<bool> {
+    use crate::{IndexExpression, IndexKeyPart};
+
+    for index in catalog.indexes() {
+        let table = catalog.table(index.table)?;
+        for part in &index.parts {
+            if let IndexKeyPart::Expression(expression @ IndexExpression::Arithmetic { .. }) = part
+            {
+                let mut types = BTreeSet::new();
+                expression.referenced_columns(&mut |column| {
+                    types.insert(table.column(column)?.data_type);
+                    Ok(())
+                })?;
+                if types.len() > 1 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// ODC1 is readable only where the new codec leaves every possible key unchanged.

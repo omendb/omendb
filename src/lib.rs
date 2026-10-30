@@ -10,6 +10,7 @@
 //! backend and a bounded SQL/wire implementation. It is not yet the target
 //! concurrent, restart-safe native relational engine.
 
+mod arithmetic;
 mod authorization;
 mod fault;
 mod model;

@@ -833,6 +833,9 @@ pub(super) fn plan_index_expression(
 ) -> Result<crate::IndexExpression> {
     use crate::{ArithmeticOperator, IndexExpression};
 
+    if let Expr::Nested(inner) = expression {
+        return plan_index_expression(table, inner);
+    }
     if let Some(position) = column_position(table, expression)? {
         return Ok(IndexExpression::Column(table.columns[position].id));
     }
@@ -865,46 +868,10 @@ pub(super) fn plan_index_expression(
 /// arithmetic shape. The typed tree persists in the catalog, so the write
 /// path never re-parses SQL.
 fn index_key_part(table: &TableDefinition, expression: &Expr) -> Result<crate::IndexKeyPart> {
-    use crate::{ArithmeticOperator, IndexExpression, IndexKeyPart};
-
-    // Plain column.
     if let Some(position) = column_position(table, expression)? {
-        return Ok(IndexKeyPart::Column(table.columns[position].id));
+        return Ok(crate::IndexKeyPart::Column(table.columns[position].id));
     }
-
-    pub(super) fn plan_expression(
-        table: &TableDefinition,
-        expression: &Expr,
-    ) -> Result<IndexExpression> {
-        if let Some(position) = column_position(table, expression)? {
-            return Ok(IndexExpression::Column(table.columns[position].id));
-        }
-        let Expr::BinaryOp { left, op, right } = expression else {
-            return Err(unsupported(
-                "CREATE INDEX",
-                "index keys support columns and +, -, *, / arithmetic over them",
-            ));
-        };
-        let op = match op {
-            sqlparser::ast::BinaryOperator::Plus => ArithmeticOperator::Add,
-            sqlparser::ast::BinaryOperator::Minus => ArithmeticOperator::Subtract,
-            sqlparser::ast::BinaryOperator::Multiply => ArithmeticOperator::Multiply,
-            sqlparser::ast::BinaryOperator::Divide => ArithmeticOperator::Divide,
-            other => {
-                return Err(unsupported(
-                    "CREATE INDEX",
-                    &format!("index expression operator {other} is not supported"),
-                ));
-            }
-        };
-        Ok(IndexExpression::Arithmetic {
-            left: Box::new(plan_expression(table, left)?),
-            op,
-            right: Box::new(plan_expression(table, right)?),
-        })
-    }
-
-    Ok(IndexKeyPart::Expression(plan_expression(
+    Ok(crate::IndexKeyPart::Expression(plan_index_expression(
         table, expression,
     )?))
 }
