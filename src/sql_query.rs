@@ -6,9 +6,8 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    Catalog, ColumnId, DbError, IndexDefinition, IndexId, RelationalDatabase,
-    RelationalDatabaseTransaction, Result, Row, RowIdentity, SqlColumn, SqlResult, TableDefinition,
-    Value,
+    Catalog, ColumnId, DbError, IndexId, RelationalDatabase, RelationalDatabaseTransaction, Result,
+    Row, RowIdentity, SqlColumn, SqlResult, TableDefinition, Value,
 };
 
 use super::arithmetic::evaluate as arithmetic;
@@ -445,8 +444,6 @@ fn resolve_scalar_subqueries(
     Ok(resolved)
 }
 
-/// DISTINCT deduplicates projected rows preserving first-seen order
-/// (PostgreSQL applies DISTINCT after projection, before LIMIT).
 /// The row-access decision the executor makes for one table and
 /// predicate. Pure over (catalog, table, predicate, params): both
 /// execution and `EXPLAIN` resolve it so a named plan never disagrees
@@ -455,32 +452,16 @@ fn resolve_scalar_subqueries(
 pub(super) enum PredicatePlan {
     /// One row through its exact primary-key identity.
     PrimaryKeyLookup { primary_key: Vec<ColumnId> },
-    /// A secondary index whose full key the predicate binds; the scan
-    /// runs against that index. `key_parts` describes each bound key
-    /// component so EXPLAIN can name it: a plain column or an
-    /// expression rendered as SQL text.
+    /// A plain-column secondary index whose full key the predicate binds.
     IndexScan {
         index_id: IndexId,
         columns: Vec<ColumnId>,
     },
-    /// An index scan over at least one expression key part; bound by
-    /// matching `expression = literal` equality terms. The label names
-    /// every key part in index order for EXPLAIN.
-    ExpressionIndexScan {
-        index_id: IndexId,
-        labels: Vec<String>,
-    },
-    /// The predicate pins a primary-key column to NULL: nothing can
+    /// A modeled equality compares a column to NULL: nothing can
     /// match and execution short-circuits to no rows.
     NullShortCircuit,
 }
 
-/// Resolve the access plan for `selection` over `table` exactly as the
-/// executor does: same term collection, same coverage checks, same
-/// most-bound-columns index choice with the lowest id breaking ties.
-/// `Ok(None)` means the caller falls back to a scan because the
-/// predicate shape is not modeled, or no fast path applies, so the
-/// caller scans every row (the executor's `None` contract).
 /// Resolve the single-table SELECT's target and WHERE for EXPLAIN.
 /// Mirrors execute_query's table resolution without executing: rejects
 /// the same shapes the executor rejects.
@@ -517,6 +498,8 @@ pub(crate) fn table_name_from_insert(
     Ok(resolved.name.clone())
 }
 
+/// Resolve only executable access paths. An unmodeled predicate requires a
+/// table scan, even when its modeled prefix binds an otherwise usable index.
 pub(super) fn resolve_predicate_plan(
     catalog: &Catalog,
     table: &TableDefinition,
@@ -526,156 +509,61 @@ pub(super) fn resolve_predicate_plan(
     let Some(selection) = selection else {
         return Ok(None);
     };
-    let mut terms: Vec<(usize, Value)> = Vec::new();
-    // A predicate the plain column-term collector cannot model can still
-    // be an expression-equality an expression index binds, so a `false`
-    // here must not end planning outright.
-    let plain_modeled = collect_equality_terms(selection, table, params, &mut terms)?;
-    let expression_terms = if plain_modeled {
-        Vec::new()
-    } else {
-        expression_equality_expressions(selection, table)?
-    };
-    if expression_terms.is_empty() && !plain_modeled {
+    let mut terms = Vec::new();
+    if !collect_equality_terms(selection, table, params, &mut terms)? {
         return Ok(None);
     }
     if terms.iter().any(|(_, value)| matches!(value, Value::Null)) {
         return Ok(Some(PredicatePlan::NullShortCircuit));
     }
-    if let Some(primary_key) = catalog.primary_key(table.id)
-        && columns_covered_exactly_once(primary_key, table, &terms)
-    {
+    let primary_key = catalog.primary_key(table.id).unwrap_or_default();
+    if !primary_key.is_empty() && columns_covered_exactly_once(primary_key, table, &terms) {
         return Ok(Some(PredicatePlan::PrimaryKeyLookup {
             primary_key: primary_key.to_vec(),
         }));
     }
-    let primary_key = catalog.primary_key(table.id);
-    // Query bindings: plain column positions, plus any `expr = literal`
-    // equalities whose expression matches an index key part structurally.
-    // Collect expression-shaped equalities separately; each that matches
-    // an index part binds it.
-    let mut candidates: Vec<&IndexDefinition> = catalog
+    let candidate = catalog
         .indexes()
         .filter(|index| index.table == table.id)
-        .filter(|index| !index.parts.is_empty())
-        .filter(|index| {
-            // A partial index applies only when the query predicate
-            // implies its WHERE clause: every predicate term must be
-            // bound to the same value in the query's terms.
-            index.predicate.as_ref().is_none_or(|predicate| {
-                predicate.terms.iter().all(|(column, value)| {
-                    table
-                        .columns
-                        .iter()
-                        .position(|candidate| candidate.id == *column)
-                        .is_some_and(|position| {
-                            terms.iter().any(|(term_position, term_value)| {
-                                *term_position == position && term_value == value
-                            })
-                        })
-                })
-            })
-        })
-        .filter(|index| {
-            index.parts.iter().any(|part| match part {
-                crate::IndexKeyPart::Column(column) => {
-                    !primary_key.unwrap_or_default().contains(column)
-                }
-                crate::IndexKeyPart::Expression(_) => true,
-            })
-        })
-        .filter(|index| {
-            // Every part must be bound: columns by equality terms,
-            // expressions by structurally matching expression terms.
-            index.parts.iter().all(|part| match part {
-                crate::IndexKeyPart::Column(column) => terms
-                    .iter()
-                    .any(|(position, _)| table.columns[*position].id == *column),
-                crate::IndexKeyPart::Expression(expression) => expression_terms
-                    .iter()
-                    .any(|(planned, _)| planned == expression),
-            })
-        })
-        .collect();
-    // Plain-column indexes keep the exact-once rule, with one exception:
-    // a partial index's query legitimately carries extra terms (the
-    // predicate's own equalities), so its columns must each be bound
-    // exactly once while the query may bind more. Expression indexes
-    // accept any full binding. Most parts first; lowest id breaks ties.
-    candidates.retain(|index| {
-        let plain = index
-            .parts
-            .iter()
-            .all(|part| matches!(part, crate::IndexKeyPart::Column(_)));
-        if !plain {
-            return true;
-        }
-        let index_columns: Vec<ColumnId> = index
-            .parts
-            .iter()
-            .map(|part| part.as_column().expect("plain-column guarded"))
-            .collect();
-        if index.predicate.is_some() {
-            // Partial: every indexed column bound exactly once; the
-            // predicate's terms may bind additional columns.
-            index_columns.iter().all(|column| {
-                terms
-                    .iter()
-                    .filter(|(position, _)| table.columns[*position].id == *column)
-                    .count()
-                    == 1
-            })
-        } else {
-            columns_covered_exactly_once(&index_columns, table, &terms)
-        }
-    });
-    candidates.sort_by(|left, right| {
-        let plain_left = left
-            .parts
-            .iter()
-            .all(|part| matches!(part, crate::IndexKeyPart::Column(_)));
-        let plain_right = right
-            .parts
-            .iter()
-            .all(|part| matches!(part, crate::IndexKeyPart::Column(_)));
-        plain_left
-            .cmp(&plain_right)
-            .then(right.parts.len().cmp(&left.parts.len()))
-            .then(left.id.cmp(&right.id))
-    });
-    Ok(candidates.first().map(|index| {
-        let has_expression = index
-            .parts
-            .iter()
-            .any(|part| matches!(part, crate::IndexKeyPart::Expression(_)));
-        if has_expression {
-            PredicatePlan::ExpressionIndexScan {
-                index_id: index.id,
-                labels: index
-                    .parts
-                    .iter()
-                    .map(|part| match part {
-                        crate::IndexKeyPart::Column(column) => table
-                            .column(*column)
-                            .map(|definition| definition.name.clone())
-                            .unwrap_or_default(),
-                        crate::IndexKeyPart::Expression(expression) => {
-                            expression.to_sql_text(table).unwrap_or_default()
-                        }
+        .filter_map(|index| {
+            // Native expression indexes remain maintained, but SQL cannot
+            // bind their typed lookup keys yet. Never advertise that path.
+            let columns: Vec<ColumnId> = index
+                .parts
+                .iter()
+                .map(crate::IndexKeyPart::as_column)
+                .collect::<Option<_>>()?;
+            if columns.is_empty() || columns.iter().all(|column| primary_key.contains(column)) {
+                return None;
+            }
+            if let Some(predicate) = &index.predicate
+                && !predicate.terms.iter().all(|(column, value)| {
+                    terms.iter().any(|(position, term)| {
+                        table.columns[*position].id == *column && term == value
                     })
-                    .collect(),
+                })
+            {
+                return None;
             }
-        } else {
-            PredicatePlan::IndexScan {
-                index_id: index.id,
-                columns: index
-                    .parts
-                    .iter()
-                    .map(|part| part.as_column().expect("plain-column guarded"))
-                    .collect(),
-            }
-        }
-    }))
+            let covered = if index.predicate.is_some() {
+                // Partial-index predicates may bind additional columns.
+                columns.iter().all(|column| {
+                    terms
+                        .iter()
+                        .filter(|(position, _)| table.columns[*position].id == *column)
+                        .count()
+                        == 1
+                })
+            } else {
+                columns_covered_exactly_once(&columns, table, &terms)
+            };
+            covered.then_some((index.id, columns))
+        })
+        // Most bound columns first; the lowest ID breaks ties.
+        .min_by(|(left_id, left), (right_id, right)| {
+            right.len().cmp(&left.len()).then(left_id.cmp(right_id))
+        });
+    Ok(candidate.map(|(index_id, columns)| PredicatePlan::IndexScan { index_id, columns }))
 }
 
 /// Candidate rows for SELECT/UPDATE/DELETE: the primary-key identity
@@ -722,45 +610,6 @@ pub(super) fn predicate_candidate_rows(
             rows.sort_by_key(|left| left.primary);
             Ok(Some(rows))
         }
-        Some(PredicatePlan::ExpressionIndexScan { index_id, .. }) => {
-            let Some(selection) = selection else {
-                return Ok(None);
-            };
-            let index =
-                database.catalog().index(index_id).cloned().ok_or_else(|| {
-                    DbError::InvalidState("planned index does not exist".to_owned())
-                })?;
-            let mut terms: Vec<(usize, Value)> = Vec::new();
-            if !collect_equality_terms(selection, table, params, &mut terms)? {
-                return Ok(None);
-            }
-            let expression_terms = expression_equality_expressions(selection, table)?;
-            // Bind each key part in index order: columns from the query
-            // terms, expressions from structurally matching equalities.
-            let mut values = Vec::with_capacity(index.parts.len());
-            for part in &index.parts {
-                match part {
-                    crate::IndexKeyPart::Column(column) => {
-                        values.push(bound_values(&[*column], table, &terms)?[0].clone());
-                    }
-                    crate::IndexKeyPart::Expression(expression) => {
-                        let bound = expression_terms
-                            .iter()
-                            .find(|(planned, _)| planned == expression)
-                            .map(|(_, value)| value.clone())
-                            .ok_or_else(|| {
-                                DbError::InvalidState(
-                                    "expression index part is not bound".to_owned(),
-                                )
-                            })?;
-                        values.push(bound);
-                    }
-                }
-            }
-            let mut rows = transaction.index_get(database, table.id, index_id, &values)?;
-            rows.sort_by_key(|left| left.primary);
-            Ok(Some(rows))
-        }
         // Unmodeled predicate shape or no predicate: the caller scans.
         None => Ok(None),
     }
@@ -801,53 +650,6 @@ fn bound_values(
         values.push(value);
     }
     Ok(values)
-}
-
-/// Collect `expression = literal` equalities from an AND chain whose
-/// left side plans as an index expression (arithmetic over columns).
-/// Returns (typed tree, literal value) pairs for structural matching
-/// against expression index parts.
-fn expression_equality_expressions(
-    selection: &Expr,
-    table: &TableDefinition,
-) -> Result<Vec<(crate::IndexExpression, Value)>> {
-    fn collect(
-        selection: &Expr,
-        table: &TableDefinition,
-        out: &mut Vec<(crate::IndexExpression, Value)>,
-    ) -> Result<()> {
-        match selection {
-            Expr::Nested(inner) => collect(inner, table, out),
-            Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::And => {
-                collect(left, table, out)?;
-                collect(right, table, out)
-            }
-            Expr::BinaryOp { left, op, right } if op == &sqlparser::ast::BinaryOperator::Eq => {
-                // One side must be a literal; the other plans as an
-                // expression over columns. Plain columns stay in the
-                // column-term path.
-                let value = if let Ok(value) = literal_value(left, &[]) {
-                    (right, value)
-                } else if let Ok(value) = literal_value(right, &[]) {
-                    (left, value)
-                } else {
-                    return Ok(());
-                };
-                if column_position(table, value.0)?.is_some() {
-                    return Ok(());
-                }
-                match super::schema::plan_index_expression(table, value.0) {
-                    Ok(planned) => out.push((planned, value.1)),
-                    Err(_) => return Ok(()),
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-    let mut out = Vec::new();
-    collect(selection, table, &mut out)?;
-    Ok(out)
 }
 
 /// Collect AND-joined `column = literal` terms. Returns `Ok(false)` when

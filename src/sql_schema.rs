@@ -824,9 +824,7 @@ fn column_id_by_name(table: &TableDefinition, name: &str, role: &str) -> Result<
         .ok_or_else(|| DbError::InvalidState(format!("{role} column {name} does not exist")))
 }
 
-/// Translate one WHERE/INDEX key expression into the typed index tree
-/// the catalog persists. Shared by DDL (CREATE INDEX) and the planner
-/// (matching `expr = literal` equality terms to expression index parts).
+/// Translate one index key expression into the typed tree persisted by DDL.
 pub(super) fn plan_index_expression(
     table: &TableDefinition,
     expression: &Expr,

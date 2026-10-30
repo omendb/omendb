@@ -487,21 +487,20 @@ fn expression_indexes_compute_keys_and_match_queries() {
     // (3,4)=7 and (0,7)=7.
     assert_eq!(result.rows.len(), 2);
 
-    // EXPLAIN shows the expression index with the rendered expression.
-    let explained = database
-        .execute_sql("EXPLAIN SELECT id FROM positions WHERE x + y = 7")
-        .expect("explain expression lookup");
-    let Value::Text(plan) = &explained.rows[0][0] else {
-        panic!(
-            "EXPLAIN result must be text, got {:?}",
-            explained.rows[0][0]
-        );
-    };
-    assert!(
-        plan.contains("Index Scan using manhattan_idx"),
-        "plan was: {plan}"
+    // Native probes exercise expression keys; SQL expression predicates scan.
+    let index = database
+        .catalog()
+        .indexes()
+        .find(|index| database.catalog().index_name(index.id) == Some("manhattan_idx"))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        database
+            .index_get(index.table, index.id, &[Value::I64(7)])
+            .unwrap()
+            .len(),
+        2
     );
-    assert!(plan.contains("+"), "plan was: {plan}");
 
     // Reopen: the catalog round-trips the expression tree.
     database.close().expect("close");
@@ -510,16 +509,17 @@ fn expression_indexes_compute_keys_and_match_queries() {
         .execute_sql("SELECT id FROM positions WHERE x + y = 7")
         .expect("expression lookup after reopen");
     assert_eq!(result.rows.len(), 2);
-    let explained = database
-        .execute_sql("EXPLAIN SELECT id FROM positions WHERE x + y = 7")
-        .expect("explain after reopen");
-    let Value::Text(plan) = &explained.rows[0][0] else {
-        panic!(
-            "EXPLAIN result must be text, got {:?}",
-            explained.rows[0][0]
-        );
-    };
-    assert!(plan.contains("manhattan_idx"), "plan was: {plan}");
+    assert_eq!(
+        database.catalog().index_name(index.id),
+        Some("manhattan_idx")
+    );
+    assert_eq!(
+        database
+            .index_get(index.table, index.id, &[Value::I64(7)])
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]

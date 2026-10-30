@@ -21,14 +21,13 @@ pub(crate) enum AccessPath {
     /// One row fetched through its exact primary-key identity.
     PrimaryKeyLookup { table: String },
     /// Rows fetched through one secondary index whose full key the
-    /// predicate binds; `columns` names each key part (a column or a
-    /// rendered expression).
+    /// predicate binds; `columns` names each bound column.
     IndexScan {
         table: String,
         index: String,
         columns: Vec<String>,
     },
-    /// The predicate pins a primary-key column to NULL: nothing can
+    /// A modeled equality compares a column to NULL: nothing can
     /// match and the executor short-circuits to no rows.
     NullShortCircuit { table: String },
     /// Every table row is read and filtered.
@@ -122,36 +121,22 @@ fn explain_table_predicate(
         Some(PredicatePlan::NullShortCircuit) => AccessPath::NullShortCircuit {
             table: table.name.clone(),
         },
-        Some(PredicatePlan::IndexScan { index_id, .. })
-        | Some(PredicatePlan::ExpressionIndexScan { index_id, .. }) => {
-            let definition = database
+        Some(PredicatePlan::IndexScan { index_id, columns }) => AccessPath::IndexScan {
+            table: table.name.clone(),
+            index: database
                 .catalog()
-                .index(index_id)
-                .ok_or_else(|| DbError::InvalidState("index is missing".to_owned()))?;
-            AccessPath::IndexScan {
-                table: table.name.clone(),
-                index: database
-                    .catalog()
-                    .index_name(index_id)
-                    .unwrap_or("unnamed")
-                    .to_owned(),
-                columns: definition
-                    .parts
-                    .iter()
-                    .map(|part| match part {
-                        crate::IndexKeyPart::Column(column) => table
-                            .columns
-                            .iter()
-                            .find(|candidate| candidate.id == *column)
-                            .map(|candidate| candidate.name.clone())
-                            .unwrap_or_else(|| format!("column {}", column.0)),
-                        crate::IndexKeyPart::Expression(expression) => expression
-                            .to_sql_text(table)
-                            .unwrap_or_else(|_| format!("expression over table {}", table.name)),
-                    })
-                    .collect(),
-            }
-        }
+                .index_name(index_id)
+                .unwrap_or("unnamed")
+                .to_owned(),
+            columns: columns
+                .iter()
+                .map(|column| {
+                    table
+                        .column(*column)
+                        .map(|definition| definition.name.clone())
+                })
+                .collect::<Result<_>>()?,
+        },
         None => AccessPath::SeqScan {
             table: table.name.clone(),
         },
