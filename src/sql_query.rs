@@ -2393,115 +2393,26 @@ impl JoinedAggregation {
     }
 
     fn values(&self, rows: &[Vec<Value>]) -> Result<Vec<Value>> {
-        let plans = &self.plans;
-        let mut result = vec![Value::U64(rows.len() as u64); plans.len()];
-        for (index, (kind, position)) in plans.iter().enumerate() {
-            result[index] = match kind {
-                JoinedAggregate::CountStar => Value::U64(rows.len() as u64),
-                JoinedAggregate::CountColumn => Value::U64(
-                    rows.iter()
-                        .filter(|row| !matches!(&row[position.expect("resolved")], Value::Null))
-                        .count() as u64,
-                ),
-                JoinedAggregate::Sum | JoinedAggregate::Min | JoinedAggregate::Max => {
-                    let mut accumulator: Option<Value> = None;
-                    for row in rows {
-                        let value = &row[position.expect("resolved")];
-                        if matches!(value, Value::Null) {
-                            continue;
-                        }
-                        accumulator = Some(match (kind, accumulator.take()) {
-                            (JoinedAggregate::Min, Some(current)) => {
-                                if joined_value_ordering(value, &current) == Ordering::Less {
-                                    value.clone()
-                                } else {
-                                    current
-                                }
-                            }
-                            (JoinedAggregate::Max, Some(current)) => {
-                                if joined_value_ordering(value, &current) == Ordering::Greater {
-                                    value.clone()
-                                } else {
-                                    current
-                                }
-                            }
-                            (JoinedAggregate::Sum, Some(Value::U64(current))) => match value {
-                                Value::U64(addend) => Value::U64(current + addend),
-                                Value::I64(addend) => Value::I64(current as i64 + addend),
-                                other => {
-                                    return Err(DbError::InvalidState(format!(
-                                        "cannot sum {other:?}"
-                                    )));
-                                }
-                            },
-                            (JoinedAggregate::Sum, Some(Value::I64(current))) => match value {
-                                Value::I64(addend) => Value::I64(current + addend),
-                                Value::U64(addend) => Value::I64(current + *addend as i64),
-                                other => {
-                                    return Err(DbError::InvalidState(format!(
-                                        "cannot sum {other:?}"
-                                    )));
-                                }
-                            },
-                            // Float and decimal sums accumulate in their own
-                            // domain: floats add in f64, decimals align scales
-                            // exactly (the same rule as the morsel executor).
-                            (JoinedAggregate::Sum, Some(Value::Float64(current))) => match value {
-                                Value::Float64(addend) => {
-                                    Value::Float64(crate::sql_types::F64::new(current.0 + addend.0))
-                                }
-                                other => {
-                                    return Err(DbError::InvalidState(format!(
-                                        "cannot sum {other:?}"
-                                    )));
-                                }
-                            },
-                            (JoinedAggregate::Sum, Some(Value::Decimal(current))) => match value {
-                                Value::Decimal(addend) => {
-                                    let target = current.scale.max(addend.scale);
-                                    let left = current.rescale(target).map_err(|_| {
-                                        DbError::SqlNumericValueOutOfRange(
-                                            "decimal sum overflow".to_owned(),
-                                        )
-                                    })?;
-                                    let right = addend.rescale(target).map_err(|_| {
-                                        DbError::SqlNumericValueOutOfRange(
-                                            "decimal sum overflow".to_owned(),
-                                        )
-                                    })?;
-                                    let mantissa = left
-                                        .mantissa
-                                        .checked_add(right.mantissa)
-                                        .ok_or_else(|| {
-                                            DbError::SqlNumericValueOutOfRange(
-                                                "decimal sum overflow".to_owned(),
-                                            )
-                                        })?;
-                                    Value::Decimal(
-                                        crate::sql_types::DecimalValue::new(mantissa, target)
-                                            .map_err(|_| {
-                                                DbError::SqlNumericValueOutOfRange(
-                                                    "decimal sum overflow".to_owned(),
-                                                )
-                                            })?,
-                                    )
-                                }
-                                other => {
-                                    return Err(DbError::InvalidState(format!(
-                                        "cannot sum {other:?}"
-                                    )));
-                                }
-                            },
-                            (_, None) => value.clone(),
-                            _ => unreachable!("min/max handled above"),
-                        });
-                    }
-                    accumulator.unwrap_or(Value::Null)
-                }
-            };
-        }
+        use crate::morsel::{AggregateAccumulator, AggregateKind};
 
-        Ok(result)
+        self.plans
+            .iter()
+            .map(|(kind, position)| {
+                let aggregate = match kind {
+                    JoinedAggregate::CountStar => return Ok(Value::U64(rows.len() as u64)),
+                    JoinedAggregate::CountColumn => AggregateKind::Count,
+                    JoinedAggregate::Sum => AggregateKind::Sum,
+                    JoinedAggregate::Min => AggregateKind::Min,
+                    JoinedAggregate::Max => AggregateKind::Max,
+                };
+                let mut accumulator = AggregateAccumulator::new(aggregate);
+                let position = position.expect("non-wildcard aggregate has a resolved column");
+                for row in rows {
+                    accumulator.update(Some(&row[position]))?;
+                }
+                Ok(accumulator.finalize())
+            })
+            .collect()
     }
 }
 

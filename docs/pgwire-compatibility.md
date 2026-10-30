@@ -3,10 +3,11 @@
 This is the current development evidence for OmenDB's deliberately bounded
 PostgreSQL wire surface. It is a compatibility record, not a claim that OmenDB
 implements PostgreSQL. The ordinary behavior and negative-path evidence lives
-in `tests/project_pgwire_server.rs` and `tests/project_transaction_controls.rs`:
+in `tests/project_pgwire_server.rs`, `tests/project_transaction_controls.rs`, and
+`tests/project_aggregate_wire.rs`:
 
 ```bash
-cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls
+cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls --test project_aggregate_wire
 ```
 
 The [gap register](gap-register.md) qualifies this evidence. Integrity and
@@ -95,6 +96,21 @@ and type OIDs for a representative typed workload in every CI run.
 
 Known divergence: `NUMERIC(p,s)` typmods are accepted in DDL but not stored
 or enforced (values track their own scale, like unconstrained `NUMERIC`).
+
+## Aggregate result limits
+
+`SUM` returns NULL without non-NULL inputs, including all-NULL groups and window
+frames. Integer sums retain the argument's signed or unsigned 64-bit domain;
+running-total overflow fails with `22003` and aborts the transaction, rather than
+clamping or wrapping. There is no automatic widening to PostgreSQL's
+`SUM(bigint)` result type, `NUMERIC`. `AVG` currently returns `FLOAT8` for all
+numeric inputs, unlike PostgreSQL's exact numeric average for integer and
+numeric inputs.
+
+`tests/project_aggregate_wire.rs` exercises empty inputs, boundaries, overflow
+and rollback through real clients. The live aggregate oracle explicitly casts
+PostgreSQL sums to `BIGINT` to check the bounded result domain; it does not
+qualify PostgreSQL's default aggregate result types.
 
 ## SQL workload coverage
 

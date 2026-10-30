@@ -129,6 +129,9 @@ pub struct AggregateSpec {
 }
 
 /// State accumulator for an aggregate function.
+///
+/// Same-type integer sums do not widen: overflow is an error. SUM without any
+/// non-NULL input finalizes to NULL, not integer zero.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AggregateAccumulator {
     Count(u64),
@@ -157,6 +160,8 @@ impl AggregateAccumulator {
     }
 
     pub fn update(&mut self, value: Option<&Value>) -> Result<()> {
+        let integer_overflow =
+            || DbError::SqlNumericValueOutOfRange("integer SUM overflow".to_owned());
         match self {
             Self::Count(count) => {
                 if let Some(val) = value {
@@ -237,8 +242,13 @@ impl AggregateAccumulator {
             Self::SumI64(sum) => {
                 if let Some(val) = value {
                     match val {
-                        Value::I64(i) => *sum = sum.saturating_add(*i),
-                        Value::U64(u) => *sum = sum.saturating_add(*u as i64),
+                        Value::I64(i) => {
+                            *sum = sum.checked_add(*i).ok_or_else(integer_overflow)?;
+                        }
+                        Value::U64(u) => {
+                            *sum = i64::try_from(i128::from(*sum) + i128::from(*u))
+                                .map_err(|_| integer_overflow())?;
+                        }
                         Value::Null => {}
                         _ => {
                             return Err(DbError::InvalidState(
@@ -251,10 +261,15 @@ impl AggregateAccumulator {
             Self::SumU64(sum) => {
                 if let Some(val) = value {
                     match val {
-                        Value::U64(u) => *sum = sum.saturating_add(*u),
-                        Value::I64(i) if *i >= 0 => *sum = sum.saturating_add(*i as u64),
+                        Value::U64(u) => {
+                            *sum = sum.checked_add(*u).ok_or_else(integer_overflow)?;
+                        }
+                        Value::I64(i) if *i >= 0 => {
+                            *sum = sum.checked_add(*i as u64).ok_or_else(integer_overflow)?;
+                        }
                         Value::I64(i) => {
-                            let converted = (*sum as i64).saturating_add(*i);
+                            let converted = i64::try_from(i128::from(*sum) + i128::from(*i))
+                                .map_err(|_| integer_overflow())?;
                             *self = Self::SumI64(converted);
                         }
                         Value::Null => {}
@@ -329,7 +344,7 @@ impl AggregateAccumulator {
     pub fn finalize(self) -> Value {
         match self {
             Self::Count(count) => Value::U64(count),
-            Self::SumUnset => Value::U64(0),
+            Self::SumUnset => Value::Null,
             Self::SumI64(sum) => Value::I64(sum),
             Self::SumU64(sum) => Value::U64(sum),
             Self::SumF64(sum) => Value::Float64(crate::sql_types::F64::new(sum)),
@@ -589,8 +604,7 @@ mod tests {
 
         assert_eq!(count.finalize(), Value::U64(3));
         assert_eq!(sum.finalize(), Value::U64(60));
-        // AVG returns float8 for every input type, like PostgreSQL's
-        // documented numeric result rendered through the wire as float.
+        // AVG currently returns float8 for every input type.
         assert_eq!(
             avg.finalize(),
             Value::Float64(crate::sql_types::F64::new(20.0))

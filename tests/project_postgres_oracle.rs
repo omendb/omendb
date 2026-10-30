@@ -7,6 +7,10 @@
 
 #![cfg(feature = "pgwire")]
 
+#[path = "common/aggregate_sum.rs"]
+mod aggregate_sum;
+#[path = "common/aggregate_sum_wire.rs"]
+mod aggregate_sum_wire;
 #[path = "common/simple_query_boundaries.rs"]
 mod simple_query_boundaries;
 
@@ -970,6 +974,60 @@ async fn immediate_foreign_keys_match_live_postgresql() -> Result<()> {
         "oracle_timing_children",
         "oracle_timing_parents",
     ] {
+        postgres
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await?;
+    }
+    drop((omen, postgres));
+    server.shutdown().await?;
+    omen_connection.await??;
+    postgres_connection.await??;
+    Ok(())
+}
+
+/// Compare NULLs, fixed bounded result types and overflow rollback. PostgreSQL's
+/// reference explicitly casts SUM(bigint) to BIGINT; its default NUMERIC widening
+/// is not part of OmenDB's current aggregate contract.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn bounded_integer_sums_match_live_postgresql_reference() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL)?;
+    let directory = tempdir()?;
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse()?,
+    ))
+    .await?;
+    let (omen, omen_connection) = connect(&format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    ))
+    .await?;
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+    aggregate_sum_wire::exercise(&omen, false).await?;
+    aggregate_sum_wire::exercise(&postgres, true).await?;
+    for values in [
+        None,
+        Some("(1, 1, NULL), (2, 1, NULL)"),
+        Some("(1, 1, -7), (2, 1, 7)"),
+    ] {
+        for client in [&omen, &postgres] {
+            client.batch_execute("DELETE FROM aggregate_items").await?;
+            if let Some(values) = values {
+                client
+                    .batch_execute(&format!("INSERT INTO aggregate_items VALUES {values}"))
+                    .await?;
+            }
+        }
+        for &(name, omen_sql, postgres_sql) in aggregate_sum::CASES {
+            assert_eq!(
+                snapshot(&omen, omen_sql, &[]).await?,
+                snapshot(&postgres, postgres_sql, &[]).await?,
+                "{name}"
+            );
+        }
+    }
+    for table in ["aggregate_saved", "aggregate_items", "aggregate_groups"] {
         postgres
             .batch_execute(&format!("DROP TABLE {table}"))
             .await?;

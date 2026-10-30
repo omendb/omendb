@@ -29,6 +29,9 @@ admission authority and must not be treated as a hard resource bound.
 
 - `NUMERIC(p,s)` modifiers are not enforced. U64 dumps as `NUMERIC(20,0)` for
   PostgreSQL, which has no matching unsigned integer type.
+- Integer `SUM` keeps a bounded 64-bit running total rather than PostgreSQL's
+  `SUM(bigint)` widening to `NUMERIC`; overflow fails with `22003`. `AVG` returns
+  `FLOAT8` even for integer and numeric inputs, rather than an exact numeric result.
 - SET NOT NULL, ALTER TYPE on constrained columns and appended non-null defaults
   lack qualified schema-evolution support.
 - GROUPING SETS, explicit/named window frames, `nth_value`, explicit `lag`/`lead`
