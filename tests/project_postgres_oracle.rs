@@ -11,10 +11,16 @@
 mod aggregate_sum;
 #[path = "common/aggregate_sum_wire.rs"]
 mod aggregate_sum_wire;
+#[path = "common/numeric_text.rs"]
+mod numeric_text;
+#[path = "common/scalar_arithmetic_wire.rs"]
+mod scalar_arithmetic_wire;
 #[path = "common/simple_query_boundaries.rs"]
 mod simple_query_boundaries;
 
 use std::env;
+
+use numeric_text::NumericText;
 
 use futures::{TryStreamExt, pin_mut};
 
@@ -597,93 +603,6 @@ impl<'a> FromSql<'a> for TimestampText {
     }
 }
 
-/// NUMERIC: ndigits | weight | sign | dscale | base-10000 groups ->
-/// PostgreSQL-normalized text.
-struct NumericText(String);
-
-impl<'a> FromSql<'a> for NumericText {
-    fn from_sql(
-        _ty: &Type,
-        raw: &'a [u8],
-    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() < 8 || !raw.len().is_multiple_of(2) {
-            return Err("numeric width".into());
-        }
-        let be16 = |offset: usize| u16::from_be_bytes([raw[offset], raw[offset + 1]]);
-        let ndigits = be16(0) as usize;
-        if raw.len() != 8 + ndigits * 2 {
-            return Err("numeric group count".into());
-        }
-        let weight = i16::from_be_bytes([raw[2], raw[3]]) as i64;
-        let sign = be16(4);
-        let dscale = be16(6) as usize;
-        let groups: Vec<u16> = (0..ndigits).map(|i| be16(8 + i * 2)).collect();
-
-        let mut text = String::new();
-        if sign == 0x4000 {
-            text.push('-');
-        }
-        if groups.is_empty() {
-            text.push('0');
-            if dscale > 0 {
-                text.push('.');
-                for _ in 0..dscale {
-                    text.push('0');
-                }
-            }
-            return Ok(NumericText(text));
-        }
-        // Integer part: groups [0..weight+1) when weight >= 0.
-        let int_group_count = usize::try_from(weight + 1).unwrap_or(0);
-        let (int_groups, frac_groups) = if groups.len() >= int_group_count && weight >= 0 {
-            (&groups[..int_group_count], &groups[int_group_count..])
-        } else {
-            (&[] as &[u16], &groups[..])
-        };
-        let mut int_part = String::new();
-        for (index, group) in int_groups.iter().enumerate() {
-            if index == 0 {
-                int_part.push_str(&group.to_string());
-            } else {
-                int_part.push_str(&format!("{group:04}"));
-            }
-        }
-        if int_part.is_empty() {
-            text.push('0');
-        } else {
-            text.push_str(&int_part);
-        }
-        if dscale > 0 {
-            // Fraction digits from the groups below 10^0, padded to 4,
-            // then fixed to exactly dscale digits.
-            let mut frac_digits = String::new();
-            let mut remaining_groups = frac_groups.to_vec();
-            if weight < 0 {
-                // All groups are fractional; leading zero digits sit
-                // between the decimal point and the first group.
-                let leading_zeros = (-weight - 1) * 4;
-                for _ in 0..leading_zeros {
-                    frac_digits.push('0');
-                }
-                remaining_groups = groups.clone();
-            }
-            for group in &remaining_groups {
-                frac_digits.push_str(&format!("{group:04}"));
-            }
-            while frac_digits.len() < dscale {
-                frac_digits.push('0');
-            }
-            frac_digits.truncate(dscale);
-            text.push('.');
-            text.push_str(&frac_digits);
-        }
-        Ok(NumericText(text))
-    }
-    fn accepts(ty: &Type) -> bool {
-        ty == &Type::NUMERIC
-    }
-}
-
 /// UUID: 16 raw bytes -> canonical hyphenated lowercase hex.
 struct UuidText(String);
 
@@ -1151,6 +1070,38 @@ async fn schema_mutation_batches_match_live_postgresql() -> Result<()> {
     server.shutdown().await?;
     omen_connection.await??;
     postgres_connection.await??;
+    Ok(())
+}
+
+/// Check values, bound signatures and failure ownership against PostgreSQL.
+/// Numeric division compares an explicit reference scale, not PG's default.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn scalar_arithmetic_matches_live_postgresql_reference() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL)?;
+    let directory = tempdir()?;
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse()?,
+    ))
+    .await?;
+    let (omen, omen_connection) = connect(&format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    ))
+    .await?;
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+    scalar_arithmetic_wire::exercise(&omen, false).await?;
+    scalar_arithmetic_wire::exercise(&postgres, true).await?;
+    for table in ["oracle_scalar_saved", "oracle_scalar_numbers"] {
+        postgres
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await?;
+    }
+    drop((omen, postgres));
+    omen_connection.await??;
+    postgres_connection.await??;
+    server.shutdown().await?;
     Ok(())
 }
 

@@ -236,14 +236,11 @@ fn typed_aggregates_and_arithmetic() {
         vec![vec![Value::Decimal(DecimalValue::new(250, 2).unwrap())]]
     );
 
-    // Float division by zero yields infinity (PostgreSQL float8).
-    let inf = session
-        .execute_sql(&control, "SELECT ratio / 0.0 FROM samples WHERE id = 1")
-        .expect("q");
-    assert_eq!(
-        inf.rows,
-        vec![vec![Value::Float64(F64::new(f64::INFINITY))]]
-    );
+    // PostgreSQL float8 division by zero is a statement error, not infinity.
+    assert!(matches!(
+        session.execute_sql(&control, "SELECT ratio / 0.0 FROM samples WHERE id = 1"),
+        Err(omendb::DbError::SqlDivisionByZero)
+    ));
 }
 
 #[test]

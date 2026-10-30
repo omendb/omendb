@@ -3,11 +3,11 @@
 This is the current development evidence for OmenDB's deliberately bounded
 PostgreSQL wire surface. It is a compatibility record, not a claim that OmenDB
 implements PostgreSQL. The ordinary behavior and negative-path evidence lives
-in `tests/project_pgwire_server.rs`, `tests/project_transaction_controls.rs`, and
-`tests/project_aggregate_wire.rs`:
+in `tests/project_pgwire_server.rs`, `tests/project_transaction_controls.rs`,
+`tests/project_aggregate_wire.rs`, and `tests/project_arithmetic_wire.rs`:
 
 ```bash
-cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls --test project_aggregate_wire
+cargo test --features pgwire --test project_pgwire_server --test project_transaction_controls --test project_aggregate_wire --test project_arithmetic_wire
 ```
 
 The [gap register](gap-register.md) qualifies this evidence. Integrity and
@@ -91,11 +91,29 @@ and type OIDs for a representative typed workload in every CI run.
 | `FLOAT8` / `DOUBLE PRECISION` | IEEE-754 bits | PostgreSQL float8 binary; NaN/Infinity text forms | SQL float total order: all NaNs compare equal and sort greatest, `-0 == 0`; equality keys canonicalize these classes, row bits are retained | `typed_scalar_subset_matches_live_postgres`, `project_typed_values.rs` |
 | `DATE` | days since Unix epoch | i32 days since 2000-01-01 | Proleptic Gregorian, no timezone | `typed_scalar_subset_matches_live_postgres`, date parse/format unit tests |
 | `TIMESTAMP` (without time zone) | microseconds since Unix epoch | i64 microseconds since 2000-01-01 | Microsecond precision, no timezone | `typed_scalar_subset_matches_live_postgres` |
-| `NUMERIC` / `DECIMAL` | i128 mantissa + scale | PostgreSQL base-10000 groups, decimal-point-aligned weight, u16 dscale | Exact decimal arithmetic (PG divide rule: result scale = dscale + divisor digits + 4); stored rows keep dscale (`1.50` round-trips), equality keys normalize trailing zeros (`1.50 == 1.5`) | `typed_scalar_subset_matches_live_postgres`, `tests/project_typed_values.rs` |
+| `NUMERIC` / `DECIMAL` | i128 mantissa + scale | PostgreSQL base-10000 groups, decimal-point-aligned weight, u16 dscale | Bounded decimal arithmetic; division rounds half away from zero; stored rows keep dscale (`1.50` round-trips), equality keys normalize trailing zeros (`1.50 == 1.5`) | `typed_scalar_subset_matches_live_postgres`, `tests/project_typed_values.rs` |
 | `UUID` | 128 raw bits | PostgreSQL uuid binary | Canonical hex text parse/format | `typed_scalar_subset_matches_live_postgres` |
 
 Known divergence: `NUMERIC(p,s)` typmods are accepted in DDL but not stored
-or enforced (values track their own scale, like unconstrained `NUMERIC`).
+or enforced. Decimal values and intermediate rescaling have a bounded precision:
+`mantissa digits + scale <= 38`. Division uses result scale `dividend scale +
+divisor mantissa digits + 4`, with checked i128 intermediates. This is not
+PostgreSQL's arbitrary-precision numeric division or its default result scale.
+
+Scalar arithmetic propagates NULL. Integer results keep the bound 64-bit domain:
+two U64 operands produce U64, while mixed I64/U64 operands produce I64. Integer
+division truncates toward zero and remainder follows the dividend's sign.
+Out-of-range integer/decimal arithmetic fails with `22003`; integer, decimal and
+float division by zero fail with `22012` (NaN float numerators remain NaN).
+These errors abort the transaction,
+including earlier staged writes. UPDATE's supported `+`/`-` assignments share
+the query evaluator's exact integer/decimal promotion before target coercion.
+
+`tests/project_arithmetic_integrity.rs` and `tests/project_arithmetic_wire.rs`
+exercise values, fixed signatures, error codes and rollback through durable
+reopen. The live scalar-arithmetic oracle explicitly rounds PostgreSQL numeric
+division to the tested bounded result scale; it does not qualify PostgreSQL's
+full numeric or floating-point arithmetic semantics.
 
 ## Aggregate result limits
 

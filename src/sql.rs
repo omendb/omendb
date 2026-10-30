@@ -38,6 +38,7 @@ pub(crate) mod typed_input {
 #[path = "sql_write.rs"]
 mod write;
 
+mod arithmetic;
 pub(crate) mod binding;
 mod control;
 #[path = "sql/explain.rs"]

@@ -519,7 +519,7 @@ pub(crate) fn coerce_value(value: Value, column: &ColumnDefinition) -> Result<Va
     // type when the value fits, mirroring sql_primary_key's rule. String
     // literals convert into the column's type like PostgreSQL input parsing.
     let value = match (&value, column.data_type) {
-        (Value::I64(inner), ColumnType::U64) if *inner >= 0 => {
+        (Value::I64(inner), ColumnType::U64) => {
             Value::U64(u64::try_from(*inner).map_err(|_| {
                 DbError::SqlNumericValueOutOfRange(format!(
                     "value does not fit SQL column {}",

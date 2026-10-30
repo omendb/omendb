@@ -27,8 +27,11 @@ admission authority and must not be treated as a hard resource bound.
 
 ## Supported-subset and operational gaps
 
-- `NUMERIC(p,s)` modifiers are not enforced. U64 dumps as `NUMERIC(20,0)` for
-  PostgreSQL, which has no matching unsigned integer type.
+- `NUMERIC(p,s)` modifiers are not enforced. Decimal arithmetic has bounded
+  precision and checked i128 intermediates; division uses a bounded result-scale
+  rule, not PostgreSQL's arbitrary-precision division or default result scale.
+  U64 dumps as `NUMERIC(20,0)` for PostgreSQL, which has no matching unsigned
+  integer type. See the [scalar limits](pgwire-compatibility.md#scalar-value-types).
 - Integer `SUM` keeps a bounded 64-bit running total rather than PostgreSQL's
   `SUM(bigint)` widening to `NUMERIC`; overflow fails with `22003`. `AVG` returns
   `FLOAT8` even for integer and numeric inputs, rather than an exact numeric result.
@@ -36,7 +39,10 @@ admission authority and must not be treated as a hard resource bound.
   lack qualified schema-evolution support.
 - GROUPING SETS, explicit/named window frames, `nth_value`, explicit `lag`/`lead`
   offsets and general index expressions are outside the supported subset;
-  expression indexes currently cover arithmetic.
+  expression indexes currently cover arithmetic. Their evaluator still uses
+  separate numeric/error rules, including Float64 promotion for mixed signed
+  and unsigned integers; the scalar query/UPDATE arithmetic checks do not
+  qualify expression-index correctness.
 - Transactional DDL is unsupported. Send DDL alone in simple Query messages,
   outside explicit blocks; mixed or compound DDL messages are refused.
   Multi-table drops do not reorder dependencies; drop referencing tables first.

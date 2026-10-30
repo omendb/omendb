@@ -225,10 +225,9 @@ fn ignored_sql_parse_bind_and_execution_errors_abort_the_native_transaction() {
         ("UPDATE items SET email = 'same'", |e| {
             matches!(e, DbError::UniqueViolation { .. })
         }),
-        (
-            "UPDATE items SET n = n + 9223372036854775792",
-            |e| matches!(e, DbError::InvalidState(reason) if reason == "integer assignment overflow"),
-        ),
+        ("UPDATE items SET n = n + 9223372036854775792", |e| {
+            matches!(e, DbError::SqlNumericValueOutOfRange(_))
+        }),
         ("INSERT nonsense", |e| matches!(e, DbError::SqlParse(_))),
         ("SELECT $1", |e| matches!(e, DbError::SqlParameter(_))),
         ("SELECT * FROM missing", |e| {
