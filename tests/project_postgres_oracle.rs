@@ -815,6 +815,172 @@ async fn simple_query_boundaries_match_live_postgresql() -> Result<()> {
     Ok(())
 }
 
+/// Immediate FK failures belong to the statement, not its eventual COMMIT.
+#[tokio::test]
+#[ignore = "requires a live PostgreSQL oracle"]
+async fn immediate_foreign_keys_match_live_postgresql() -> Result<()> {
+    let postgres_url = env::var(POSTGRES_ORACLE_URL)?;
+    let directory = tempdir()?;
+    let server = pgwire_server::RunningServer::start(pgwire_server::ServerConfig::new(
+        directory.path().join("db"),
+        "127.0.0.1:0".parse()?,
+    ))
+    .await?;
+    let (omen, omen_connection) = connect(&format!(
+        "host=127.0.0.1 port={} user=omendb",
+        server.local_addr().port()
+    ))
+    .await?;
+    let (postgres, postgres_connection) = connect(&postgres_url).await?;
+    postgres
+        .batch_execute(
+            "DROP TABLE IF EXISTS oracle_timing_nodes;
+         DROP TABLE IF EXISTS oracle_timing_children;
+         DROP TABLE IF EXISTS oracle_timing_parents",
+        )
+        .await?;
+    for (engine, client) in [("OmenDB", &omen), ("PostgreSQL", &postgres)] {
+        for sql in [
+            "CREATE TABLE oracle_timing_parents (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE oracle_timing_children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES oracle_timing_parents(id))",
+            "CREATE TABLE oracle_timing_nodes (id BIGINT PRIMARY KEY, code BIGINT, link BIGINT, UNIQUE (code), FOREIGN KEY (link) REFERENCES oracle_timing_nodes(code))",
+            "INSERT INTO oracle_timing_parents VALUES (1)",
+            "INSERT INTO oracle_timing_children VALUES (10, 1)",
+        ] {
+            client
+                .batch_execute(sql)
+                .await
+                .with_context(|| format!("{engine} seed: {sql}"))?;
+        }
+        for statement in [
+            "INSERT INTO oracle_timing_children VALUES (11, 7)",
+            "UPDATE oracle_timing_children SET parent_id = 7 WHERE id = 10",
+            "DELETE FROM oracle_timing_parents WHERE id = 1",
+        ] {
+            client.batch_execute("BEGIN").await?;
+            client
+                .execute("INSERT INTO oracle_timing_parents VALUES (2)", &[])
+                .await?;
+            let failure = client.execute(statement, &[]).await.unwrap_err();
+            assert_eq!(
+                failure.code(),
+                Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION),
+                "{engine}: {statement}"
+            );
+            let repair = client
+                .execute("INSERT INTO oracle_timing_parents VALUES (7)", &[])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                repair.code(),
+                Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION),
+                "{engine}"
+            );
+            client.batch_execute("COMMIT").await?;
+            let ids: Vec<i64> = client
+                .query("SELECT id FROM oracle_timing_parents ORDER BY id", &[])
+                .await?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert_eq!(ids, [1], "{engine}: no prefix may publish");
+            let child = client
+                .query_one(
+                    "SELECT parent_id FROM oracle_timing_children WHERE id = 10",
+                    &[],
+                )
+                .await?;
+            assert_eq!(child.get::<_, i64>(0), 1, "{engine}");
+        }
+        let stream = client
+            .simple_query_raw(
+                "INSERT INTO oracle_timing_parents VALUES (2);
+             INSERT INTO oracle_timing_children VALUES (11, 7);
+             INSERT INTO oracle_timing_parents VALUES (7)",
+            )
+            .await?;
+        pin_mut!(stream);
+        let mut completions = 0;
+        loop {
+            match stream.try_next().await {
+                Ok(Some(tokio_postgres::SimpleQueryMessage::CommandComplete(_))) => {
+                    completions += 1
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    bail!("{engine}: an immediate violation was repaired by a later statement")
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.code(),
+                        Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION),
+                        "{engine}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            completions, 1,
+            "{engine}: the bad statement must not complete"
+        );
+        let ids: Vec<i64> = client
+            .query("SELECT id FROM oracle_timing_parents ORDER BY id", &[])
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(ids, [1], "{engine}: the implicit prefix must roll back");
+
+        client.batch_execute("BEGIN").await?;
+        for sql in [
+            "INSERT INTO oracle_timing_nodes VALUES (1, 1, 2), (2, 2, 1)",
+            "UPDATE oracle_timing_nodes SET code = code + 10, link = link + 10",
+        ] {
+            assert_eq!(client.execute(sql, &[]).await?, 2, "{engine}: {sql}");
+        }
+        let links: Vec<(i64, i64)> = client
+            .query(
+                "SELECT code, link FROM oracle_timing_nodes ORDER BY id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(links, [(11, 12), (12, 11)], "{engine}");
+        assert_eq!(
+            client
+                .execute("DELETE FROM oracle_timing_nodes", &[])
+                .await?,
+            2,
+            "{engine}"
+        );
+        client.batch_execute("COMMIT").await?;
+        assert!(
+            client
+                .query("SELECT id FROM oracle_timing_nodes", &[])
+                .await?
+                .is_empty(),
+            "{engine}"
+        );
+    }
+    for table in [
+        "oracle_timing_nodes",
+        "oracle_timing_children",
+        "oracle_timing_parents",
+    ] {
+        postgres
+            .batch_execute(&format!("DROP TABLE {table}"))
+            .await?;
+    }
+    drop((omen, postgres));
+    server.shutdown().await?;
+    omen_connection.await??;
+    postgres_connection.await??;
+    Ok(())
+}
+
 /// Dump/restore differential: an OmenDB dump must restore into real
 /// PostgreSQL and reproduce the same logical content. This is the
 /// data-in/data-out trust gate — if a dump cannot move data into

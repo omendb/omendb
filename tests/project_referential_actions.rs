@@ -1,7 +1,6 @@
-//! Legacy direct-adapter referential-action evidence: Restrict, Cascade and
-//! SetNull, with bounded cascade staging and publication-time FK validation.
-//! Target timing and schema-transaction rules are owned by the relational design;
-//! these tests do not establish immediate-statement semantics or qualify vNext.
+//! Direct-adapter referential actions, bounded cascade staging and FK
+//! certification. Statement timing has separate coverage in
+//! project_constraint_timing.rs; these tests do not qualify vNext.
 
 use omendb::{
     ColumnDefinition, ColumnId, ColumnType, ConstraintId, ForeignKeyDefinition, IndexDefinition,
@@ -285,7 +284,7 @@ fn set_null_activation_refuses_non_nullable_fk_column() {
 }
 
 #[test]
-fn staged_cascade_resolves_when_transaction_reinserts_the_child() {
+fn cascade_effects_are_readable_before_transaction_commit() {
     let (_dir, mut database) = setup();
     seed(&mut database);
     database
@@ -294,14 +293,14 @@ fn staged_cascade_resolves_when_transaction_reinserts_the_child() {
     let (_, _commit) = database
         .transaction(|database, transaction| {
             transaction.delete(database, PARENTS, key_of(PARENTS, 1))?;
-            // The cascaded delete of the child is already staged; the
-            // publication fixpoint must accept a re-insert that leaves a
-            // consistent final state. Grandchildren's link column is
-            // nullable, so a parentless insert is representable.
+            // The complete delete, including its cascade, passed immediate
+            // validation. Later operations see the staged child deletion.
+            assert!(transaction.scan(database, CHILDREN, 10)?.is_empty());
+            // No FK governs grandchildren here; a parentless insert is valid.
             transaction.insert(database, GRANDCHILDREN, row(GRANDCHILDREN, 31, None))?;
             Ok(())
         })
-        .expect("transaction with staged cascade resolves");
+        .expect("transaction with staged cascade");
     assert!(database.scan(PARENTS, 10).expect("parents").is_empty());
     assert!(database.scan(CHILDREN, 10).expect("children").is_empty());
     // Only the CHILDREN->PARENTS cascade exists here; grandchild 21 keeps

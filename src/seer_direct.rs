@@ -11,9 +11,10 @@ use std::path::Path;
 use seerdb::{CommitSeq, Error as SeerError, Options, Transaction, TransactionDatabase, TreeId};
 
 use crate::relational::{
-    Catalog, ColumnId, ForeignKeyDefinition, IndexDefinition, RelationalSchemaDefinition, Row,
-    TableDefinition, TableId, Value, encode_catalog, encode_row, foreign_key_values,
-    index_values_key, row_from_storage_identity, row_identity_bytes, row_index_key,
+    Catalog, ColumnId, ConstraintTiming, ForeignKeyDefinition, IndexDefinition,
+    RelationalSchemaDefinition, Row, TableDefinition, TableId, Value, encode_catalog, encode_row,
+    foreign_key_values, index_values_key, row_from_storage_identity, row_identity_bytes,
+    row_index_key,
 };
 use crate::{DbError, IndexId, Key, Result};
 
@@ -791,6 +792,7 @@ pub(crate) struct DirectTransaction {
     transaction: Transaction,
     catalog_tree: TreeId,
     rows_changed: bool,
+    needs_immediate_validation: bool,
     /// Heap (primary-key-less) inserts this transaction has staged. The
     /// engine-allocated identity is derived from the durable transaction
     /// ID so identities are unique without a durable counter: TxnIds
@@ -826,6 +828,7 @@ impl DirectTransaction {
             transaction,
             catalog_tree: store.catalog_tree,
             rows_changed: false,
+            needs_immediate_validation: false,
             heap_inserts: 0,
         })
     }
@@ -1002,6 +1005,7 @@ impl DirectTransaction {
             )));
         }
         self.rows_changed = true;
+        self.needs_immediate_validation = true;
         self.transaction
             .put(tree, &identity, &encode_row(&row)?)
             .map_err(map_seer_error)?;
@@ -1024,6 +1028,7 @@ impl DirectTransaction {
         let previous = row_from_storage_identity(&self.catalog, &definition, &identity, &bytes)?;
         self.stage_indexes_for(table, &definition, &previous, &identity, false)?;
         self.rows_changed = true;
+        self.needs_immediate_validation = true;
         self.transaction
             .put(tree, &identity, &encode_row(&row)?)
             .map_err(map_seer_error)?;
@@ -1041,6 +1046,7 @@ impl DirectTransaction {
             .ok_or_else(|| DbError::InvalidState("row does not exist".to_owned()))?;
         let row = row_from_storage_identity(&self.catalog, &definition, identity, &bytes)?;
         self.rows_changed = true;
+        self.needs_immediate_validation = true;
         self.transaction
             .delete(tree, identity)
             .map_err(map_seer_error)?;
@@ -1051,8 +1057,8 @@ impl DirectTransaction {
     /// Expand `ON DELETE` actions for one deleted parent row. Cascaded
     /// deletions and NULL updates are staged eagerly so later staged reads
     /// observe them; cycles terminate because deleted rows vanish from the
-    /// staged view. `Restrict` is enforced by commit-time referential
-    /// validation instead.
+    /// staged view. `Restrict` is enforced by referential validation at the
+    /// operation boundary or publication, according to the constraint timing.
     fn expand_referential_actions(
         &mut self,
         parent_table: TableId,
@@ -1187,13 +1193,23 @@ impl DirectTransaction {
         Ok(())
     }
 
-    /// Publish every staged change atomically after validating immediate
-    /// foreign-key constraints against the transaction's own final state.
+    /// Check only dirty row state at the complete operation/statement boundary.
+    /// Authorization-only and read-only operations acquire no FK dependencies.
+    pub(crate) fn validate_immediate_constraints(&mut self) -> Result<()> {
+        if self.needs_immediate_validation {
+            self.validate_referential_integrity(Some(ConstraintTiming::Immediate))?;
+            self.needs_immediate_validation = false;
+        }
+        Ok(())
+    }
+
+    /// Publish every staged change atomically after validating all foreign keys,
+    /// including deferred constraints, against the transaction's final state.
     pub(crate) fn commit(mut self) -> Result<CommitSeq> {
         // Authorization-only commits do not inspect relational rows or
         // acquire FK dependencies on already-authorized concurrent work.
         if self.rows_changed {
-            self.validate_referential_integrity()?;
+            self.validate_referential_integrity(None)?;
         }
         self.transaction
             .commit()
@@ -1201,15 +1217,16 @@ impl DirectTransaction {
             .map(|p| p.csn)
     }
 
-    /// Validate every foreign key in the catalog against the transaction's
+    /// Validate matching foreign keys (all timings when `None`) against the
     /// snapshot-plus-staged state. Every non-null child reference must have
     /// a matching entry in the referenced table's unique covering index.
-    fn validate_referential_integrity(&mut self) -> Result<()> {
-        if self.catalog.foreign_keys().next().is_none() {
-            return Ok(());
-        }
-        let foreign_keys: Vec<ForeignKeyDefinition> =
-            self.catalog.foreign_keys().cloned().collect();
+    fn validate_referential_integrity(&mut self, timing: Option<ConstraintTiming>) -> Result<()> {
+        let foreign_keys: Vec<ForeignKeyDefinition> = self
+            .catalog
+            .foreign_keys()
+            .filter(|foreign_key| timing.is_none_or(|timing| foreign_key.timing == timing))
+            .cloned()
+            .collect();
         for foreign_key in foreign_keys {
             let parts = resolve_foreign_key_parts(&self.catalog, &foreign_key)?;
 

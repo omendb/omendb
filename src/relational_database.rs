@@ -466,15 +466,19 @@ impl RelationalDatabase {
         Ok(CommitId(commit.get()))
     }
 
-    /// Apply several mutations in one atomic transaction.
+    /// Apply several mutations as one atomic operation. Immediate foreign keys
+    /// check the complete batch, including references to later mutations.
     pub fn commit_batch(
         &mut self,
         mutations: impl IntoIterator<Item = RelationalMutation>,
     ) -> Result<CommitId> {
         let mut transaction = self.begin()?;
-        for mutation in mutations {
-            transaction.stage_mutation(self, mutation)?;
-        }
+        transaction.operation(self, |transaction| {
+            for mutation in mutations {
+                transaction.stage_mutation(self, mutation)?;
+            }
+            Ok(())
+        })?;
         transaction.commit()
     }
 
@@ -692,6 +696,7 @@ pub struct RelationalDatabaseTransaction {
     snapshot: CommitId,
     catalog_version: u64,
     wrote: bool,
+    in_operation: bool,
     control: Option<OperationControl>,
     backend: Option<DirectTransaction>,
 }
@@ -704,6 +709,7 @@ impl RelationalDatabaseTransaction {
             snapshot: CommitId(backend.snapshot_csn().get()),
             catalog_version: database.store.catalog_version().get(),
             wrote: false,
+            in_operation: false,
             control,
             backend: Some(backend),
         })
@@ -716,13 +722,25 @@ impl RelationalDatabaseTransaction {
         store: &RelationalDatabase,
         operation: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        // SQL statements and native mutation batches own their complete delta;
+        // nested row operations must not check partially applied self-references.
+        let nested = self.in_operation;
+        self.in_operation = true;
         let result = (|| {
             self.ensure_active()?;
             if self.owner_id != store.handle_id {
                 return Err(invalid_transaction_owner());
             }
-            operation(self)
+            let value = operation(self)?;
+            if !nested {
+                // A nested error may have aborted the backend even if caught.
+                self.ensure_active()?;
+                self.backend_mut().validate_immediate_constraints()?;
+                self.ensure_active()?;
+            }
+            Ok(value)
         })();
+        self.in_operation = nested;
         if result.is_err() {
             // Release staged mutations and snapshot/read dependencies now,
             // even if the caller catches the error and retains this handle.

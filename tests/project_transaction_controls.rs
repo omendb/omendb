@@ -157,6 +157,107 @@ struct Outcome {
 }
 
 #[tokio::test]
+async fn immediate_foreign_key_errors_abort_simple_and_extended_blocks_before_success() {
+    let fixture = Fixture::new().await;
+    for sql in [
+        "CREATE TABLE parents (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents(id))",
+        "INSERT INTO parents VALUES (1)",
+        "INSERT INTO children VALUES (10, 1)",
+    ] {
+        fixture.client.batch_execute(sql).await.unwrap();
+    }
+    let mut wire = Wire::connect(&fixture.server).await;
+    for extended in [false, true] {
+        for statement in [
+            "INSERT INTO children VALUES (11, 7)",
+            "UPDATE children SET parent_id = 7 WHERE id = 10",
+            "DELETE FROM parents WHERE id = 1",
+        ] {
+            assert_eq!(wire.query("BEGIN", extended).await.status, b'T');
+            assert!(
+                wire.query("INSERT INTO items VALUES (1)", extended)
+                    .await
+                    .errors
+                    .is_empty()
+            );
+            let failure = wire.query(statement, extended).await;
+            assert_eq!(
+                (failure.status, failure.errors),
+                (b'E', vec!["23503".to_owned()]),
+                "{statement}, extended={extended}"
+            );
+            assert!(
+                failure.tags.is_empty(),
+                "a violating statement must not complete"
+            );
+            let repair = wire.query("INSERT INTO parents VALUES (7)", extended).await;
+            assert_eq!(
+                (repair.status, repair.errors),
+                (b'E', vec!["25P02".to_owned()])
+            );
+            let commit = wire.query("COMMIT", extended).await;
+            assert_eq!(
+                (commit.status, commit.tags),
+                (b'I', vec!["ROLLBACK".to_owned()])
+            );
+            assert!(commit.errors.is_empty());
+            assert_eq!(fixture.count().await, 0);
+            assert_eq!(
+                fixture
+                    .client
+                    .query("SELECT id FROM parents", &[])
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let child = fixture
+                .client
+                .query_one("SELECT parent_id FROM children WHERE id = 10", &[])
+                .await
+                .unwrap();
+            assert_eq!(child.get::<_, i64>(0), 1);
+        }
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn implicit_simple_batch_stops_at_the_immediate_foreign_key_violation() {
+    let fixture = Fixture::new().await;
+    for sql in [
+        "CREATE TABLE parents (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parents(id))",
+    ] {
+        fixture.client.batch_execute(sql).await.unwrap();
+    }
+    let mut wire = Wire::connect(&fixture.server).await;
+    let failure = wire.query(
+        "INSERT INTO items VALUES (1); INSERT INTO children VALUES (10, 7); INSERT INTO parents VALUES (7)",
+        false,
+    ).await;
+    assert_eq!(
+        (failure.status, failure.errors),
+        (b'I', vec!["23503".to_owned()])
+    );
+    assert_eq!(failure.tags.len(), 1, "only the valid prefix may complete");
+    assert_eq!(fixture.count().await, 0);
+    for table in ["parents", "children"] {
+        assert!(
+            fixture
+                .client
+                .query(&format!("SELECT id FROM {table}"), &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    drop(wire);
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn wire_status_and_tags_follow_failure_and_terminal_commit_ownership() {
     let fixture = Fixture::new().await;
     let mut wire = Wire::connect(&fixture.server).await;

@@ -356,8 +356,8 @@ pub struct NamedIndexDefinition {
 /// the constraint-timing contract; they are not representable.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReferentialAction {
-    /// Reject the parent delete while referencing children remain (default).
-    /// Enforced by the publication-time referential-integrity pass.
+    /// Reject a parent delete if referencing children remain when the
+    /// constraint is checked, according to its timing (default).
     #[default]
     Restrict,
     /// Stage deletion of referencing child rows when the parent is deleted.
@@ -367,17 +367,16 @@ pub enum ReferentialAction {
     SetNull,
 }
 
-/// When a constraint's satisfaction is observable. In the serialized-writer
-/// kernel both timings resolve at the publication-validation pass; the
-/// attribute records declared intent for the SQL surface and future
-/// concurrent profiles.
+/// When a foreign key must hold in the transaction's staged view.
+/// All foreign keys are also validated before publication.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConstraintTiming {
-    /// Every publication must satisfy the constraint (default).
+    /// Validate before a native operation or SQL statement succeeds (default).
+    /// A multi-row statement or native mutation batch is checked as a whole.
     #[default]
     Immediate,
-    /// Staged mutations may violate the constraint between publications;
-    /// the publication-validation pass still resolves it before durability.
+    /// Allow violations between operations, but reject an inconsistent final
+    /// state before publication. This native timing is not SQL deferrability.
     DeferredToPublication,
 }
 

@@ -69,6 +69,12 @@ aborts the entire typed transaction, even if its error is caught. Later operatio
 and `commit()` return `DbError::TransactionAborted`; begin a new transaction to
 continue. Statement-level recovery and savepoints are not supported.
 
+Immediate foreign keys must hold before each native operation or SQL statement
+succeeds. Multi-row statements and native `commit_batch` calls check their whole
+delta; separate SQL statements cannot repair an earlier immediate violation.
+Native `DeferredToPublication` constraints allow intermediate violations but
+must hold before commit publishes.
+
 Typed transactions retain their catalog alongside their row/index snapshot;
 `transaction.catalog()` exposes that layout even after later DDL. Old writers
 conflict with schema publication rather than omitting new constraints or indexes.

@@ -7,16 +7,6 @@ The [compatibility matrix](pgwire-compatibility.md) describes tested overlap, no
 complete PostgreSQL compatibility. [Architecture](architecture.md) describes the
 target, not current implementation.
 
-## Open integrity boundaries
-
-These concern the serving relational path, independently of the experimental
-storage replacement. Fixes must preserve independent semantic/security oracles,
-not treat current erroneous output as the contract.
-
-| Boundary | Known limitation | Source |
-| --- | --- | --- |
-| Constraint timing | Immediate and deferred typed FKs both validate at publication; advertised statement-time FK behavior is unqualified. | `src/relational.rs::ConstraintTiming`, `src/seer_direct.rs::validate_referential_integrity` |
-
 ## Resource and execution limits
 
 Connection limits, cooperative deadlines and estimated result-payload checks are
@@ -46,6 +36,7 @@ admission authority and must not be treated as a hard resource bound.
   expression indexes currently cover arithmetic.
 - Transactional DDL is unsupported. Send DDL alone in simple Query messages,
   outside explicit blocks; mixed or compound DDL messages are refused.
+  Dropping a self-referencing table is also refused.
 - SQL isolation alternatives are not selectable. Legacy serializability tests do
   not qualify the replacement's read/range/catalog certification.
 - TLS is not terminated by OmenDB. Use loopback/private deployment or a TLS proxy;

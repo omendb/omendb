@@ -10,7 +10,7 @@ cargo test --features pgwire --test project_pgwire_server --test project_transac
 ```
 
 The [gap register](gap-register.md) qualifies this evidence. Integrity and
-resource-boundary limitations remain open; the intended
+resource-boundary qualification remains incomplete; the intended
 [product architecture](architecture.md) is not a compatibility claim.
 
 A separate live differential in `tests/project_postgres_oracle.rs` compares a
@@ -45,8 +45,11 @@ POSTGRES_ORACLE_URL='host=127.0.0.1 port=5432 user=postgres password=postgres db
 SQL foreign keys support explicit column pairs and `ON DELETE RESTRICT`,
 `CASCADE` and `SET NULL` in `CREATE TABLE` and `ALTER TABLE ADD CONSTRAINT`.
 Explicit `NO ACTION`, `SET DEFAULT`, `ON UPDATE`, `MATCH` and deferrability clauses
-are refused. Publication-time FK validation is not qualification of PostgreSQL's
-statement-time constraint semantics; see the [known gaps](gap-register.md).
+are refused. Immediate foreign keys check the complete staged statement before
+success, including multi-row self-references and delete actions. A violation
+aborts the transaction; a later statement cannot repair it. Native
+`DeferredToPublication` timing permits intermediate violations but validates the
+final state before publication; it does not add SQL deferrability.
 
 ## Wire protocol
 
@@ -59,6 +62,7 @@ statement-time constraint semantics; see the [known gaps](gap-register.md).
 | Result encoding | Typed integers, text, NULL values, projections, aggregates, and `RETURNING` results are decoded by `tokio-postgres`. OmenDB's logical text type is described as PostgreSQL `TEXT`; all supported result signatures come from binding, not observed rows. | `wire_client_selects_seeds_and_reads_typed_rows`, `wire_insert_returning`, `wire_update_delete_returning`, `wire_left_outer_join_null_extension`, live PostgreSQL oracle |
 | Transactions | Plain `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, and `ROLLBACK`/`ABORT` map to connection-local blocks. Complete controls are parsed: characteristics (including read-only/isolation), savepoints and chaining are rejected rather than ignored. Explicit-block errors and idle expiry retain a rollback-only boundary (`25P02`); COMMIT then reports ROLLBACK. Consumed commit errors report idle, not a phantom aborted block. | `tests/project_transaction_controls.rs`, `wire_grant_enforcement_reader_writer_admin`, `idle_expiry_releases_transactions_without_restoring_autocommit` |
 | Cancellation | `CancelRequest` routes through the server-owned `(pid, secret)` registry to cooperative checkpoints and maps to `57014`. | `wire_cancel_request_aborts_lock_wait_before_publication`, `persistent_server_shutdown_cancels_query_before_database_close` |
+| Foreign-key timing | Immediate INSERT, UPDATE and DELETE violations return `23503` before statement completion in simple and extended execution. Explicit blocks become rollback-only; implicit batches stop before a later repair. | `immediate_foreign_key_errors_abort_simple_and_extended_blocks_before_success`, `implicit_simple_batch_stops_at_the_immediate_foreign_key_violation`, `immediate_foreign_keys_match_live_postgresql` |
 | Clean statement failure | Errors do not tear down a usable connection; syntax errors map to `42601`, parameter-shape errors to protocol violation `08P01`, undefined tables to `42P01`, undefined columns to `42703`, datatype mismatches to `42804`, division by zero to `22012`, numeric overflow to `22003`, not-null violations to `23502`, and unsupported statements to `0A000`. | `wire_client_gets_clean_errors_and_rejects_unsupported_sql`, `sql_parameter_errors_use_protocol_violation_state` (unit) |
 
 A simple Query error stops the remaining statements. An implicit block rolls back
@@ -145,13 +149,12 @@ or later compatibility work:
   need their real identity threaded into session functions;
 - exhaustive SQLSTATE mapping; remaining execution-time `InvalidState` errors
   still report a generic internal wire error rather than their
-  PostgreSQL-specific SQLSTATE;
+  PostgreSQL-specific SQLSTATE. Explicit `ON DELETE RESTRICT` violations use
+  the generic FK code `23503`, rather than PostgreSQL's `23001`;
 - query-result execution-memory quotas; the result-payload bound is an
   estimated pre-encoding check and is not a full memory quota;
 - full serving-path and replacement-kernel process-level kill/reopen coverage;
-  existing SeerDB legacy publication tests do not qualify vNext;
-- statement-time immediate FK semantics and action/timing-preserving conversion:
-  legacy typed FK validation occurs at publication even when labelled immediate.
+  existing SeerDB legacy publication tests do not qualify vNext.
 
 ## Parameter and window semantics
 
