@@ -54,7 +54,7 @@ implementation.
 
 SeerDB does not yet claim physical per-record page MVCC, parallel physical
 publication, SQL, HA, or cross-device performance parity. The transactional
-facade is a qualified development surface, not a release guarantee; the
+facade is a development surface, not a qualified release; the
 OmenDB server contract remains active architecture work.
 
 ## Basic use

@@ -1,11 +1,7 @@
-//! Attribute the SQL-tier statement cost that now dominates a commit.
+//! Measure the embedded SQL tier with a five-statement TPC-B mix.
 //!
-//! After the sync-class landing, the engine wave is ~223 us/txn
-//! (kernel class) while the full-stack single-client differential runs
-//! at ~8.2 ms/txn. This probe drives the five-statement TPC-B mix
-//! through the embedded SQL tier (no wire) and splits the wall time
-//! across parse, plan+execute per statement, and commit, with a
-//! parse-only baseline loop so the parser's share is measured directly.
+//! Reports plan-and-execute and commit timing, with a parse-only baseline.
+//! This is a component probe, not a server qualification benchmark.
 //!
 //! Run with:
 //!   cargo run --release -p omendb --features pgwire --example sql_tier_probe -- [txns]

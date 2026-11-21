@@ -33,7 +33,6 @@ All notable changes to OmenDB are documented here. Format follows
 - Development PostgreSQL wire compatibility matrix
   (`docs/pgwire-compatibility.md`) listing tested protocol/authentication/
   authorization behavior and explicit compatibility gaps.
-- Internal relational release-qualification checklist.
 - Reproducible single-client OLTP baseline `examples/alpha_oltp.rs` with
   workload metadata, latency percentiles, peak RSS, and SQLite comparison.
 - Peak-RSS reporting in the benchmark JSON output.
@@ -67,6 +66,9 @@ All notable changes to OmenDB are documented here. Format follows
 
 ### Removed
 
+- The throwaway `pgwire_serve` demo; use `omendbd` for client smoke tests.
+- The one-off `facade_wave_probe`; use the tier probes for engine, SQL,
+  and wire-path comparisons.
 - Legacy R-milestone diagnostic examples (`r0_*`, `r1_replay`, `r2_replay`,
   `seer_r*`, `runtime_mix`, `project_r2_replay`) and their orphaned
   fixtures; superseded by the integration test suites.

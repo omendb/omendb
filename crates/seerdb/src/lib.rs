@@ -42,8 +42,8 @@
 //! The first replacement slice is a buffered B-tree over guarded frames,
 //! followed by log-authoritative transactions and generic record/extent
 //! facilities. OmenDB's SQL-row layouts and index meanings remain in OmenDB.
-//! Physical page materialization becomes asynchronous relative to a durable
-//! transaction decision. Integrated consumers may share the same runtime
+//! Asynchronous materialization after durable decision is a design candidate,
+//! not a claim about the current runtime. Integrated consumers may share the same runtime
 //! without imposing a universal byte-KV representation.
 //!
 //! The current group-publication lane and generation-COW storage remain a

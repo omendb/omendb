@@ -1,12 +1,7 @@
-//! Attribute the wire-tier cost that dominates a committed transaction.
+//! Measure round trips for a five-statement TPC-B mix over PostgreSQL wire.
 //!
-//! The 2026-09-06 attribution chain: engine wave 223 us/txn (kernel
-//! class, wave_cost_probe), embedded SQL tier 1.161 ms/txn
-//! (sql_tier_probe, parse only 2.2%), yet the full-stack single-client
-//! differential runs at ~8.2 ms/txn. This probe closes the gap: it
-//! drives the same five-statement TPC-B mix through the real wire
-//! (tokio-postgres against a kernel-class omendbd) and reports the
-//! per-transaction round-trip cost without pgbench in the loop.
+//! Uses tokio-postgres against the persistent server entry point without
+//! pgbench in the loop. This is a component probe, not a qualification run.
 //!
 //! Run with:
 //!   cargo run --release -p omendb --features pgwire --example wire_tier_probe -- [txns]

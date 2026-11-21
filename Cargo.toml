@@ -48,10 +48,6 @@ name = "concurrency_stress"
 required-features = ["pgwire"]
 
 [[example]]
-name = "pgwire_serve"
-required-features = ["pgwire"]
-
-[[example]]
 name = "sql_tier_probe"
 required-features = ["pgwire"]
 
